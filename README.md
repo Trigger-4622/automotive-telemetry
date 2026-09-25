@@ -43,13 +43,16 @@ for the PC: the master runs in a simulated car (CAN bus, ECU answering OBD-II
 and SSM2, bus faults), and the screens render real LVGL into PNG screenshots.
 
 ```bash
-python scripts/test_all.py            # all three
-python scripts/test_all.py master     # or screen1 / screen2
+python scripts/test_all.py            # everything
+python scripts/test_all.py master     # or sync / screen1 / screen2
 ```
 
-Needs g++ and the libraries a first `pio run` downloads (or
-`bash scripts/cloud-setup.sh --force` on Linux). GitHub Actions runs the same
-tests and all three firmware builds on every pull request.
+`sync` checks that the files the projects share are still identical and that
+generated files (the master portal, the studio page) match their sources.
+The harnesses need g++ and the libraries a first `pio run` downloads (or
+`bash scripts/cloud-setup.sh --force` on Linux). GitHub Actions runs every
+suite and builds all three firmwares on each pull request and push to `main`,
+with a results table on the run page and the screen renders attached.
 
 ## Using Claude on GitHub
 

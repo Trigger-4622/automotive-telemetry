@@ -11,7 +11,9 @@ README.md for the layout. Three standalone PlatformIO projects:
 ## Commands
 
 ```bash
-python scripts/test_all.py                    # every host harness (master, screen1, screen2)
+python scripts/test_all.py                    # everything: sync checks + the three harnesses
+python scripts/test_all.py sync master        # or any of: sync master screen1 screen2
+python scripts/check_sync.py                  # just the copies-and-generated-files rules below
 python master/test_host/run.py [scenario] [-v]                 # master in a simulated car
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster)
@@ -19,11 +21,23 @@ python master/tools/build_portal.py           # after editing master/tools/porta
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
 
-Run the harness for every project you touch; they are the only way to exercise
-the firmware without hardware. In a cloud session `scripts/cloud-setup.sh`
-(session-start hook) has installed what they need; if it printed "NOT set up",
-say so rather than skipping the tests. Firmware builds need `*.platformio.org`
-on the environment's network allowlist.
+The harnesses are the only way to exercise the firmware without hardware.
+In a cloud session `scripts/cloud-setup.sh` (session-start hook) has installed
+what they need; if it printed "NOT set up", say so rather than skipping the
+tests. Firmware builds need `*.platformio.org` on the environment's network
+allowlist; if the build cannot download, say so - CI builds all three anyway.
+
+## How to deliver a change
+
+1. Work on a branch. Add or extend a harness scenario for what you change
+   (`master/test_host/tests/scenarios.cpp`, `screens/*/test_host/tests/ui_tests.cpp`
+   - the latter is shared, so the same file goes in both screens).
+2. `python scripts/test_all.py` must pass before you finish.
+3. Open a pull request and explain what changed and how it was tested. CI
+   (`.github/workflows/ci.yml`) runs `Tests - sync/master/screen1/screen2` and
+   `Build - <project>`; all must be green. Screen renders are attached to the
+   run as artifacts - look at them after any UI change.
+4. Say plainly what still needs the hardware: nothing here can flash a board.
 
 ## Rules from the owner - always
 
@@ -47,14 +61,18 @@ on the environment's network allowlist.
   partition table matches the build, plain `pio run -t upload`, then read back
   the settings partition.
 
-## Things that must stay in sync
+## Things that must stay in sync (`scripts/check_sync.py` enforces them)
 
-- `include/MasterPacket.h` byte-identical in master and both screens (compare
-  md5). Metric store sizes move together on all three nodes.
-- `src/ui/Telltales.*`, `include/Palette.h` and most of `test_host/` are shared
-  by the two screens - change both.
-- The master portal's source is `master/tools/portal_page.html` +
-  `WebPortal.cpp.in`; `src/WebPortal.cpp` is generated. Never edit it directly.
+- `include/MasterPacket.h` byte-identical in master and both screens. Metric
+  store sizes move together on all three nodes.
+- Shared by the two screens, change both: `include/Palette.h`,
+  `include/TelltaleIcons.h`, `src/ui/Telltales.*`, `tools/embed_studio.py`,
+  `tools/make_icons.py`, `tools/telltale_icons.json` and all of `test_host/`.
+- Generated, never edit by hand: `master/src/WebPortal.cpp` (from
+  `master/tools/portal_page.html` + `WebPortal.cpp.in` via build_portal.py),
+  the studio metric catalogue in `screens/*/data/www/index.html` (from
+  MasterPacket.h via known_catalogue.py), and `screens/*/src/config/StudioPage.h`
+  (from `data/www/index.html`; every firmware build regenerates it).
 
 ## Platform traps
 
