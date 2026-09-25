@@ -110,5 +110,13 @@ chip itself is microamps.
   load-dump transients well above 12 V.
 - Keep the CANH/CANL stub under ~30 cm and twisted.
 - Never fit the transceiver's 120 ohm termination on a vehicle bus.
+- Fit a 10 kΩ pull-up from the transceiver's TXD to 3V3. While the ESP32 is in
+  reset (a brown-out at cranking, say) its pins float; a TXD left low drives
+  the bus dominant and jams every module. The firmware drives TXD recessive
+  the moment it starts and latches it across sleep, but only the resistor
+  covers the reset window itself.
+- If the car sets P1718/P0700 (transmission ECU losing the engine ECU's CAN
+  messages): `P1718_DIAGNOSIS.md` has the causes, the fixes, and a test plan.
+  The portal's Diagnostics tab keeps the evidence (reset reasons, guard trips).
 - **Silent** mode (CAN tab) makes the controller electrically incapable of
   transmitting, for first contact with an unfamiliar bus.

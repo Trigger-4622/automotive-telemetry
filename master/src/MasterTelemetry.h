@@ -122,9 +122,32 @@ struct MasterStats {
     uint32_t errIdle;      /**< Bus errors while we were not transmitting.  */
     uint8_t  guardTrips;   /**< Times requests were paused this session.    */
     uint32_t guardPauseMs; /**< Pause left, ms (0 = requests allowed).      */
-    bool     guardSilent;  /**< Guard forced the controller to listen-only. */
+    bool     guardSilent;  /**< A guard forced the controller to listen-only.*/
+    bool     rxGuardSilent;/**< The receive-error guard did, specifically.  */
     /** @} */
 };
+
+/** @brief One entry of the persistent evidence log, for the portal. */
+struct EvView {
+    uint32_t ms;    /**< millis() when it happened.                       */
+    uint8_t  type;  /**< Event kind — see masterEventName().              */
+    uint8_t  act;   /**< What the master was transmitting at the time.    */
+    uint16_t a;     /**< Type-specific detail (reset reason, error count).*/
+    uint16_t b;     /**< Type-specific detail.                            */
+};
+
+/**
+ * @brief Copy the evidence log (boot/reset reasons, guard trips, bus-off,
+ *        sleep), oldest first.
+ * @return Rows written.
+ */
+size_t masterEventLog(EvView *out, size_t max);
+
+/** @brief Plain-word name of an evidence-log event type. */
+const char *masterEventName(uint8_t type);
+
+/** @brief Empty the evidence log (before a test drive). */
+void masterEventLogClear();
 
 /** @brief One row of the CAN identifier census. */
 struct CensusView {

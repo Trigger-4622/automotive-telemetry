@@ -92,6 +92,7 @@ static bool isObd(const twai_message_t &m, int pid = -1) {
     return (m.identifier == 0x7E0 || m.identifier == 0x7DF) && m.data[0] == 0x02 && m.data[1] == 0x01 &&
            (pid < 0 || m.data[2] == pid);
 }
+static bool isObdReq(const twai_message_t &m) { return isObd(m); }   // any PID, for txCount
 static bool isSsm(const twai_message_t &m) { return m.identifier == 0x7E0 && !isObd(m); }
 static bool anyFrame(const twai_message_t &) { return true; }
 
@@ -908,6 +909,299 @@ static void scDeviceConfig() {
           "SSM and PID tables intact after a minute");
 }
 
+/* ═══════════════════ the check-engine light: P1718 / P0700 ═══════════════════
+ *
+ * The transmission ECU sets P1718 when it stops receiving the engine ECU's
+ * periodic CAN messages, and P0700 to ask for the lamp. These scenarios run the
+ * master with the car's own settings file (DEVICE_CONFIG, as device_config
+ * does) in the simulated car with a transmission ECU watching for those frames,
+ * and reproduce each way the master can take them away from it.
+ */
+
+/** The car's settings file, exactly as read off the master; the stored
+ *  defaults for anything it lacks (the settle wait included). */
+static void loadCarConfig() {
+    std::string text;
+    if (const char *path = std::getenv("DEVICE_CONFIG")) {
+        if (FILE *f = std::fopen(path, "rb")) {
+            char buf[4096]; size_t n;
+            while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+            std::fclose(f);
+        }
+    }
+    if (text.empty())        // the values that matter, if the fixture is not there
+        text = R"({"cfg_ver":5,"diag_mode":2,"guard":false,"obd_gap":10,"obd_to":20,"obd_addr":0,"sleep_enabled":false})";
+    simfs::files["/config.json"] = text;
+    s_keepSettle = true;
+}
+
+/* Event types of the evidence log (main.cpp EvType), for the checks. */
+enum { EVT_BOOT = 0, EVT_BUS_UP, EVT_SETTLE_END, EVT_TX_TRIP, EVT_RX_TRIP, EVT_BUS_OFF, EVT_SLEEP, EVT_RESUME };
+static int evCount(int type, uint16_t *aOut = nullptr, uint8_t *actOut = nullptr) {
+    static EvView ev[64];
+    const size_t n = masterEventLog(ev, 64);
+    int k = 0;
+    for (size_t i = 0; i < n; i++)
+        if (ev[i].type == type) { k++; if (aOut) *aOut = ev[i].a; if (actOut) *actOut = ev[i].act; }
+    return k;
+}
+static int unexpectedErrors(const char *allowed) {
+    int n = 0;
+    for (const auto &l : logLines)
+        if (l.find("] E ") != std::string::npos && l.find(allowed) == std::string::npos) n++;
+    return n;
+}
+
+/**
+ * SUSPECT 2, the marginal link. The car's settings (transmit-side bus guard off,
+ * as on the car), a link on which our normal-mode controller detects errors in
+ * the engine ECU's broadcasts and error-flags them - destroying them for every
+ * module - and the transmission ECU watching. The receive-error guard must
+ * notice the storm on our own receive-error counter and drop the controller to
+ * listen-only, where it cannot flag anything, before the TCM loses the frames.
+ * Before that guard existed the master carried on and the TCM set P1718.
+ */
+static void scTcmP1718() {
+    loadCarConfig();
+    boot();
+    runUntil(20);                                   // settle over, requests running
+    check(tcm().armed && !tcm().p1718, "the TCM is receiving the ECM's broadcasts",
+          fmt("%u received", tcm().ecmRx));
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 12, 20) > 10,
+          "master in normal mode, requesting over OBD-II");
+    faults.rxCorruptRate = 0.9;                     // the link goes marginal
+    runUntil(60);
+    MasterStats st; masterGetStats(st);
+    check(st.rxGuardSilent && st.guardSilent, "receive-error guard tripped on the REC storm",
+          fmt("REC %u, TEC %u", st.rec, st.tec));
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY, "controller switched to listen-only");
+    check(st.silent, "the portal reports listen-only");
+    check(!tcm().p1718 && !tcm().p0700, "the TCM never lost the ECM: no P1718, no P0700",
+          fmt("%u frames destroyed before the guard acted, %u received", tcm().ecmLost, tcm().ecmRx));
+    check(tcm().windowRx >= 30, "the ECM's broadcasts flow to the TCM again", fmt("%u in the window", tcm().windowRx));
+    check(txCount(anyFrame, 25, 60) == 0, "nothing transmitted since", fmt("%llu", (unsigned long long)txCount(anyFrame, 25, 60)));
+    const sim::Shown *rx = shown(METRIC_ID_MASTER_CAN_RX);
+    check(rx && rx->value > 100, "still listening: frames reach the displays' health channel",
+          fmt("%.0f frames/s", rx ? rx->value : -1.0f));
+    uint16_t rec = 0; uint8_t act = 0;
+    check(evCount(EVT_RX_TRIP, &rec, &act) == 1 && rec >= 96 && (act & 0x01),
+          "evidence log: the trip, its REC, and that we were polling at the time",
+          fmt("REC %u, activity 0x%02X", rec, act));
+    check(simfs::files.count("/evlog.json") == 1, "evidence written to flash");
+    diagGuardReset();                               // Resume from the portal
+    faults.rxCorruptRate = 0;                       // (the link fixed)
+    runUntil(70);
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 65, 70) > 0, "Resume puts it back to normal");
+    check(evCount(EVT_RESUME) == 1, "...and that is recorded too");
+    check(unexpectedErrors("receive-error guard") == 0 && simBugs() == 0, "no other errors");
+}
+
+/** The same fault with the receive-error guard turned off: the master carries
+ *  on as before, and the TCM sets P1718 - the car's fault, reproduced. That is
+ *  what the guard prevents, and turning it off is the owner's choice. */
+static void scTcmP1718Optout() {
+    loadCarConfig();
+    boot();
+    portalPost(R"({"rx_guard":false})");
+    runUntil(20);
+    faults.rxCorruptRate = 0.9;
+    runUntil(60);
+    MasterStats st; masterGetStats(st);
+    check(controller().mode == TWAI_MODE_NORMAL && !st.rxGuardSilent, "guard off: the master stays in normal mode");
+    check(tcm().p1718 && tcm().p0700, "...and the TCM sets P1718 and P0700 - the fault, reproduced",
+          fmt("%u destroyed, %u in the window", tcm().ecmLost, tcm().windowRx));
+    check(evCount(EVT_RX_TRIP) == 0, "no trip recorded (nothing acted)");
+    check(txCount(isObdReq, 30, 60) > 0, "requests continued regardless");
+}
+
+/** Stray errors that are not ours (a few a second on a busy bus) keep REC near
+ *  zero, so they must not trip the receive-error guard either. */
+static void scRxGuardTrickle() {
+    boot();
+    runUntil(10);
+    faults.idleErrorsPerSec = 5;
+    runUntil(120);
+    MasterStats st; masterGetStats(st);
+    check(st.errIdle > 300, "plenty of stray errors seen", fmt("%u", st.errIdle));
+    check(!st.rxGuardSilent && controller().mode == TWAI_MODE_NORMAL, "a trickle does not trip the receive-error guard",
+          fmt("REC %u", st.rec));
+    check(evCount(EVT_RX_TRIP) == 0, "nothing recorded as a trip");
+    commonChecks();
+}
+
+static double minObdGapMs(double fromS, double toS) {
+    double best = 1e9, last = -1;
+    for (const auto &r : sim::transmitted) {
+        const double t = tOf(r.tUs);
+        if (t < fromS || t >= toS || !isObd(r.msg)) continue;
+        if (last >= 0) best = std::min(best, (t - last) * 1000);
+        last = t;
+    }
+    return best;
+}
+
+/**
+ * SUSPECT 1, request pacing. The car's obd_to is 20 ms; ISO 15765-4 gives the
+ * ECU 50 ms (P2CAN) to answer. An ECU that answers in 35 ms is timed out at
+ * 20 ms, and the next request used to go out 10 ms later - into the reply the
+ * ECU was still sending. After an unanswered request the next one now waits
+ * until P2CAN has passed since the send (obd_p2can). The stored obd_to is left
+ * as it is (device_config must show 0 differences); the wait is the extra.
+ */
+static void scPacingP2can() {
+    loadCarConfig();
+    ecu.replyLatencyUs = 35000;
+    boot();
+    runUntil(30);
+    check(masterPidSupported(0x0C), "the probe (150 ms wait) finds the ECU");
+    const double gap = minObdGapMs(12, 30);
+    check(gap >= 49.5, "after an unanswered request the next waits for P2CAN (50 ms)", fmt("min gap %.1f ms", gap));
+    check(txCount(isObdReq, 12, 30) > 20, "requests continue - spread over time, none dropped",
+          fmt("%llu", (unsigned long long)txCount(isObdReq, 12, 30)));
+    check(shown(METRIC_ID_COOLANT_TEMP) != nullptr, "the late replies are still decoded");
+    check(Cfg.obdTimeoutMs == 20, "the stored obd_to is untouched", fmt("%u", Cfg.obdTimeoutMs));
+    portalPost(R"({"obd_p2can":0})");
+    runUntil(50);
+    const double gap0 = minObdGapMs(35, 50);
+    check(gap0 < 50.0, "obd_p2can 0 turns the wait off (adjustable)", fmt("min gap %.1f ms", gap0));
+    portalPost(R"({"obd_p2can":5000})");
+    check(Cfg.obdP2CanMs == 2000, "clamped to 2000 ms", fmt("%u", Cfg.obdP2CanMs));
+    portalPost(R"({"obd_p2can":50})");
+    JsonDocument d; deserializeJson(d, simfs::files["/config.json"]);
+    check((d["obd_p2can"] | -1) == 50, "saved in the file", fmt("%d", d["obd_p2can"] | -1));
+}
+
+/** The overall request budget: an adjustable ceiling on requests per second
+ *  that spreads them out and never drops a value. Off (0) by default. */
+static void scBudget() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"diag_mode":2,"req_max_hz":20})";
+    boot();
+    runUntil(20);
+    const double rate = txCount(isObdReq, 5, 20) / 15.0;
+    check(rate <= 21.0, "OBD-II requests capped at req_max_hz (20/s)", fmt("%.1f/s", rate));
+    check(rate >= 8.0, "...and still flowing", fmt("%.1f/s", rate));
+    const double gap = minObdGapMs(5, 20);
+    check(gap >= 49.0, "at least 50 ms between requests", fmt("min gap %.1f ms", gap));
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "values flow", info);
+    portalPost(R"({"req_max_hz":0})");
+    runUntil(40);
+    const double rate0 = txCount(isObdReq, 25, 40) / 15.0;
+    check(rate0 > 22.0, "0 removes the cap (adjustable)", fmt("%.1f/s", rate0));
+    portalPost(R"({"req_max_hz":999})");
+    check(Cfg.reqMaxHz == 200, "clamped to 200/s", fmt("%u", Cfg.reqMaxHz));
+    commonChecks();
+}
+
+static bool isFunctional(const twai_message_t &m) { return m.identifier == 0x7DF; }
+
+/**
+ * SUSPECT 5, functional requests. 0x7DF reaches every ECU, the transmission
+ * ECU included, and it answers. With addressing on auto, one missed physical
+ * probe used to switch the master to 0x7DF for good. Physical now gets several
+ * tries and, once it has worked, is never given up.
+ */
+static void scNoFunctional() {
+    ecu.obdPhysical = false;            // the engine ECU misses the first probes...
+    boot();
+    runUntil(2.5);
+    ecu.obdPhysical = true;             // ...then answers
+    runUntil(30);
+    MasterStats st; masterGetStats(st);
+    check(st.obdPhysical, "still addressing the engine ECU alone after a transient miss");
+    check(txCount(isFunctional, 0) == 0, "not one functional (0x7DF) frame - the TCM is never addressed",
+          fmt("%llu", (unsigned long long)txCount(isFunctional, 0)));
+    check(masterPidSupported(0x0C), "OBD-II working");
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "values flow", info);
+    commonChecks();
+}
+
+/**
+ * SUSPECTS 3 and 4, a reboot during cranking. The reset reason is recorded and
+ * the settle wait holds the controller listen-only while the car's modules
+ * start, so a master that browned out at cranking cannot start requesting -
+ * or even ACKing - into a bus that is still coming up. An earlier boot in the
+ * stored log survives to show the history.
+ */
+static void scCrankReset() {
+    sim::resetReason = 9;                                       // ESP_RST_BROWNOUT
+    simfs::files["/evlog.json"] = "[[123456,0,32,1,5]]";        // an earlier clean power-on
+    loadCarConfig();
+    boot();
+    runUntil(0.5);
+    check(logHas("boot: reset reason 9"), "the brown-out reset is logged");
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY, "listen-only while the bus settles after it");
+    runUntil(9.5);
+    check(txCount(anyFrame, 0, 9.5) == 0, "nothing transmitted for the settle wait",
+          fmt("%llu", (unsigned long long)txCount(anyFrame, 0, 9.5)));
+    runUntil(15);
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 10.5, 15) > 0, "requests after the wait");
+    static EvView ev[64];
+    const size_t n = masterEventLog(ev, 64);
+    check(n >= 4 && ev[0].type == EVT_BOOT && ev[0].a == 1, "the earlier boot loaded from flash first",
+          fmt("%zu records, first type %u reason %u", n, n ? ev[0].type : 99, n ? ev[0].a : 0));
+    uint16_t reason = 0;
+    check(evCount(EVT_BOOT, &reason) == 2 && reason == 9, "this boot recorded as a brown-out", fmt("reason %u", reason));
+    check(evCount(EVT_BUS_UP) == 1, "the bus coming up is recorded");
+    uint16_t waited = 0;
+    check(evCount(EVT_SETTLE_END, &waited) == 1 && waited == 10, "the end of the settle wait is recorded", fmt("%u s", waited));
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/evlog.json"]) && d.size() == n, "all of it written to flash",
+          fmt("%u records in the file", (unsigned)d.size()));
+    commonChecks();
+}
+
+/** The evidence log around a transmit-side guard trip, and clearing it. */
+static void scEvlog() {
+    boot();
+    runUntil(20);
+    faults.errorPerOwnFrame = 0.5;
+    runUntil(30);
+    faults.errorPerOwnFrame = 0;
+    uint16_t reason = 0;
+    check(evCount(EVT_BOOT, &reason) == 1 && reason == 1, "boot recorded as a power-on", fmt("reason %u", reason));
+    uint16_t trip = 0; uint8_t act = 0;
+    check(evCount(EVT_TX_TRIP, &trip, &act) >= 1 && (act & 0x01), "the bus-guard trip is recorded with OBD-II polling at the time",
+          fmt("trip %u, activity 0x%02X", trip, act));
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/evlog.json"]) && d.size() >= 3, "written to flash", fmt("%u records", (unsigned)d.size()));
+    masterEventLogClear();
+    runUntil(35);
+    check(evCount(EVT_BOOT) == 0 && evCount(EVT_TX_TRIP) == 0, "Clear empties it");
+    JsonDocument e;
+    check(!deserializeJson(e, simfs::files["/evlog.json"]) && e.size() == 0, "...on flash too");
+}
+
+/** The CAN TX line: driven recessive the instant the firmware starts, and
+ *  latched recessive across deep sleep (tx_hold). */
+static void scTxHold() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"sleep_idle_s":20})";
+    boot();
+    runUntil(2);
+    check(txConfiguredOut && txDrivenHigh, "CAN TX driven recessive at boot, before the driver");
+    check(gpioHoldEnabled == 0, "no latch while running - the controller owns the pin");
+    runUntil(15);
+    faults.silenceBus = true;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;
+    runUntil(60);
+    check(sleepEntered, "slept");
+    check(gpioHoldEnabled > 0 && txDrivenHigh, "TX latched recessive for the whole sleep");
+    check(evCount(EVT_SLEEP) == 1, "sleep recorded in the evidence log");
+}
+
+/** ...and the latch is the owner's to turn off. */
+static void scTxHoldOff() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"sleep_idle_s":20,"tx_hold":false})";
+    boot();
+    runUntil(15);
+    check(txConfiguredOut && txDrivenHigh, "the boot-time recessive drive is unconditional");
+    faults.silenceBus = true;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;
+    runUntil(60);
+    check(sleepEntered && gpioHoldEnabled == 0, "tx_hold off: no latch across sleep (adjustable)");
+}
+
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
 static const Scenario SCENARIOS[] = {
     {"auto", scAuto, 0}, {"silent", scSilent, 0}, {"mode_switch", scModeSwitch, 0},
@@ -924,6 +1218,11 @@ static const Scenario SCENARIOS[] = {
     {"timing_1m", scTiming1M, 0}, {"sleep_held", scSleepHeld, 0},
     {"settle", scSettle, 0}, {"settle_restart", scSettleRestart, 0}, {"settle_portal", scSettlePortal, 0},
     {"device_config", scDeviceConfig, 0},
+    {"tcm_p1718", scTcmP1718, 0}, {"tcm_p1718_optout", scTcmP1718Optout, 0},
+    {"rx_guard_trickle", scRxGuardTrickle, 0}, {"pacing_p2can", scPacingP2can, 0},
+    {"budget", scBudget, 0}, {"no_functional", scNoFunctional, 0},
+    {"crank_reset", scCrankReset, 0}, {"evlog", scEvlog, 0},
+    {"tx_hold", scTxHold, 0}, {"tx_hold_off", scTxHoldOff, 0},
 };
 
 static const Scenario *s_sc = nullptr;

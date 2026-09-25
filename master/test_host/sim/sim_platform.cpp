@@ -15,8 +15,10 @@
 #include "MasterPacket.h"
 #include "WebPortal.h"
 #include "WiFi.h"
+#include "driver/gpio.h"
 #include "esp_now.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -186,6 +188,26 @@ EspClassMock ESP;
 uint32_t EspClassMock::getFreeHeap() { return sim::heapFree; }
 void EspClassMock::restart() { std::printf("*** ESP.restart()\n"); std::_Exit(5); }
 int analogRead(uint8_t) { return 2000; }
+
+/* ─────────────── reset reason, GPIO hold, digital IO ─────────────── */
+
+namespace sim {
+int  gpioHoldEnabled = 0;
+bool txDrivenHigh = false;
+bool txConfiguredOut = false;
+}
+
+esp_reset_reason_t esp_reset_reason() { return (esp_reset_reason_t)sim::resetReason; }
+
+esp_err_t gpio_hold_en(gpio_num_t)  { sim::gpioHoldEnabled++; return ESP_OK; }
+esp_err_t gpio_hold_dis(gpio_num_t) { if (sim::gpioHoldEnabled) sim::gpioHoldEnabled--; return ESP_OK; }
+void      gpio_deep_sleep_hold_en()  {}
+void      gpio_deep_sleep_hold_dis() {}
+esp_err_t gpio_pullup_en(gpio_num_t) { return ESP_OK; }
+
+void pinMode(uint8_t, uint8_t mode) { if (mode == OUTPUT) sim::txConfiguredOut = true; }
+void digitalWrite(uint8_t, uint8_t val) { sim::txDrivenHigh = (val == HIGH); }
+int  digitalRead(uint8_t) { return sim::txDrivenHigh ? HIGH : LOW; }
 
 /* ═════════════════════════════ LittleFS ═════════════════════════════════ */
 

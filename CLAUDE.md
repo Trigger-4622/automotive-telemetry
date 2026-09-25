@@ -111,6 +111,12 @@ no known source.
 
 - Master power-on settle wait (`start_delay_s`, 10 s default) is built and
   tested but not yet flashed.
+- The check-engine-light work (`master/P1718_DIAGNOSIS.md`): receive-error
+  guard (`rx_guard`), P2CAN wait (`obd_p2can`), request budget
+  (`req_max_hz`), TX recessive hold (`tx_hold`), physical-addressing latch and
+  the evidence log (portal Diagnostics tab) are built and tested in the
+  harness (`tcm_p1718` and the scenarios after it) but not yet flashed. The
+  simulator has a TCM that sets P1718.
 - Screens: warning lamps, dash screen and the cluster redesign are built and
   tested in the harness but not yet flashed or seen on hardware.
 - Cluster: whether the Arduino_GFX driver cured the panel speckle is

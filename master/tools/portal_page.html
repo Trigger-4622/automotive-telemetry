@@ -88,6 +88,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <button data-t="src">Sources</button>
   <button data-t="set">Settings</button>
   <button data-t="adv">Advanced</button>
+  <button data-t="diag">Diagnostics</button>
  </nav>
 </header>
 <main>
@@ -170,6 +171,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="f"><div class="l"><b>Allow Subaru SSM2 requests</b><span>only for what OBD-II cannot give: knock, A/F learning, switches</span></div><input type="checkbox" id="sSsm"></div>
   <div class="f"><div class="l"><b>Learn automatically</b><span>matches requested values to bus traffic, then stops requesting them</span></div><input type="checkbox" data-k="learn"></div>
   <div class="f"><div class="l"><b>Bus guard</b><span>pauses requests if bus errors follow our frames</span></div><input type="checkbox" data-k="guard"></div>
+  <div class="f"><div class="l"><b>Receive-error guard</b><span>switches to listen-only if our controller starts corrupting other modules' frames (a receive-error storm) — the protection against the transmission ECU losing the engine ECU's messages</span></div><input type="checkbox" data-k="rx_guard"></div>
   <div class="f"><div class="l"><b>Wait after power-on</b><span>seconds of listening only while the car's bus settles, before the first request · 0 = no wait</span></div><input type="number" data-k="start_delay_s" min="0" max="300"></div>
   <p class="say" style="margin:8px 0 0">With both requests off the master only listens and cannot transmit at all - the CAN controller switches to listen-only the moment you save.</p>
  </div>
@@ -214,6 +216,16 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
    <label class="b">Upload<input type="file" id="jf" accept=".json,application/json" hidden onchange="jsonUpload(this)"></label>
   </div></div>
 </section>
+
+<section id="t-diag" hidden>
+ <div class="card"><h2>Evidence log <small id="evN"></small>
+  <button class="b" style="margin-left:auto" onclick="if(confirm('Clear the evidence log?'))post('/api/evlog/clear','Cleared',pollEvlog)">Clear</button></h2>
+  <p class="say" style="margin:0 0 8px">Kept on the master's flash across reboots and firmware updates: every boot with its reset reason,
+   the bus coming up and settling, every guard trip with the error counters and what the master was transmitting at the time,
+   bus-off and sleep. Clear it before a test drive, read it after.</p>
+  <p class="say" id="evSay"></p>
+  <div class="wrap"><table><thead><tr><th>Uptime</th><th>Event</th><th>Detail</th><th>Master was</th></tr></thead><tbody id="evTab"></tbody></table></div></div>
+</section>
 </main>
 <div id="save"><span class="muted" id="saveMsg">Unsaved changes</span><button class="b" onclick="load()">Discard</button><button class="b p" onclick="save()">Save</button></div>
 <div id="toast"></div>
@@ -232,8 +244,9 @@ function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';cl
 async function post(u,msg,then){try{const r=await fetch(u,{method:'POST'});if(!r.ok)throw 0;toast(msg);if(then)setTimeout(then,500)}catch(e){toast('Failed')}}
 function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v)}
 function go(t){TAB=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
- ['dash','bus','src','set','adv'].forEach(x=>$('#t-'+x).hidden=x!==t);
- if(t==='bus')pollBus();if(t==='src')renderSources();if(t==='dash'&&L)renderDash();if(t==='adv'){renderAdv();jsonShow()}}
+ ['dash','bus','src','set','adv','diag'].forEach(x=>$('#t-'+x).hidden=x!==t);
+ if(t==='bus')pollBus();if(t==='src')renderSources();if(t==='dash'&&L)renderDash();if(t==='adv'){renderAdv();jsonShow()}
+ if(t==='diag')pollEvlog()}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
 /* ───────────── settings: every input bound to the config by data-k ───────────── */
@@ -309,6 +322,8 @@ const ADV=[
   ['obd_addr','OBD-II addressing','sel',[[0,'Auto (engine ECU first)'],[1,'Engine ECU only (0x7E0)'],[2,'All ECUs (0x7DF)']]],
   ['obd_gap','Pause between OBD-II requests','num','ms',0,255],
   ['obd_to','OBD-II reply timeout','num','ms',20,2000],
+  ['obd_p2can','After an unanswered request, wait at least (ISO 15765-4 P2CAN)','num','ms from the send · 0 = off',0,2000],
+  ['req_max_hz','Request budget','num','requests/s · 0 = no cap',0,200],
   ['ssm_gap','Pause between SSM2 requests','num','ms',50,5000],
   ['ssm_batch','Values per SSM2 request','num','2–33',2,33],
   ['ssm_to','SSM2 reply timeout','num','ms',100,5000],
@@ -326,7 +341,9 @@ const ADV=[
   ['guard_errs','Errors after our frames that trip it','num','',1,100],
   ['guard_win','…within','num','s',1,120],
   ['guard_pause','Pause requests for','num','s',1,3600],
-  ['guard_trips','Trips before switching to listen-only','num','',1,50]]],
+  ['guard_trips','Trips before switching to listen-only','num','',1,50],
+  ['rx_guard','Receive-error guard: listen-only when our controller corrupts other modules\' frames','bool'],
+  ['rx_guard_rec','…receive-error counter that trips it','num','96 = error-warning level',16,255]]],
  ['CAN controller',[
   ['bitrate_kbps','Bitrate','sel',[[125,'125 kbit/s'],[250,'250 kbit/s'],[500,'500 kbit/s'],[1000,'1 Mbit/s']],1],
   ['can_sp875','Late sample point (87.5 %)','bool',null,null,null,null,1]]],
@@ -340,7 +357,8 @@ const ADV=[
   ['ldr_light','Light sensor: day above','num','ADC',0,4095]]],
  ['Power',[
   ['sleep_enabled','Sleep when the car is off','bool'],
-  ['sleep_idle_s','Sleep after','num','s',10,3600]]],
+  ['sleep_idle_s','Sleep after','num','s',10,3600],
+  ['tx_hold','Hold the CAN TX line recessive across sleep','bool']]],
  ['Network',[
   ['wifi_channel','Display channel','num','1–13',1,13,1,1],
   ['ap_ssid','Wi-Fi name','str',null,null,null,null,1],
@@ -403,7 +421,8 @@ function renderDash(){
   if(nObd)say+=`OBD-II is asked for ${nObd} the car does not broadcast`+(nSsm?`, and SSM2 for ${nSsm} more OBD-II has no PID for. `:'. ');
   else if(nSsm)say+=`SSM2 is asked for ${nSsm}. `;
   if(d.obd.answers===2&&d.ssm.answers===2)say+='<span class="warn">The ECU answers neither OBD-II nor SSM2.</span> ';
-  if(d.guard.silent)say+='<span class="crit">Bus errors kept following our requests, so the master switched itself to listen-only.</span> See the Bus tab. ';
+  if(d.guard.rx_silent)say+='<span class="crit">Our controller was corrupting other modules\' frames, so the master switched itself to listen-only.</span> See the Bus and Diagnostics tabs. ';
+  else if(d.guard.silent)say+='<span class="crit">Bus errors kept following our requests, so the master switched itself to listen-only.</span> See the Bus tab. ';
   else if(d.guard.pause)say+=`<span class="warn">Requests paused for ${Math.ceil(d.guard.pause/1000)} s after bus errors.</span> `;
   if(todo)say+=`${todo} more ${todo===1?'is':'are'} being learned.`;
  }
@@ -466,7 +485,8 @@ function renderBusTiles(){
  $('#bErrTxS').textContent=`${d.bus.err_idle} while we were quiet`;
  const g=d.guard;$('#gCard').hidden=!(g.silent||g.pause);
  const trips=C.guard_trips||3;
- if(g.silent)$('#gSay').innerHTML='Bus errors kept following our frames, so the controller was switched to <b>listen-only</b> — it cannot disturb the car now. Fix the wiring (see below), then resume. The guard can be turned off in Settings.';
+ if(g.rx_silent)$('#gSay').innerHTML='Our controller\'s receive-error counter climbed into the error-warning region: it was error-flagging — destroying — other modules\' frames, which is how the transmission ECU loses the engine ECU\'s messages. It was switched to <b>listen-only</b>. Check the transceiver ground and stub length, try the late sample point (Advanced), then resume. The Diagnostics tab has the record.';
+ else if(g.silent)$('#gSay').innerHTML='Bus errors kept following our frames, so the controller was switched to <b>listen-only</b> — it cannot disturb the car now. Fix the wiring (see below), then resume. The guard can be turned off in Settings.';
  else if(g.pause)$('#gSay').innerHTML=`Bus errors followed our frames, so all requests are paused for another ${Math.ceil(g.pause/1000)} s (pause ${g.trips} of ${trips}; the last one switches to listen-only).`;
  $('#bLoad').textContent=d.bus.alive?RATES.load.toFixed(0)+'%':'–';
  const bar=$('#bBar');bar.style.width=Math.min(100,RATES.load)+'%';
@@ -658,6 +678,35 @@ function updateSourceText(){
   (s.refused?` · ${s.refused} refused by the ECU`:'')+(s.last_err?` · last problem: ${s.last_err}`:'');
  $('#sEcu').innerHTML=s.ecu_id?`ECU <b>${s.ecu_id}</b> · SYS ${s.sys_id} · ${s.flags} capability bytes${s.init?'':' (remembered)'} · this master ${esc(L.mac)}`:`This master ${esc(L.mac)}`}
 
+/* ───────────── diagnostics: the evidence log ───────────── */
+const EVN={0:'Boot',1:'Bus up',2:'Bus settled',3:'Bus guard trip',4:'Receive-error guard',5:'Bus-off',6:'Sleep',7:'Resumed'};
+const RST={0:'unknown',1:'power-on',2:'external reset',3:'software reset',4:'panic',5:'interrupt watchdog',6:'task watchdog',7:'watchdog',8:'wake from deep sleep',9:'brown-out',10:'SDIO'};
+const ACTS=a=>{const p=[];if(a&4)p.push('listen-only');else if(a&8)p.push('free to transmit');if(a&1)p.push('OBD-II polling');if(a&2)p.push('settling');
+ p.push('mode '+(['auto','SSM2','OBD-II','both','silent'][(a>>4)&15]||'?'));return p.join(', ')};
+function evDetail(e){
+ if(e.t===0)return`reset: <b class="${e.a===9?'crit':''}">${RST[e.a]||e.a}</b> · config v${e.b}`;
+ if(e.t===1)return`bus session ${e.a}`;
+ if(e.t===2)return`after ${e.a} s of listening`;
+ if(e.t===3)return`trip ${e.a}${e.b?' → listen-only':''}`;
+ if(e.t===4)return`REC ${e.a}, TEC ${e.b} → listen-only`;
+ if(e.t===5)return`TEC ${e.a}`;
+ return''}
+async function pollEvlog(){
+ if(TAB!=='diag')return;
+ let d;try{d=await fetch('/api/evlog').then(r=>r.json())}catch(e){return}
+ const ev=d.events||[],rows=ev.slice().reverse();
+ $('#evN').textContent=ev.length+' events';
+ $('#evTab').innerHTML=rows.map(e=>`<tr><td class="muted">${(e.ms/1000).toFixed(0)} s</td><td><b>${EVN[e.t]||e.t}</b></td><td>${evDetail(e)}</td><td class="muted">${ACTS(e.act)}</td></tr>`).join('')||
+  '<tr><td colspan="4" class="empty">Nothing recorded yet.</td></tr>';
+ const boots=ev.filter(e=>e.t===0),brown=boots.filter(e=>e.a===9).length,rx=ev.filter(e=>e.t===4).length,tx=ev.filter(e=>e.t===3).length,off=ev.filter(e=>e.t===5).length;
+ let s='';
+ if(brown)s+=`<span class="crit">${brown} brown-out reset${brown>1?'s':''}</span> — the master rebooted on a voltage dip (cranking); the settle wait and the TX hold matter. `;
+ if(rx)s+=`<span class="crit">${rx} receive-error guard trip${rx>1?'s':''}</span> — our controller was corrupting other modules' frames on a marginal link: check the ground, the stub length and try the late sample point. `;
+ if(tx)s+=`<span class="warn">${tx} bus-guard trip${tx>1?'s':''}</span> — errors followed our own requests. `;
+ if(off)s+=`<span class="crit">${off} bus-off</span>. `;
+ if(!s)s=`<span class="ok">${boots.length} boot${boots.length===1?'':'s'}, no brown-out, no guard trip, no bus-off</span> — if the lamp still came on, the master was not the one disturbing the bus.`;
+ $('#evSay').innerHTML=s}
+
 /* ───────────── polling ───────────── */
 async function poll(){
  let d;try{d=await fetch('/api/live').then(r=>r.json())}catch(e){
@@ -680,5 +729,5 @@ async function poll(){
  if(TAB==='dash')renderDash();
  if(TAB==='bus')renderBusTiles();
  if(TAB==='src'||TAB==='set')updateSourceText()}
-load();poll();setInterval(poll,1000);setInterval(pollBus,1000);
+load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);
 </script></body></html>

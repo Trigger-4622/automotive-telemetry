@@ -21,6 +21,7 @@ BusFaults faults;
 std::vector<TxRecord> transmitted;
 uint64_t obdRequests = 0, ssmRequests = 0, ssmReadsWithBad = 0;
 int reinstalls = 0, bugUninstallWhileWaiting = 0;
+int resetReason = 1;   // ESP_RST_POWERON
 }
 using namespace sim;
 
@@ -170,9 +171,80 @@ static void schedule(uint64_t atUs, const twai_message_t &m) { s_pending.emplace
 
 static void deliver(const twai_message_t &m) {
     if (!C.installed || C.state != TWAI_STATE_RUNNING) return;
+    // A frame received without a bus error winds the receive-error counter back
+    // down, as a real controller does - so a trickle of stray errors on a busy
+    // bus keeps REC near zero, and only a sustained storm drives it up.
+    if (C.rec) C.rec--;
     if (C.rx.size() >= C.rxLen) { C.rxMissed++; raiseAlert(TWAI_ALERT_RX_QUEUE_FULL); return; }
     C.rx.push_back(m);
     simrtos::notify(&C.rxw);
+}
+
+/**
+ * The transmission ECU (TCM) and the master's effect on the ECM's broadcasts.
+ *
+ * These frames are what the TCM needs; P1718 is it not getting them.
+ */
+static const uint32_t ECM_TO_TCM[] = { 0x231, 0x232 };
+static bool isEcmToTcm(uint32_t id) {
+    for (uint32_t x : ECM_TO_TCM) if (x == id) return true;
+    return false;
+}
+
+static struct Tcm {
+    bool     p1718 = false, p0700 = false, armed = false;
+    uint32_t rx = 0, lost = 0;
+    std::deque<uint64_t> recent;   // arrival times, for the sliding window
+} T;
+
+static constexpr uint64_t TCM_WINDOW_US = 1500000;  // 1.5 s
+static constexpr size_t   TCM_MIN_RX    = 30;       // ~150/s healthy; a real gap is far below
+
+TcmView sim::tcm() {
+    return { T.p1718, T.p0700, (uint32_t)T.rx, (uint32_t)T.lost, (uint32_t)T.recent.size(), T.armed };
+}
+
+/** A received receive-error: REC climbs, and the controller flags it (which is
+ *  exactly what destroys the frame for the other modules). */
+static void rxError() {
+    C.busErrors++;
+    C.rec += 8;
+    raiseAlert(TWAI_ALERT_BUS_ERROR);
+    if (C.rec >= 96)  raiseAlert(TWAI_ALERT_ABOVE_ERR_WARN);
+    if (C.rec >= 128) raiseAlert(TWAI_ALERT_ERR_PASS);
+}
+
+/** True when the master, as a normal-mode node on a marginal link, corrupts
+ *  this ECM broadcast frame with an error flag before the TCM can receive it. */
+static bool masterCorruptsRx() {
+    return faults.rxCorruptRate > 0 && C.installed && C.state == TWAI_STATE_RUNNING &&
+           C.mode == TWAI_MODE_NORMAL && urand() < faults.rxCorruptRate;
+}
+
+/** Run the TCM's view of one ECM broadcast frame about to go on the bus.
+ *  @return true if the frame survived (deliver it), false if it was destroyed. */
+static bool tcmSee(const twai_message_t &m) {
+    if (!isEcmToTcm(m.identifier)) return true;
+    if (masterCorruptsRx()) {
+        rxError();
+        T.lost++;
+        return false;                       // destroyed on the bus, TCM included
+    }
+    T.rx++;
+    T.recent.push_back(simrtos::nowUs());
+    return true;
+}
+
+/** Latch P1718 when the ECM's broadcasts thin out on an otherwise live bus. */
+static void tcmEvaluate(uint64_t now) {
+    while (!T.recent.empty() && T.recent.front() + TCM_WINDOW_US < now) T.recent.pop_front();
+    if (faults.silenceBus) return;          // car asleep: no broadcasts expected
+    if (T.recent.size() >= TCM_MIN_RX) T.armed = true;
+    if (T.armed && T.recent.size() < TCM_MIN_RX) {
+        if (!T.p1718) simLog('W', "SIM-TCM: P1718 - ECM broadcasts lost (%zu in %llu ms)",
+                              T.recent.size(), (unsigned long long)(TCM_WINDOW_US / 1000));
+        T.p1718 = T.p0700 = true;
+    }
 }
 
 /* ═════════════════════════════════ the car ══════════════════════════════ */
@@ -268,7 +340,7 @@ static void carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
             case 0x332: m = frame(0x332, {s_cnt, (uint8_t)(s_cnt * 7), 0, 0, 0, 0, 0, 0}); break;
             default:    m = frame(d.id, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}); break;
         }
-        deliver(m);
+        if (tcmSee(m)) deliver(m);      // the TCM watches the ECM's broadcasts
     }
     // Stress: many more identifiers than the census holds, each at 20 Hz,
     // spread over time as a real bus would carry them (not in one burst).
@@ -559,6 +631,7 @@ static void busTask(void *) {
             deliver(m);
         }
         if (!faults.silenceBus) carFrames(now, next);
+        tcmEvaluate(now);
         for (int i = 0; i < faults.burstFramesPerMs * 5; i++)          // 5 ms per pass
             deliver(frame(0x600 + (i & 0x3F), {(uint8_t)i, 0, 0, 0, 0, 0, 0, 0}));
         if (faults.idleErrorsPerSec > 0 && C.installed && C.state == TWAI_STATE_RUNNING &&
