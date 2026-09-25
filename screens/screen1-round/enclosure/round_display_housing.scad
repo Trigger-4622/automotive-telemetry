@@ -10,13 +10,19 @@
 //              flat, with pockets for two magnets (or tape it straight on).
 //    bezel   - a ring screwed onto the cup rim with three M2 self-tapping
 //              screws. Its lip holds the glass down on a 1 mm foam ring.
-//    base    - a wedge for the dash: VHB tape underneath, a shallow locating
-//              recess and two magnet pockets on top, tilted towards the driver.
+//    stand   - the dash mount: the puck stands upright like a gauge pod,
+//              leaning back a little, held by magnets on a plate behind it and
+//              resting on two small lips; a neck down to a flat foot with a
+//              VHB pad underneath. The USB-C plug hangs from the puck's bottom
+//              with a right-angle lead going sideways round the neck.
+//    wedge   - the alternative, lying down: a tilted wedge with a locating
+//              recess and magnet pockets, for a dash you look down at.
 //    testring- a 3 mm slice of the cup's cavity with the USB slot: print it
 //              first (a minute), drop the board in, adjust the numbers below.
 //
 //  Render one part:  openscad -o cup.stl -D 'part="cup"' round_display_housing.scad
-//  Parts: "cup" "bezel" "base" "testring" "assembly" (exploded, for a look)
+//  Parts: "cup" "bezel" "stand" "wedge" "testring"
+//         "assembly" (the puck standing on the stand) "exploded" (the parts apart)
 //
 //  Everything in millimetres. Measure your board before printing (README).
 // =============================================================================
@@ -61,7 +67,19 @@ magnet_d     = 10.0;   // two Ø10 x 2 mm disc magnets in cup and base (0 = none
 magnet_t     = 2.0;
 magnet_gap   = 16.0;   // centre-to-centre
 
-/* ───────────── the dash base ────────────────────────────────────────────── */
+/* ───────────── the stand (upright, on the dash top) ─────────────────────── */
+face_tilt    = 12;     // the puck leans back from vertical by this much
+plug_gap     = 9;      // clear height under the puck's bottom edge: a right-angle USB-C plug
+plate_d      = 36;     // magnet plate behind the puck
+plate_t      = 4;
+finger_w     = 6;      // the two arms from the plate down to the puck's edge
+lip_len      = 4;      // ...each ending in a lip the puck's edge rests on
+lip_angles   = [235, 305]; // where those lips are (like usb_angle; the plug is at 270)
+foot_w       = 52;     // the foot on the dash (a 45 x 40 VHB pad fits underneath)
+foot_l       = 46;
+foot_t       = 4;
+
+/* ───────────── the wedge (alternative, lying down) ──────────────────────── */
 tilt_deg     = 20;     // face tilts up towards the driver by this much
 base_w       = 52;     // footprint (a 50 x 50 VHB pad fits underneath)
 base_l       = 50;
@@ -79,6 +97,13 @@ bezel_in = glass_d - 2 * lip_overlap;
 bezel_h  = gasket_t + lip_t + lip_proud; // ring height above the cup rim
 r_screw  = (cav_d + outer_d) / 4;        // screw circle: middle of the wall
 eps = 0.01;
+// The stand: the puck's centre sits here, so its bottom edge is plug_gap above the foot.
+z_c = foot_t + plug_gap + (outer_d / 2) * cos(face_tilt);
+/** The puck's frame on the stand: local z points at the driver (world -y, a
+ *  little up), local y is up (leaning back by face_tilt). The cup's own z
+ *  axis is this local z, so cup() drops straight in. */
+module puck_frame() { translate([0, 0, z_c]) rotate([90 - face_tilt, 0, 0]) children(); }
+function polar(a, r) = [r * cos(a), r * sin(a), 0];
 
 assert(bezel_in >= active_d + 0.6, "the bezel opening would cover the display: reduce lip_overlap");
 assert(wall - screw_hole >= 1.6, "wall too thin around the bezel screws");
@@ -167,8 +192,46 @@ module bezel() {
     }
 }
 
-/* ───────────── the dash base ────────────────────────────────────────────── */
-module base() {
+/* ───────────── the stand ────────────────────────────────────────────────── */
+module stand() {
+    difference() {
+        union() {
+            // the foot
+            linear_extrude(foot_t)
+                offset(r = 4) offset(delta = -4) square([foot_w, foot_l], center = true);
+            // the neck: from a pad on the foot up to a slab on the back of the
+            // plate and its arms, so nothing in front is left hanging in the air
+            hull() {
+                translate([0, 9, foot_t - eps]) linear_extrude(1)
+                    offset(r = 3) offset(delta = -3) square([22, 10], center = true);
+                puck_frame() translate([0, -2.5, -plate_t - 0.5]) linear_extrude(1)
+                    offset(r = 4) offset(delta = -4) square([32, 37], center = true);
+            }
+            // the plate, the two arms and their lips, all in the puck's plane
+            puck_frame() {
+                translate([0, 0, -plate_t]) cylinder(d = plate_d, h = plate_t);
+                for (a = lip_angles) {
+                    hull() {
+                        translate(polar(a, plate_d / 2 - 3) + [0, 0, -plate_t]) cylinder(d = finger_w, h = plate_t);
+                        translate(polar(a, outer_d / 2 + 1.8) + [0, 0, -plate_t]) cylinder(d = finger_w, h = plate_t);
+                    }
+                    rotate([0, 0, a - 8]) rotate_extrude(angle = 16)
+                        translate([outer_d / 2 + 0.3, -plate_t]) square([3, plate_t + lip_len]);
+                }
+            }
+        }
+        // magnet pockets in the plate's face
+        puck_frame() translate([0, 0, -magnet_t - 0.2]) magnet_pockets(0, magnet_t + 0.2);
+        // shallow pocket underneath to locate the VHB pad
+        translate([0, 0, -eps]) linear_extrude(0.6)
+            offset(r = 2) offset(delta = -2) square([foot_w - 8, foot_l - 8], center = true);
+        // nothing below the foot
+        translate([0, 0, -50 - eps]) cube([200, 200, 100], center = true);
+    }
+}
+
+/* ───────────── the wedge (alternative) ──────────────────────────────────── */
+module wedge() {
     // wedge: flat underneath, top face tilted by tilt_deg about the x axis
     top_t = base_min_t + base_l * tan(tilt_deg);
     difference() {
@@ -212,11 +275,20 @@ module board_mock() {
 /* ───────────── output ───────────────────────────────────────────────────── */
 if (part == "cup")      cup();
 if (part == "bezel")    bezel();
-if (part == "base")     base();
+if (part == "stand")    stand();
+if (part == "wedge")    wedge();
 if (part == "testring") testring();
-if (part == "assembly") {
+if (part == "assembly") {                 // the puck standing on the dash
+    color("#444") stand();
+    puck_frame() {
+        color("#2b2b2b") cup();
+        board_mock();
+        color("#3a3a3a") translate([0, 0, cup_h]) bezel();
+    }
+}
+if (part == "exploded") {
     color("#2b2b2b") cup();
     board_mock();
     color("#3a3a3a") translate([0, 0, cup_h + 8]) bezel();
-    color("#444") translate([0, 0, -45]) base();
+    color("#444") translate([0, 0, -60]) stand();
 }
