@@ -200,9 +200,11 @@ void MasterConfig::loadDefaults() {
     ssmSwitches = true;
     learnEnabled = true;
     guardEnabled = true; guardErrs = 3; guardWindowS = 10; guardPauseS = 30; guardTrips = 3;
+    rxGuardEnabled = true; rxGuardRec = 96; rxGuardErrs = 60; txRecessiveHold = true;
     startDelayS = BUS_SETTLE_S;
     learnR2 = 0.985f; learnMinN = 40; learnSteady = 0.10f; learnPhi = 0.95f; verifyN = 30;
-    obdGapMs = 8; obdTimeoutMs = 80; obdAddressing = 0; ssmTimeoutMs = 1000; coverMs = 2500;
+    obdGapMs = 8; obdTimeoutMs = 80; obdP2CanMs = 50; reqMaxHz = 0; obdAddressing = 0;
+    ssmTimeoutMs = 1000; coverMs = 2500;
     keepaliveMs = 300; sourceHoldMs = 500; ldrDark = NIGHT_LDR_DARK_ADC; ldrLight = NIGHT_LDR_LIGHT_ADC;
     sleepEnabled = true;
     sleepIdleS   = 90;
@@ -482,6 +484,10 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["guard_win"]    = guardWindowS;
     doc["guard_pause"]  = guardPauseS;
     doc["guard_trips"]  = guardTrips;
+    doc["rx_guard"]     = rxGuardEnabled;
+    doc["rx_guard_rec"] = rxGuardRec;
+    doc["rx_guard_errs"] = rxGuardErrs;
+    doc["tx_hold"]      = txRecessiveHold;
     doc["start_delay_s"] = startDelayS;
     doc["learn_r2"]     = learnR2;
     doc["learn_min_n"]  = learnMinN;
@@ -490,6 +496,8 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["verify_n"]     = verifyN;
     doc["obd_gap"]      = obdGapMs;
     doc["obd_to"]       = obdTimeoutMs;
+    doc["obd_p2can"]    = obdP2CanMs;
+    doc["req_max_hz"]   = reqMaxHz;
     doc["obd_addr"]     = obdAddressing;
     doc["ssm_to"]       = ssmTimeoutMs;
     doc["cover_ms"]     = coverMs;
@@ -598,6 +606,10 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     guardWindowS = v["guard_win"]    | guardWindowS;
     guardPauseS  = v["guard_pause"]  | guardPauseS;
     guardTrips   = v["guard_trips"]  | guardTrips;
+    rxGuardEnabled = v["rx_guard"]   | rxGuardEnabled;
+    rxGuardRec   = (uint8_t)jint(v["rx_guard_rec"], rxGuardRec, 16, 255);
+    rxGuardErrs  = (uint8_t)jint(v["rx_guard_errs"], rxGuardErrs, 1, 250);
+    txRecessiveHold = v["tx_hold"]   | txRecessiveHold;
     startDelayS  = jint(v["start_delay_s"], startDelayS, 0, 300);
     learnR2      = v["learn_r2"]     | learnR2;
     learnMinN    = v["learn_min_n"]  | learnMinN;
@@ -606,6 +618,8 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     verifyN      = v["verify_n"]     | verifyN;
     obdGapMs     = v["obd_gap"]      | obdGapMs;
     obdTimeoutMs = v["obd_to"]       | obdTimeoutMs;
+    obdP2CanMs   = (uint16_t)jint(v["obd_p2can"], obdP2CanMs, 0, 2000);
+    reqMaxHz     = (uint16_t)jint(v["req_max_hz"], reqMaxHz, 0, 200);
     obdAddressing = v["obd_addr"]    | obdAddressing;
     ssmTimeoutMs = v["ssm_to"]       | ssmTimeoutMs;
     coverMs      = v["cover_ms"]     | coverMs;

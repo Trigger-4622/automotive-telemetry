@@ -83,3 +83,16 @@ extern EspClassMock ESP;
 
 int analogRead(uint8_t pin);
 inline void analogReadResolution(uint8_t) {}
+
+/* Digital IO — only what the CAN-TX recessive hold uses. The mock records the
+ * TX pin's driven level (sim::txDrivenHigh) so the tests can check it. */
+#define INPUT        0x01
+#define OUTPUT       0x03
+#define INPUT_PULLUP 0x05
+#ifndef LOW
+#define LOW  0
+#define HIGH 1
+#endif
+void pinMode(uint8_t pin, uint8_t mode);
+void digitalWrite(uint8_t pin, uint8_t val);
+int  digitalRead(uint8_t pin);

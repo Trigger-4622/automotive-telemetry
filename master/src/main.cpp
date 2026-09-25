@@ -26,12 +26,15 @@
  */
 #include <Arduino.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <freertos/semphr.h>
 #include <vector>
+#include <LittleFS.h>
 #include "driver/twai.h"
+#include "driver/gpio.h"
 
 #include "MasterPacket.h"
 #include "CanDecoderConfig.h"
@@ -109,6 +112,151 @@ static volatile uint32_t s_busSession = 0;      /**< Times it came up (0 = never
 static volatile uint32_t s_settledSession = 0;  /**< The one whose wait is over, */
 static volatile uint32_t s_settledAtMs = 0;     /**< ...and since when.          */
 /** @} */
+
+/* ═══════════════════════════ evidence log ════════════════════════════════
+ *
+ * A small persistent record of what the master was doing when the bus misbehaved,
+ * so one drive can say which fault it is instead of a shrug. Boot and reset
+ * reasons (a brownout at cranking looks nothing like a clean power-on), the bus
+ * coming up and settling, every guard trip with the error counters and what we
+ * were transmitting at the time, bus-off, and sleep. Kept in a ring on LittleFS
+ * (its own file, so it survives a firmware update alongside the config) and shown
+ * in the portal's Diagnostics tab.
+ *
+ * Writing is split in two: evLog() only appends to the RAM ring under a spinlock
+ * (safe from any task, no I/O), and loop() flushes the ring to flash when it is
+ * dirty - so the CAN receive path never touches the filesystem.
+ */
+enum EvType : uint8_t {
+    EV_BOOT = 0,     /**< a = esp_reset_reason(), b = cfg version.            */
+    EV_BUS_UP,       /**< the bus produced its first frame (a = session).     */
+    EV_SETTLE_END,   /**< the settle wait ended; requests allowed.            */
+    EV_TX_TRIP,      /**< bus guard: errors during our own frames (a = count).*/
+    EV_RX_TRIP,      /**< receive-error guard: we were corrupting frames (a=REC).*/
+    EV_BUS_OFF,      /**< the controller went bus-off.                        */
+    EV_SLEEP,        /**< entering deep sleep.                                */
+    EV_RESUME,       /**< the guard was cleared from the portal.              */
+    EV_TYPE_COUNT
+};
+
+/** What the master was transmitting when an event happened, as a bitmask, so a
+ *  burst can be pinned to what provoked it. */
+static uint8_t diagActivityMask();
+
+struct EvRecord {
+    uint32_t ms;    /**< millis() when it happened.                 */
+    uint8_t  type;  /**< @ref EvType.                               */
+    uint8_t  act;   /**< diagActivityMask() at the time.            */
+    uint16_t a;     /**< Type-specific (reset reason, error count). */
+    uint16_t b;     /**< Type-specific.                             */
+};
+
+static constexpr size_t EV_MAX = 48;
+static EvRecord s_ev[EV_MAX] = {};
+static volatile uint8_t s_evHead = 0;    /**< Next write slot.        */
+static volatile uint8_t s_evCount = 0;   /**< Records held (<= EV_MAX).*/
+static portMUX_TYPE s_evMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_evDirty = false;
+/** One writer of the file at a time: loop() flushes it, and the sleep path
+ *  flushes it from the housekeeping task. */
+static SemaphoreHandle_t s_evSaveMutex = nullptr;
+static constexpr const char *EV_PATH = "/evlog.json";
+static constexpr const char *EV_TMP  = "/evlog.tmp";
+
+/** Append one event to the RAM ring. No I/O: loop() writes it to flash. */
+static void evLog(uint8_t type, uint16_t a = 0, uint16_t b = 0) {
+    const uint32_t now = millis();
+    const uint8_t act = diagActivityMask();
+    portENTER_CRITICAL(&s_evMux);
+    EvRecord &r = s_ev[s_evHead];
+    r.ms = now; r.type = type; r.act = act; r.a = a; r.b = b;
+    s_evHead = (uint8_t)((s_evHead + 1) % EV_MAX);
+    if (s_evCount < EV_MAX) s_evCount++;
+    s_evDirty = true;
+    portEXIT_CRITICAL(&s_evMux);
+}
+
+/** Load the ring from flash at boot, oldest first, so history survives a reset. */
+static void evLoad() {
+    File f = LittleFS.open(EV_PATH, "r");
+    if (!f && LittleFS.exists(EV_TMP)) f = LittleFS.open(EV_TMP, "r");
+    if (!f) return;
+    JsonDocument d;
+    const DeserializationError err = deserializeJson(d, f);
+    f.close();
+    if (err || !d.is<JsonArrayConst>()) return;
+    for (JsonVariantConst v : d.as<JsonArrayConst>()) {
+        if (!v.is<JsonArrayConst>()) continue;
+        JsonArrayConst rec = v.as<JsonArrayConst>();
+        if (rec.size() < 5) continue;
+        EvRecord &r = s_ev[s_evHead];
+        r.ms   = rec[0] | 0u;
+        r.type = (uint8_t)(rec[1] | 0);
+        r.act  = (uint8_t)(rec[2] | 0);
+        r.a    = (uint16_t)(rec[3] | 0);
+        r.b    = (uint16_t)(rec[4] | 0);
+        s_evHead = (uint8_t)((s_evHead + 1) % EV_MAX);
+        if (s_evCount < EV_MAX) s_evCount++;
+    }
+}
+
+/** Copy the ring oldest-first into @p out. */
+static size_t evSnapshot(EvRecord *out, size_t max) {
+    portENTER_CRITICAL(&s_evMux);
+    const uint8_t n = s_evCount;
+    const uint8_t start = (uint8_t)((s_evHead + EV_MAX - n) % EV_MAX);
+    size_t w = 0;
+    for (uint8_t i = 0; i < n && w < max; i++)
+        out[w++] = s_ev[(start + i) % EV_MAX];
+    portEXIT_CRITICAL(&s_evMux);
+    return w;
+}
+
+/** Flush the ring to flash (atomic tmp+rename, like the config). */
+static void evSaveNow() {
+    if (!s_evSaveMutex) return;
+    xSemaphoreTake(s_evSaveMutex, portMAX_DELAY);
+    static EvRecord snap[EV_MAX];
+    const size_t n = evSnapshot(snap, EV_MAX);
+    JsonDocument d;
+    JsonArray arr = d.to<JsonArray>();
+    for (size_t i = 0; i < n; i++) {
+        JsonArray r = arr.add<JsonArray>();
+        r.add(snap[i].ms); r.add(snap[i].type); r.add(snap[i].act);
+        r.add(snap[i].a);  r.add(snap[i].b);
+    }
+    File f = LittleFS.open(EV_TMP, "w");
+    if (f) {
+        const size_t expected = measureJson(d);
+        const size_t written = serializeJson(d, f);
+        f.close();
+        if (!written || written != expected) {
+            LittleFS.remove(EV_TMP);              // a short write never replaces the log
+        } else if (!LittleFS.rename(EV_TMP, EV_PATH)) {
+            LittleFS.remove(EV_PATH);
+            LittleFS.rename(EV_TMP, EV_PATH);
+        }
+    }
+    xSemaphoreGive(s_evSaveMutex);
+}
+
+/** Called from loop(): write the ring to flash when it changed, at most every
+ *  few seconds so a run of events is not a run of flash writes. */
+static void evService() {
+    static uint32_t lastSave = 0;
+    if (!s_evDirty) return;
+    if (lastSave && millis() - lastSave < 3000) return;
+    s_evDirty = false;
+    lastSave = millis();
+    evSaveNow();
+}
+
+/** Human-readable event names, shared by the serial log and the portal. */
+static const char *evName(uint8_t type) {
+    static const char *N[] = { "boot", "bus-up", "settled", "tx-guard-trip",
+                               "rx-guard-trip", "bus-off", "sleep", "resume" };
+    return type < EV_TYPE_COUNT ? N[type] : "?";
+}
 
 static MasterMetric *findSlot(uint16_t id) {
     for (auto &m : s_metrics)
@@ -277,6 +425,10 @@ static volatile uint32_t s_guardPauseAt = 0;
 static volatile uint32_t s_guardPauseMs = 0;
 static volatile uint8_t  s_guardTrips   = 0;
 static volatile bool     s_guardSilent  = false;
+/** The receive-error guard's own listen-only latch. Separate from s_guardSilent
+ *  so it protects even with the (transmit-side) bus guard turned off - which is
+ *  how the car is configured - and clears on its own setting, not the guard's. */
+static volatile bool     s_rxGuardSilent = false;
 static volatile bool     s_twaiReinstall = false;   /**< RX task reinstalls TWAI. */
 static volatile bool     s_twaiWantSilent = false;  /**< ...in this mode.        */
 static volatile bool     s_twaiSilentNow  = false;  /**< Mode actually installed. */
@@ -338,15 +490,28 @@ uint32_t diagSettleLeftMs() { return settleLeft(); }
 bool diagGuardOk() {
     // A listen-only controller cannot transmit whatever the guard setting,
     // and nothing is sent while the bus settles.
-    if (s_guardSilent || s_twaiSilentNow || settleLeft()) return false;
+    if (s_guardSilent || s_rxGuardSilent || s_twaiSilentNow || settleLeft()) return false;
     if (!Cfg.guardEnabled) return true;
     return guardPauseLeft() == 0;
+}
+
+/** What the master was transmitting, as a bitmask, for the evidence log. */
+static uint8_t diagActivityMask() {
+    uint8_t m = 0;
+    if (s_obdActive)                        m |= 0x01;   // OBD-II poller running
+    if (settleLeft())                       m |= 0x02;   // in the settle wait
+    if (s_guardSilent || s_rxGuardSilent || s_twaiSilentNow) m |= 0x04;  // listen-only
+    if (!(m & 0x04) && guardPauseLeft() == 0 && !settleLeft()) m |= 0x08; // free to transmit
+    m |= (uint8_t)((Cfg.diagMode & 0x0F) << 4);
+    return m;
 }
 
 void diagGuardReset() {
     s_guardPauseMs = 0;
     s_guardTrips = 0;
     s_guardSilent = false;           // the guard task switches the mode back
+    s_rxGuardSilent = false;         // and leaves the receive-error listen-only
+    evLog(EV_RESUME);
     log_i("bus guard: reset by user - requests resumed");
 }
 
@@ -363,6 +528,7 @@ static void guardTrip(const char *why) {
         log_w("bus guard: %s - requests paused for %u s (trip %u of %u)",
               why, Cfg.guardPauseS, s_guardTrips, Cfg.guardTrips);
     }
+    evLog(EV_TX_TRIP, s_guardTrips, s_guardSilent ? 1 : 0);
 }
 
 bool diagBusLock(uint32_t timeoutMs) {
@@ -934,6 +1100,11 @@ static void obdCountSupported() {
  * @return ASK_OK when the ECU answered PID 0x00, ASK_BUSY when the question
  *         could not be put, ASK_NO_REPLY when nobody answered it.
  */
+/** A physical (0x7E0) request has answered this session: once true, the probe
+ *  never reverts to functional 0x7DF, which would reach the transmission ECU. */
+static bool    s_physicalConfirmed = false;
+static uint8_t s_physMisses = 0;   /**< Consecutive physical probe misses (auto). */
+
 static AskResult obdProbe(bool &rangesComplete) {
     // Addressing: 1 = engine ECU only, 2 = all ECUs, 0 = try the first.
     if (Cfg.obdAddressing == 2) s_obdPhysical = false;
@@ -942,11 +1113,21 @@ static AskResult obdProbe(bool &rangesComplete) {
     if (Cfg.obdAddressing == 2) {
         r = obdAsk(0x00, 150, true);
         if (r != ASK_OK) return r;
-    } else if ((r = obdAsk(0x00, 150, false)) != ASK_OK) {
-        if (r == ASK_BUSY || Cfg.obdAddressing == 1) return r;
-        if ((r = obdAsk(0x00, 150, true)) != ASK_OK) return r;
-        if (s_obdPhysical) log_w("OBD-II: ECU ignores physical requests - using 0x7DF");
-        s_obdPhysical = false;
+    } else {
+        r = obdAsk(0x00, 150, false);           // the engine ECU directly, on 0x7E0
+        if (r == ASK_OK) { s_physicalConfirmed = true; s_physMisses = 0; }
+        else if (r == ASK_BUSY || Cfg.obdAddressing == 1) return r;
+        // Never revert to functional once physical has worked, and give physical
+        // several tries before ever addressing every ECU - a transient miss at
+        // startup must not switch us to 0x7DF, which the transmission ECU answers.
+        else if (s_physicalConfirmed || ++s_physMisses < 4) return r;
+        else {
+            r = obdAsk(0x00, 150, true);        // last resort: functional 0x7DF
+            if (r != ASK_OK) return r;
+            s_obdPhysical = false;
+            log_w("OBD-II: engine ECU ignored %u physical probes - falling back to 0x7DF",
+                  s_physMisses);
+        }
     }
     rangesComplete = obdProbeRanges();
     obdCountSupported();
@@ -985,6 +1166,16 @@ static bool obdPidCovered(uint8_t pid) {
  * the ECU asleep and the bus still awake that turns a steady stream of
  * unanswered requests into a trickle.
  */
+/** @name OBD-II request pacing
+ *  P2CAN cool-down after a timeout, and the overall request budget. Kept as a
+ *  start and a length, not an end time, so they read right across the millis()
+ *  wrap (see the guard pause for the same reasoning).
+ *  @{ */
+static uint32_t s_obdCooldownAt = 0;   /**< When the unanswered request was sent... */
+static uint32_t s_obdCooldownMs = 0;   /**< ...and how long to hold off after it.    */
+static uint32_t s_reqLastSendMs = 0;   /**< Last OBD-II request, for req_max_hz.     */
+/** @} */
+
 static void obdPollTask(void *) {
     static uint32_t nextDue[256] = {};
     static uint8_t  misses[256]  = {};
@@ -1050,7 +1241,33 @@ static void obdPollTask(void *) {
             const uint32_t now = millis();
             if ((int32_t)(now - nextDue[p.pid]) < 0) continue;
             if (obdPidCovered(p.pid)) { nextDue[p.pid] = now + 1000; continue; }
+            // Pace before sending: the overall request budget (req_max_hz, 0 =
+            // off) spreads requests over time, and the post-timeout P2CAN
+            // cool-down (obd_p2can) keeps the next request from landing in the
+            // tail of a reply a slow ECU is still sending. Both delay, never drop.
+            {
+                const uint32_t nowP = millis();
+                uint32_t wait = 0;
+                if (Cfg.reqMaxHz) {
+                    const uint32_t minGap = max((uint32_t)1, (uint32_t)(1000u / Cfg.reqMaxHz));
+                    const uint32_t since  = nowP - s_reqLastSendMs;
+                    if (since < minGap) wait = minGap - since;
+                }
+                const uint32_t sinceTimeout = nowP - s_obdCooldownAt;
+                if (sinceTimeout < s_obdCooldownMs)
+                    wait = max(wait, s_obdCooldownMs - sinceTimeout);
+                if (wait) vTaskDelay(pdMS_TO_TICKS(wait));
+            }
+            const uint32_t sendMs = millis();
             const AskResult r = obdAsk(p.pid, Cfg.obdTimeoutMs);
+            s_reqLastSendMs = sendMs;
+            if (r == ASK_NO_REPLY || r == ASK_NRC) {
+                s_obdCooldownMs = 0;             // never a half-updated hold-off
+                s_obdCooldownAt = sendMs;
+                s_obdCooldownMs = Cfg.obdP2CanMs;
+            } else if (r == ASK_OK) {
+                s_obdCooldownMs = 0;             // answered: nothing to wait for
+            }
             uint32_t period = p.periodMs ? p.periodMs : 100;
             if (r == ASK_OK) {
                 misses[p.pid] = 0;
@@ -1123,6 +1340,32 @@ static void setupTwai(bool silent);
  *  Defined further down, next to the rest of the sleep handling. */
 static void sleepCheck();
 
+/* ═══════════════════════ CAN TX line held recessive ══════════════════════
+ *
+ * A CAN bus idles recessive (high) and is pulled dominant (low) only while a
+ * node transmits. Nothing here holds GPIO CAN_TX_GPIO high across a reset or a
+ * brown-out, so if the transceiver's TX input floats or is driven low while the
+ * ESP32 restarts - which is exactly what a cranking voltage dip can cause - the
+ * transceiver drives the bus dominant and jams every module, the transmission
+ * ECU included. The window before this firmware runs can only be covered by an
+ * external pull-up on the TX line (see the flash checklist); what firmware can
+ * do is drive the pin recessive the instant it starts, and latch it recessive
+ * across deep sleep. Opt out of the sleep latch with tx_hold.
+ */
+static void txRecessiveBoot() {
+    gpio_hold_dis((gpio_num_t)CAN_TX_GPIO);   // release any latch from before sleep
+    pinMode(CAN_TX_GPIO, OUTPUT);
+    digitalWrite(CAN_TX_GPIO, HIGH);          // recessive = bus idle
+    gpio_pullup_en((gpio_num_t)CAN_TX_GPIO);  // and pulled up should the pin float
+}
+static void txRecessiveForSleep() {
+    if (!Cfg.txRecessiveHold) return;
+    pinMode(CAN_TX_GPIO, OUTPUT);
+    digitalWrite(CAN_TX_GPIO, HIGH);
+    gpio_hold_en((gpio_num_t)CAN_TX_GPIO);    // latch it high for the whole sleep
+    gpio_deep_sleep_hold_en();
+}
+
 /* ═══════════════════════════ FreeRTOS tasks ══════════════════════════════ */
 
 /**
@@ -1170,6 +1413,7 @@ static void twaiRxTask(void *) {
         if (!s_busSession || rxMs - s_lastCanMs >= BUS_QUIET_MS) {
             s_busUpMs    = rxMs;
             s_busSession = s_busSession + 1;
+            evLog(EV_BUS_UP, (uint16_t)s_busSession);
         }
         s_lastCanMs = rxMs;          // the sleep timer's only input
         // SOF..EOF + IFS is 47 bits standard, 67 extended, plus ~10% stuffing.
@@ -1355,7 +1599,9 @@ static void housekeepingTask(void *) {
  */
 static void busGuardTask(void *) {
     uint32_t lastErrCount = 0, lastTec = 0, winStart = 0, winErrs = 0, lastSwitch = 0;
+    uint32_t rxWinStart = 0, rxWinErrs = 0;   /**< Receive-side errors, per window. */
     bool     wasPassive = false, wasSettling = false;
+    bool     ctrlRunning = false;             /**< Last status read said RUNNING. */
     for (;;) {
         // Mode follows the settings. Turning the guard off also ends a
         // listen-only it imposed: the user has taken responsibility.
@@ -1364,17 +1610,32 @@ static void busGuardTask(void *) {
             s_guardTrips  = 0;
             log_i("bus guard: turned off - leaving listen-only");
         }
+        // The receive-error guard has its own switch, so it releases on its own.
+        if (!Cfg.rxGuardEnabled && s_rxGuardSilent) {
+            s_rxGuardSilent = false;
+            log_i("receive-error guard: turned off - leaving listen-only");
+        }
         // The settle wait, logged once each way: it explains a quiet start.
         const bool settling = diagBusAlive() && settleLeft();
         if (settling && !wasSettling)
             log_i("bus up - listening only for %u s while it settles", Cfg.startDelayS);
-        else if (!settling && wasSettling && diagBusAlive())
+        else if (!settling && wasSettling && diagBusAlive()) {
             log_i("bus settled - requests allowed");
+            evLog(EV_SETTLE_END, (uint16_t)Cfg.startDelayS);
+        }
         wasSettling = settling;
-        const bool wantSilent = Cfg.diagMode == DIAG_MODE_SILENT || s_guardSilent || settleLeft();
-        // (At most every 2 s, so a controller that will not install is not
-        // retried in a tight loop.)
-        if (wantSilent != s_twaiSilentNow && !s_twaiReinstall && millis() - lastSwitch > 2000) {
+        const bool wantSilent = Cfg.diagMode == DIAG_MODE_SILENT || s_guardSilent ||
+                                s_rxGuardSilent || settleLeft();
+        // Towards listen-only the switch is immediate: every moment in normal
+        // mode after a guard trip is another moment of error flags on the
+        // car's traffic, and the likeliest trip is right after the settle
+        // wait, in the first normal-mode contact with a marginal link. Back
+        // towards normal, and while a controller will not install, at most
+        // every 2 s so nothing is retried in a tight loop. Never while the
+        // controller is recovering from bus-off: the driver cannot be replaced
+        // mid-recovery.
+        if (wantSilent != s_twaiSilentNow && !s_twaiReinstall &&
+            ((wantSilent && ctrlRunning) || millis() - lastSwitch > 2000)) {
             lastSwitch = millis();
             s_twaiWantSilent = wantSilent;
             s_twaiReinstall  = true;         // carried out by the RX task
@@ -1410,6 +1671,7 @@ static void busGuardTask(void *) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        ctrlRunning = st.state == TWAI_STATE_RUNNING;
 
         const uint32_t delta = st.bus_error_count - lastErrCount;
         lastErrCount = st.bus_error_count;
@@ -1432,7 +1694,56 @@ static void busGuardTask(void *) {
                 }
             } else {
                 s_errIdle += delta;
+                /*
+                 * Receive-side errors while we are a normal-mode node: every one
+                 * we detected, we also flagged, and the flag destroyed the frame
+                 * for the module it was meant for. REC alone misses a moderate
+                 * marginal link - a good frame winds it down faster than a
+                 * flagged one winds it up - so the rate is watched as well: this
+                 * many in the guard window and we are corrupting the car's
+                 * traffic, whatever REC says. (Not counted in listen-only, where
+                 * an error we see is one we cannot signal.)
+                 */
+                if (ctrlRunning && !s_twaiSilentNow) {
+                    const uint32_t now = millis();
+                    if (now - rxWinStart > Cfg.guardWindowS * 1000UL) { rxWinStart = now; rxWinErrs = 0; }
+                    rxWinErrs += delta;
+                    if (Cfg.rxGuardEnabled && !s_rxGuardSilent && rxWinErrs >= Cfg.rxGuardErrs) {
+                        s_rxGuardSilent = true;
+                        evLog(EV_RX_TRIP, (uint16_t)st.rx_error_counter,
+                              (uint16_t)min(rxWinErrs, (uint32_t)0xFFFF));
+                        log_e("receive-error guard: %u receive errors in %u s - our controller "
+                              "is corrupting other nodes' frames; switching to listen-only "
+                              "(resume from the portal)", (unsigned)rxWinErrs,
+                              (unsigned)Cfg.guardWindowS);
+                        rxWinErrs = 0;
+                    }
+                }
             }
+        }
+
+        /*
+         * Receive-error guard. Our controller's receive-error counter climbing
+         * into the error-warning region means it is detecting - and, as a
+         * normal-mode node, error-flagging - a sustained stream of faults in
+         * frames it only receives. Every one of those error flags destroys the
+         * frame in flight for EVERY module, which is exactly how the transmission
+         * ECU loses the engine ECU's broadcasts (P1718). So drop to listen-only,
+         * where the controller cannot signal an error at all. Independent of the
+         * transmit-side bus guard and of whether it is on, because a marginal
+         * link corrupts the car's own traffic whether or not we are polling. REC
+         * winds back down on every good frame, so this only fires on a real
+         * storm, not the odd stray error. Opt out with rx_guard.
+         */
+        if (Cfg.rxGuardEnabled && !s_rxGuardSilent && !s_twaiSilentNow &&
+            ctrlRunning && st.rx_error_counter >= Cfg.rxGuardRec) {
+            s_rxGuardSilent = true;
+            evLog(EV_RX_TRIP, (uint16_t)st.rx_error_counter,
+                  (uint16_t)min(rxWinErrs, (uint32_t)0xFFFF));
+            log_e("receive-error guard: REC %u - our controller is corrupting other "
+                  "nodes' frames; switching to listen-only (resume from the portal)",
+                  (unsigned)st.rx_error_counter);
+            rxWinErrs = 0;
         }
 
         const bool passive = st.state == TWAI_STATE_RUNNING && st.tx_error_counter >= 128;
@@ -1446,7 +1757,24 @@ static void busGuardTask(void *) {
         // same errors back on the car's bus.
         if (wentBusOff) {
             log_w("TWAI bus-off - recovering");
-            if (Cfg.guardEnabled && diagGuardOk()) guardTrip("controller went bus-off");
+            if (Cfg.guardEnabled) {
+                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
+                if (diagGuardOk()) guardTrip("controller went bus-off");
+            } else if (Cfg.rxGuardEnabled && !s_rxGuardSilent) {
+                /*
+                 * Bus-off is the protocol itself throwing us off: our frames
+                 * failed 32 times over, each failure an active error flag on
+                 * the bus. With the transmit guard off, recovering and carrying
+                 * on as before would just do it all again, so the receive-error
+                 * guard's latch holds the controller listen-only until Resume.
+                 */
+                s_rxGuardSilent = true;
+                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 1);
+                log_e("bus-off with the bus guard off - switching to listen-only for this "
+                      "session (resume from the portal)");
+            } else {
+                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
+            }
         }
     }
 }
@@ -1476,6 +1804,8 @@ static void enterDeepSleep() {
     log_i("bus quiet for %u s - sleeping, will wake on CAN activity",
           Cfg.sleepIdleS);
     Cfg.serviceSave();               // never lose a pending save to sleep
+    evLog(EV_SLEEP);
+    evSaveNow();                     // and the evidence log
     Serial.flush();
 
     // Leave the bus and the radio cleanly rather than mid-transfer. The RX
@@ -1490,6 +1820,10 @@ static void enterDeepSleep() {
     }
     esp_now_deinit();
     WiFi.mode(WIFI_OFF);
+
+    // Hold the CAN TX line recessive for the whole sleep, so nothing on our side
+    // drives the bus dominant while the chip is down.
+    txRecessiveForSleep();
 
     // Wake when the receive pin is pulled low, i.e. the moment a dominant bit
     // appears. The pin must be RTC-capable for ext0 to watch it while asleep.
@@ -1569,13 +1903,14 @@ void masterGetStats(MasterStats &out) {
     out.obdPhysical  = s_obdPhysical;
     // Listen-only the user chose or the guard imposed - not the settle wait,
     // nor the moment after it while the controller switches back to normal.
-    out.silent     = Cfg.diagMode == DIAG_MODE_SILENT || s_guardSilent ||
+    out.silent     = Cfg.diagMode == DIAG_MODE_SILENT || s_guardSilent || s_rxGuardSilent ||
                      (s_twaiSilentNow && !settleLeft(3000));
     out.settleMs   = settleLeft();
     out.errWhileTx = s_errWhileTx;
     out.errIdle    = s_errIdle;
     out.guardTrips = s_guardTrips;
-    out.guardSilent = s_guardSilent;
+    out.guardSilent = s_guardSilent || s_rxGuardSilent;
+    out.rxGuardSilent = s_rxGuardSilent;
     out.guardPauseMs = guardPauseLeft();
     out.busBitsRx  = s_busBitsRx;
     out.canTx      = s_canTxCount;
@@ -1652,6 +1987,28 @@ size_t masterGetMetrics(MetricViewM *out, size_t max) {
     }
     portEXIT_CRITICAL(&s_metricMux);
     return w;
+}
+
+size_t masterEventLog(EvView *out, size_t max) {
+    static EvRecord snap[EV_MAX];
+    const size_t n = evSnapshot(snap, EV_MAX);
+    size_t w = 0;
+    for (size_t i = 0; i < n && w < max; i++) {
+        out[w].ms = snap[i].ms; out[w].type = snap[i].type;
+        out[w].act = snap[i].act; out[w].a = snap[i].a; out[w].b = snap[i].b;
+        w++;
+    }
+    return w;
+}
+
+const char *masterEventName(uint8_t type) { return evName(type); }
+
+void masterEventLogClear() {
+    portENTER_CRITICAL(&s_evMux);
+    s_evHead = 0;
+    s_evCount = 0;
+    s_evDirty = true;                // loop() writes the empty log
+    portEXIT_CRITICAL(&s_evMux);
 }
 
 void masterResetCensus() {
@@ -1792,16 +2149,29 @@ void setup() {
     log_i("CAN Telemetry Master v%s (proto v%d)", FIRMWARE_VERSION,
           TELEMETRY_PROTO_VERSION);
 
+    // Put the CAN TX line into its recessive idle the instant we run, before the
+    // driver or anything else can leave it low.
+    txRecessiveBoot();
+
     logWakeCause();
 
     s_busMutex = xSemaphoreCreateMutex();
     s_obdSem   = xSemaphoreCreateBinary();
     s_twaiCtl  = xSemaphoreCreateMutex();
+    s_evSaveMutex = xSemaphoreCreateMutex();
 
     // Configuration first: TWAI mode, bitrate and the ESP-NOW channel are all
     // decided from it during the bring-up that follows.
     Cfg.begin();
     analogReadResolution(12);
+
+    // The evidence log lives beside the config on the filesystem, so it survives
+    // a firmware update. Load the history, then stamp this boot with why we reset
+    // - a brown-out at cranking reads very differently from a clean power-on.
+    evLoad();
+    const esp_reset_reason_t rr = esp_reset_reason();
+    evLog(EV_BOOT, (uint16_t)rr, MasterConfig::CFG_VERSION);
+    log_i("boot: reset reason %d", (int)rr);
 
     // Listen-only to begin with while there is a settle wait: it runs from
     // the bus's first frame, and busGuardTask switches to normal after it.
@@ -1868,6 +2238,7 @@ void loop() {
     }
     Portal.loop();
     Cfg.serviceSave();
+    evService();
     delay(10);
 }
 

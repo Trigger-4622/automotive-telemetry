@@ -36,6 +36,16 @@ struct BusFaults {
     bool     silenceBus = false;       ///< Car asleep: nothing is broadcast.
     int      extraIds = 0;             ///< More distinct IDs, 20 Hz each.
     int      burstFramesPerMs = 0;     ///< Flood: this many extra frames every ms.
+    /**
+     * A marginal link: while the master is a NORMAL-mode node (it ACKs and
+     * error-flags), it corrupts this fraction of the ECM's broadcast frames to
+     * the TCM. Each corrupted frame is destroyed on the bus for every module -
+     * the TCM included - and bumps the master's receive-error counter (REC), as
+     * a real error-active controller does when it signals an error it detected
+     * in another node's frame. In LISTEN-ONLY mode the controller cannot send
+     * error flags, so it corrupts nothing whatever this is set to.
+     */
+    double   rxCorruptRate = 0;
 };
 
 extern EcuConfig ecu;
@@ -56,6 +66,34 @@ extern bool sleepEntered;
 extern int  logErrors, logWarnings;
 extern std::vector<std::string> logLines;
 extern bool verbose;
+
+/* ── the transmission ECU (TCM) watching the engine ECU's broadcasts ──────────
+ *
+ * P1718 on this car means the TCM stopped receiving the ECM's periodic CAN
+ * messages. The model watches the ECM's engine broadcast frames (0x231, 0x232)
+ * and latches P1718 when, on a bus that is otherwise alive, too few of them
+ * arrive in a one-and-a-half-second window - which is what the master's error
+ * flags do to those frames while it is a normal-mode node on a marginal link.
+ * P0700 is the TCM asking for the lamp because P1718 is set. */
+struct TcmView {
+    bool     p1718;        ///< Latched: the TCM lost the ECM's broadcasts.
+    bool     p0700;        ///< Latched: the TCM asked for the MIL (follows P1718).
+    uint32_t ecmRx;        ///< ECM broadcast frames the TCM received.
+    uint32_t ecmLost;      ///< ECM broadcast frames destroyed before it got them.
+    uint32_t windowRx;     ///< Received in the last window (what P1718 watches).
+    bool     armed;        ///< Has seen the ECM healthy at least once.
+};
+TcmView tcm();
+
+/** Reset reason esp_reset_reason() returns (default power-on). A scenario sets
+ *  it to ESP_RST_BROWNOUT to replay a reboot during cranking. */
+extern int resetReason;
+
+/** CAN-TX recessive hold observation. gpioHoldPin/Enabled track gpio_hold_en on
+ *  the TX pin (latched high across sleep); txDrivenHigh is its driven level. */
+extern int  gpioHoldEnabled;   ///< Net hold count on the TX pin (>0 = latched).
+extern bool txDrivenHigh;      ///< Last level driven onto the TX pin.
+extern bool txConfiguredOut;   ///< TX was configured as a recessive output.
 
 struct CtrlView { bool installed; twai_mode_t mode; twai_state_t state; uint32_t tec, rec; };
 CtrlView controller();

@@ -169,6 +169,7 @@ void WebPortal::setupRoutes() {
         g["trips"]  = st.guardTrips;
         g["pause"]  = st.guardPauseMs;
         g["silent"] = st.guardSilent;
+        g["rx_silent"] = st.rxGuardSilent;
         {
             static CensusView cen[128];
             b["ids"] = masterCensusRaw(cen, 128);
@@ -281,6 +282,31 @@ void WebPortal::setupRoutes() {
         }
         sendJson(doc);
     });
+
+    /*
+     * The evidence log: boot and reset reasons, the bus coming up and settling,
+     * every guard trip with the error counters and what the master was
+     * transmitting at the time, bus-off and sleep. Persisted on the master's
+     * flash, so one drive can say which fault it is.
+     */
+    s_server.on("/api/evlog", HTTP_GET, []() {
+        JsonDocument doc;
+        static EvView ev[48];
+        const size_t n = masterEventLog(ev, 48);
+        doc["now"] = millis();
+        JsonArray a = doc["events"].to<JsonArray>();
+        for (size_t i = 0; i < n; i++) {
+            JsonObject o = a.add<JsonObject>();
+            o["ms"]  = ev[i].ms;
+            o["t"]   = ev[i].type;
+            o["n"]   = masterEventName(ev[i].type);
+            o["act"] = ev[i].act;
+            o["a"]   = ev[i].a;
+            o["b"]   = ev[i].b;
+        }
+        sendJson(doc);
+    });
+    s_server.on("/api/evlog/clear", HTTP_POST, []() { masterEventLogClear(); sendOk(); });
 
     s_server.on("/api/census/reset", HTTP_POST, []() { masterResetCensus(); sendOk(); });
     s_server.on("/api/ssm/reinit",   HTTP_POST, []() { ssm2Reinit(); sendOk(); });
