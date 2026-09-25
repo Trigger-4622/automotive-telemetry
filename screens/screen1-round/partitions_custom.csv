@@ -1,0 +1,22 @@
+# =============================================================================
+# Custom 4 MB partition table — ESP32-C3 Round Telemetry Display (Slave Node)
+# -----------------------------------------------------------------------------
+# No OTA (single factory app) to maximize room for the app AND a large
+# LittleFS partition holding: /layout.json, /www/* (Gauge Studio SPA),
+# /assets/* (user-uploaded gauge backgrounds & icons).
+#
+# NAMING — do not "fix" this to something more descriptive:
+#   * The Name column is the partition LABEL. Arduino's LittleFS.begin() finds
+#     its partition by label and defaults to "spiffs", so the filesystem
+#     partition must be named "spiffs" (ConfigManager also passes the label
+#     explicitly — keep the two in sync if you ever change it).
+#   * SubType "spiffs" is what PlatformIO looks for to decide where to write
+#     the image on `uploadfs`.
+# The on-flash format is LittleFS regardless of these legacy SPIFFS names
+# (board_build.filesystem = littlefs in platformio.ini).
+# =============================================================================
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xF000,   0x1000,
+factory,    app,  factory, 0x10000,  0x1E0000,
+spiffs,     data, spiffs,  0x1F0000, 0x200000,

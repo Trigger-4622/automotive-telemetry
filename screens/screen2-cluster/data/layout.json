@@ -1,0 +1,275 @@
+{
+  "_doc": "Dash cluster layout schema v1 — 480x272 LANDSCAPE. Keys starting with '_' are documentation only. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; upload with 'pio run -t uploadfs' or POST /api/layout. This is the SAME schema as the 1.28in round display, plus the landscape-only screen types 'cluster' and 'bars' and a wider grid — a layout written for the round board loads here unchanged, it just will not use the extra room.",
+  "version": 2,
+
+  "global": {
+    "_doc": "smoothing_alpha: EMA coefficient 0-1 applied at packet rate (higher = snappier, lower = smoother). lerp_speed: fraction moved toward target per UI tick (needle glide). stale_timeout_ms: metric age before it renders as '--'.",
+    "smoothing_alpha": 0.35,
+    "lerp_speed": 0.18,
+    "stale_timeout_ms": 1500,
+
+    "_doc_swipe": "swipe_anim: 'over' (default, cheapest), 'move', 'fade', or 'none'. swipe_easing shapes the motion: LVGL's own default for screen transitions is LINEAR - constant velocity, hard start and stop - which is what makes a slide feel mechanical however fast it renders. 'ease_out' starts quickly and settles gently. A 480x272 frame is 2.3x the pixels of the round board, so if transitions feel heavy on a busy layout, shorten swipe_anim_ms before reaching for 'none'.",
+    "swipe_anim": "over",
+    "swipe_easing": "ease_out",
+    "swipe_anim_ms": 260,
+
+    "alert_ack_ms": 30000,
+    "gauge_alarm_colors": true,
+
+    "_doc_button": "button_gpio: the side button's pin (BOOT is GPIO0 on this board). While button_discovery is true the firmware records each candidate pin's resting level at boot and reports any that DEVIATES, naming it on screen. Set button_discovery false once the pin is known.",
+    "_doc_panel": "bgr_order: leave false unless the DIAGNOSTICS colour strip shows R and B exchanged (the R patch looking blue). touch_swap_xy / touch_invert_x / touch_invert_y correct a touch panel bonded out of alignment - if taps land fine but horizontal swipes do nothing, watch the DIAGNOSTICS Touch readout while dragging left-to-right: if the SECOND number moves instead of the first, set touch_swap_xy true.",
+    "_doc_calib": "color_gain_r/g/b scale each RGB565 channel on the way to the panel, 1.0 = untouched. Dial these from the Settings tab while watching the screen; the DIAGNOSTICS colour strip is the reference. This corrects a panel's colour cast, which no amount of channel-order swapping can fix.",
+    "color_gain_r": 1.0,
+    "color_gain_g": 1.0,
+    "color_gain_b": 1.0,
+
+    "bgr_order": false,
+    "_doc_touch_native": "touch_native_w/h are the coordinate range the GT911 reports in ITS OWN frame, which is not the display's once the panel is bonded rotated. Get them from the DIAGNOSTICS Touch row: drag a finger into all four corners and read the 'max' pair. Wrong values do not stop touch working - they make one axis dominate the other, so swipes fire in one direction only.",
+    "touch_native_w": 480,
+    "touch_native_h": 272,
+    "touch_swap_xy": true,
+    "touch_invert_x": false,
+    "touch_invert_y": false,
+
+    "button_gpio": 0,
+    "button_discovery": true,
+
+    "day_bg": "#101418",
+    "night_bg": "#000000"
+  },
+
+  "_doc_network": "NETWORK — read once at boot, so a reboot is needed to apply. wifi_channel MUST match the master exactly: a mismatch produces silence rather than an error. Leave master_mac empty to accept any master; set it when more than one is in range. THIS DISPLAY AND THE ROUND ONE CAN RUN TOGETHER off a single master — ESP-NOW broadcasts reach every listener on the channel, so both simply receive the same frames.",
+  "network": {
+    "wifi_channel": 1,
+    "master_mac": "",
+    "ap_ssid": "Telemetry-Dash-Config",
+    "ap_password": ""
+  },
+
+  "screens": [
+    {
+      "_doc": "SCREEN 1 — DASH, the mini instrument cluster: warning lamps along the top with the indicators in the corners, a tachometer with its redline band, speed, gear with a shift light, fuel and coolant, and four small readouts along the bottom. Every part is optional: set it to false to remove it ('gear': false). Each part takes metric_id, label, units, decimals, min, max and thresholds like any gauge. The shift light's five LEDs fill from 'start' to 'rpm' and flash at 'rpm'; the tach's red band starts at 'redline' (default: the shift point). 'ghost_lamps' draws unlit lamps dimly, the way a real cluster's symbols show when off. On the round board the 'info' row has no room and is ignored.",
+      "id": "dash",
+      "type": "dash",
+      "label": "DASH",
+      "tach":  { "metric_id": "0x010C", "label": "RPM", "max": 8000, "redline": 6500 },
+      "speed": { "metric_id": "0x010D", "units": "km/h", "max": 260 },
+      "gear":  { "metric_id": "0x1005" },
+      "fuel":  { "metric_id": "0x012F", "units": "%",
+                 "thresholds": { "warning": { "value": 12, "hysteresis": 3, "direction": "below" } } },
+      "temp":  { "metric_id": "0x0105", "min": 40, "max": 130,
+                 "thresholds": { "warning":  { "value": 105, "hysteresis": 3 },
+                                 "critical": { "value": 110, "hysteresis": 3 } } },
+      "info": [
+        { "metric_id": "0x0142", "label": "BATT",  "units": "V",   "decimals": 1 },
+        { "metric_id": "0x015C", "label": "OIL",   "units": "°C" },
+        { "metric_id": "0x010F", "label": "IAT",   "units": "°C" },
+        { "metric_id": "0x1001", "label": "BOOST", "units": "bar", "decimals": 2 }
+      ],
+      "shift_light": { "rpm": 6500, "start": 5000 },
+      "lamps": true,
+      "ghost_lamps": true
+    },
+    {
+      "_doc": "SCREEN 2 — CLUSTER. The landscape-only hero screen, and the reason this panel earns its place: a needle dial on the left, one dominant digital readout in the centre, and a stack of secondary values down the right. Three regions, one glance each. 'dial' drives the needle, 'main' is the big number, 'side' holds up to 4 small readouts.",
+      "id": "cluster",
+      "type": "cluster",
+      "texture": "gt_dial",
+      "dial": {
+        "metric_id": "0x010C", "label": "RPM", "units": "rpm", "decimals": 0,
+        "min": 0, "max": 8000, "major_tick_every": 1000, "tick_label_div": 1000,
+        "color": "#FF2D16",
+        "thresholds": {
+          "warning":  { "value": 6200, "hysteresis": 200, "color": "#FF9E00" },
+          "critical": { "value": 7000, "hysteresis": 150, "color": "#FF2D16" }
+        }
+      },
+      "main": {
+        "metric_id": "0x010D", "label": "SPEED", "units": "km/h",
+        "decimals": 0, "min": 0, "max": 260, "color": "#F2F4F6"
+      },
+      "side": [
+        { "metric_id": "0x0105", "label": "COOLANT", "units": "°C",
+          "decimals": 0, "min": 40, "max": 130, "color": "#FF9E00" },
+        { "metric_id": "0x0142", "label": "BATTERY", "units": "V",
+          "decimals": 1, "min": 8, "max": 16, "color": "#F2F4F6" },
+        { "metric_id": "0x1001", "label": "BOOST", "units": "bar",
+          "decimals": 2, "min": -1, "max": 2, "color": "#00E5FF" },
+        { "metric_id": "0x015C", "label": "OIL", "units": "°C",
+          "decimals": 0, "min": 0, "max": 160, "color": "#FF9E00" }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 3 — BARS. Landscape-native: six horizontal bar gauges stacked down the screen. The eye compares lengths along one axis far faster than it compares six separate numbers, which is why this screen exists here and not on the round board.",
+      "id": "bars",
+      "type": "bars",
+      "label": "SYSTEM LOAD",
+      "texture": "gt_dial",
+      "rows": [
+        { "metric_id": "0x0104", "label": "LOAD",     "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#00E5FF" },
+        { "metric_id": "0x0111", "label": "THROTTLE", "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#00E5FF" },
+        { "metric_id": "0x012F", "label": "FUEL",     "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#F2F4F6" },
+        { "metric_id": "0x1102", "label": "BATT SOC", "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#F2F4F6" },
+        { "metric_id": "0x1107", "label": "ALT LOAD", "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#FF9E00" },
+        { "metric_id": "0x0105", "label": "COOLANT",  "units": "°C",
+          "decimals": 0, "min": 40, "max": 130, "color": "#FF9E00" }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 4 — ELECTRICAL, 6-cell grid. The round board capped at 4 cells in a 2x2; landscape takes up to 8, and picks its column count from the number of cells so 6 lays out as 3x2 rather than a 2x2 with holes.",
+      "id": "electrical",
+      "type": "quad",
+      "texture": "gt_dial",
+      "cells": [
+        { "metric_id": "0x0142", "label": "BATT", "units": "V",
+          "decimals": 1, "min": 8, "max": 16, "color": "#F2F4F6",
+          "thresholds": {
+            "warning":  { "value": 12.1, "hysteresis": 0.2, "color": "#FF9E00",
+                          "direction": "below" },
+            "critical": { "value": 11.5, "hysteresis": 0.2, "color": "#FF2D16",
+                          "direction": "below" }
+          } },
+        { "metric_id": "0x1101", "label": "CURRENT", "units": "A",
+          "decimals": 1, "min": -100, "max": 100, "color": "#00E5FF" },
+        { "metric_id": "0x1105", "label": "ALT", "units": "V",
+          "decimals": 1, "min": 8, "max": 16, "color": "#F2F4F6" },
+        { "metric_id": "0x1102", "label": "SOC", "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#F2F4F6" },
+        { "metric_id": "0x1104", "label": "BATT T", "units": "°C",
+          "decimals": 0, "min": -20, "max": 80, "color": "#00E5FF" },
+        { "metric_id": "0x1109", "label": "LOAD", "units": "W",
+          "decimals": 0, "min": 0, "max": 2000, "color": "#FF9E00" }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 5 — POWERTRAIN, 8-cell grid at 4x2. The densest layout the panel supports.",
+      "id": "powertrain",
+      "type": "quad",
+      "texture": "gt_dial",
+      "cells": [
+        { "metric_id": "0x010D", "label": "SPEED", "units": "km/h",
+          "decimals": 0, "min": 0, "max": 260, "color": "#F2F4F6" },
+        { "metric_id": "0x010C", "label": "RPM", "units": "rpm",
+          "decimals": 0, "min": 0, "max": 8000, "color": "#F2F4F6" },
+        { "metric_id": "0x1001", "label": "BOOST", "units": "bar",
+          "decimals": 2, "min": -1, "max": 2, "color": "#00E5FF" },
+        { "metric_id": "0x010B", "label": "MAP", "units": "kPa",
+          "decimals": 0, "min": 0, "max": 250, "color": "#00E5FF" },
+        { "metric_id": "0x0105", "label": "COOLANT", "units": "°C",
+          "decimals": 0, "min": 40, "max": 130, "color": "#FF9E00" },
+        { "metric_id": "0x015C", "label": "OIL T", "units": "°C",
+          "decimals": 0, "min": 0, "max": 160, "color": "#FF9E00" },
+        { "metric_id": "0x010F", "label": "IAT", "units": "°C",
+          "decimals": 0, "min": -20, "max": 90, "color": "#F2F4F6" },
+        { "metric_id": "0x0111", "label": "THROTTLE", "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#00E5FF" }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 6 — MULTI-SERIES TREND. 'series' overlays up to 4 metrics on one set of axes with a legend along the bottom, which is what the extra width buys you: comparing traces beats comparing four separate numbers. They share one Y range (the screen's min/max), so only overlay metrics that live on a comparable scale — these four are all percentages. Omit 'series' and give the screen its own metric_id to get the plain single-metric strip chart instead. points x sample_ms is the visible window, shown in the corner.",
+      "id": "load_trend",
+      "type": "chart",
+      "label": "LOAD TRENDS",
+      "min": 0,
+      "max": 100,
+      "points": 120,
+      "sample_ms": 1000,
+      "texture": "gt_dial",
+      "series": [
+        { "metric_id": "0x0104", "label": "LOAD",     "units": "%",
+          "decimals": 0, "color": "#00E5FF" },
+        { "metric_id": "0x0111", "label": "THROTTLE", "units": "%",
+          "decimals": 0, "color": "#FF9E00" },
+        { "metric_id": "0x1107", "label": "ALT LOAD", "units": "%",
+          "decimals": 0, "color": "#69F0AE" },
+        { "metric_id": "0x012F", "label": "FUEL",     "units": "%",
+          "decimals": 0, "color": "#B39DDB" }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 7 — Single-metric trend, the classic strip chart. Same screen type, no 'series' key.",
+      "id": "coolant_trend",
+      "type": "chart",
+      "metric_id": "0x0105",
+      "label": "COOLANT TREND",
+      "units": "°C",
+      "decimals": 0,
+      "min": 40,
+      "max": 130,
+      "points": 120,
+      "sample_ms": 1000,
+      "color": "#FF9E00",
+      "texture": "gt_dial"
+    },
+
+    {
+      "_doc": "SCREEN 8 — Diagnostics: link rate, drops, heap, uptime and the live GPIO scan for identifying the side button.",
+      "id": "diag",
+      "type": "diag"
+    }
+  ],
+
+  "_doc_warnings": "WARNING LAMPS — the car's own telltales: check engine (MIL), seat belt, doors, parking brake, oil pressure, charging, engine hot/cold, low fuel, knock, high beam, lights, cruise and the indicators, plus three spare lamps (custom_1..3) for anything found on the bus later. They light on a strip over the screens and on the dash screen, and the serious ones raise the same alert card as the watchdog. EVERYTHING HERE CAN BE SWITCHED OFF: 'enabled' is the whole feature, 'strip' the overlay ('strip_mode' 'peek' shows new lamps for 'peek_secs' then folds to the most urgent fault; 'always' keeps every lit lamp up), 'popups' the alert card, and each lamp on its own with \"<lamp>\": false. A lamp object overrides any of: enabled, strip, metric_id, rule (on/off/above/below), threshold, hysteresis, engine (only judged with the engine running), debounce_ms, hold_ms, popup (off/once/repeat), popup_speed (km/h), blink_speed (km/h, -1 never), popup_secs, critical, tone (red/amber/green/blue), icon, title, detail, units, decimals, extra_metric_id. A lamp whose metric the master never sends simply stays dark. Edit this in the Gauge Studio's Warnings tab.",
+  "warnings": {
+    "enabled": true,
+    "strip": true,
+    "strip_position": "bottom",
+    "strip_mode": "always",
+    "peek_secs": 6,
+    "popups": true,
+    "lamps": {
+      "seatbelt": { "popup": "repeat", "popup_speed": 10, "blink_speed": 10 },
+      "knock": { "threshold": -3.0 },
+      "custom_1": { "enabled": false }
+    }
+  },
+
+  "_doc_watchdog": "WATCHDOG — the guard. A standalone list of metrics policed whether or not any screen shows them. When one crosses a limit a warning-triangle card is raised over whichever screen is showing. Tap to acknowledge and mute that fault for alert_ack_ms; an escalation or a second fault re-arms it. 'popup' false on an item polices it silently; 'show_popup' false here silences all of them; each screen also has its own 'show_popup'.",
+  "_doc_alert_style": "alert_style: 'bar' (default here) puts the warning across the top of the screen as a strip; 'card' centres it as a box. On a landscape panel the bar is the better default because a centred card covers the very gauges you are trying to read — the round board uses 'card' since a 240px circle has no room for a strip.",
+  "watchdog": {
+    "enabled": true,
+    "show_popup": true,
+    "alert_style": "bar",
+    "items": [
+      { "metric_id": "0x0105", "label": "COOLANT", "units": "°C", "decimals": 0,
+        "warning":  { "value": 105, "hysteresis": 3, "color": "#FF9E00" },
+        "critical": { "value": 115, "hysteresis": 3, "color": "#FF2D16",
+                      "overlay_text": "ENGINE OVERHEAT" } },
+
+      { "metric_id": "0x0142", "label": "BATTERY", "units": "V", "decimals": 1,
+        "warning":  { "value": 12.1, "hysteresis": 0.2, "direction": "below",
+                      "color": "#FF9E00" },
+        "critical": { "value": 11.5, "hysteresis": 0.2, "direction": "below",
+                      "color": "#FF2D16", "overlay_text": "NOT CHARGING" } },
+
+      { "metric_id": "0x015C", "label": "OIL TEMP", "units": "°C", "decimals": 0,
+        "warning":  { "value": 130, "hysteresis": 5, "color": "#FF9E00" },
+        "critical": { "value": 145, "hysteresis": 5, "color": "#FF2D16",
+                      "overlay_text": "OIL TEMP" } },
+
+      { "metric_id": "0x1003", "label": "OIL PRESS", "units": "bar", "decimals": 1,
+        "critical": { "value": 0.8, "hysteresis": 0.2, "direction": "below",
+                      "color": "#FF2D16", "overlay_text": "OIL PRESSURE" } },
+
+      { "metric_id": "0x010C", "label": "RPM", "units": "rpm", "decimals": 0,
+        "popup": false,
+        "critical": { "value": 7000, "hysteresis": 200, "color": "#FF2D16",
+                      "overlay_text": "OVER-REV" } },
+
+      { "metric_id": "0x1001", "label": "BOOST", "units": "bar", "decimals": 2,
+        "critical": { "value": 1.6, "hysteresis": 0.1, "color": "#FF2D16",
+                      "overlay_text": "OVERBOOST" } }
+    ]
+  }
+}
+

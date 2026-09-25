@@ -1,0 +1,325 @@
+/**
+ * @file WebPortal.cpp
+ * @brief AP, REST API and the embedded configuration page.
+ *
+ * The page source lives in the project as a readable HTML file and is folded
+ * into this file by a build script; what is compiled is the single string
+ * below. Four tabs: Dashboard (what is happening, in plain words), Bus (the
+ * raw traffic and hand mapping), Sources (where each value comes from, in the
+ * order the master prefers them) and Settings.
+ */
+#include "WebPortal.h"
+
+#include <ArduinoJson.h>
+#include <DNSServer.h>
+#include <WebServer.h>
+#include <WiFi.h>
+
+#include "Learner.h"
+#include "MasterConfig.h"
+#include "MasterTelemetry.h"
+#include "Ssm2.h"
+
+WebPortal Portal;
+
+static WebServer s_server(80);
+static DNSServer s_dns;
+
+/*
+ * The page lives in flash rather than a filesystem. It is one file, it changes
+ * only when the firmware does, and keeping it here means the master needs no
+ * `uploadfs` step — see the note in MasterConfig.h about why that matters.
+ */
+static const char PORTAL_HTML[] PROGMEM = R"HTML(@@PAGE@@)HTML";
+
+void WebPortal::begin() {
+    if (!Cfg.portalOn) {
+        log_i("portal disabled by configuration");
+        return;
+    }
+
+    /*
+     * AP mode, pinned to the telemetry channel.
+     *
+     * softAP's channel argument is not cosmetic here: the ESP-NOW peers listen
+     * on Cfg.wifiChannel, and a radio can only be on one channel at a time. Let
+     * the AP choose its own and every display goes silent the moment someone
+     * connects to the portal — with no error anywhere to explain it.
+     */
+    WiFi.mode(WIFI_AP);
+    const bool secured = strlen(Cfg.apPass) >= 8;
+    WiFi.softAP(Cfg.apSsid, secured ? Cfg.apPass : nullptr, Cfg.wifiChannel);
+
+    s_dns.start(53, "*", WiFi.softAPIP());
+    setupRoutes();
+    s_server.begin();
+    _running = true;
+
+    log_i("portal up: SSID '%s' (%s) at %s, channel %u", Cfg.apSsid,
+          secured ? "WPA2" : "open", WiFi.softAPIP().toString().c_str(),
+          Cfg.wifiChannel);
+}
+
+void WebPortal::loop() {
+    if (!_running) return;
+    s_dns.processNextRequest();
+    s_server.handleClient();
+}
+
+/**
+ * @brief Hands the client 1 KB at a time. ArduinoJson writes byte by byte,
+ *        and a TCP write per byte would crawl.
+ */
+class ClientBuffer : public Print {
+public:
+    explicit ClientBuffer(WiFiClient &c) : _c(c) {}
+    ~ClientBuffer() { push(); }
+    size_t write(uint8_t b) override {
+        _b[_n++] = b;
+        if (_n == sizeof(_b)) push();
+        return 1;
+    }
+    size_t write(const uint8_t *p, size_t n) override {
+        for (size_t i = 0; i < n; i++) write(p[i]);
+        return n;
+    }
+    void push() { if (_n) { _c.write(_b, _n); _n = 0; } }
+private:
+    WiFiClient &_c;
+    uint8_t     _b[1024];
+    size_t      _n = 0;
+};
+
+/**
+ * @brief Stream a document to the client. Never built as one String first:
+ *        the full configuration runs to tens of kilobytes, and one
+ *        allocation that size can fail on a fragmented heap - which the page
+ *        would see as a settings load that silently never finishes.
+ */
+static void sendJson(JsonDocument &doc) {
+    s_server.setContentLength(measureJson(doc));
+    s_server.send(200, "application/json", "");
+    WiFiClient client = s_server.client();
+    ClientBuffer out(client);
+    serializeJson(doc, out);
+}
+
+static void sendOk() { s_server.send(200, "application/json", "{\"ok\":true}"); }
+
+void WebPortal::setupRoutes() {
+    s_server.on("/", HTTP_GET, []() {
+        s_server.send_P(200, "text/html", PORTAL_HTML);
+    });
+
+    s_server.on("/api/config", HTTP_GET, []() {
+        JsonDocument doc;
+        Cfg.toJson(doc);
+        sendJson(doc);
+    });
+
+    s_server.on("/api/config", HTTP_POST, []() {
+        JsonDocument doc;
+        if (deserializeJson(doc, s_server.arg("plain")) ||
+            !Cfg.fromJson(doc.as<JsonVariantConst>(), true)) {   // not an object
+            s_server.send(400, "application/json", "{\"error\":\"bad json\"}");
+            return;
+        }
+        const bool ok = Cfg.save();
+        s_server.send(ok ? 200 : 500, "application/json",
+                      ok ? "{\"ok\":true}" : "{\"error\":\"fs write\"}");
+    });
+
+    /*
+     * Everything the Dashboard, Sources and Settings tabs show, in one
+     * document polled once a second. Totals rather than rates: the page
+     * divides by its own poll interval, so nothing here has to keep history.
+     */
+    s_server.on("/api/live", HTTP_GET, []() {
+        MasterStats st;
+        masterGetStats(st);
+        Ssm2Status ss;
+        ssm2GetStatus(ss);
+
+        JsonDocument doc;
+        doc["uptime"] = millis() / 1000;
+        doc["heap"]   = ESP.getFreeHeap();
+        // The MAC the displays see is the one the broadcast leaves from, and
+        // with the portal up that is the AP interface, not the station's.
+        doc["mac"]    = Portal.running() ? WiFi.softAPmacAddress() : WiFi.macAddress();
+        doc["mode"]   = Cfg.diagMode;
+        doc["silent"] = st.silent;
+        doc["settle"] = st.settleMs;
+        doc["night"]  = st.night;
+
+        JsonObject b = doc["bus"].to<JsonObject>();
+        b["alive"]   = st.busAlive;
+        b["off"]     = st.busOff;
+        b["rx"]      = st.canRx;
+        b["tx"]      = st.canTx;
+        b["bits"]    = st.busBitsRx;
+        b["bitrate"] = st.bitrate;
+        b["tec"]     = st.tec;
+        b["rec"]     = st.rec;
+        b["err"]     = st.busErrors;
+        b["missed"]  = st.rxMissed + st.rxOverrun;
+        b["err_tx"]  = st.errWhileTx;
+        b["err_idle"] = st.errIdle;
+
+        JsonObject g = doc["guard"].to<JsonObject>();
+        g["trips"]  = st.guardTrips;
+        g["pause"]  = st.guardPauseMs;
+        g["silent"] = st.guardSilent;
+        {
+            static CensusView cen[128];
+            b["ids"] = masterCensusRaw(cen, 128);
+        }
+
+        JsonObject o = doc["obd"].to<JsonObject>();
+        o["answers"]   = st.obdAnswers;
+        o["active"]    = st.obdActive;
+        o["physical"]  = st.obdPhysical;
+        o["supported"] = st.obdSupported;
+        o["rx"]        = st.obdRx;
+
+        JsonObject so = doc["ssm"].to<JsonObject>();
+        so["answers"]   = st.ssmAnswers;
+        so["init"]      = ss.initOk;
+        so["active"]    = ss.active;
+        so["ecu_id"]    = ss.initOk ? ss.ecuId : Cfg.ecuId;
+        so["sys_id"]    = ss.initOk ? ss.sysId : Cfg.ecuSysId;
+        so["flags"]     = ss.initOk ? ss.flagCount : (uint8_t)(strlen(Cfg.ecuFlags) / 2);
+        so["supported"] = ss.supported;
+        so["total"]     = ss.total;
+        so["rate"]      = ss.exchPerSec;
+        so["ok"]        = ss.responses;
+        so["err"]       = ss.errors;
+        so["nrc"]       = ss.nrcs;
+        so["refused"]   = ss.refused;
+        so["batch"]     = ss.batch;
+        so["last_err"]  = ss.lastErr;
+
+        JsonObject e = doc["esp"].to<JsonObject>();
+        {
+            static uint32_t lastTx = 0, lastMet = 0, lastMs = 0;
+            const uint32_t now = millis();
+            float fps = 0, mps = 0;
+            if (lastMs && now > lastMs) {
+                const float dt = (now - lastMs) / 1000.0f;
+                fps = (st.espTx - lastTx) / dt;
+                mps = (st.espMetrics - lastMet) / dt;
+            }
+            lastTx = st.espTx; lastMet = st.espMetrics; lastMs = now;
+            e["fps"]  = fps;
+            e["mps"]  = mps;
+            e["fail"] = st.espFail;
+        }
+
+        // Every slot, plus every value already read from the bus.
+        static LearnView lv[32 + MAX_RT_SIGNALS];
+        const size_t nl = learnerStatus(lv, sizeof(lv) / sizeof(lv[0]));
+        JsonArray la = doc["learn"].to<JsonArray>();
+        for (size_t i = 0; i < nl; i++) {
+            JsonObject x = la.add<JsonObject>();
+            x["m"]   = lv[i].metric;
+            x["st"]  = lv[i].state;
+            x["p"]   = lv[i].progress;
+            x["fit"] = lv[i].fit;
+            x["n"]   = lv[i].samples;
+            x["id"]  = lv[i].canId;
+            x["s"]   = lv[i].start;
+            x["l"]   = lv[i].len;
+            x["be"]  = lv[i].be;
+        }
+        uint16_t lf = 0, lb = 0;
+        learnerCounts(lf, lb);
+        doc["learn_f"] = lf;
+        doc["learn_b"] = lb;
+
+        JsonArray sup = doc["ssm_sup"].to<JsonArray>();
+        Cfg.lock();
+        for (const auto &x : Cfg.ssm) sup.add(ssm2Supported(x));
+        Cfg.unlock();
+        if (st.obdAnswers == 1) {
+            JsonArray ps = doc["pid_sup"].to<JsonArray>();
+            for (uint16_t p = 1; p < 256; p++)
+                if (masterPidSupported((uint8_t)p)) ps.add(p);
+        }
+
+        static MetricViewM mv[192];
+        const size_t nm = masterGetMetrics(mv, 192);
+        JsonArray ma = doc["metrics"].to<JsonArray>();
+        for (size_t i = 0; i < nm; i++) {
+            JsonObject m = ma.add<JsonObject>();
+            m["id"]  = mv[i].id;
+            m["v"]   = mv[i].value;
+            m["age"] = mv[i].ageMs;
+            m["src"] = mv[i].source;
+        }
+        sendJson(doc);
+    });
+
+    /* The Bus tab's frame list, polled only while that tab is open. */
+    s_server.on("/api/bus", HTTP_GET, []() {
+        JsonDocument doc;
+        static CensusView cen[128];
+        const size_t nc = masterGetCensus(cen, 128);
+        JsonArray ca = doc["census"].to<JsonArray>();
+        char hx[17], chx[17];
+        for (size_t i = 0; i < nc; i++) {
+            JsonObject o = ca.add<JsonObject>();
+            o["id"]    = cen[i].id;
+            o["count"] = cen[i].count;
+            o["ext"]   = cen[i].extd;
+            o["age"]   = cen[i].ageMs;
+            for (uint8_t k = 0; k < cen[i].dlc; k++) {
+                snprintf(hx + 2 * k, 3, "%02X", cen[i].data[k]);
+                snprintf(chx + 2 * k, 3, "%02X", cen[i].changed[k]);
+            }
+            hx[2 * cen[i].dlc] = chx[2 * cen[i].dlc] = '\0';
+            o["d"] = hx;
+            o["c"] = chx;
+        }
+        sendJson(doc);
+    });
+
+    s_server.on("/api/census/reset", HTTP_POST, []() { masterResetCensus(); sendOk(); });
+    s_server.on("/api/ssm/reinit",   HTTP_POST, []() { ssm2Reinit(); sendOk(); });
+    s_server.on("/api/learn/reset",  HTTP_POST, []() {
+        learnerReset();
+        masterResetSignalVerify();
+        sendOk();
+    });
+    s_server.on("/api/learn/forget", HTTP_POST, []() { learnerForget(); sendOk(); });
+    s_server.on("/api/guard/reset",  HTTP_POST, []() { diagGuardReset(); sendOk(); });
+    // Per value: "Listen now" (use the best match so far) and "Request instead".
+    s_server.on("/api/learn/accept", HTTP_POST, []() {
+        learnerAccept((uint16_t)s_server.arg("m").toInt());
+        sendOk();
+    });
+    s_server.on("/api/learn/unlearn", HTTP_POST, []() {
+        learnerUnlearn((uint16_t)s_server.arg("m").toInt());
+        sendOk();
+    });
+
+    s_server.on("/api/defaults", HTTP_POST, []() {
+        Cfg.loadDefaults();
+        Cfg.save();
+        sendOk();
+        delay(300);
+        ESP.restart();
+    });
+
+    s_server.on("/api/reboot", HTTP_POST, []() {
+        sendOk();
+        delay(300);
+        ESP.restart();
+    });
+
+    // Captive-portal probes and anything unknown land on the page itself.
+    s_server.onNotFound([]() {
+        s_server.sendHeader("Location",
+                            String("http://") + WiFi.softAPIP().toString() + "/",
+                            true);
+        s_server.send(302, "text/plain", "");
+    });
+}

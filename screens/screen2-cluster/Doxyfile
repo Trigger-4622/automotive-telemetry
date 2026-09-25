@@ -1,0 +1,104 @@
+# =============================================================================
+#  Doxygen configuration — Vehicle Telemetry System
+# -----------------------------------------------------------------------------
+#  Generate with:   doxygen Doxyfile
+#  Output:          docs/html/index.html
+#
+#  Doxygen is not required to build the firmware; it only produces the API
+#  reference. Install it from https://www.doxygen.nl/download.html, or on
+#  Windows:  winget install DimitriVanHeesch.Doxygen
+# =============================================================================
+
+#---------------------------------------------------------------------------
+# Project
+#---------------------------------------------------------------------------
+PROJECT_NAME           = "Vehicle Telemetry System"
+PROJECT_BRIEF          = "ESP32-C3 round gauge display (slave) + CAN bus bridge (master)"
+PROJECT_NUMBER         = 1.0.0
+OUTPUT_DIRECTORY       = docs
+CREATE_SUBDIRS         = NO
+OUTPUT_LANGUAGE        = English
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+
+#---------------------------------------------------------------------------
+# Input
+#---------------------------------------------------------------------------
+INPUT                  = include \
+                         src \
+                         ../../master/include \
+                         ../../master/src \
+                         docs/mainpage.md
+FILE_PATTERNS          = *.h *.hpp *.c *.cpp *.md
+RECURSIVE              = YES
+EXCLUDE                = .pio docs/html
+EXCLUDE_PATTERNS       = */.pio/* */libdeps/*
+USE_MDFILE_AS_MAINPAGE = docs/mainpage.md
+
+#---------------------------------------------------------------------------
+# Extraction — this is firmware, so document the internals too. Static helpers
+# and private members carry real design intent here and are worth publishing.
+#---------------------------------------------------------------------------
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+OPTIMIZE_OUTPUT_FOR_C  = NO
+BUILTIN_STL_SUPPORT    = YES
+TYPEDEF_HIDES_STRUCT   = YES
+SHOW_INCLUDE_FILES     = YES
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+#---------------------------------------------------------------------------
+# Warnings — surface documentation gaps rather than hiding them
+#---------------------------------------------------------------------------
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = docs/doxygen-warnings.log
+
+#---------------------------------------------------------------------------
+# Preprocessing — Doxygen cannot see the toolchain's headers, so hand it the
+# macros that gate real declarations. Without these, the ESP-NOW receive
+# callback and the packed wire structs would be parsed wrongly or skipped.
+#---------------------------------------------------------------------------
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = YES
+INCLUDE_PATH           = include src src/hal src/telemetry src/ui src/config \
+                         ../../master/include
+PREDEFINED             = __DOXYGEN__ \
+                         ESP_ARDUINO_VERSION_MAJOR=2 \
+                         OBD_POLLING_ENABLED=1 \
+                         NIGHT_SOURCE=1 \
+                         "LV_ATTRIBUTE_LARGE_CONST=" \
+                         "PROGMEM=" \
+                         "portMUX_TYPE=int" \
+                         "portMUX_INITIALIZER_UNLOCKED=0"
+
+#---------------------------------------------------------------------------
+# Output formats
+#---------------------------------------------------------------------------
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_COLORSTYLE        = TOGGLE
+GENERATE_TREEVIEW      = YES
+FULL_SIDEBAR           = NO
+DISABLE_INDEX          = NO
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+
+#---------------------------------------------------------------------------
+# Diagrams — text-only fallbacks unless Graphviz is installed. Set HAVE_DOT to
+# YES after installing Graphviz for call graphs and collaboration diagrams.
+#---------------------------------------------------------------------------
+HAVE_DOT               = NO
+CLASS_DIAGRAMS         = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = NO

@@ -1,0 +1,24 @@
+# PlatformIO build output and downloaded libraries - regenerable, large, and
+# full of absolute paths
+.pio/
+.vscode/
+
+# Host test harness output (rebuilt by every run; CI keeps the screenshots)
+**/test_host/build/
+**/test_host/shots/
+
+# Raw flash dumps read off a device: images of one board, not source
+master/backups/
+
+# Doxygen output - regenerate with: doxygen Doxyfile
+**/docs/html/
+**/docs/doxygen-warnings.log
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# OS / editor cruft
+desktop.ini
+Thumbs.db
+.DS_Store

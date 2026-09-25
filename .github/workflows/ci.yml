@@ -1,0 +1,56 @@
+# Every pull request and every push to main: the three firmwares must build,
+# and the host tests (simulated car + rendered screens) must pass. Claude's
+# cloud sessions open pull requests, so this is also what Auto-fix watches.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilers and libraries
+        run: SKIP_PIO=1 bash scripts/cloud-setup.sh --force
+      - name: Master, screen 1, screen 2
+        run: python scripts/test_all.py
+      - name: Keep the rendered screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screens/*/test_host/shots/
+          if-no-files-found: ignore
+
+  firmware:
+    name: Build ${{ matrix.project }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [master, screens/screen1-round, screens/screen2-cluster]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles(format('{0}/platformio.ini', matrix.project)) }}
+      - run: pip install platformio
+      - run: pio run -d ${{ matrix.project }}

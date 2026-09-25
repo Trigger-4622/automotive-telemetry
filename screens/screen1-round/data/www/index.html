@@ -1,0 +1,1528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telemetry Gauge Studio</title>
+<style>
+:root{
+  /* color-scheme is what stops native <select> controls and their dropdown
+     lists from being painted by the OS in its light theme, which is where
+     that washed-out brown came from: a light widget bleeding through a dark
+     page. It also fixes scrollbars and focus rings for free. */
+  color-scheme: dark;
+  --bg:#0b1117;--panel:#121a23;--panel2:#0e151d;--line:#1e2a36;
+  --text:#dce6ee;--muted:#7d8b99;
+  --accent:#00e5ff;--accent2:#40c4ff;
+  --warn:#ffc400;--crit:#ff1744;--ok:#69f0ae;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);
+     font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;padding-bottom:90px}
+header{display:flex;align-items:center;gap:12px;padding:14px 18px;
+       background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:17px;font-weight:600}
+header h1 span{color:var(--accent)}
+#devStatus{margin-left:auto;font-size:12px;color:var(--muted)}
+#devStatus.up{color:var(--ok)}
+nav{display:flex;gap:4px;padding:10px 18px;background:var(--panel2);
+    border-bottom:1px solid var(--line)}
+nav button{background:none;border:1px solid transparent;color:var(--muted);
+    padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px}
+nav button.active{background:var(--panel);color:var(--accent);
+    border-color:var(--line)}
+main{padding:18px;max-width:1100px;margin:0 auto}
+.cols{display:grid;grid-template-columns:220px 1fr 300px;gap:16px}
+@media(max-width:900px){.cols{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);
+      border-radius:12px;padding:14px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;
+         color:var(--muted);margin-bottom:10px}
+#screenList div{padding:8px 10px;border-radius:8px;cursor:pointer;
+    display:flex;justify-content:space-between;margin-bottom:4px}
+#screenList div.sel{background:var(--panel2);color:var(--accent);
+    outline:1px solid var(--line)}
+#screenList small{color:var(--muted)}
+.btnrow{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+button.b{background:var(--panel2);border:1px solid var(--line);
+    color:var(--text);padding:6px 12px;border-radius:8px;cursor:pointer;
+    font-size:13px}
+button.b:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:#00232b;font-weight:600;
+    border:none}
+button.danger{color:var(--crit)}
+label.f{display:block;margin-bottom:8px;font-size:12px;color:var(--muted)}
+label.f input,label.f select{display:block;width:100%;margin-top:3px;
+    background:var(--panel2);border:1px solid var(--line);color:var(--text);
+    padding:7px 9px;border-radius:8px;font-size:13px}
+label.f input[type=color]{padding:2px;height:34px}
+label.f input[type=checkbox]{display:inline;width:auto}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 10px}
+fieldset{border:1px solid var(--line);border-radius:10px;padding:10px;
+    margin:12px 0}
+legend{font-size:11px;color:var(--muted);padding:0 6px;
+    text-transform:uppercase;letter-spacing:.08em}
+.preview{text-align:center}
+canvas{background:#000;border-radius:50%;border:1px solid var(--line)}
+input[type=range]{width:90%;margin-top:12px;accent-color:var(--accent)}
+.savebar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);
+    border-top:1px solid var(--line);padding:12px 18px;display:flex;gap:10px;
+    justify-content:flex-end}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
+th{color:var(--muted);font-weight:500;font-size:11px;
+   text-transform:uppercase;letter-spacing:.06em}
+textarea{width:100%;min-height:420px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:10px;color:var(--text);
+    font:12px/1.5 ui-monospace,Consolas,monospace;padding:12px}
+
+/* Native selects still deserve explicit colours: some browsers ignore the
+   inherited background on the popup list even with color-scheme set. */
+label.f select option{background:var(--panel);color:var(--text)}
+select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
+#toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);
+    background:var(--panel);border:1px solid var(--accent);padding:9px 18px;
+    border-radius:10px;display:none;z-index:9}
+.hint{font-size:12px;color:var(--muted);margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Telemetry <span>Gauge Studio</span></h1>
+  <span id="devStatus">connecting…</span>
+</header>
+<nav>
+  <button data-tab="screens" class="active">Screens</button>
+  <button data-tab="watchdog">Watchdog</button>
+  <button data-tab="warnings">Warnings</button>
+  <button data-tab="settings">Settings</button>
+  <button data-tab="assets">Assets</button>
+  <button data-tab="system">System</button>
+  <button data-tab="json">Raw JSON</button>
+</nav>
+<main>
+  <section id="tab-screens">
+    <div class="cols">
+      <div class="card">
+        <h2>Screens</h2>
+        <div id="screenList"></div>
+        <div class="btnrow">
+          <button class="b" onclick="addScreen()">＋ Add</button>
+          <button class="b danger" onclick="delScreen()">Delete</button>
+          <button class="b" onclick="moveScreen(-1)">↑</button>
+          <button class="b" onclick="moveScreen(1)">↓</button>
+        </div>
+      </div>
+      <div class="card"><h2>Properties</h2><div id="editor"></div></div>
+      <div class="card preview">
+        <h2>Live Preview</h2>
+        <canvas id="cv" width="260" height="260"></canvas>
+        <input type="range" id="sim" min="0" max="1000" value="400">
+        <div class="hint">Drag to simulate the metric value</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-watchdog" hidden>
+    <div class="card">
+      <h2>Watchdog &mdash; guarded metrics</h2>
+      <p class="hint">The guard list. Anything here is monitored
+      <b>whether or not a screen shows it</b>. When a value crosses a limit,
+      a warning triangle pops up over whichever screen is showing, naming the
+      metric, its value and the limit it broke. Tap the display to acknowledge
+      and mute that one fault; an escalation to critical or a second fault
+      re-arms it straight away.</p>
+      <label class="f" style="margin-top:10px">
+        <input type="checkbox" id="wdEnabled" onchange="wdToggle(this)">
+        Watchdog armed
+      </label>
+      <label class="f">
+        <input type="checkbox" id="wdShowPopup" onchange="wSet('show_popup',this)">
+        Draw the pop-up over the screen
+        <span class="hint" style="display:block">Uncheck to police everything
+        silently. Same switch as on the Settings tab.</span>
+      </label>
+      <div class="btnrow">
+        <button class="b" onclick="wdAdd()">＋ Guard a metric</button>
+      </div>
+    </div>
+    <br>
+    <div id="wdList"></div>
+  </section>
+
+  <section id="tab-warnings" hidden>
+    <div class="card">
+      <h2>Warning lamps</h2>
+      <p class="hint">The car's own telltales &mdash; check engine, seat belt,
+      doors, parking brake, oil, charging, temperature, fuel, knock, lights,
+      cruise and the indicators. Each lights on the <b>dash</b> screen and on a
+      strip over the other screens, and the serious ones can pop up the alert
+      card. A lamp whose signal the master never sends simply stays dark, so
+      leaving one on costs nothing. Tap the display to dismiss a pop-up.</p>
+      <div class="grid2" style="margin-top:10px">
+        <label class="f"><input type="checkbox" id="wnEnabled"
+          onchange="wnSet('enabled',this);renderWarnings()"> <b>Warning lamps on</b></label>
+        <label class="f"><input type="checkbox" id="wnPopups"
+          onchange="wnSet('popups',this)"> Lamps may pop up the alert card</label>
+        <label class="f"><input type="checkbox" id="wnStrip"
+          onchange="wnSet('strip',this)"> Lamp strip over the screens</label>
+        <label class="f">Strip position<select id="wnPos"
+          onchange="wnSet('strip_position',this)">
+          <option value="bottom">bottom</option><option value="top">top</option>
+          </select></label>
+        <label class="f">Strip behaviour<select id="wnMode"
+          onchange="wnSet('strip_mode',this)">
+          <option value="peek">show new lamps, then fold to the fault</option>
+          <option value="always">show every lit lamp all the time</option>
+          </select></label>
+        <label class="f">Seconds a new lamp stays on the strip<input type="number"
+          id="wnPeek" min="0" max="60" data-num="1" onchange="wnSet('peek_secs',this)"></label>
+      </div>
+      <p class="hint">Folded, the strip keeps only the most urgent red or amber
+      lamp (with "+N" for the rest) so it never sits over your data for long.
+      Indicators keep it open while they flash; high beam, cruise and lights go
+      after the few seconds - the dash screen shows them all the time.</p>
+      <p class="hint">Seat belt, door and parking brake only pop up and flash
+      when the car is moving; oil pressure and charging are only judged once
+      the engine has been running a few seconds. The three custom lamps are
+      spares for anything found on the bus later (ABS, airbag&hellip;).</p>
+    </div>
+    <br>
+    <div id="wnList"></div>
+  </section>
+
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <h2>What happens when something is wrong</h2>
+      <p class="hint">Two independent things, so you can have either, both or
+      neither.</p>
+      <label class="f"><input type="checkbox" id="setShowPopup"
+        onchange="wSet('show_popup',this)">
+        <b>Draw the warning pop-up over the screen</b>
+        <span class="hint" style="display:block">The card with the warning
+        triangle that appears on top of whatever screen you are on. Uncheck and
+        nothing is ever drawn over the dial &mdash; metrics are still policed,
+        and individual metrics can be silenced on their own in the Watchdog
+        tab.</span></label>
+      <label class="f"><input type="checkbox" id="setAlarmColors"
+        onchange="gSet('gauge_alarm_colors',this)">
+        <b>Let the gauge itself turn yellow / red</b>
+        <span class="hint" style="display:block">Recolours the arc, needle or
+        cell in place. Nothing is drawn on top. Individual levels can be
+        removed per gauge on the Screens tab.</span></label>
+    </div>
+    <br>
+    <div class="card">
+      <h2>Swipe animation</h2>
+      <div class="grid3">
+        <label class="f">Style
+          <select id="setSwipeAnim" onchange="gSet('swipe_anim',this)">
+            <option value="over">over &mdash; incoming slides on top</option>
+            <option value="move">move &mdash; both slide</option>
+            <option value="fade">fade</option>
+            <option value="none">none &mdash; instant</option>
+          </select></label>
+        <label class="f">Easing
+          <select id="setSwipeEasing" onchange="gSet('swipe_easing',this)">
+            <option value="ease_out">ease out (recommended)</option>
+            <option value="ease_in_out">ease in-out</option>
+            <option value="ease_in">ease in</option>
+            <option value="overshoot">overshoot</option>
+            <option value="bounce">bounce</option>
+            <option value="linear">linear</option>
+          </select></label>
+        <label class="f">Duration (ms)
+          <input type="number" id="setSwipeMs" data-num="1"
+            onchange="gSet('swipe_anim_ms',this)"></label>
+      </div>
+      <p class="hint">LVGL's own default is <b>linear</b>, which is what makes a
+      slide feel mechanical. Easing is what makes it read as smooth.</p>
+    </div>
+    <br>
+    <div class="card">
+      <h2>Master &amp; ESP-NOW network</h2>
+      <p class="hint">Read once at boot &mdash; <b>reboot to apply</b>.</p>
+      <div class="grid2">
+        <label class="f">ESP-NOW channel (1&ndash;13)
+          <input type="number" min="1" max="13" id="setChannel" data-num="1"
+            onchange="nSet('wifi_channel',this)"></label>
+        <label class="f">Accept only this master (MAC)
+          <input id="setMasterMac" placeholder="blank = any master"
+            onchange="nSet('master_mac',this)"></label>
+      </div>
+      <div class="btnrow">
+        <button class="b" onclick="useHeardMac()">Use the master I can hear</button>
+        <span id="heardMac" class="hint" style="align-self:center"></span>
+      </div>
+      <p class="hint"><b>The channel must match the master exactly.</b> A
+      mismatch produces silence rather than an error, which is a miserable
+      thing to debug &mdash; if the link is down, check this first. A MAC
+      filter only matters when more than one master is in range, since
+      ESP-NOW broadcasts carry no notion of which network they belong to.</p>
+      <div class="grid2">
+        <label class="f">Config AP name
+          <input id="setApSsid" onchange="nSet('ap_ssid',this)"></label>
+        <label class="f">Config AP password
+          <input id="setApPass" placeholder="under 8 chars = open network"
+            onchange="nSet('ap_password',this)"></label>
+      </div>
+      <p class="hint">WPA2 needs at least 8 characters; anything shorter leaves
+      the portal open. Changing these changes the network you are currently
+      connected to &mdash; you will have to rejoin after the reboot.</p>
+    </div>
+    <br>
+    <div class="card">
+      <h2>Alerts &amp; input</h2>
+      <div class="grid2">
+        <label class="f">Mute an acknowledged alert for (ms)
+          <input type="number" id="setAckMs" data-num="1"
+            onchange="gSet('alert_ack_ms',this)"></label>
+        <label class="f">Side button GPIO
+          <input type="number" id="setButtonGpio" data-num="1"
+            onchange="gSet('button_gpio',this)"></label>
+      </div>
+      <p class="hint">If the button does nothing, open the DIAGNOSTICS screen on
+      the device, hold the button, and watch the GPIO row &mdash; the pin that
+      reads <b>L</b> is the one to put here.</p>
+    </div>
+    <br>
+    <div class="card">
+      <h2>Smoothing &amp; colours</h2>
+      <div class="grid3">
+        <label class="f">Smoothing (EMA alpha)
+          <input type="number" step="any" id="setAlpha" data-num="1"
+            onchange="gSet('smoothing_alpha',this)"></label>
+        <label class="f">Needle glide (lerp)
+          <input type="number" step="any" id="setLerp" data-num="1"
+            onchange="gSet('lerp_speed',this)"></label>
+        <label class="f">Stale timeout (ms)
+          <input type="number" id="setStale" data-num="1"
+            onchange="gSet('stale_timeout_ms',this)"></label>
+      </div>
+      <div class="grid2">
+        <label class="f">Day background
+          <input type="color" id="setDayBg" onchange="gSet('day_bg',this)"></label>
+        <label class="f">Night background
+          <input type="color" id="setNightBg" onchange="gSet('night_bg',this)"></label>
+      </div>
+      <p class="hint">Higher alpha = snappier but noisier. Lower = smoother but
+      laggier.</p>
+    </div>
+  </section>
+
+  <section id="tab-assets" hidden>
+    <div class="card">
+      <h2>Asset Uploader</h2>
+      <p class="hint">Upload LVGL <b>.bin</b> images for gauge backgrounds
+      (240&times;240), then reference them in a screen as
+      <code>/assets/name.bin</code>. Convert with the LVGL online image
+      converter using <b>CF_TRUE_COLOR</b>, <b>binary</b> output and
+      <b>RGB565 Swap</b> &mdash; the firmware runs with
+      <code>LV_COLOR_16_SWAP&nbsp;=&nbsp;1</code>, so an unswapped image comes
+      out with red and blue channels mangled. The bundled backgrounds were
+      made by <code>tools/make_assets.py</code>.</p>
+      <p class="hint">Backgrounds are streamed from flash on every repaint, so
+      prefer them on cell/text screens; on a screen with a sweeping needle they
+      cost frame rate.</p>
+      <div class="btnrow">
+        <input type="file" id="assetFile">
+        <button class="b primary" onclick="uploadAsset()">Upload</button>
+      </div>
+      <table id="assetTable"><thead><tr><th>File</th><th>Size</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section id="tab-system" hidden>
+    <div class="card">
+      <h2>Device</h2>
+      <table id="infoTable"><tbody></tbody></table>
+      <div class="btnrow">
+        <button class="b" onclick="resetPeaks()">Reset peak values</button>
+        <button class="b danger" onclick="reboot()">Reboot device</button>
+      </div>
+    </div>
+    <br>
+    <div class="card">
+      <h2>Live Telemetry (last received from Master)</h2>
+      <table id="liveTable"><thead><tr><th>Metric</th><th>ID</th><th>Value</th>
+      <th>Peak</th><th>Flags</th><th>Age</th></tr></thead><tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-json" hidden>
+    <div class="card">
+      <h2>layout.json</h2>
+      <textarea id="jsonEd" spellcheck="false"></textarea>
+      <div class="btnrow">
+        <button class="b primary" onclick="applyJson()">Apply to editor</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="savebar">
+  <button class="b" onclick="saveLayout(false)">💾 Save to device</button>
+  <button class="b primary" onclick="saveLayout(true)">Save &amp; Reboot
+  (apply)</button>
+</div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+/* ───────────────────────── metric registry (mirror of MasterPacket.h) ──── */
+const KNOWN = {
+ '0x0101':'MIL lamp','0x0103':'Fuel system status','0x0104':'Engine load %',
+ '0x0105':'Coolant °C','0x0106':'STFT B1 %','0x0107':'LTFT B1 %',
+ '0x0108':'STFT B2 %','0x0109':'LTFT B2 %','0x010A':'Fuel press kPa',
+ '0x010B':'MAP kPa','0x010C':'RPM','0x010D':'Speed km/h','0x010E':'Timing °',
+ '0x010F':'IAT °C','0x0110':'MAF g/s','0x0111':'Throttle %',
+ '0x0114':'O2 B1S1 V','0x0115':'O2 B1S2 V','0x0118':'O2 B2S1 V',
+ '0x0119':'O2 B2S2 V','0x011F':'Run time s','0x0121':'Dist MIL km',
+ '0x0122':'Fuel rail (vac) kPa','0x0123':'Fuel rail gauge kPa',
+ '0x0124':'WB B1S1 λ','0x0128':'WB B2S1 λ','0x012C':'EGR cmd %',
+ '0x012D':'EGR error %','0x012E':'Evap purge %','0x012F':'Fuel level %',
+ '0x0130':'Warm-ups','0x0131':'Dist cleared km','0x0132':'Evap vapor Pa',
+ '0x0133':'Barometric kPa','0x0134':'WB B1S1 λ (I)','0x0138':'WB B2S1 λ (I)',
+ '0x013C':'Cat temp °C','0x013D':'Cat temp B2S1 °C',
+ '0x013E':'Cat temp B1S2 °C','0x013F':'Cat temp B2S2 °C','0x0142':'Battery V',
+ '0x0143':'Abs load %','0x0144':'Cmd λ','0x0145':'Rel throttle %',
+ '0x0146':'Ambient °C','0x0147':'Abs throttle B %','0x0148':'Throttle C %',
+ '0x0149':'Pedal D %','0x014A':'Pedal E %','0x014B':'Pedal F %',
+ '0x014C':'Cmd throttle %','0x014D':'Time MIL on min',
+ '0x014E':'Time since clear min','0x0151':'Fuel type','0x0152':'Ethanol %',
+ '0x0153':'Evap abs kPa','0x0159':'Fuel rail abs kPa',
+ '0x015A':'Relative pedal %','0x015B':'Hybrid SOC %','0x015C':'Oil temp °C',
+ '0x015D':'Injection timing °','0x015E':'Fuel rate L/h',
+ '0x0161':'Demand torque %','0x0162':'Actual torque %',
+ '0x0163':'Reference torque Nm','0x01A6':'Odometer km','0x0301':'DTC count',
+ '0x0314':'O2 B1S1 trim %','0x0315':'O2 B1S2 trim %',
+ '0x0318':'O2 B2S1 trim %','0x0319':'O2 B2S2 trim %','0x0324':'WB B1S1 V',
+ '0x0328':'WB B2S1 V','0x0334':'WB B1S1 mA','0x0338':'WB B2S1 mA',
+ '0x1001':'Boost bar','0x1002':'AFR','0x1003':'Oil press bar',
+ '0x1004':'EGT °C','0x1005':'Gear','0x1006':'Steering °','0x1007':'Brake bar',
+ '0x1008':'Wheel FL km/h','0x1009':'Wheel FR km/h','0x100A':'Wheel RL km/h',
+ '0x100B':'Wheel RR km/h','0x100C':'Lateral G g','0x100D':'Longitudinal G g',
+ '0x100E':'Yaw rate °/s','0x1101':'Batt current A','0x1102':'Batt SOC %',
+ '0x1103':'Batt SOH %','0x1104':'Batt temp °C','0x1105':'Alternator V',
+ '0x1106':'Alternator A','0x1107':'Alternator load %','0x1108':'12V rail V',
+ '0x1109':'Elec load W','0x110A':'Charge status','0x1201':'Left turn signal',
+ '0x1202':'Right turn signal','0x1203':'High beam','0x1204':'Door open',
+ '0x1205':'Handbrake','0x1206':'Seatbelt unfastened','0x1207':'Cruise active',
+ '0x1208':'Reverse','0x1F01':'Night sense','0x1F02':'Master uptime s',
+ '0x1F03':'CAN frames/s','0x1F04':'CAN IDs','0x1F05':'OBD replies/s',
+ '0x1F06':'SSM2 exch/s','0x2001':'Knock corr °','0x2002':'Knock corr fine °',
+ '0x2003':'A/F learn %','0x2004':'A/F corr %','0x2005':'Inj duty %',
+ '0x2006':'Target boost bar','0x2007':'Wastegate %','0x2008':'A/F corr 2 %',
+ '0x2009':'A/F learn 2 %','0x200A':'Front O2 #1 V','0x200B':'Rear O2 V',
+ '0x200C':'Front O2 #2 V','0x200D':'MAF sensor V','0x200E':'TPS V',
+ '0x200F':'Atmospheric kPa','0x2010':'Manifold rel kPa',
+ '0x2011':'Tank press kPa','0x2012':'Learned timing °',
+ '0x2013':'Accel pedal %','0x2014':'Fuel temp °C','0x2015':'Wastegate 2 %',
+ '0x2016':'CPC duty %','0x2017':'ISC duty %','0x2018':'A/F lean %',
+ '0x2019':'A/F heater %','0x201A':'ISC step','0x201B':'EGR steps',
+ '0x201C':'Alternator duty %','0x201D':'Fuel pump %',
+ '0x201E':'Intake VVT R °','0x201F':'Intake VVT L °',
+ '0x2020':'Intake OCV R %','0x2021':'Intake OCV L %',
+ '0x2022':'A/F current mA','0x2023':'Lambda','0x2024':'Lambda 2',
+ '0x2025':'Throttle motor %','0x2026':'Main TPS V','0x2027':'Main APS V',
+ '0x2028':'Brake boost kPa','0x2029':'Fuel HP MPa','0x202B':'Exhaust VVT R °',
+ '0x202C':'Exhaust VVT L °','0x202D':'Rough cyl 1','0x202E':'Rough cyl 2',
+ '0x202F':'Rough cyl 3','0x2030':'Rough cyl 4','0x2031':'Inj 2 pulse ms',
+ '0x2032':'Cold start inj ms','0x2033':'Alternator mode',
+ '0x2034':'Fuel sender V','0x2035':'Radiator fan %',
+ '0x2036':'Learned ign corr °','0x2037':'Boost feedback %',
+ '0x2038':'Target RPM','0x2039':'SI-Drive','0x203A':'Odometer (SSM) km',
+ '0x203B':'EPS current A','0x203C':'Fuel pump A','0x203E':'Inj 1 pulse ms',
+ '0x2101':'Brake switch','0x2102':'Clutch switch','0x2103':'Neutral switch',
+ '0x2104':'A/C switch','0x2105':'Idle switch','0x2106':'Knock signal',
+ '0x2107':'Electrical load','0x2108':'Light switch','0x2109':'Radiator fan 1',
+ '0x210A':'Radiator fan 2','0x210B':'A/C compressor',
+ '0x210C':'Fuel pump relay','0x210D':'Oil pressure switch','0x210E':'Starter',
+ '0x210F':'Rear defogger','0x2110':'Blower','0x2111':'Wiper switch',
+ '0x2112':'Ignition','0x2113':'Stop lamp switch','0x2114':'Knock signal 2',
+ '0x3001':'Custom 1','0x3002':'Custom 2','0x3003':'Custom 3',
+ '0x3004':'Custom 4','0x3005':'Custom 5','0x3006':'Custom 6',
+ '0x3007':'Custom 7','0x3008':'Custom 8','0x3009':'Custom 9',
+ '0x300A':'Custom 10','0x300B':'Custom 11','0x300C':'Custom 12',
+ '0x300D':'Custom 13','0x300E':'Custom 14','0x300F':'Custom 15',
+ '0x3010':'Custom 16'
+};
+let layout=null, sel=0, cellSel=0, liveTimer=null;
+
+const $=q=>document.querySelector(q);
+const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';
+  setTimeout(()=>t.style.display='none',2200);};
+const scr=()=>layout&&layout.screens[sel];
+
+/* ─────────────────────────────── bootstrap ─────────────────────────────── */
+async function boot(){
+  try{
+    layout=await fetch('/api/layout').then(r=>r.json());
+    $('#devStatus').textContent='device connected';
+    $('#devStatus').classList.add('up');
+  }catch(e){
+    $('#devStatus').textContent='offline (demo layout)';
+    layout={version:1,global:{},screens:[{id:'demo',type:'arc_gauge',
+      metric_id:'0x010C',label:'RPM',units:'rpm',decimals:0,min:0,max:8000,
+      arc:{start_angle:135,end_angle:45,width:18,color:'#00E5FF'}}]};
+  }
+  if(!Array.isArray(layout.screens))layout.screens=[];
+  renderAll();
+}
+function renderAll(){renderList();renderEditor();draw();$('#jsonEd').value=
+  JSON.stringify(layout,null,2);}
+
+/* ─────────────────────────────── tabs ──────────────────────────────────── */
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button').forEach(x=>
+    x.classList.toggle('active',x===b));
+  ['screens','watchdog','warnings','settings','assets','system','json'].forEach(t=>
+    $('#tab-'+t).hidden=(t!==b.dataset.tab));
+  clearInterval(liveTimer);
+  if(b.dataset.tab==='system'){pollSystem();liveTimer=setInterval(pollSystem,1000);}
+  if(b.dataset.tab==='assets')loadAssets();
+  if(b.dataset.tab==='watchdog')renderWatchdog();
+  if(b.dataset.tab==='warnings')renderWarnings();
+  if(b.dataset.tab==='settings')renderSettings();
+  if(b.dataset.tab==='json')$('#jsonEd').value=JSON.stringify(layout,null,2);
+});
+
+/* ───────────────────────────── settings tab ────────────────────────────── */
+function glob(){ if(!layout.global)layout.global={}; return layout.global; }
+function net(){ if(!layout.network)layout.network={}; return layout.network; }
+function gSet(key,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
+  glob()[key]=v;
+}
+function nSet(key,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
+  net()[key]=v;
+}
+function wSet(key,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
+  wd()[key]=v;
+}
+/* Copy the MAC we are actually receiving from into the peer filter. */
+function useHeardMac(){
+  const m=$('#heardMac').dataset.mac||'';
+  if(!m)return toast('No master heard yet');
+  net().master_mac=m;
+  $('#setMasterMac').value=m;
+  toast('Filter set to '+m);
+}
+function renderSettings(){
+  const g=glob(),n=net();
+  const set=(id,val)=>{const e=$(id);if(e)e.value=val;};
+  $('#setAlarmColors').checked = g.gauge_alarm_colors!==false;
+  $('#setShowPopup').checked   = wd().show_popup!==false;
+  set('#setChannel',   n.wifi_channel ?? 1);
+  set('#setMasterMac', n.master_mac ?? '');
+  set('#setApSsid',    n.ap_ssid ?? 'Telemetry-Gauge-Config');
+  set('#setApPass',    n.ap_password ?? '');
+  // Show which master is actually transmitting, so the filter can be set
+  // without going and looking the MAC up on the master itself.
+  fetch('/api/info').then(r=>r.json()).then(i=>{
+    const el=$('#heardMac');
+    el.dataset.mac=i.peer_mac||'';
+    el.textContent=i.peer_mac?('hearing '+i.peer_mac):'no master heard yet';
+  }).catch(()=>{
+    const el=$('#heardMac');el.textContent='device offline';
+  });
+  set('#setSwipeAnim',   g.swipe_anim   ?? 'over');
+  set('#setSwipeEasing', g.swipe_easing ?? 'ease_out');
+  set('#setSwipeMs',     g.swipe_anim_ms ?? 240);
+  set('#setAckMs',       g.alert_ack_ms ?? 30000);
+  set('#setButtonGpio',  g.button_gpio  ?? 9);
+  set('#setAlpha',       g.smoothing_alpha ?? 0.35);
+  set('#setLerp',        g.lerp_speed   ?? 0.18);
+  set('#setStale',       g.stale_timeout_ms ?? 1500);
+  set('#setDayBg',       g.day_bg   ?? '#101418');
+  set('#setNightBg',     g.night_bg ?? '#000000');
+}
+
+/* ───────────────────────────── watchdog tab ────────────────────────────── */
+function wd(){
+  if(!layout.watchdog)layout.watchdog={enabled:true,items:[]};
+  if(!Array.isArray(layout.watchdog.items))layout.watchdog.items=[];
+  return layout.watchdog;
+}
+function wdToggle(el){wd().enabled=el.checked;}
+function wdAdd(){
+  wd().items.push({metric_id:'0x0105',label:'COOLANT',units:'°C',decimals:0,
+    warning:{value:105,hysteresis:3,direction:'above',color:'#FFC400'}});
+  renderWatchdog();
+}
+function wdDel(i){wd().items.splice(i,1);renderWatchdog();}
+/* Resolve "0.warning.value" style paths inside watchdog.items */
+function wdSet(path,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
+  const seg=path.split('.');let o=wd().items;
+  for(let i=0;i<seg.length-1;i++){
+    const k=isNaN(+seg[i])?seg[i]:+seg[i];
+    if(o[k]==null)o[k]={};
+    o=o[k];
+  }
+  o[seg[seg.length-1]]=v;
+  renderWatchdogSummaries();
+}
+/* Enable/disable a whole tier by adding or removing its object. */
+function wdTier(i,tier,on){
+  const it=wd().items[i];
+  if(on)it[tier]={value:0,hysteresis:0,direction:'above',
+                  color:tier==='critical'?'#FF1744':'#FFC400'};
+  else delete it[tier];
+  renderWatchdog();
+}
+function wdTierFields(i,tier,t){
+  const on=!!t;t=t||{};
+  const crit=tier==='critical';
+  return `<fieldset><legend>
+      <input type="checkbox" ${on?'checked':''}
+        onchange="wdTier(${i},'${tier}',this.checked)">
+      ${crit?'Critical (pulsing red)':'Warning (steady amber)'}</legend>
+    ${on?`<div class="grid3">
+      ${fld('Limit',`<input type="number" step="any" data-num="1" value="${t.value??0}"
+        oninput="wdSet('${i}.${tier}.value',this)">`)}
+      ${fld('Hysteresis',`<input type="number" step="any" data-num="1" value="${t.hysteresis??0}"
+        oninput="wdSet('${i}.${tier}.hysteresis',this)">`)}
+      ${fld('Trips when',`<select oninput="wdSet('${i}.${tier}.direction',this)">
+        <option value="above" ${t.direction!=='below'?'selected':''}>above limit</option>
+        <option value="below" ${t.direction==='below'?'selected':''}>below limit</option>
+        </select>`)}
+      </div><div class="grid2">
+      ${fld('Color',`<input type="color" value="${t.color||(crit?'#FF1744':'#FFC400')}"
+        oninput="wdSet('${i}.${tier}.color',this)">`)}
+      ${crit?fld('Headline',`<input value="${t.overlay_text||''}"
+        placeholder="e.g. ENGINE OVERHEAT"
+        oninput="wdSet('${i}.critical.overlay_text',this)">`):''}
+      </div>`:'<p class="hint">Not guarded at this level.</p>'}
+    </fieldset>`;
+}
+function wdSummary(it){
+  const p=[];
+  if(it.warning)p.push(`warn ${it.warning.direction==='below'?'<':'>'} ${it.warning.value}`);
+  if(it.critical)p.push(`crit ${it.critical.direction==='below'?'<':'>'} ${it.critical.value}`);
+  if(it.popup===false)p.push('silent');
+  return p.join('  ·  ')||'no limits set';
+}
+function renderWatchdogSummaries(){
+  wd().items.forEach((it,i)=>{
+    const el=document.getElementById('wdsum'+i);
+    if(el)el.textContent=wdSummary(it);
+  });
+}
+function renderWatchdog(){
+  $('#wdEnabled').checked=wd().enabled!==false;
+  $('#wdShowPopup').checked=wd().show_popup!==false;
+  const host=$('#wdList');host.innerHTML='';
+  if(!wd().items.length){
+    host.innerHTML='<div class="card"><p class="hint">Nothing guarded yet. '+
+      'Add a metric and the display will watch it on every screen.</p></div>';
+    return;
+  }
+  wd().items.forEach((it,i)=>{
+    const d=document.createElement('div');
+    d.className='card';d.style.marginBottom='12px';
+    d.innerHTML=`
+      <div style="display:flex;align-items:center;gap:10px">
+        <h2 style="margin:0">${it.label||KNOWN[it.metric_id]||'metric'}</h2>
+        <small id="wdsum${i}" style="color:var(--muted)">${wdSummary(it)}</small>
+        <button class="b danger" style="margin-left:auto"
+          onclick="wdDel(${i})">Remove</button>
+      </div>
+      <div class="grid2" style="margin-top:10px">
+        ${fld('Metric',`<select oninput="wdSet('${i}.metric_id',this)">
+          ${Object.entries(KNOWN).map(([k,v])=>
+            `<option value="${k}" ${k===it.metric_id?'selected':''}>${k} — ${v}</option>`
+          ).join('')}</select>`)}
+        ${fld('Display name',`<input value="${it.label||''}"
+          oninput="wdSet('${i}.label',this)">`)}
+        ${fld('Units',`<input value="${it.units||''}"
+          oninput="wdSet('${i}.units',this)">`)}
+        ${fld('Decimals',`<input type="number" min="0" max="3" data-num="1"
+          value="${it.decimals??0}" oninput="wdSet('${i}.decimals',this)">`)}
+      </div>
+      <label class="f"><input type="checkbox" ${it.popup!==false?'checked':''}
+        onchange="wdSet('${i}.popup',this)"> Show pop-up alert on the display
+        <span class="hint" style="display:block">Uncheck to police this metric
+        silently &mdash; right choice when a gauge already turns red for it, so
+        a card would just cover the reading. It still counts toward
+        &ldquo;+N more&rdquo;.</span></label>
+      ${wdTierFields(i,'warning',it.warning)}
+      ${wdTierFields(i,'critical',it.critical)}`;
+    host.appendChild(d);
+  });
+}
+
+/* ───────────────────────────── screen list ─────────────────────────────── */
+function renderList(){
+  const el=$('#screenList');el.innerHTML='';
+  layout.screens.forEach((s,i)=>{
+    const d=document.createElement('div');
+    if(i===sel)d.classList.add('sel');
+    d.innerHTML=`<span>${s.id||('screen '+(i+1))}</span><small>${s.type}</small>`;
+    d.onclick=()=>{sel=i;cellSel=0;renderList();renderEditor();draw();};
+    el.appendChild(d);
+  });
+}
+function addScreen(){
+  layout.screens.push({id:'new_'+(layout.screens.length+1),type:'arc_gauge',
+    metric_id:'0x010C',label:'LABEL',units:'',decimals:0,min:0,max:100,
+    arc:{start_angle:135,end_angle:45,width:18,color:'#00E5FF',
+         bg_color:'#1A2A33',rounded:true}});
+  sel=layout.screens.length-1;renderAll();
+}
+function delScreen(){if(layout.screens.length<=1)return toast('Keep at least one screen');
+  layout.screens.splice(sel,1);sel=Math.max(0,sel-1);renderAll();}
+function moveScreen(d){const j=sel+d;
+  if(j<0||j>=layout.screens.length)return;
+  [layout.screens[sel],layout.screens[j]]=[layout.screens[j],layout.screens[sel]];
+  sel=j;renderAll();}
+
+/* ───────────────────────────── property editor ─────────────────────────── */
+function fld(lbl,inner){return `<label class="f">${lbl}${inner}</label>`;}
+function inp(path,val,type='text',extra=''){
+  return `<input type="${type}" value="${val??''}" ${extra}
+          oninput="setVal('${path}',this)">`;}
+function metricSel(path,val){
+  let o=Object.entries(KNOWN).map(([k,v])=>
+    `<option value="${k}" ${k===val?'selected':''}>${k} — ${v}</option>`).join('');
+  return `<select oninput="setVal('${path}',this)">
+          <option value="${val}" ${KNOWN[val]?'':'selected'}>${val||'choose…'}</option>${o}</select>`;}
+
+/* Resolve "a.b.2.c" paths into layout.screens[sel] and coerce types. */
+function setVal(path,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
+  const seg=path.split('.');let o=scr();
+  for(let i=0;i<seg.length-1;i++){
+    const k=isNaN(+seg[i])?seg[i]:+seg[i];
+    if(o[k]==null)o[k]=isNaN(+seg[i+1])?{}:[];
+    o=o[k];
+  }
+  const last=seg[seg.length-1];
+  o[isNaN(+last)?last:+last]=v;
+  if(path==='type'){normalizeType();renderEditor();}
+  renderList();draw();
+}
+function normalizeType(){
+  const s=scr();
+  if(s.type==='dash')dashDefaults(s);
+  if((s.type==='quad'||s.type==='split')&&!Array.isArray(s.cells))
+    s.cells=[{metric_id:'0x0142',label:'BATT',units:'V',decimals:1,min:8,max:16}];
+  if(s.type==='text_list'&&!Array.isArray(s.rows))
+    s.rows=[{metric_id:'0x0105',label:'Coolant',units:'°C',decimals:0}];
+}
+
+/* Resolve a dotted path inside the selected screen to {parent, key},
+   creating intermediate objects/arrays as needed. */
+function scrPathParent(path){
+  const seg=path.split('.');let o=scr();
+  for(let i=0;i<seg.length-1;i++){
+    const k=isNaN(+seg[i])?seg[i]:+seg[i];
+    if(o[k]==null)o[k]=isNaN(+seg[i+1])?{}:[];
+    o=o[k];
+  }
+  const last=seg[seg.length-1];
+  return {parent:o,key:isNaN(+last)?last:+last};
+}
+/* Turn a gauge colour tier on or off by adding/removing its object. */
+function gaugeTier(base,tier,on){
+  const {parent,key}=scrPathParent(base+'.'+tier);
+  if(on)parent[key]={value:0,hysteresis:0,direction:'above',
+      color:tier==='critical'?'#FF1744':'#FFC400'};
+  else delete parent[key];
+  renderEditor();draw();
+}
+
+/* Gauge colour tiers. These ONLY recolour the widget — they never pop
+   anything up. Pop-ups come from the Watchdog tab, which is also where the
+   headline text lives. */
+function thrFields(base,tier,t){
+  const on=!!t;t=t||{};const critical=(tier==='critical');
+  const p=base+'.'+tier;
+  return `<fieldset><legend>
+      <input type="checkbox" ${on?'checked':''}
+        onchange="gaugeTier('${base}','${tier}',this.checked)">
+      ${critical?'Turn the gauge red':'Turn the gauge yellow'}</legend>
+    ${on?`<div class="grid3">
+      ${fld('Value',inp(p+'.value',t.value??'','number','step="any" data-num="1"'))}
+      ${fld('Hysteresis',inp(p+'.hysteresis',t.hysteresis??0,'number','step="any" data-num="1"'))}
+      ${fld('Direction',`<select oninput="setVal('${p}.direction',this)">
+        <option value="above" ${t.direction!=='below'?'selected':''}>above</option>
+        <option value="below" ${t.direction==='below'?'selected':''}>below</option>
+        </select>`)}
+      </div>
+      ${fld('Color',inp(p+'.color',t.color||(critical?'#FF1744':'#FFC400'),'color'))}`
+      :`<p class="hint">Off &mdash; the gauge keeps its normal colour at this
+        level.</p>`}
+    </fieldset>`;
+}
+
+function metricFields(prefix,o){
+  return `<div class="grid2">
+    ${fld('Metric',metricSel(prefix+'metric_id',o.metric_id||''))}
+    ${fld('Label',inp(prefix+'label',o.label||''))}
+    ${fld('Units',inp(prefix+'units',o.units||''))}
+    ${fld('Decimals',inp(prefix+'decimals',o.decimals??0,'number','min="0" max="3" data-num="1"'))}
+    ${fld('Min',inp(prefix+'min',o.min??0,'number','step="any" data-num="1"'))}
+    ${fld('Max',inp(prefix+'max',o.max??100,'number','step="any" data-num="1"'))}
+    </div>
+    <p class="hint">These two only change the gauge's colour. To make something
+    <b>pop up over any screen</b>, add the metric on the
+    <b>Watchdog</b> tab &mdash; that is also where the headline text lives.</p>
+    ${thrFields(prefix+'thresholds','warning',(o.thresholds||{}).warning)}
+    ${thrFields(prefix+'thresholds','critical',(o.thresholds||{}).critical)}`;
+}
+
+function renderEditor(){
+  const s=scr();if(!s){$('#editor').innerHTML='';return;}
+  let h=`<div class="grid2">
+    ${fld('Screen ID',inp('id',s.id||''))}
+    ${fld('Type',`<select oninput="setVal('type',this)">
+      ${['dash','arc_gauge','meter_gauge','quad','text_list','chart','diag'].map(t=>
+      `<option ${s.type===t?'selected':''}>${t}</option>`).join('')}</select>`)}
+    </div>`;
+  if(s.type==='diag'){$('#editor').innerHTML=h+
+    '<p class="hint">Diagnostics screen has no configurable metrics. It also '+
+    'shows a live GPIO scan &mdash; hold the side button and the pin that '+
+    'reads <b>L</b> is the one to set as <code>global.button_gpio</code>.</p>'+
+    popupFieldForScreen(s);
+    return;}
+  if(s.type==='dash'){$('#editor').innerHTML=h+dashEditor(s)+popupFieldForScreen(s);
+    return;}
+
+  if(s.type==='quad'||s.type==='split'){
+    const cells=s.cells||[];cellSel=Math.min(cellSel,cells.length-1);
+    h+=`<fieldset><legend>Cells (2 or 4)</legend><div class="btnrow">
+      <select onchange="cellSel=+this.value;renderEditor();draw()">
+      ${cells.map((c,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
+        Cell ${i+1}: ${c.label||'?'}</option>`).join('')}</select>
+      <button class="b" onclick="if((scr().cells||[]).length<4){scr().cells.push(
+        {metric_id:'0x010C',label:'NEW',units:'',decimals:0,min:0,max:100});
+        cellSel=scr().cells.length-1;renderEditor();draw();}">＋</button>
+      <button class="b danger" onclick="if(scr().cells.length>1){
+        scr().cells.splice(cellSel,1);cellSel=0;renderEditor();draw();}">✕</button>
+      </div>`;
+    h+=metricFields(`cells.${cellSel}.`,cells[cellSel]||{});
+    h+=fld('Cell color',inp(`cells.${cellSel}.color`,
+        (cells[cellSel]||{}).color||'#E0F2F7','color'))+'</fieldset>';
+  }else if(s.type==='text_list'){
+    const rows=s.rows||[];cellSel=Math.min(cellSel,rows.length-1);
+    h+=fld('Screen title',inp('label',s.label||''));
+    h+=`<fieldset><legend>Rows (max 5)</legend><div class="btnrow">
+      <select onchange="cellSel=+this.value;renderEditor();draw()">
+      ${rows.map((c,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
+        Row ${i+1}: ${c.label||'?'}</option>`).join('')}</select>
+      <button class="b" onclick="if((scr().rows||[]).length<5){scr().rows.push(
+        {metric_id:'0x010C',label:'New',units:'',decimals:0});
+        cellSel=scr().rows.length-1;renderEditor();draw();}">＋</button>
+      <button class="b danger" onclick="if(scr().rows.length>1){
+        scr().rows.splice(cellSel,1);cellSel=0;renderEditor();draw();}">✕</button>
+      </div>`;
+    h+=metricFields(`rows.${cellSel}.`,rows[cellSel]||{})+'</fieldset>';
+  }else if(s.type==='chart'){
+    h+=metricFields('',s);
+    h+=`<fieldset><legend>Trend</legend><div class="grid3">
+      ${fld('Points',inp('points',s.points??60,'number','data-num="1"'))}
+      ${fld('Sample ms',inp('sample_ms',s.sample_ms??1000,'number','data-num="1"'))}
+      ${fld('Line color',inp('color',s.color||'#00E5FF','color'))}
+      </div><p class="hint">Visible window = points &times; sample ms
+      (${((s.points??60)*(s.sample_ms??1000)/1000).toFixed(0)} s).</p>
+      </fieldset>`;
+  }else{ // arc_gauge / meter_gauge
+    h+=metricFields('',s);
+    const a=s.arc||{};
+    h+=`<fieldset><legend>Gauge geometry &amp; colors</legend><div class="grid3">
+      ${fld('Start angle',inp('arc.start_angle',a.start_angle??135,'number','data-num="1"'))}
+      ${fld('End angle',inp('arc.end_angle',a.end_angle??45,'number','data-num="1"'))}
+      ${fld('Arc width',inp('arc.width',a.width??18,'number','data-num="1"'))}
+      </div><div class="grid3">
+      ${fld('Color',inp('arc.color',a.color||'#00E5FF','color'))}
+      ${fld('Track color',inp('arc.bg_color',a.bg_color||'#1A2A33','color'))}
+      ${fld('Value font px',inp('value_font',s.value_font??(s.type==='arc_gauge'?48:32),'number','data-num="1"'))}
+      </div>`;
+    if(s.type==='meter_gauge')h+=`<div class="grid2">
+      ${fld('Major tick every',inp('major_tick_every',s.major_tick_every??'','number','step="any" data-num="1"'))}
+      ${fld('Tick label ÷',inp('tick_label_div',s.tick_label_div??1,'number','step="any" data-num="1"'))}
+      </div>`;
+    h+=fld('Background asset (optional, e.g. /assets/bg.bin)',
+           inp('background_asset',s.background_asset||''))+'</fieldset>';
+  }
+  h+=popupFieldForScreen(s);
+  $('#editor').innerHTML=h;
+}
+
+/* Per-screen pop-up switch. Offered on every screen type, because "keep this
+   particular dial unobstructed" is a property of the screen, not of the
+   metric on it. */
+function popupFieldForScreen(s){
+  return telltaleFieldForScreen(s)+`<fieldset><legend>Pop-up alerts on this screen</legend>
+    <label class="f"><input type="checkbox" ${s.show_popup!==false?'checked':''}
+      onchange="setVal('show_popup',this)">
+      Allow the warning card to cover this screen
+      <span class="hint" style="display:block">Uncheck to keep this screen
+      clean. Faults are still policed and the gauge still recolours &mdash;
+      nothing is just drawn on top while you are on this screen.</span>
+    </label></fieldset>`;
+}
+
+/* ───────────────────────────── canvas preview ──────────────────────────── */
+$('#sim').oninput=draw;
+const D2R=Math.PI/180;
+function draw(){
+  const s=scr(),c=$('#cv'),x=c.getContext('2d');if(!s)return;
+  if(s.type==='dash'){
+    x.clearRect(0,0,c.width,c.height);drawDash(s,x,$('#sim').value/1000);return;}
+  const cx=130,cy=130,frac=$('#sim').value/1000;
+  x.clearRect(0,0,260,260);
+  x.fillStyle='#101418';x.beginPath();x.arc(cx,cy,128,0,7);x.fill();
+
+  const obj=(s.type==='quad'||s.type==='split')?(s.cells||[])[cellSel]:
+            (s.type==='text_list')?(s.rows||[])[cellSel]:s;
+  const min=obj?.min??0,max=obj?.max??100,val=min+(max-min)*frac;
+  const fmt=v=>v.toFixed(obj?.decimals??0);
+  const alarm=state(obj,val);
+  const color=alarm==='crit'?(obj?.thresholds?.critical?.color||'#FF1744'):
+              alarm==='warn'?(obj?.thresholds?.warning?.color||'#FFC400'):
+              (s.arc?.color||obj?.color||'#00E5FF');
+
+  if(s.type==='arc_gauge'||s.type==='meter_gauge'){
+    const a=s.arc||{},st=(a.start_angle??135),en=(a.end_angle??45);
+    const sweep=((en-st)%360+360)%360||270,w=a.width??18;
+    // track
+    x.lineWidth=w;x.lineCap='round';x.strokeStyle=a.bg_color||'#1A2A33';
+    x.beginPath();x.arc(cx,cy,112-w/2,st*D2R,(st+sweep)*D2R);x.stroke();
+    if(s.type==='arc_gauge'){
+      x.strokeStyle=color;x.beginPath();
+      x.arc(cx,cy,112-w/2,st*D2R,(st+sweep*frac)*D2R);x.stroke();
+    }else{
+      // zones
+      const zone=(from,to,col)=>{x.lineWidth=6;x.strokeStyle=col;x.beginPath();
+        x.arc(cx,cy,108,(st+sweep*((from-min)/(max-min)))*D2R,
+              (st+sweep*((to-min)/(max-min)))*D2R);x.stroke();};
+      const w0=s.thresholds?.warning?.value,c0=s.thresholds?.critical?.value;
+      if(w0!=null)zone(w0,c0??max,s.thresholds.warning.color||'#FFC400');
+      if(c0!=null)zone(c0,max,s.thresholds.critical.color||'#FF1744');
+      // ticks
+      const div=s.tick_label_div||1,maj=s.major_tick_every||((max-min)/8);
+      x.fillStyle='#C8D2D8';x.font='11px system-ui';x.textAlign='center';
+      for(let v=min;v<=max+1e-6;v+=maj){
+        const ang=(st+sweep*((v-min)/(max-min)))*D2R;
+        x.lineWidth=3;x.strokeStyle='#C8D2D8';x.beginPath();
+        x.moveTo(cx+Math.cos(ang)*112,cy+Math.sin(ang)*112);
+        x.lineTo(cx+Math.cos(ang)*98,cy+Math.sin(ang)*98);x.stroke();
+        x.fillText(''+Math.round(v/div),cx+Math.cos(ang)*84,
+                   cy+Math.sin(ang)*84+4);
+      }
+      // needle
+      const na=(st+sweep*frac)*D2R;
+      x.lineWidth=4;x.strokeStyle=color;x.beginPath();x.moveTo(cx,cy);
+      x.lineTo(cx+Math.cos(na)*92,cy+Math.sin(na)*92);x.stroke();
+      x.fillStyle=color;x.beginPath();x.arc(cx,cy,7,0,7);x.fill();
+    }
+    x.fillStyle='#fff';x.textAlign='center';
+    x.font=`600 ${s.type==='arc_gauge'?(s.value_font||48):28}px system-ui`;
+    x.fillText(fmt(val),cx,s.type==='arc_gauge'?cy+14:cy+66);
+    x.fillStyle='#9AA7B0';x.font='13px system-ui';
+    x.fillText(s.label||'',cx,cy-(s.type==='arc_gauge'?64:-40));
+    x.fillText(s.units||'',cx,s.type==='arc_gauge'?cy+44:cy+86);
+  }else if(s.type==='quad'||s.type==='split'){
+    const cells=s.cells||[],four=cells.length>2;
+    x.strokeStyle='#2A3A44';x.lineWidth=2;
+    x.beginPath();x.moveTo(cx-84,cy);x.lineTo(cx+84,cy);x.stroke();
+    if(four){x.beginPath();x.moveTo(cx,cy-84);x.lineTo(cx,cy+84);x.stroke();}
+    cells.slice(0,4).forEach((cl,i)=>{
+      const px=four?(i%2?cx+46:cx-46):cx,
+            py=four?(i<2?cy-46:cy+46):(i?cy+48:cy-48);
+      const cv=(cl.min??0)+((cl.max??100)-(cl.min??0))*frac;
+      const cs=state(cl,cv);
+      x.textAlign='center';x.fillStyle='#9AA7B0';x.font='10px system-ui';
+      x.fillText(cl.label||'',px,py-20);
+      x.fillStyle=cs==='crit'?'#FF1744':cs==='warn'?'#FFC400':
+                  (cl.color||'#E0F2F7');
+      x.font=`600 ${four?20:26}px system-ui`;
+      x.fillText(cv.toFixed(cl.decimals??0),px,py+6);
+      x.fillStyle='#9AA7B0';x.font='10px system-ui';
+      x.fillText(cl.units||'',px,py+22);
+    });
+  }else if(s.type==='text_list'){
+    x.textAlign='center';x.fillStyle='#9AA7B0';x.font='12px system-ui';
+    x.fillText(s.label||'',cx,42);
+    (s.rows||[]).slice(0,5).forEach((r,i)=>{
+      const rv=(r.min??0)+((r.max??100)-(r.min??0))*frac,y=70+i*28;
+      x.textAlign='left';x.fillStyle='#9AA7B0';x.font='12px system-ui';
+      x.fillText(r.label||'',48,y);
+      x.textAlign='right';
+      const rs=state(r,rv);
+      x.fillStyle=rs==='crit'?'#FF1744':rs==='warn'?'#FFC400':
+                  (r.color||'#E0F2F7');
+      x.font='600 14px system-ui';
+      x.fillText(`${rv.toFixed(r.decimals??0)} ${r.units||''}`,214,y);
+    });
+  }else if(s.type==='chart'){
+    const g=x.createLinearGradient(0,60,0,180);
+    x.strokeStyle=s.color||'#00E5FF';x.lineWidth=2;x.beginPath();
+    for(let i=0;i<=60;i++){
+      const px=44+i*(172/60);
+      const py=130-Math.sin(i/7+frac*6)*34*(0.4+frac*0.6);
+      i?x.lineTo(px,py):x.moveTo(px,py);
+    }
+    x.stroke();
+    x.strokeStyle='#1E2A34';x.lineWidth=1;
+    for(let i=1;i<4;i++){x.beginPath();x.moveTo(44,86+i*24);
+      x.lineTo(216,86+i*24);x.stroke();}
+    x.textAlign='center';x.fillStyle='#9AA7B0';x.font='12px system-ui';
+    x.fillText(s.label||'',cx,44);x.fillText(s.units||'',cx,62);
+    x.fillStyle='#fff';x.font='600 22px system-ui';
+    x.fillText(fmt(val),cx,206);
+  }else{ // diag
+    x.textAlign='center';x.fillStyle='#00E5FF';x.font='13px system-ui';
+    x.fillText('DIAGNOSTICS',cx,44);
+    x.fillStyle='#9AA7B0';x.font='11px system-ui';
+    ['Link  UP','Rate  20 pkt/s','Drops  0','Heap  160 KB','Uptime  321 s',
+     'GPIO  9H 8H 20H 21H'].forEach((t,i)=>x.fillText(t,cx,70+i*24));
+  }
+  /* Watchdog alert preview.
+   *
+   * This must mirror the device exactly, or the switches look broken: the
+   * card is drawn ONLY when the watchdog is armed, pop-ups are on globally,
+   * this screen allows them, and the metric is actually a guarded one whose
+   * own limit the simulated value has crossed. Gauge colour thresholds never
+   * raise it — they only recolour, which is why previewing off them made
+   * unticking the switches appear to do nothing. */
+  const wdOn = wd().enabled!==false && wd().show_popup!==false &&
+               s.show_popup!==false;
+  const guard = (wd().items||[]).find(it=>it.metric_id===(obj||{}).metric_id &&
+                                          it.popup!==false);
+  const guardTier = !guard ? null :
+    (guard.critical && ((guard.critical.direction==='below') ? val<=guard.critical.value
+                                                             : val>=guard.critical.value)) ? 'crit'
+    : (guard.warning && ((guard.warning.direction==='below') ? val<=guard.warning.value
+                                                             : val>=guard.warning.value)) ? 'warn'
+    : null;
+  if(wdOn && guardTier && s.type!=='diag'){
+    // Everything below comes from the WATCHDOG item, not the gauge, so the
+    // preview shows the text the device will actually draw.
+    const crit=(guardTier==='crit');
+    const th=crit?guard.critical:guard.warning;
+    const ac=th.color||(crit?'#FF1744':'#FFC400');
+    x.fillStyle=crit?'#1A0A0A':'#140D08';
+    x.strokeStyle=ac;x.lineWidth=2;
+    const w=200,hh=104;
+    x.beginPath();
+    // roundRect is recent; fall back so older phone browsers still preview.
+    if(x.roundRect)x.roundRect(cx-w/2,cy-hh/2,w,hh,14);
+    else x.rect(cx-w/2,cy-hh/2,w,hh);
+    x.fill();x.stroke();
+    x.fillStyle=ac;x.font='28px system-ui';x.textAlign='left';
+    x.fillText('⚠',cx-86,cy+10);
+    x.fillStyle='#C8D2D8';x.font='12px system-ui';
+    x.fillText(guard.label||'',cx-38,cy-18);
+    x.fillStyle='#fff';x.font='600 24px system-ui';
+    x.fillText(val.toFixed(guard.decimals??0)+' '+(guard.units||''),cx-38,cy+8);
+    x.fillStyle='#9AA7B0';x.font='11px system-ui';
+    const headline=(crit&&th.overlay_text)?th.overlay_text
+      :((th.direction==='below'?'LOW':'HIGH')+'  ·  LIMIT '+(th.value??''));
+    x.fillText(headline,cx-38,cy+30);
+  }
+}
+function state(o,v){
+  if(!o||!o.thresholds)return'ok';
+  const t=o.thresholds,hit=(th)=>th&&th.value!=null&&
+    (th.direction==='below'?v<=th.value:v>=th.value);
+  return hit(t.critical)?'crit':hit(t.warning)?'warn':'ok';
+}
+
+/* ───────────────────────────── persistence ─────────────────────────────── */
+async function saveLayout(rebootAfter){
+  try{
+    const r=await fetch('/api/layout',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(layout)});
+    if(!r.ok)throw new Error((await r.json()).error||r.status);
+    toast('Layout saved ✔');
+    if(rebootAfter){await fetch('/api/reboot',{method:'POST'});
+      toast('Rebooting — reconnect to the display network');}
+  }catch(e){toast('Save failed: '+e.message);}
+}
+function applyJson(){
+  try{layout=JSON.parse($('#jsonEd').value);sel=0;cellSel=0;renderAll();
+      toast('Applied — remember to Save');}
+  catch(e){toast('JSON error: '+e.message);}
+}
+
+/* ───────────────────────────── assets ──────────────────────────────────── */
+async function loadAssets(){
+  try{
+    const d=await fetch('/api/assets').then(r=>r.json());
+    const tb=$('#assetTable tbody');tb.innerHTML='';
+    (d.assets||[]).forEach(a=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>/assets/${a.name}</td><td>${(a.size/1024).toFixed(1)} KB</td>
+        <td><button class="b danger" onclick="delAsset('${a.name}')">✕</button></td>`;
+      tb.appendChild(tr);
+    });
+  }catch(e){toast('Asset list failed');}
+}
+async function uploadAsset(){
+  const f=$('#assetFile').files[0];if(!f)return toast('Choose a file first');
+  const fd=new FormData();fd.append('file',f);
+  await fetch('/api/asset',{method:'POST',body:fd});
+  toast('Uploaded ✔');loadAssets();
+}
+async function delAsset(n){
+  await fetch('/api/asset/delete?name='+encodeURIComponent(n),{method:'POST'});
+  loadAssets();
+}
+
+/* ───────────────────────────── system tab ──────────────────────────────── */
+async function pollSystem(){
+  try{
+    const info=await fetch('/api/info').then(r=>r.json());
+    $('#infoTable tbody').innerHTML=Object.entries({
+      'Firmware':info.firmware,'Protocol':'v'+info.proto,
+      'ESP-NOW channel':info.channel,
+      'Free heap':(info.heap_free/1024).toFixed(0)+' KB',
+      'Filesystem':(info.fs_used/1024).toFixed(0)+' / '+
+                   (info.fs_total/1024).toFixed(0)+' KB',
+      'Uptime':info.uptime_s+' s',
+      'Display memory (LVGL)':info.lvgl_total?(info.lvgl_used/1024).toFixed(1)+' / '+
+                   (info.lvgl_total/1024).toFixed(0)+' KB':'—'
+    }).map(([k,v])=>`<tr><th>${k}</th><td>${v}</td></tr>`).join('');
+    const live=await fetch('/api/live').then(r=>r.json());
+    $('#liveTable tbody').innerHTML=(live.metrics||[]).map(m=>{
+      const fl=[m.flags&1?'V':'',m.flags&2?'W':'',m.flags&4?'C':'',
+                m.flags&8?'N':''].join('');
+      return `<tr><td>${KNOWN[m.id]||'—'}</td><td>${m.id}</td>
+        <td>${(+m.value).toFixed(2)}</td><td>${(+m.peak).toFixed(2)}</td>
+        <td>${fl}</td><td>${m.age_ms} ms</td></tr>`;
+    }).join('')||'<tr><td colspan="6">No telemetry received — Master silent '+
+      'while display is in config mode (ESP-NOW paused).</td></tr>';
+  }catch(e){/* device busy */}
+}
+async function resetPeaks(){await fetch('/api/peaks/reset',{method:'POST'});
+  toast('Peaks reset');}
+async function reboot(){await fetch('/api/reboot',{method:'POST'});
+  toast('Rebooting…');}
+
+/* Which board this studio configures: decides the dash preview's geometry
+   and which dash parts exist. */
+const BOARD = 'round';
+/* ─────────────────────────── warning lamps ─────────────────────────────── */
+/* Symbols: the same shapes the firmware draws (tools/make_icons.py). Cuts are
+   painted in the page background, as the firmware's transparency shows. */
+const ICONS = {"mil":"<rect x=\"5.5\" y=\"8.5\" width=\"12.5\" height=\"10.5\" rx=\"1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"8\" y=\"4.5\" width=\"7\" height=\"2\" fill=\"currentColor\"/><line x1=\"11.5\" y1=\"6.5\" x2=\"11.5\" y2=\"8.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.2\" y1=\"11\" x2=\"2.2\" y2=\"17\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.2\" y1=\"14\" x2=\"5.5\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"18\" y1=\"11.5\" x2=\"21.5\" y2=\"9\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"21.5\" y1=\"9\" x2=\"21.5\" y2=\"18.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"21.5\" y1=\"18.5\" x2=\"18\" y2=\"16\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","seatbelt":"<circle cx=\"12\" cy=\"4.2\" r=\"2.9\" fill=\"currentColor\"/><polygon points=\"7.4,8.8 16.6,8.8 18.2,13 17.4,21.8 6.6,21.8 5.8,13\" fill=\"currentColor\"/><line x1=\"18.6\" y1=\"7.4\" x2=\"7\" y2=\"22.8\" stroke=\"var(--iconbg,#0b1014)\" stroke-width=\"3.6\" stroke-linecap=\"round\"/><line x1=\"17\" y1=\"9.2\" x2=\"8.6\" y2=\"20.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>","door":"<rect x=\"8\" y=\"2\" width=\"9.5\" height=\"20\" rx=\"3\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><line x1=\"10\" y1=\"7\" x2=\"15.5\" y2=\"7\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"10\" y1=\"17.5\" x2=\"15.5\" y2=\"17.5\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><rect x=\"7\" y=\"9.2\" width=\"2.4\" height=\"5\" fill=\"var(--iconbg,#0b1014)\"/><line x1=\"8.2\" y1=\"9.4\" x2=\"3\" y2=\"14.2\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","park":"<circle cx=\"12\" cy=\"12\" r=\"7.2\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\"/><line x1=\"10.3\" y1=\"8.4\" x2=\"10.3\" y2=\"15.8\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"10.3\" y1=\"8.4\" x2=\"12.2\" y2=\"8.4\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"10.3\" y1=\"12.6\" x2=\"12.2\" y2=\"12.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M12.2 8.4A2.1 2.1 0 0 1 12.2 12.6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M4.5 19.5A10.6 10.6 0 0 1 4.5 4.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M19.5 4.5A10.6 10.6 0 0 1 19.5 19.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>","turn_l":"<polygon points=\"1.5,12 10,3.8 10,8.6 21.5,8.6 21.5,15.4 10,15.4 10,20.2\" fill=\"currentColor\"/>","turn_r":"<polygon points=\"22.5,12 14,3.8 14,8.6 2.5,8.6 2.5,15.4 14,15.4 14,20.2\" fill=\"currentColor\"/>","high_beam":"<line x1=\"13.5\" y1=\"5\" x2=\"13.5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M13.5 5A7 7 0 0 1 13.5 19\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"6.5\" x2=\"10\" y2=\"6.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"10\" x2=\"10\" y2=\"10\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"14\" x2=\"10\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"17.5\" x2=\"10\" y2=\"17.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","lights":"<line x1=\"13.5\" y1=\"5\" x2=\"13.5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M13.5 5A7 7 0 0 1 13.5 19\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"9.5\" x2=\"10\" y2=\"7\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"13.5\" x2=\"10\" y2=\"11\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"17.5\" x2=\"10\" y2=\"15\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","cruise":"<path d=\"M5.92 19.58A8.6 8.6 0 1 1 18.08 19.58\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"12\" y1=\"13.5\" x2=\"16.8\" y2=\"8.6\" stroke=\"currentColor\" stroke-width=\"2.1\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"13.5\" r=\"2.2\" fill=\"currentColor\"/><line x1=\"12\" y1=\"19.5\" x2=\"12\" y2=\"22.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"22.5\" x2=\"16\" y2=\"22.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","fuel":"<rect x=\"4\" y=\"4.5\" width=\"9.5\" height=\"16\" rx=\"1.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"6.5\" y=\"7\" width=\"4.5\" height=\"3.8\" fill=\"currentColor\"/><line x1=\"2.5\" y1=\"21.2\" x2=\"15\" y2=\"21.2\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"13.5\" y1=\"8\" x2=\"16.4\" y2=\"8\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"16.4\" y1=\"8\" x2=\"19.2\" y2=\"10.8\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"19.2\" y1=\"10.8\" x2=\"19.2\" y2=\"17.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"19.2\" y1=\"17.6\" x2=\"17.2\" y2=\"17.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>","battery":"<rect x=\"2.5\" y=\"7\" width=\"19\" height=\"12.5\" rx=\"1.2\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"5\" y=\"4.3\" width=\"4.4\" height=\"2.7\" fill=\"currentColor\"/><rect x=\"14.6\" y=\"4.3\" width=\"4.4\" height=\"2.7\" fill=\"currentColor\"/><line x1=\"5.8\" y1=\"13.2\" x2=\"9.8\" y2=\"13.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"14.2\" y1=\"13.2\" x2=\"18.2\" y2=\"13.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"16.2\" y1=\"11.2\" x2=\"16.2\" y2=\"15.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/>","oil":"<polygon points=\"4.5,11.2 14.6,11.2 16.4,13.6 16.4,17.2 4.5,17.2\" fill=\"currentColor\"/><rect x=\"8\" y=\"8.4\" width=\"3\" height=\"2.8\" fill=\"currentColor\"/><line x1=\"6.5\" y1=\"8.2\" x2=\"12.5\" y2=\"8.2\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"15.8\" y1=\"13\" x2=\"21.4\" y2=\"9.6\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\"/><path d=\"M4.5 16.8A2.6 2.6 0 0 1 4.5 11.6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><circle cx=\"21.2\" cy=\"15.2\" r=\"1.45\" fill=\"currentColor\"/><polygon points=\"21.2,12.2 19.9,14.9 22.5,14.9\" fill=\"currentColor\"/>","coolant":"<line x1=\"12\" y1=\"3.2\" x2=\"12\" y2=\"13\" stroke=\"currentColor\" stroke-width=\"3.2\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"15\" r=\"3.1\" fill=\"currentColor\"/><line x1=\"14.8\" y1=\"4.6\" x2=\"17.4\" y2=\"4.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"14.8\" y1=\"7.6\" x2=\"17.4\" y2=\"7.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"14.8\" y1=\"10.6\" x2=\"17.4\" y2=\"10.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"20.2\" x2=\"5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"5\" y1=\"19\" x2=\"8\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"20.2\" x2=\"9.8\" y2=\"19.5\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"14.2\" y1=\"19.5\" x2=\"16\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"16\" y1=\"20.2\" x2=\"19\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"19\" y1=\"19\" x2=\"22\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"23\" x2=\"5\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"5\" y1=\"21.8\" x2=\"8\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"23\" x2=\"11\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"11\" y1=\"21.8\" x2=\"14\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"14\" y1=\"23\" x2=\"17\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"17\" y1=\"21.8\" x2=\"20\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"20\" y1=\"23\" x2=\"22\" y2=\"22.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>","knock":"<polygon points=\"14,1.5 5,13.5 11,13.5 8.5,22.5 19.5,9 13.2,9 16,1.5\" fill=\"currentColor\"/>","warn":"<polygon points=\"12,2.2 23,21.2 1,21.2\" fill=\"currentColor\"/><line x1=\"12\" y1=\"8.6\" x2=\"12\" y2=\"14.4\" stroke=\"var(--iconbg,#0b1014)\" stroke-width=\"2.4\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"17.6\" r=\"1.5\" fill=\"var(--iconbg,#0b1014)\"/>"};
+const TONES = {red:'#FF1744',amber:'#FFC400',green:'#00E676',blue:'#448AFF'};
+/* Mirror of the built-in lamp table in src/ui/Telltales.cpp: the defaults the
+   firmware applies before this layout's overrides. Only what differs from
+   these is saved, so a default improved in a later firmware still reaches
+   every lamp you did not touch. */
+const LAMP_BASE = {enabled:true,strip:true,metric_id:'',rule:'on',threshold:0,
+  hysteresis:0,engine:false,critical:false,popup:'off',popup_speed:0,
+  blink_speed:-1,popup_secs:0,debounce_ms:0,hold_ms:0,title:'',detail:'',
+  units:'',decimals:0,tone:'amber',icon:'warn'};
+const LAMPS = [
+ {key:'mil',title:'CHECK ENGINE',detail:'ENGINE FAULT STORED',icon:'mil',tone:'amber',
+  metric_id:'0x0101',popup:'once',popup_secs:10,units:'CODES'},
+ {key:'oil',title:'OIL PRESSURE',detail:'STOP THE ENGINE SAFELY',icon:'oil',tone:'red',
+  metric_id:'0x1003',rule:'below',threshold:0.5,hysteresis:0.2,engine:true,
+  critical:true,popup:'repeat',debounce_ms:1000,units:'bar',decimals:1},
+ {key:'charging',title:'CHARGING',detail:'ALTERNATOR NOT CHARGING',icon:'battery',
+  tone:'red',metric_id:'0x0142',rule:'below',threshold:12,hysteresis:0.5,engine:true,
+  popup:'once',debounce_ms:5000,units:'V',decimals:1},
+ {key:'coolant_hot',title:'ENGINE HOT',detail:'EASE OFF, CHECK COOLANT',icon:'coolant',
+  tone:'red',metric_id:'0x0105',rule:'above',threshold:110,hysteresis:3,critical:true,
+  popup:'repeat',debounce_ms:2000,units:'°C'},
+ {key:'coolant_cold',title:'ENGINE COLD',detail:'GO EASY UNTIL IT WARMS UP',
+  icon:'coolant',tone:'blue',metric_id:'0x0105',rule:'below',threshold:45,
+  hysteresis:3,units:'°C'},
+ {key:'seatbelt',title:'FASTEN SEAT BELT',detail:'DRIVER BELT NOT FASTENED',
+  icon:'seatbelt',tone:'red',metric_id:'0x1206',popup:'repeat',popup_speed:10,
+  blink_speed:10},
+ {key:'door',title:'DOOR OPEN',detail:'CLOSE ALL DOORS',icon:'door',tone:'red',
+  metric_id:'0x1204',critical:true,popup:'repeat',popup_speed:5,blink_speed:5},
+ {key:'parking_brake',title:'PARKING BRAKE',detail:'RELEASE THE PARKING BRAKE',
+  icon:'park',tone:'red',metric_id:'0x1205',critical:true,popup:'repeat',
+  popup_speed:5,blink_speed:5},
+ {key:'low_fuel',title:'LOW FUEL',detail:'REFUEL SOON',icon:'fuel',tone:'amber',
+  metric_id:'0x012F',rule:'below',threshold:12,hysteresis:3,popup:'once',
+  popup_secs:8,debounce_ms:10000,units:'%'},
+ {key:'knock',title:'KNOCK',detail:'ECU IS PULLING TIMING',icon:'knock',tone:'amber',
+  metric_id:'0x2001',rule:'below',threshold:-3,hysteresis:0.5,hold_ms:3000,
+  units:'°',decimals:1},
+ {key:'high_beam',title:'HIGH BEAM',icon:'high_beam',tone:'blue',metric_id:'0x1203'},
+ {key:'lights',title:'LIGHTS ON',icon:'lights',tone:'green',metric_id:'0x2108',strip:false},
+ {key:'cruise',title:'CRUISE',icon:'cruise',tone:'green',metric_id:'0x1207'},
+ {key:'turn_left',title:'LEFT INDICATOR',icon:'turn_l',tone:'green',metric_id:'0x1201',
+  hold_ms:1000,turn:true},
+ {key:'turn_right',title:'RIGHT INDICATOR',icon:'turn_r',tone:'green',metric_id:'0x1202',
+  hold_ms:1000,turn:true},
+ {key:'custom_1',title:'CUSTOM 1',enabled:false},
+ {key:'custom_2',title:'CUSTOM 2',enabled:false},
+ {key:'custom_3',title:'CUSTOM 3',enabled:false},
+];
+const LAMP_NUM = ['threshold','hysteresis','debounce_ms','hold_ms','popup_speed',
+                  'popup_secs','blink_speed','decimals'];
+const openLamps = new Set();
+const esc = v => String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                              .replace(/"/g,'&quot;');
+
+function warn(){
+  if(!layout.warnings||typeof layout.warnings!=='object')
+    layout.warnings={enabled:layout.warnings!==false,lamps:{}};
+  const w=layout.warnings;
+  if(!w.lamps||typeof w.lamps!=='object'||Array.isArray(w.lamps))w.lamps={};
+  return w;
+}
+function lampDefault(key){
+  return Object.assign({},LAMP_BASE,LAMPS.find(l=>l.key===key)||{});
+}
+/* Effective settings: the default, then this layout's override. A lamp can
+   also be switched off with a bare `false`, as the firmware accepts. */
+function lampEff(key){
+  const o=warn().lamps[key];
+  return Object.assign(lampDefault(key),typeof o==='boolean'?{enabled:o}:(o||{}));
+}
+function wnSet(k,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  if(el.dataset.num==='1'){v=parseFloat(v);if(!isFinite(v))v=0;}
+  warn()[k]=v;
+}
+function lampSet(key,field,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  if(LAMP_NUM.includes(field)){v=parseFloat(v);if(!isFinite(v))v=0;}
+  const L=warn().lamps;
+  if(typeof L[key]==='boolean')L[key]={enabled:L[key]};
+  if(!L[key])L[key]={};
+  if(v===lampDefault(key)[field])delete L[key][field];else L[key][field]=v;
+  if(!Object.keys(L[key]).length)delete L[key];
+  renderWarnings();
+}
+function lampReset(key){delete warn().lamps[key];renderWarnings();}
+function lampOpen(key,open){open?openLamps.add(key):openLamps.delete(key);}
+function iconSvg(name,color,size){
+  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}"
+    style="color:${color};--iconbg:var(--panel);flex:none">${ICONS[name]||''}</svg>`;
+}
+function lampSummary(e){
+  if(!e.metric_id)return 'no signal chosen &mdash; pick one under Settings';
+  const when={on:'on',off:'off',above:'&ge; '+e.threshold,
+              below:'&le; '+e.threshold}[e.rule]||e.rule;
+  const p=[`${KNOWN[e.metric_id]||e.metric_id} ${when}`];
+  if(e.engine)p.push('engine running');
+  if(e.popup!=='off')p.push((e.popup==='once'?'pops up once':'pops up until tapped')+
+    (e.popup_speed>0?' above '+e.popup_speed+' km/h':''));
+  if(e.blink_speed>=0)p.push('flashes'+(e.blink_speed>0?' above '+e.blink_speed+' km/h':''));
+  if(!e.strip)p.push('dash only');
+  return p.join(' &middot; ');
+}
+function lampCard(key){
+  const e=lampEff(key),changed=warn().lamps[key]!==undefined;
+  const col=e.enabled?(TONES[e.tone]||TONES.amber):'#3A4650';
+  const opt=(v,cur,t)=>`<option value="${esc(v)}" ${String(cur)===String(v)?'selected':''}>${t??v}</option>`;
+  const num=(f,step)=>`<input type="number" step="${step||'any'}" value="${e[f]}"
+    onchange="lampSet('${key}','${f}',this)">`;
+  const txt=(f,max)=>`<input value="${esc(e[f])}" maxlength="${max}"
+    onchange="lampSet('${key}','${f}',this)">`;
+  return `<div class="card" style="margin-bottom:10px">
+    <div style="display:flex;align-items:center;gap:12px">
+      ${iconSvg(e.icon,col,30)}
+      <div><b style="color:${e.enabled?'var(--text)':'var(--muted)'}">${esc(e.title)}</b>
+        <div class="hint" style="margin:0">${e.enabled?lampSummary(e):'off'}</div></div>
+      <label class="f" style="margin:0 0 0 auto;white-space:nowrap">
+        <input type="checkbox" ${e.enabled?'checked':''}
+          onchange="lampSet('${key}','enabled',this)"> On</label>
+      ${changed?`<button class="b" onclick="lampReset('${key}')">Defaults</button>`:''}
+    </div>
+    <details ${openLamps.has(key)?'open':''} ontoggle="lampOpen('${key}',this.open)">
+      <summary class="hint" style="cursor:pointer">Settings</summary>
+      <div class="grid3" style="margin-top:8px">
+        ${fld('Signal',`<select onchange="lampSet('${key}','metric_id',this)">
+          ${opt('',e.metric_id,'none')}
+          ${Object.entries(KNOWN).map(([k,v])=>opt(k,e.metric_id,k+' — '+v)).join('')}
+          </select>`)}
+        ${fld('Lights when',`<select onchange="lampSet('${key}','rule',this)">
+          ${opt('on',e.rule,'signal is on')}${opt('off',e.rule,'signal is off')}
+          ${opt('above',e.rule,'value &ge; limit')}${opt('below',e.rule,'value &le; limit')}
+          </select>`)}
+        ${fld('Limit',num('threshold'))}
+        ${fld('Hysteresis',num('hysteresis'))}
+        ${fld('Must hold for (ms)',num('debounce_ms',1))}
+        ${fld('Stays lit after (ms)',num('hold_ms',1))}
+        ${fld('Pop-up',`<select onchange="lampSet('${key}','popup',this)">
+          ${opt('off',e.popup,'never')}${opt('once',e.popup,'once each time it lights')}
+          ${opt('repeat',e.popup,'until tapped, then again')}</select>`)}
+        ${fld('Pop up only above (km/h)',num('popup_speed'))}
+        ${fld('Pop-up hides after (s, 0 = tap)',num('popup_secs',1))}
+        ${fld('Flash above (km/h, &minus;1 never)',num('blink_speed'))}
+        ${fld('Colour',`<select onchange="lampSet('${key}','tone',this)">
+          ${['red','amber','green','blue'].map(t=>opt(t,e.tone)).join('')}</select>`)}
+        ${fld('Symbol',`<select onchange="lampSet('${key}','icon',this)">
+          ${Object.keys(ICONS).map(t=>opt(t,e.icon)).join('')}</select>`)}
+      </div>
+      <div class="grid3">
+        <label class="f"><input type="checkbox" ${e.engine?'checked':''}
+          onchange="lampSet('${key}','engine',this)"> Only with the engine running</label>
+        <label class="f"><input type="checkbox" ${e.critical?'checked':''}
+          onchange="lampSet('${key}','critical',this)"> Critical (pulsing pop-up)</label>
+        <label class="f"><input type="checkbox" ${e.strip?'checked':''}
+          onchange="lampSet('${key}','strip',this)"> On the strip over screens</label>
+      </div>
+      <div class="grid3">
+        ${fld('Title',txt('title',23))}
+        ${fld('Advice line',txt('detail',35))}
+        ${fld('Units',txt('units',6))}
+      </div>
+    </details></div>`;
+}
+function renderWarnings(){
+  const w=warn();
+  $('#wnEnabled').checked=w.enabled!==false;
+  $('#wnPopups').checked=w.popups!==false;
+  $('#wnStrip').checked=w.strip!==false;
+  $('#wnPos').value=w.strip_position==='top'?'top':'bottom';
+  $('#wnMode').value=(w.strip_mode??(BOARD==='cluster'?'always':'peek'))==='always'?'always':'peek';
+  $('#wnPeek').value=w.peek_secs??6;
+  $('#wnList').innerHTML=LAMPS.map(l=>lampCard(l.key)).join('');
+}
+
+/* Canvas copies of the symbols, per colour; the preview redraws as they load. */
+const _lampImgs={};
+function drawLamp(x,name,color,px,py){
+  const k=name+color;let im=_lampImgs[k];
+  if(!im){
+    im=new Image();im.onload=()=>draw();
+    im.src='data:image/svg+xml,'+encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24"
+        height="24" color="${color}">${(ICONS[name]||'')
+        .replace(/var\(--iconbg,#0b1014\)/g,'#101418')}</svg>`);
+    _lampImgs[k]=im;
+  }
+  if(im.complete&&im.naturalWidth)x.drawImage(im,px,py,24,24);
+}
+
+/* ───────────────────────────── dash screen ─────────────────────────────── */
+const DASH_DEF = {
+  tach:  {metric_id:'0x010C',label:'RPM',max:8000,redline:6500},
+  speed: {metric_id:'0x010D',units:'km/h',max:260},
+  gear:  {metric_id:'0x1005'},
+  fuel:  {metric_id:'0x012F',units:'%',
+          thresholds:{warning:{value:12,hysteresis:3,direction:'below'}}},
+  temp:  {metric_id:'0x0105',min:40,max:130,
+          thresholds:{warning:{value:105,hysteresis:3},critical:{value:110,hysteresis:3}}},
+  info:  [{metric_id:'0x0142',label:'BATT',units:'V',decimals:1},
+          {metric_id:'0x015C',label:'OIL',units:'°C'},
+          {metric_id:'0x010F',label:'IAT',units:'°C'},
+          {metric_id:'0x1001',label:'BOOST',units:'bar',decimals:2}],
+  shift_light: {rpm:6500,start:5000},
+};
+/* Firmware defaults for fields a part may leave out. */
+const DASH_BASE = {
+  tach:{label:'RPM',units:'',min:0,max:8000,decimals:0},
+  speed:{label:'',units:'km/h',min:0,max:260,decimals:0},
+  gear:{label:'GEAR',units:'',min:-1,max:6,decimals:0},
+  fuel:{label:'',units:'%',min:0,max:100,decimals:0},
+  temp:{label:'',units:'°C',min:40,max:130,decimals:0},
+};
+const DASH_PARTS = [['tach','Tachometer'],['speed','Speed'],['gear','Gear'],
+  ['fuel','Fuel'],['temp','Coolant temperature'],['info','Bottom readouts'],
+  ['shift_light','Shift light'],['lamps','Warning lamps']];
+let dashSel='tach';
+const clone=o=>JSON.parse(JSON.stringify(o));
+function dashDefaults(s){
+  ['tach','speed','gear','fuel','temp','shift_light'].forEach(p=>{
+    if(s[p]===undefined||s[p]===true)s[p]=clone(DASH_DEF[p]);});
+  if(s.info===undefined||s.info===true)s.info=clone(DASH_DEF.info);
+  if(s.lamps===undefined)s.lamps=true;
+}
+function dashToggle(p,on){
+  const s=scr();
+  s[p]=on?(p==='lamps'?true:clone(DASH_DEF[p])):false;
+  renderEditor();draw();
+}
+function dashEditor(s){
+  dashDefaults(s);
+  const parts=DASH_PARTS.filter(p=>BOARD==='cluster'||p[0]!=='info');
+  if(!parts.some(p=>p[0]===dashSel))dashSel='tach';
+  const p=dashSel,v=s[p];
+  let h=`<fieldset><legend>Part</legend><div class="btnrow">
+    <select onchange="dashSel=this.value;cellSel=0;renderEditor();draw()">
+    ${parts.map(([k,t])=>`<option value="${k}" ${k===p?'selected':''}>${t}${
+      s[k]===false?' (off)':''}</option>`).join('')}</select></div>
+    <label class="f" style="margin-top:8px"><input type="checkbox" ${v!==false?'checked':''}
+      onchange="dashToggle('${p}',this.checked)"> Show this part</label>`;
+  if(v===false)return h+'<p class="hint">Switched off &mdash; not drawn at all.</p></fieldset>';
+  if(DASH_BASE[p]){
+    h+=metricFields(p+'.',Object.assign({},DASH_BASE[p],v));
+    h+=fld('Colour',inp(p+'.color',v.color||(p==='speed'?'#E0F2F7':'#00E5FF'),'color'));
+    if(p==='tach')h+=`<div class="grid3">
+      ${fld('Redline starts',inp('tach.redline',v.redline??'','number','step="any" data-num="1"'))}
+      ${fld('Numeral every',inp('tach.major_tick_every',v.major_tick_every??'','number','step="any" data-num="1"'))}
+      ${fld('Numeral ÷',inp('tach.tick_label_div',v.tick_label_div??'','number','step="any" data-num="1"'))}
+      </div><p class="hint">Numerals default to every eighth of the scale, in
+      thousands; the red band defaults to the shift light's rpm.</p>`;
+    if(p==='gear')h+=`<p class="hint">Shows R, N or the gear number. Where the
+      bus has a reverse signal (0x1208) it wins over the gear value.</p>`;
+  }else if(p==='info'){
+    const rows=s.info;cellSel=Math.min(cellSel,Math.max(rows.length-1,0));
+    h+=`<div class="btnrow"><select onchange="cellSel=+this.value;renderEditor();draw()">
+      ${rows.map((r,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
+        Readout ${i+1}: ${esc(r.label||'?')}</option>`).join('')}</select>
+      <button class="b" onclick="if(scr().info.length<4){scr().info.push(
+        {metric_id:'0x0104',label:'LOAD',units:'%'});cellSel=scr().info.length-1;
+        renderEditor();draw();}">＋</button>
+      <button class="b danger" onclick="scr().info.splice(cellSel,1);cellSel=0;
+        renderEditor();draw();">✕</button></div>`;
+    if(rows.length)h+=metricFields(`info.${cellSel}.`,rows[cellSel]);
+  }else if(p==='shift_light'){
+    h+=`<div class="grid2">
+      ${fld('Shift at (rpm)',inp('shift_light.rpm',v.rpm??6500,'number','data-num="1"'))}
+      ${fld('First LED at (rpm)',inp('shift_light.start',v.start??((v.rpm??6500)-1500),'number','data-num="1"'))}
+      </div><p class="hint">Five LEDs fill green, amber, red between the two,
+      then all flash red at the shift point, and the gear box flashes with them.</p>`;
+  }else if(p==='lamps'){
+    h+=`<label class="f"><input type="checkbox" ${s.ghost_lamps!==false?'checked':''}
+      onchange="setVal('ghost_lamps',this)"> Draw unlit lamps dimly</label>
+      <p class="hint">Which lamps exist, what lights them and whether they pop
+      up is set on the <b>Warnings</b> tab.${BOARD==='round'?' On the round '+
+      'screen only the lit lamps are shown, in the gap under the arc.':''}</p>`;
+  }
+  return h+'</fieldset>';
+}
+function telltaleFieldForScreen(s){
+  if(s.type==='dash')return '';
+  const def=!(BOARD==='cluster'&&s.type==='diag');
+  return `<fieldset><legend>Warning lamps on this screen</legend>
+    <label class="f"><input type="checkbox" ${(s.show_telltales??def)?'checked':''}
+      onchange="setVal('show_telltales',this)">
+      Show the strip of lit warning lamps over this screen
+      <span class="hint" style="display:block">The way the car's own cluster
+      keeps its lamps visible whatever else it shows. Hidden when nothing is
+      lit.</span></label></fieldset>`;
+}
+
+/* Preview: the dash as the firmware lays it out. The slider is engine speed;
+   past half-way a few lamps light, to show where they go. */
+function drawDash(s,x,frac){
+  dashDefaults(s);
+  const part=p=>s[p]===false?null:Object.assign({},DASH_BASE[p]||{},DASH_DEF[p]||{},
+                   typeof s[p]==='object'?s[p]:{});
+  const lamps=LAMPS.map(l=>lampEff(l.key)).filter(e=>e.enabled);
+  const ghost=s.ghost_lamps!==false?'#1A2A33':null;
+  const demo=frac>=0.5;
+  const t=part('tach'),sl=s.shift_light===false?null:Object.assign({},DASH_DEF.shift_light,s.shift_light);
+  const tmin=t?t.min:0,tmax=t?t.max:8000,rpm=tmin+(tmax-tmin)*frac;
+  const shiftAt=sl?sl.rpm:6500,start=sl?(sl.start??shiftAt-1500):0,over=sl&&rpm>=shiftAt;
+  const redline=t?(t.redline??shiftAt):0;
+  x.save();x.textBaseline='top';x.textAlign='center';
+  const G=BOARD==='cluster'?{
+      W:480,H:272,tcx:106,tcy:136,tR:92,tw:12,band:81.5,num:68,led:[284-46,50,20,12],
+      gear:[252,144,64,58,10,40],speed:[284,66,48,118,14],
+      turn:[[10,6],[446,6]]}
+    :{W:240,H:240,tcx:120,tcy:120,tR:109,tw:10,band:99.5,num:0,led:[90,34,13,8],
+      gear:[98,46,44,36,8,28],speed:[120,88,48,138,12],turn:[[64,52],[152,52]]};
+  if(BOARD==='round'){x.translate(10,10);x.beginPath();x.arc(120,120,120,0,7);x.clip();}
+  x.fillStyle='#101418';x.fillRect(0,0,G.W,G.H);
+
+  if(t){
+    const ang=v=>(135+270*(v-tmin)/(tmax-tmin))*D2R;
+    x.lineCap='butt';x.lineWidth=G.tw;
+    x.strokeStyle='#1A2A33';x.beginPath();x.arc(G.tcx,G.tcy,G.tR,135*D2R,405*D2R);x.stroke();
+    x.strokeStyle=t.color||'#00E5FF';x.beginPath();x.arc(G.tcx,G.tcy,G.tR,135*D2R,ang(rpm));x.stroke();
+    if(redline>tmin&&redline<tmax){x.lineWidth=3;x.strokeStyle='#FF1744';
+      x.beginPath();x.arc(G.tcx,G.tcy,G.band,ang(redline),405*D2R);x.stroke();}
+    if(G.num){
+      const every=t.major_tick_every||(tmax-tmin)/8,div=t.tick_label_div||(tmax>=1000?1000:1);
+      x.font='14px system-ui';
+      for(let v=tmin,k=0;v<=tmax+1e-6&&k<=16;v+=every,k++){
+        x.fillStyle=v>=redline?'#FF1744':'#C8D2D8';
+        x.fillText(Math.round(v/div),G.tcx+Math.cos(ang(v))*G.num,G.tcy+Math.sin(ang(v))*G.num-8);}
+      x.fillStyle='#E0F2F7';x.font='600 28px system-ui';
+      x.fillText(Math.round(rpm),G.tcx,G.tcy-20);
+      x.fillStyle='#9AA7B0';x.font='12px system-ui';x.fillText(t.label||'',G.tcx,G.tcy+14);
+    }
+  }
+  if(sl){
+    const [lx,ly,lp,ls]=G.led,cols=['#00E676','#00E676','#FFC400','#FFC400','#FF1744'];
+    for(let k=0;k<5;k++){
+      const at=start+(shiftAt-start)*k/4;
+      x.fillStyle=over?'#FF1744':rpm>=at?cols[k]:'#1A2A33';
+      x.beginPath();x.arc(lx+k*lp+ls/2,ly+ls/2,ls/2,0,7);x.fill();}
+  }
+  const g=part('gear');
+  if(g){
+    const [gx,gy,gw,gh,gr,gf]=G.gear;
+    x.fillStyle='#0A1016';x.strokeStyle=over?'#FF1744':'#2A3A44';x.lineWidth=2;
+    x.beginPath();x.roundRect?x.roundRect(gx,gy,gw,gh,gr):x.rect(gx,gy,gw,gh);x.fill();x.stroke();
+    x.fillStyle=g.color||'#00E5FF';x.font=`600 ${gf}px system-ui`;
+    x.fillText(frac<0.08?'N':String(1+Math.min(5,Math.floor(frac*6))),gx+gw/2,gy+(gh-gf)/2);
+    if(BOARD==='cluster'){x.fillStyle='#5A6870';x.font='12px system-ui';x.fillText(g.label||'',gx+gw/2,206);}
+  }
+  const sp=part('speed');
+  if(sp){
+    const [sx,sy,sf,uy,uf]=G.speed;
+    x.fillStyle=sp.color||'#E0F2F7';x.font=`600 ${sf}px system-ui`;
+    x.fillText(Math.round(sp.min+(sp.max-sp.min)*frac*0.8),sx,sy);
+    x.fillStyle='#9AA7B0';x.font=`${uf}px system-ui`;x.fillText(sp.units||'',sx,uy);
+  }
+  const lampOf=icon=>lamps.find(e=>e.icon===icon);
+  // Fuel and coolant: upright bars on the landscape board, readouts on the round.
+  [['fuel','fuel',380,56],['temp','coolant',430,128]].forEach(([p,icon,bx,rx])=>{
+    const o=part(p);if(!o)return;
+    const f=p==='fuel'?1-frac*0.9:0.3+frac*0.6,val=o.min+(o.max-o.min)*f;
+    const lit=demo&&p==='fuel'&&lampOf('fuel');
+    const ic=lit?TONES[lit.tone]:'#9AA7B0';
+    const txt=Math.round(val)+' '+(o.units||'');
+    if(BOARD==='cluster'){
+      x.fillStyle='#0A1016';x.fillRect(bx,66,16,130);
+      x.fillStyle=o.color||'#00E5FF';x.fillRect(bx,66+130*(1-f),16,130*f);
+      x.fillStyle='#E0F2F7';x.font='14px system-ui';x.fillText(txt,bx+8,46);
+      drawLamp(x,icon,ic,bx-4,204);
+    }else{
+      drawLamp(x,icon,ic,rx,158);
+      x.textAlign='left';x.fillStyle='#E0F2F7';x.font='14px system-ui';
+      x.fillText(txt,rx+27,163);x.textAlign='center';
+    }
+  });
+  if(BOARD==='cluster'&&s.info!==false){
+    (Array.isArray(s.info)?s.info:DASH_DEF.info).slice(0,4).forEach((r,i)=>{
+      const ix=[8,106,280,378][i];x.textAlign='left';
+      x.fillStyle='#5A6870';x.font='12px system-ui';x.fillText(r.label||'',ix,249);
+      x.fillStyle=r.color||'#E0F2F7';x.font='14px system-ui';
+      const v=(r.min??0)+((r.max??100)-(r.min??0))*frac;
+      x.fillText(v.toFixed(r.decimals??0)+' '+(r.units||''),ix+42,247);
+    });
+    x.textAlign='center';
+  }
+  if(s.lamps!==false){
+    const hasL=lamps.some(e=>e.icon==='turn_l'),hasR=lamps.some(e=>e.icon==='turn_r');
+    const icons=[];
+    lamps.forEach(e=>{if(e.icon!=='turn_l'&&e.icon!=='turn_r'&&!icons.includes(e.icon))icons.push(e.icon);});
+    const litIcons=demo?icons.slice(0,3):[];
+    const colOf=ic=>TONES[(lampOf(ic)||{}).tone]||TONES.amber;
+    if(BOARD==='cluster'){
+      const row=icons.slice(0,13),pitch=29,x0=Math.floor((480-row.length*pitch+(pitch-24))/2);
+      row.forEach((ic,k)=>{const c=litIcons.includes(ic)?colOf(ic):ghost;if(c)drawLamp(x,ic,c,x0+k*pitch,6);});
+    }else{
+      const x0=120-Math.floor((litIcons.length*26-2)/2);
+      litIcons.forEach((ic,k)=>drawLamp(x,ic,colOf(ic),x0+k*26,190));
+    }
+    const turnCol=demo?TONES.green:ghost;
+    if(hasL&&turnCol)drawLamp(x,'turn_l',turnCol,G.turn[0][0],G.turn[0][1]);
+    if(hasR&&ghost)drawLamp(x,'turn_r',ghost,G.turn[1][0],G.turn[1][1]);
+  }
+  x.restore();
+}
+
+boot();
+</script>
+</body>
+</html>

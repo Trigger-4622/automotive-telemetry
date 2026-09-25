@@ -1,0 +1,245 @@
+{
+  "_doc": "Telemetry Display layout schema v1. Keys starting with '_' are documentation only — the firmware ignores them. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; upload with 'pio run -t uploadfs' or POST /api/layout.",
+  "version": 2,
+
+  "global": {
+    "_doc": "smoothing_alpha: EMA coefficient 0-1 applied at packet rate (higher = snappier, lower = smoother). lerp_speed: fraction moved toward target per UI tick (needle glide). stale_timeout_ms: metric age before it renders as '--'. Colors are #RRGGBB.",
+    "smoothing_alpha": 0.35,
+    "lerp_speed": 0.18,
+    "stale_timeout_ms": 1500,
+
+    "_doc_swipe": "swipe_anim: 'over' (default, cheapest - only the incoming screen moves), 'move' (both slide), 'fade', or 'none' (instant). swipe_easing shapes the motion: LVGL's own default for screen transitions is LINEAR - constant velocity with a hard start and a hard stop - which is what makes a slide feel mechanical however fast it renders. 'ease_out' starts quickly and settles gently, which matches the gesture. Also available: ease_in, ease_in_out, overshoot, bounce, linear.",
+    "swipe_anim": "over",
+    "swipe_easing": "ease_out",
+    "swipe_anim_ms": 240,
+
+    "_doc_gauge_alarm_colors": "gauge_alarm_colors: set false to stop gauges turning yellow/red at their own thresholds - every gauge then stays its configured colour. The watchdog is a separate path and still pops up. Per-gauge tiers can also be removed individually in the studio (untick 'Turn the gauge yellow/red').",
+    "gauge_alarm_colors": true,
+
+    "_doc_alert": "alert_ack_ms: how long a tap silences an acknowledged alarm. Muting only applies to that exact metric at that exact severity - an escalation or a second fault re-arms the alert immediately.",
+    "alert_ack_ms": 30000,
+
+    "_doc_button": "button_gpio: the side button's pin. While button_discovery is true the firmware records each candidate pin's RESTING level at boot and reports any pin that DEVIATES from it - a toast pops up naming the pin, and the DIAGNOSTICS screen's GPIO row shows 'PRESS = GPIO n'. Watching for change rather than for a low level is what catches an active-high button too; assuming active-low is exactly what makes one invisible. If nothing at all reacts while you hold the button, that button is wired to EN/reset rather than to a GPIO, and no firmware can read it. Set button_gpio to whatever discovery names, then set button_discovery false.",
+    "button_gpio": 9,
+    "button_discovery": true,
+
+    "day_bg": "#101418",
+    "night_bg": "#000000"
+  },
+
+  "_doc_network": "NETWORK - master link and config portal. Read once at boot, so a reboot is needed to apply any of it. wifi_channel MUST match the master exactly: a mismatch produces silence rather than an error, so check it first whenever the link is down. master_mac restricts which sender is accepted; leave it empty to accept any master, which is only a problem when more than one is in range, since ESP-NOW broadcasts carry no notion of which network they belong to. The Settings tab shows the MAC actually being heard and can copy it in for you. ap_password under 8 characters leaves the portal open, because WPA2 cannot use a shorter key.",
+  "network": {
+    "wifi_channel": 1,
+    "master_mac": "",
+    "ap_ssid": "Telemetry-Gauge-Config",
+    "ap_password": ""
+  },
+
+  "screens": [
+    {
+      "_doc": "SCREEN 1 — DASH, the mini instrument cluster: warning lamps along the top with the indicators in the corners, a tachometer with its redline band, speed, gear with a shift light, fuel and coolant, and four small readouts along the bottom. Every part is optional: set it to false to remove it ('gear': false). Each part takes metric_id, label, units, decimals, min, max and thresholds like any gauge. The shift light's five LEDs fill from 'start' to 'rpm' and flash at 'rpm'; the tach's red band starts at 'redline' (default: the shift point). 'ghost_lamps' draws unlit lamps dimly, the way a real cluster's symbols show when off. On the round board the 'info' row has no room and is ignored.",
+      "id": "dash",
+      "type": "dash",
+      "label": "DASH",
+      "tach":  { "metric_id": "0x010C", "label": "RPM", "max": 8000, "redline": 6500 },
+      "speed": { "metric_id": "0x010D", "units": "km/h", "max": 260 },
+      "gear":  { "metric_id": "0x1005" },
+      "fuel":  { "metric_id": "0x012F", "units": "%",
+                 "thresholds": { "warning": { "value": 12, "hysteresis": 3, "direction": "below" } } },
+      "temp":  { "metric_id": "0x0105", "min": 40, "max": 130,
+                 "thresholds": { "warning":  { "value": 105, "hysteresis": 3 },
+                                 "critical": { "value": 110, "hysteresis": 3 } } },
+      "info": [
+        { "metric_id": "0x0142", "label": "BATT",  "units": "V",   "decimals": 1 },
+        { "metric_id": "0x015C", "label": "OIL",   "units": "°C" },
+        { "metric_id": "0x010F", "label": "IAT",   "units": "°C" },
+        { "metric_id": "0x1001", "label": "BOOST", "units": "bar", "decimals": 2 }
+      ],
+      "shift_light": { "rpm": 6500, "start": 5000 },
+      "lamps": true,
+      "ghost_lamps": true
+    },
+    {
+      "_doc": "SCREEN 2 — Tachometer, the hero screen. GT STYLING: 'dial_face' false removes the drawn-on bezel rings and rim pips; the look comes from 'texture' instead. 'gt_dial' is a full-screen 240x240 carbon face compiled into the firmware (tools/make_assets.py) — because it is compiled rather than a LittleFS file, it is a straight blit and costs no frame rate, unlike 'background_asset'. Deep vignette, no concentric rings, one red index at twelve o'clock: the needle and numerals are the only bright things on the dial, which is the whole point of a sports cluster.",
+      "id": "tach",
+      "type": "meter_gauge",
+      "_doc_show_popup": "show_popup false keeps THIS screen clean: faults are still policed and the gauge still recolours, but the warning card is never drawn over this dial. Set per screen; there is also a global switch in watchdog.show_popup.",
+      "show_popup": true,
+      "dial_face": false,
+      "texture": "gt_dial",
+      "metric_id": "0x010C",
+      "label": "RPM",
+      "units": "x1000",
+      "decimals": 0,
+      "min": 0,
+      "max": 8000,
+      "major_tick_every": 1000,
+      "tick_label_div": 1000,
+      "value_font": 40,
+      "arc": { "start_angle": 135, "end_angle": 45, "color": "#FF2D16" },
+      "thresholds": {
+        "warning":  { "value": 6200, "hysteresis": 200, "color": "#FF9E00" },
+        "critical": { "value": 7000, "hysteresis": 150, "color": "#FF2D16",
+                      "overlay_text": "SHIFT!" }
+      }
+    },
+
+    {
+      "_doc": "SCREEN 3 — Coolant, big arc. 270-degree sweep from 135 to 45 degrees (LVGL angles: 0 = 3 o'clock, clockwise). Same clean GT face as the tach: no bezel rings, amber arc on a near-black carbon dial. A wider arc with square ends reads more instrument than app.",
+      "id": "coolant",
+      "type": "arc_gauge",
+      "dial_face": false,
+      "texture": "gt_dial",
+      "metric_id": "0x0105",
+      "label": "COOLANT",
+      "units": "°C",
+      "decimals": 0,
+      "min": 40,
+      "max": 130,
+      "value_font": 48,
+      "arc": { "start_angle": 135, "end_angle": 45, "width": 14,
+               "color": "#FF9E00", "bg_color": "#15171B", "rounded": false },
+      "thresholds": {
+        "warning":  { "value": 105, "hysteresis": 3, "color": "#FF9E00" },
+        "critical": { "value": 115, "hysteresis": 3, "color": "#FF2D16",
+                      "overlay_text": "OVERHEAT" }
+      }
+    },
+
+    {
+      "_doc": "SCREEN 4 — ELECTRICAL SYSTEM quad. Battery voltage/current + state of charge + alternator load. direction 'below' alarms when the value drops UNDER the threshold (undervoltage). background_asset: an LVGL .bin from /assets (generate with tools/make_assets.py). Backgrounds are used on the cell/text screens rather than the needle screens on purpose — see the note on the diag screen.",
+      "id": "electrical",
+      "type": "quad",
+      "dial_face": false,
+      "texture": "gt",
+      "cells": [
+        { "metric_id": "0x0142", "label": "BATT", "units": "V",
+          "decimals": 1, "min": 8, "max": 16, "color": "#F2F4F6",
+          "thresholds": {
+            "warning":  { "value": 12.1, "hysteresis": 0.2, "color": "#FFC400",
+                          "direction": "below" },
+            "critical": { "value": 11.5, "hysteresis": 0.2, "color": "#FF1744",
+                          "direction": "below", "overlay_text": "LOW BATTERY" }
+          } },
+        { "metric_id": "0x1101", "label": "CURRENT", "units": "A",
+          "decimals": 1, "min": -100, "max": 100, "color": "#63C8FF",
+          "thresholds": {
+            "warning": { "value": -40, "hysteresis": 5, "color": "#FFC400",
+                         "direction": "below" }
+          } },
+        { "metric_id": "0x1102", "label": "SOC", "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#F2F4F6",
+          "thresholds": {
+            "warning": { "value": 40, "hysteresis": 5, "color": "#FF9E00",
+                         "direction": "below" }
+          } },
+        { "metric_id": "0x1107", "label": "ALT LOAD", "units": "%",
+          "decimals": 0, "min": 0, "max": 100, "color": "#FF9E00",
+          "thresholds": {
+            "warning": { "value": 90, "hysteresis": 5, "color": "#FF9E00" }
+          } }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 5 — Powertrain quad: speed, boost, oil temp, IAT. GT palette: white for the primary readout, one cool accent, one warm. Four different bright colours on one screen looks like a toy; two accents against white reads like an instrument.",
+      "id": "powertrain",
+      "type": "quad",
+      "dial_face": false,
+      "texture": "gt",
+      "cells": [
+        { "metric_id": "0x010D", "label": "SPEED", "units": "km/h",
+          "decimals": 0, "min": 0, "max": 260, "color": "#F2F4F6" },
+        { "metric_id": "0x1001", "label": "BOOST", "units": "bar",
+          "decimals": 2, "min": -1, "max": 2, "color": "#63C8FF",
+          "thresholds": {
+            "critical": { "value": 1.6, "hysteresis": 0.1, "color": "#FF2D16",
+                          "overlay_text": "OVERBOOST" }
+          } },
+        { "metric_id": "0x015C", "label": "OIL T", "units": "°C",
+          "decimals": 0, "min": 0, "max": 160, "color": "#FF9E00",
+          "thresholds": {
+            "warning": { "value": 130, "hysteresis": 5, "color": "#FF9E00" }
+          } },
+        { "metric_id": "0x010F", "label": "IAT", "units": "°C",
+          "decimals": 0, "min": -20, "max": 90, "color": "#F2F4F6" }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 6 — Compact text rows: up to 5 metrics, units appended to the value. (A 'chart' screen type is also available for a rolling trend of one metric — add one from the studio with keys: metric_id, min, max, points, sample_ms, color.)",
+      "id": "overview",
+      "type": "text_list",
+      "dial_face": false,
+      "texture": "gt",
+      "label": "OVERVIEW",
+      "rows": [
+        { "metric_id": "0x1F03", "label": "CAN f/s",  "units": "",    "decimals": 0 },
+        { "metric_id": "0x1F04", "label": "CAN IDs",  "units": "",    "decimals": 0 },
+        { "metric_id": "0x1F05", "label": "OBD f/s",  "units": "",    "decimals": 0 },
+        { "metric_id": "0x1105", "label": "Alt V",    "units": "V",   "decimals": 1 },
+        { "metric_id": "0x1109", "label": "Elec load","units": "W",   "decimals": 0 }
+      ]
+    },
+
+    {
+      "_doc": "SCREEN 7 — Link diagnostics: packet rate, drops (from sequence_id gaps), heap, uptime, plus a live GPIO scan for identifying the side button. Hold the button: the pin that reads L is the one to set as global.button_gpio.",
+      "id": "diag",
+      "type": "diag"
+    }
+  ],
+
+  "_doc_warnings": "WARNING LAMPS — the car's own telltales: check engine (MIL), seat belt, doors, parking brake, oil pressure, charging, engine hot/cold, low fuel, knock, high beam, lights, cruise and the indicators, plus three spare lamps (custom_1..3) for anything found on the bus later. They light on a strip over the screens and on the dash screen, and the serious ones raise the same alert card as the watchdog. EVERYTHING HERE CAN BE SWITCHED OFF: 'enabled' is the whole feature, 'strip' the overlay ('strip_mode' 'peek' shows new lamps for 'peek_secs' then folds to the most urgent fault; 'always' keeps every lit lamp up), 'popups' the alert card, and each lamp on its own with \"<lamp>\": false. A lamp object overrides any of: enabled, strip, metric_id, rule (on/off/above/below), threshold, hysteresis, engine (only judged with the engine running), debounce_ms, hold_ms, popup (off/once/repeat), popup_speed (km/h), blink_speed (km/h, -1 never), popup_secs, critical, tone (red/amber/green/blue), icon, title, detail, units, decimals, extra_metric_id. A lamp whose metric the master never sends simply stays dark. Edit this in the Gauge Studio's Warnings tab.",
+  "warnings": {
+    "enabled": true,
+    "strip": true,
+    "strip_position": "bottom",
+    "strip_mode": "peek",
+    "peek_secs": 6,
+    "popups": true,
+    "lamps": {
+      "seatbelt": { "popup": "repeat", "popup_speed": 10, "blink_speed": 10 },
+      "knock": { "threshold": -3.0 },
+      "custom_1": { "enabled": false }
+    }
+  },
+
+  "_doc_watchdog": "WATCHDOG — the guard. A standalone list of metrics to police, independent of the screens: a metric listed here is monitored even if no screen displays it. When one crosses a limit, a warning-triangle card pops up over whatever screen is showing, naming the metric, its value and the limit it broke. Tap the screen to acknowledge and mute that one fault for global.alert_ack_ms; an escalation to critical, or a second fault, re-arms it immediately. Critical pulses its border, warning is steady. Edit this list in the Gauge Studio's Watchdog tab. 'direction' is 'above' (default) or 'below' for things like undervoltage. 'hysteresis' is how far back past the limit the value must travel before the alert clears, which stops a value hovering on the limit from flickering.",
+
+  "_doc_watchdog_popup": "'popup' (default true) controls whether an item is allowed to raise the card. Set it false to police a metric SILENTLY — the right choice when the metric already has a gauge whose red zone makes the fault obvious, so a card on top would only cover the reading you are trying to read. RPM below is set that way: the tachometer already goes red at the redline. A silent item is still evaluated and still counts toward the card's '+N more' badge.",
+  "watchdog": {
+    "_doc_show_popup": "show_popup is the master switch for the card drawn OVER the screen. false = nothing is ever drawn on top; metrics are still policed and gauges still colour themselves. Per-item 'popup' silences one metric; this silences all of them. Neither has anything to do with gauge_alarm_colors, which controls the gauge colours instead.",
+    "enabled": true,
+    "show_popup": true,
+    "items": [
+      { "metric_id": "0x0105", "label": "COOLANT", "units": "°C", "decimals": 0,
+        "warning":  { "value": 105, "hysteresis": 3, "color": "#FFC400" },
+        "critical": { "value": 115, "hysteresis": 3, "color": "#FF1744",
+                      "overlay_text": "ENGINE OVERHEAT" } },
+
+      { "metric_id": "0x0142", "label": "BATTERY", "units": "V", "decimals": 1,
+        "warning":  { "value": 12.1, "hysteresis": 0.2, "direction": "below",
+                      "color": "#FFC400" },
+        "critical": { "value": 11.5, "hysteresis": 0.2, "direction": "below",
+                      "color": "#FF1744", "overlay_text": "NOT CHARGING" } },
+
+      { "metric_id": "0x015C", "label": "OIL TEMP", "units": "°C", "decimals": 0,
+        "warning":  { "value": 130, "hysteresis": 5, "color": "#FFC400" },
+        "critical": { "value": 145, "hysteresis": 5, "color": "#FF1744",
+                      "overlay_text": "OIL TEMP" } },
+
+      { "metric_id": "0x1003", "label": "OIL PRESS", "units": "bar", "decimals": 1,
+        "critical": { "value": 0.8, "hysteresis": 0.2, "direction": "below",
+                      "color": "#FF1744", "overlay_text": "OIL PRESSURE" } },
+
+      { "metric_id": "0x010C", "label": "RPM", "units": "rpm", "decimals": 0,
+        "popup": false,
+        "critical": { "value": 7000, "hysteresis": 200, "color": "#FF1744",
+                      "overlay_text": "OVER-REV" } },
+
+      { "metric_id": "0x1001", "label": "BOOST", "units": "bar", "decimals": 2,
+        "critical": { "value": 1.6, "hysteresis": 0.1, "color": "#FF1744",
+                      "overlay_text": "OVERBOOST" } }
+    ]
+  }
+}
