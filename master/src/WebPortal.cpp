@@ -375,7 +375,8 @@ const ADV=[
   ['guard_pause','Pause requests for','num','s',1,3600],
   ['guard_trips','Trips before switching to listen-only','num','',1,50],
   ['rx_guard','Receive-error guard: listen-only when our controller corrupts other modules\' frames','bool'],
-  ['rx_guard_rec','…receive-error counter that trips it','num','96 = error-warning level',16,255]]],
+  ['rx_guard_rec','…receive-error counter that trips it','num','96 = error-warning level',16,255],
+  ['rx_guard_errs','…or receive errors within the guard window that trip it','num','',1,250]]],
  ['CAN controller',[
   ['bitrate_kbps','Bitrate','sel',[[125,'125 kbit/s'],[250,'250 kbit/s'],[500,'500 kbit/s'],[1000,'1 Mbit/s']],1],
   ['can_sp875','Late sample point (87.5 %)','bool',null,null,null,null,1]]],
@@ -720,8 +721,8 @@ function evDetail(e){
  if(e.t===1)return`bus session ${e.a}`;
  if(e.t===2)return`after ${e.a} s of listening`;
  if(e.t===3)return`trip ${e.a}${e.b?' → listen-only':''}`;
- if(e.t===4)return`REC ${e.a}, TEC ${e.b} → listen-only`;
- if(e.t===5)return`TEC ${e.a}`;
+ if(e.t===4)return`REC ${e.a}, ${e.b} receive errors in the window → listen-only`;
+ if(e.t===5)return`TEC ${e.a}${e.b?' → listen-only (bus guard off)':''}`;
  return''}
 async function pollEvlog(){
  if(TAB!=='diag')return;

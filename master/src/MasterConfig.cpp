@@ -200,7 +200,7 @@ void MasterConfig::loadDefaults() {
     ssmSwitches = true;
     learnEnabled = true;
     guardEnabled = true; guardErrs = 3; guardWindowS = 10; guardPauseS = 30; guardTrips = 3;
-    rxGuardEnabled = true; rxGuardRec = 96; txRecessiveHold = true;
+    rxGuardEnabled = true; rxGuardRec = 96; rxGuardErrs = 60; txRecessiveHold = true;
     startDelayS = BUS_SETTLE_S;
     learnR2 = 0.985f; learnMinN = 40; learnSteady = 0.10f; learnPhi = 0.95f; verifyN = 30;
     obdGapMs = 8; obdTimeoutMs = 80; obdP2CanMs = 50; reqMaxHz = 0; obdAddressing = 0;
@@ -486,6 +486,7 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["guard_trips"]  = guardTrips;
     doc["rx_guard"]     = rxGuardEnabled;
     doc["rx_guard_rec"] = rxGuardRec;
+    doc["rx_guard_errs"] = rxGuardErrs;
     doc["tx_hold"]      = txRecessiveHold;
     doc["start_delay_s"] = startDelayS;
     doc["learn_r2"]     = learnR2;
@@ -607,6 +608,7 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     guardTrips   = v["guard_trips"]  | guardTrips;
     rxGuardEnabled = v["rx_guard"]   | rxGuardEnabled;
     rxGuardRec   = (uint8_t)jint(v["rx_guard_rec"], rxGuardRec, 16, 255);
+    rxGuardErrs  = (uint8_t)jint(v["rx_guard_errs"], rxGuardErrs, 1, 250);
     txRecessiveHold = v["tx_hold"]   | txRecessiveHold;
     startDelayS  = jint(v["start_delay_s"], startDelayS, 0, 300);
     learnR2      = v["learn_r2"]     | learnR2;

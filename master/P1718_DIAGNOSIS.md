@@ -88,13 +88,29 @@ prefer that.
 
 | Fix | Setting (default) | What it does | Scenario |
 |---|---|---|---|
-| Receive-error guard | `rx_guard` (on), `rx_guard_rec` (96) | When the controller's receive error counter climbs to the error-warning level — it is error-flagging other modules' frames — switch to listen-only for the session. Independent of the transmit-side `guard` (which stays off as you set it). Resume from the portal. | `tcm_p1718`, `tcm_p1718_optout`, `rx_guard_trickle` |
+| Receive-error guard | `rx_guard` (on), `rx_guard_rec` (96), `rx_guard_errs` (60 in `guard_win`) | Switch to listen-only for the session when the controller is error-flagging other modules' frames: either its receive error counter reaches the error-warning level (a storm), or that many receive-side errors land in the guard window (a *moderate* marginal link, which never raises REC because a good frame winds it down faster than a flagged one winds it up). Also on bus-off while the transmit-side `guard` is off. Independent of `guard` (which stays off as you set it). Resume from the portal. | `tcm_p1718`, `tcm_p1718_optout`, `rx_guard_trickle`, `rx_guard_moderate`, `rx_guard_prompt`, `busoff_guard_off` |
 | P2CAN wait | `obd_p2can` (50 ms) | After a request that got no answer within `obd_to`, the next request waits until this long after the send. Delays, never drops. | `pacing_p2can` |
 | Request budget | `req_max_hz` (0 = off) | Ceiling on OBD-II requests per second; spreads them, never drops. Off by default so nothing is throttled that you did not choose; 40 is a sensible value for the car. | `budget` |
 | Settle wait | `start_delay_s` (10) | Already built; this branch puts it on the car. Listen-only for 10 s each time the bus comes up. Absent from the stored file, so it takes the default. | `settle*`, `crank_reset` |
 | Physical addressing latch | (none: behaviour) | Auto addressing gives physical several tries before ever using 0x7DF, and never goes back once physical has worked. | `no_functional` |
 | TX recessive hold | `tx_hold` (on) | GPIO 5 driven recessive the instant the firmware starts (always) and latched recessive across deep sleep (this switch). | `tx_hold`, `tx_hold_off` |
 | Evidence log | Diagnostics tab, `/api/evlog` | Boot and reset reasons, bus up, settle end, guard trips with the error counters and what we were transmitting, bus-off, sleep. Kept in `/evlog.json` on LittleFS across reboots and updates. | `crank_reset`, `evlog` |
+
+Three more things the audit of the guard task turned up and fixed, each
+with a scenario:
+
+- The controller's switch *to* listen-only used to wait for the 2 s
+  mode-switch throttle. The likeliest trip is in the first normal-mode
+  contact with a marginal link, right after the settle wait ends - which is
+  inside that 2 s. The switch towards listen-only is now immediate; only the
+  way back is throttled (`rx_guard_prompt`).
+- Bus-off with the transmit guard off - the car's setting - used to recover
+  and carry straight on. Bus-off is the protocol throwing us off after 32
+  failed frames, each an active error flag on the bus; carrying on does it
+  again. It now latches listen-only until Resume (`busoff_guard_off`). With
+  both guards off it carries on as before (`guard_off`).
+- REC alone misses a moderate marginal link (see the table); the error rate
+  in the guard window catches it (`rx_guard_moderate`).
 
 The simulator gained a transmission ECU that watches the engine ECU's
 broadcasts (0x231, 0x232 stand in for them) and latches P1718 when fewer than

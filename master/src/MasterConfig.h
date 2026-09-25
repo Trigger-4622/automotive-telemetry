@@ -223,6 +223,9 @@ public:
                                         error-flagging (destroying) other nodes'
                                         frames on a marginal link.             */
     uint8_t  rxGuardRec   = 96;    /**< REC that trips it (error-warning level).*/
+    uint8_t  rxGuardErrs  = 60;    /**< ...or this many receive-side errors in
+                                        guardWindowS: a moderate marginal link
+                                        never raises REC, but it does this.    */
     bool     txRecessiveHold = true;/**< Latch CAN TX recessive across sleep.  */
     uint16_t startDelayS  = BUS_SETTLE_S; /**< Listen only this long after the
                                                bus comes up (0 = off).     */
@@ -238,8 +241,11 @@ public:
                                         at least this long from the send before
                                         the next request (0 = off).            */
     uint16_t reqMaxHz     = 0;     /**< Overall OBD request budget, requests per
-                                        second (0 = no cap). Spreads requests
-                                        over time; never drops a value.         */
+                                        second (0 = no cap; 40 suits the car).
+                                        Spreads requests over time; never drops
+                                        a value. Off by default: a cap below the
+                                        natural rate slows learning under a
+                                        flood of unknown frames.                */
     uint8_t  obdAddressing = 0;    /**< 0 auto, 1 engine ECU, 2 all ECUs.      */
     uint16_t ssmTimeoutMs = 1000;  /**< SSM2 reply wait.                       */
     uint16_t coverMs      = 2500;  /**< A value this fresh from a better

@@ -1599,7 +1599,9 @@ static void housekeepingTask(void *) {
  */
 static void busGuardTask(void *) {
     uint32_t lastErrCount = 0, lastTec = 0, winStart = 0, winErrs = 0, lastSwitch = 0;
+    uint32_t rxWinStart = 0, rxWinErrs = 0;   /**< Receive-side errors, per window. */
     bool     wasPassive = false, wasSettling = false;
+    bool     ctrlRunning = false;             /**< Last status read said RUNNING. */
     for (;;) {
         // Mode follows the settings. Turning the guard off also ends a
         // listen-only it imposed: the user has taken responsibility.
@@ -1624,9 +1626,16 @@ static void busGuardTask(void *) {
         wasSettling = settling;
         const bool wantSilent = Cfg.diagMode == DIAG_MODE_SILENT || s_guardSilent ||
                                 s_rxGuardSilent || settleLeft();
-        // (At most every 2 s, so a controller that will not install is not
-        // retried in a tight loop.)
-        if (wantSilent != s_twaiSilentNow && !s_twaiReinstall && millis() - lastSwitch > 2000) {
+        // Towards listen-only the switch is immediate: every moment in normal
+        // mode after a guard trip is another moment of error flags on the
+        // car's traffic, and the likeliest trip is right after the settle
+        // wait, in the first normal-mode contact with a marginal link. Back
+        // towards normal, and while a controller will not install, at most
+        // every 2 s so nothing is retried in a tight loop. Never while the
+        // controller is recovering from bus-off: the driver cannot be replaced
+        // mid-recovery.
+        if (wantSilent != s_twaiSilentNow && !s_twaiReinstall &&
+            ((wantSilent && ctrlRunning) || millis() - lastSwitch > 2000)) {
             lastSwitch = millis();
             s_twaiWantSilent = wantSilent;
             s_twaiReinstall  = true;         // carried out by the RX task
@@ -1662,6 +1671,7 @@ static void busGuardTask(void *) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        ctrlRunning = st.state == TWAI_STATE_RUNNING;
 
         const uint32_t delta = st.bus_error_count - lastErrCount;
         lastErrCount = st.bus_error_count;
@@ -1684,6 +1694,31 @@ static void busGuardTask(void *) {
                 }
             } else {
                 s_errIdle += delta;
+                /*
+                 * Receive-side errors while we are a normal-mode node: every one
+                 * we detected, we also flagged, and the flag destroyed the frame
+                 * for the module it was meant for. REC alone misses a moderate
+                 * marginal link - a good frame winds it down faster than a
+                 * flagged one winds it up - so the rate is watched as well: this
+                 * many in the guard window and we are corrupting the car's
+                 * traffic, whatever REC says. (Not counted in listen-only, where
+                 * an error we see is one we cannot signal.)
+                 */
+                if (ctrlRunning && !s_twaiSilentNow) {
+                    const uint32_t now = millis();
+                    if (now - rxWinStart > Cfg.guardWindowS * 1000UL) { rxWinStart = now; rxWinErrs = 0; }
+                    rxWinErrs += delta;
+                    if (Cfg.rxGuardEnabled && !s_rxGuardSilent && rxWinErrs >= Cfg.rxGuardErrs) {
+                        s_rxGuardSilent = true;
+                        evLog(EV_RX_TRIP, (uint16_t)st.rx_error_counter,
+                              (uint16_t)min(rxWinErrs, (uint32_t)0xFFFF));
+                        log_e("receive-error guard: %u receive errors in %u s - our controller "
+                              "is corrupting other nodes' frames; switching to listen-only "
+                              "(resume from the portal)", (unsigned)rxWinErrs,
+                              (unsigned)Cfg.guardWindowS);
+                        rxWinErrs = 0;
+                    }
+                }
             }
         }
 
@@ -1701,12 +1736,14 @@ static void busGuardTask(void *) {
          * storm, not the odd stray error. Opt out with rx_guard.
          */
         if (Cfg.rxGuardEnabled && !s_rxGuardSilent && !s_twaiSilentNow &&
-            st.state == TWAI_STATE_RUNNING && st.rx_error_counter >= Cfg.rxGuardRec) {
+            ctrlRunning && st.rx_error_counter >= Cfg.rxGuardRec) {
             s_rxGuardSilent = true;
-            evLog(EV_RX_TRIP, (uint16_t)st.rx_error_counter, (uint16_t)st.tx_error_counter);
+            evLog(EV_RX_TRIP, (uint16_t)st.rx_error_counter,
+                  (uint16_t)min(rxWinErrs, (uint32_t)0xFFFF));
             log_e("receive-error guard: REC %u - our controller is corrupting other "
                   "nodes' frames; switching to listen-only (resume from the portal)",
                   (unsigned)st.rx_error_counter);
+            rxWinErrs = 0;
         }
 
         const bool passive = st.state == TWAI_STATE_RUNNING && st.tx_error_counter >= 128;
@@ -1720,8 +1757,24 @@ static void busGuardTask(void *) {
         // same errors back on the car's bus.
         if (wentBusOff) {
             log_w("TWAI bus-off - recovering");
-            evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter);
-            if (Cfg.guardEnabled && diagGuardOk()) guardTrip("controller went bus-off");
+            if (Cfg.guardEnabled) {
+                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
+                if (diagGuardOk()) guardTrip("controller went bus-off");
+            } else if (Cfg.rxGuardEnabled && !s_rxGuardSilent) {
+                /*
+                 * Bus-off is the protocol itself throwing us off: our frames
+                 * failed 32 times over, each failure an active error flag on
+                 * the bus. With the transmit guard off, recovering and carrying
+                 * on as before would just do it all again, so the receive-error
+                 * guard's latch holds the controller listen-only until Resume.
+                 */
+                s_rxGuardSilent = true;
+                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 1);
+                log_e("bus-off with the bus guard off - switching to listen-only for this "
+                      "session (resume from the portal)");
+            } else {
+                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
+            }
         }
     }
 }

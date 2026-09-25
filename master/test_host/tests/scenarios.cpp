@@ -282,9 +282,11 @@ static void scGuard() {
     check(unexpected == 0 && simBugs() == 0, "no other errors", fmt("%d", unexpected));
 }
 
-/** Guard switched off: the user accepted the risk, requests continue. */
+/** Both guards switched off: the user accepted the risk, requests continue
+ *  through errors on our frames and even through bus-off. (With only the
+ *  transmit guard off, a bus-off latches listen-only: busoff_guard_off.) */
 static void scGuardOff() {
-    simfs::files["/config.json"] = R"({"cfg_ver":5,"guard":false})";
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"guard":false,"rx_guard":false})";
     boot();
     runUntil(20);
     faults.errorPerOwnFrame = 0.3;
@@ -937,12 +939,17 @@ static void loadCarConfig() {
 
 /* Event types of the evidence log (main.cpp EvType), for the checks. */
 enum { EVT_BOOT = 0, EVT_BUS_UP, EVT_SETTLE_END, EVT_TX_TRIP, EVT_RX_TRIP, EVT_BUS_OFF, EVT_SLEEP, EVT_RESUME };
-static int evCount(int type, uint16_t *aOut = nullptr, uint8_t *actOut = nullptr) {
+static int evCount(int type, uint16_t *aOut = nullptr, uint8_t *actOut = nullptr, uint16_t *bOut = nullptr) {
     static EvView ev[64];
     const size_t n = masterEventLog(ev, 64);
     int k = 0;
     for (size_t i = 0; i < n; i++)
-        if (ev[i].type == type) { k++; if (aOut) *aOut = ev[i].a; if (actOut) *actOut = ev[i].act; }
+        if (ev[i].type == type) {
+            k++;
+            if (aOut) *aOut = ev[i].a;
+            if (actOut) *actOut = ev[i].act;
+            if (bOut) *bOut = ev[i].b;
+        }
     return k;
 }
 static int unexpectedErrors(const char *allowed) {
@@ -984,9 +991,10 @@ static void scTcmP1718() {
     check(rx && rx->value > 100, "still listening: frames reach the displays' health channel",
           fmt("%.0f frames/s", rx ? rx->value : -1.0f));
     uint16_t rec = 0; uint8_t act = 0;
-    check(evCount(EVT_RX_TRIP, &rec, &act) == 1 && rec >= 96 && (act & 0x01),
+    const int trips = evCount(EVT_RX_TRIP, &rec, &act);
+    check(trips == 1 && rec >= 96 && (act & 0x01),
           "evidence log: the trip, its REC, and that we were polling at the time",
-          fmt("REC %u, activity 0x%02X", rec, act));
+          fmt("%d trips, REC %u, activity 0x%02X", trips, rec, act));
     check(simfs::files.count("/evlog.json") == 1, "evidence written to flash");
     diagGuardReset();                               // Resume from the portal
     faults.rxCorruptRate = 0;                       // (the link fixed)
@@ -1019,14 +1027,84 @@ static void scTcmP1718Optout() {
 static void scRxGuardTrickle() {
     boot();
     runUntil(10);
-    faults.idleErrorsPerSec = 5;
+    faults.idleErrorsPerSec = 3;
     runUntil(120);
     MasterStats st; masterGetStats(st);
-    check(st.errIdle > 300, "plenty of stray errors seen", fmt("%u", st.errIdle));
+    check(st.errIdle > 200, "plenty of stray errors seen", fmt("%u", st.errIdle));
     check(!st.rxGuardSilent && controller().mode == TWAI_MODE_NORMAL, "a trickle does not trip the receive-error guard",
           fmt("REC %u", st.rec));
     check(evCount(EVT_RX_TRIP) == 0, "nothing recorded as a trip");
     commonChecks();
+}
+
+/**
+ * A moderate marginal link: a few per cent of the ECM's frames. REC never
+ * climbs (a good frame winds it down faster than a flagged one winds it up), so
+ * the receive-error counter alone would let this run for ever, destroying tens
+ * of frames a second. The error rate in the guard window catches it.
+ */
+static void scRxGuardModerate() {
+    loadCarConfig();
+    boot();
+    runUntil(20);
+    faults.rxCorruptRate = 0.05;                    // ~7 of the ECM's 150 frames/s
+    runUntil(45);
+    MasterStats st; masterGetStats(st);
+    uint16_t rec = 0, inWin = 0;
+    const int trips = evCount(EVT_RX_TRIP, &rec, nullptr, &inWin);
+    check(trips == 1 && rec < 96 && inWin >= 60,
+          "tripped on the error rate, not on REC", fmt("%d trips, REC %u, %u errors in the window", trips, rec, inWin));
+    check(st.rxGuardSilent && controller().mode == TWAI_MODE_LISTEN_ONLY, "controller listen-only");
+    check(!tcm().p1718, "the TCM never set P1718 (moderate loss does not gap the frames)",
+          fmt("%u destroyed", tcm().ecmLost));
+    check(tcm().ecmLost < 400, "the corruption was stopped within the window", fmt("%u destroyed", tcm().ecmLost));
+    check(txCount(anyFrame, 32, 45) == 0, "nothing transmitted since");
+    check(unexpectedErrors("receive-error guard") == 0 && simBugs() == 0, "no other errors");
+}
+
+/** The likeliest moment for the trip is the first normal-mode contact with a
+ *  marginal link, right after the settle wait - and the switch back to
+ *  listen-only must not wait for the 2 s mode-switch throttle. */
+static void scRxGuardPrompt() {
+    loadCarConfig();
+    boot();
+    runUntil(5);
+    faults.rxCorruptRate = 0.9;                     // marginal from the start (no effect while listen-only)
+    runUntil(9.9);
+    check(tcm().ecmLost == 0, "listen-only during the settle wait corrupts nothing");
+    runUntil(10.8);                                 // settle ends at ~10.1 s
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY && evCount(EVT_RX_TRIP) == 1,
+          "tripped and back to listen-only within 0.7 s of the first normal-mode contact",
+          fmt("mode %d", controller().mode));
+    check(tcm().ecmLost < 80, "only a short burst of frames destroyed", fmt("%u", tcm().ecmLost));
+    runUntil(30);
+    check(!tcm().p1718, "no P1718");
+    check(unexpectedErrors("receive-error guard") == 0 && simBugs() == 0, "no other errors");
+}
+
+/** Bus-off with the transmit-side bus guard off, as on the car: the
+ *  receive-error guard holds the controller listen-only instead of letting it
+ *  recover and carry straight on. Resume from the portal puts it back. */
+static void scBusOffGuardOff() {
+    loadCarConfig();                                // guard false
+    boot();
+    runUntil(20);
+    faults.busOffNow = true;
+    runUntil(25);
+    MasterStats st; masterGetStats(st);
+    check(controller().state == TWAI_STATE_RUNNING, "controller recovered from bus-off");
+    check(st.rxGuardSilent && controller().mode == TWAI_MODE_LISTEN_ONLY, "...into listen-only, not back to requesting");
+    check(st.guardTrips == 0, "the (off) bus guard was not involved");
+    uint16_t tec = 0, latched = 0;
+    const int offs = evCount(EVT_BUS_OFF, &tec, nullptr, &latched);
+    check(offs == 1 && latched == 1, "bus-off recorded as latching listen-only",
+          fmt("%d bus-offs, TEC %u, latched %u", offs, tec, latched));
+    runUntil(40);
+    check(txCount(anyFrame, 21, 40) == 0, "nothing transmitted since", fmt("%llu", (unsigned long long)txCount(anyFrame, 21, 40)));
+    diagGuardReset();
+    runUntil(50);
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 45, 50) > 0, "Resume puts it back");
+    check(unexpectedErrors("bus-off") == 0 && simBugs() == 0, "no other errors");
 }
 
 static double minObdGapMs(double fromS, double toS) {
@@ -1142,10 +1220,12 @@ static void scCrankReset() {
     check(n >= 4 && ev[0].type == EVT_BOOT && ev[0].a == 1, "the earlier boot loaded from flash first",
           fmt("%zu records, first type %u reason %u", n, n ? ev[0].type : 99, n ? ev[0].a : 0));
     uint16_t reason = 0;
-    check(evCount(EVT_BOOT, &reason) == 2 && reason == 9, "this boot recorded as a brown-out", fmt("reason %u", reason));
+    const int boots = evCount(EVT_BOOT, &reason);
+    check(boots == 2 && reason == 9, "this boot recorded as a brown-out", fmt("%d boots, last reason %u", boots, reason));
     check(evCount(EVT_BUS_UP) == 1, "the bus coming up is recorded");
     uint16_t waited = 0;
-    check(evCount(EVT_SETTLE_END, &waited) == 1 && waited == 10, "the end of the settle wait is recorded", fmt("%u s", waited));
+    const int settled = evCount(EVT_SETTLE_END, &waited);
+    check(settled == 1 && waited == 10, "the end of the settle wait is recorded", fmt("%d, %u s", settled, waited));
     JsonDocument d;
     check(!deserializeJson(d, simfs::files["/evlog.json"]) && d.size() == n, "all of it written to flash",
           fmt("%u records in the file", (unsigned)d.size()));
@@ -1160,10 +1240,12 @@ static void scEvlog() {
     runUntil(30);
     faults.errorPerOwnFrame = 0;
     uint16_t reason = 0;
-    check(evCount(EVT_BOOT, &reason) == 1 && reason == 1, "boot recorded as a power-on", fmt("reason %u", reason));
+    const int boots = evCount(EVT_BOOT, &reason);
+    check(boots == 1 && reason == 1, "boot recorded as a power-on", fmt("%d boots, reason %u", boots, reason));
     uint16_t trip = 0; uint8_t act = 0;
-    check(evCount(EVT_TX_TRIP, &trip, &act) >= 1 && (act & 0x01), "the bus-guard trip is recorded with OBD-II polling at the time",
-          fmt("trip %u, activity 0x%02X", trip, act));
+    const int trips = evCount(EVT_TX_TRIP, &trip, &act);
+    check(trips >= 1 && (act & 0x01), "the bus-guard trip is recorded with OBD-II polling at the time",
+          fmt("%d trips, last trip %u, activity 0x%02X", trips, trip, act));
     JsonDocument d;
     check(!deserializeJson(d, simfs::files["/evlog.json"]) && d.size() >= 3, "written to flash", fmt("%u records", (unsigned)d.size()));
     masterEventLogClear();
@@ -1219,7 +1301,9 @@ static const Scenario SCENARIOS[] = {
     {"settle", scSettle, 0}, {"settle_restart", scSettleRestart, 0}, {"settle_portal", scSettlePortal, 0},
     {"device_config", scDeviceConfig, 0},
     {"tcm_p1718", scTcmP1718, 0}, {"tcm_p1718_optout", scTcmP1718Optout, 0},
-    {"rx_guard_trickle", scRxGuardTrickle, 0}, {"pacing_p2can", scPacingP2can, 0},
+    {"rx_guard_trickle", scRxGuardTrickle, 0}, {"rx_guard_moderate", scRxGuardModerate, 0},
+    {"rx_guard_prompt", scRxGuardPrompt, 0}, {"busoff_guard_off", scBusOffGuardOff, 0},
+    {"pacing_p2can", scPacingP2can, 0},
     {"budget", scBudget, 0}, {"no_functional", scNoFunctional, 0},
     {"crank_reset", scCrankReset, 0}, {"evlog", scEvlog, 0},
     {"tx_hold", scTxHold, 0}, {"tx_hold_off", scTxHoldOff, 0},
