@@ -37,13 +37,18 @@ struct BusFaults {
     int      extraIds = 0;             ///< More distinct IDs, 20 Hz each.
     int      burstFramesPerMs = 0;     ///< Flood: this many extra frames every ms.
     /**
-     * A marginal link: while the master is a NORMAL-mode node (it ACKs and
-     * error-flags), it corrupts this fraction of the ECM's broadcast frames to
-     * the TCM. Each corrupted frame is destroyed on the bus for every module -
-     * the TCM included - and bumps the master's receive-error counter (REC), as
-     * a real error-active controller does when it signals an error it detected
-     * in another node's frame. In LISTEN-ONLY mode the controller cannot send
-     * error flags, so it corrupts nothing whatever this is set to.
+     * A marginal link: the master's controller misreads this fraction of the
+     * ECM's broadcast frames to the TCM - and, the fault being in how it samples
+     * those bits, every retransmission of the same frame too. What that does to
+     * the car follows the CAN fault-confinement rules (tcmSee in sim_bus.cpp):
+     * an error-active controller whose TX pad is on the wire destroys each
+     * attempt with an active error flag, gaining 9 on its REC while the ECM
+     * gains 8 on its TEC, so a normal-mode master goes error-passive - and
+     * harmless - before the ECM reaches bus-off. In LISTEN-ONLY mode the ESP32-S3
+     * still sends active error flags (Espressif erratum; ESP-IDF's fix,
+     * CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM, is off in the Arduino core) while
+     * its error counters stay frozen: a listen-only master started with REC 0
+     * never backs off, and the ECM is driven bus-off instead.
      */
     double   rxCorruptRate = 0;
 };
@@ -82,6 +87,8 @@ struct TcmView {
     uint32_t ecmLost;      ///< ECM broadcast frames destroyed before it got them.
     uint32_t windowRx;     ///< Received in the last window (what P1718 watches).
     bool     armed;        ///< Has seen the ECM healthy at least once.
+    uint32_t destroyed;    ///< ECM transmission attempts destroyed on the wire.
+    uint32_t ecmBusOffs;   ///< Times the ECM was driven bus-off.
 };
 TcmView tcm();
 
@@ -94,6 +101,12 @@ extern int resetReason;
 extern int  gpioHoldEnabled;   ///< Net hold count on the TX pin (>0 = latched).
 extern bool txDrivenHigh;      ///< Last level driven onto the TX pin.
 extern bool txConfiguredOut;   ///< TX was configured as a recessive output.
+extern int  txGlitches;        ///< Times a GPIO (not the controller) drove TX dominant.
+/** The TX pad was switched to a plain GPIO output, away from the controller
+ *  (gpio_set_direction / pinMode): the pad now shows the GPIO latch's level. */
+void txPadFromGpio();
+/** Is the controller's TX signal routed to the pad (what twai_driver_install does)? */
+bool txPadOnController();
 
 struct CtrlView { bool installed; twai_mode_t mode; twai_state_t state; uint32_t tec, rec; };
 CtrlView controller();

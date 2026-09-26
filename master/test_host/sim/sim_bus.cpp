@@ -14,6 +14,7 @@
 
 #include "Arduino.h"
 #include "sim.h"
+#include "hal/twai_ll.h"
 
 namespace sim {
 EcuConfig ecu;
@@ -43,7 +44,20 @@ static struct Ctrl {
     simrtos::Waitable rxw, alertw;
     int waitingRx = 0, waitingAlerts = 0;
     uint64_t recoveryDoneAt = 0;
+    bool txAttached = false;   ///< The controller's TX signal drives the pad.
+    bool inReset = false;      ///< Reset mode: off the bus, error counters writable.
 } C;
+
+static void txGlitch(const char *why) {
+    sim::txGlitches++;
+    simLog('E', "SIM-BUG: CAN TX driven dominant by a GPIO - %s", why);
+}
+
+void sim::txPadFromGpio() {
+    if (!sim::txDrivenHigh) txGlitch("pad switched to a GPIO output while its latch is low");
+    C.txAttached = false;
+}
+bool sim::txPadOnController() { return C.txAttached; }
 
 CtrlView sim::controller() { return { C.installed, C.mode, C.state, C.tec, C.rec }; }
 
@@ -69,6 +83,11 @@ esp_err_t twai_driver_install(const twai_general_config_t *g, const twai_timing_
     }
     C = Ctrl();
     C.installed = true;
+    // twai_configure_gpio(): gpio_config() makes the pad a GPIO output - showing
+    // the GPIO latch's level for a moment - then routes the controller onto it.
+    if (!sim::txDrivenHigh) txGlitch("twai_driver_install with the TX GPIO latch low");
+    C.txAttached = true;
+    C.inReset = true;
     C.mode = g->mode;
     C.alertsEnabled = g->alerts_enabled;
     C.rxLen = g->rx_queue_len;
@@ -97,12 +116,18 @@ esp_err_t twai_driver_uninstall() {
 esp_err_t twai_start() {
     if (!C.installed || C.state != TWAI_STATE_STOPPED) return ESP_ERR_INVALID_STATE;
     C.state = TWAI_STATE_RUNNING;
+    // twai_hal_start(): TEC and REC cleared, reset mode left. (With ESP-IDF's
+    // listen-only erratum fix it would set REC to 128 instead; the Arduino core
+    // is built without it.)
+    C.tec = C.rec = 0;
+    C.inReset = false;
     return ESP_OK;
 }
 
 esp_err_t twai_stop() {
     if (!C.installed || C.state != TWAI_STATE_RUNNING) return ESP_ERR_INVALID_STATE;
     C.state = TWAI_STATE_STOPPED;
+    C.inReset = true;
     C.rx.clear();
     return ESP_OK;
 }
@@ -170,11 +195,15 @@ static twai_message_t frame(uint32_t id, std::initializer_list<uint8_t> b) {
 static void schedule(uint64_t atUs, const twai_message_t &m) { s_pending.emplace(atUs, m); }
 
 static void deliver(const twai_message_t &m) {
-    if (!C.installed || C.state != TWAI_STATE_RUNNING) return;
+    if (!C.installed || C.state != TWAI_STATE_RUNNING || C.inReset) return;
     // A frame received without a bus error winds the receive-error counter back
-    // down, as a real controller does - so a trickle of stray errors on a busy
-    // bus keeps REC near zero, and only a sustained storm drives it up.
-    if (C.rec) C.rec--;
+    // down, as a real controller does (ISO 11898-1: by 1, or from above 127 to
+    // 119..127) - so a trickle of stray errors keeps REC near zero, and only a
+    // storm drives it up. Listen-only mode freezes the counters.
+    if (C.mode != TWAI_MODE_LISTEN_ONLY) {
+        if (C.rec > 127) C.rec = 120;
+        else if (C.rec) C.rec--;
+    }
     if (C.rx.size() >= C.rxLen) { C.rxMissed++; raiseAlert(TWAI_ALERT_RX_QUEUE_FULL); return; }
     C.rx.push_back(m);
     simrtos::notify(&C.rxw);
@@ -193,46 +222,89 @@ static bool isEcmToTcm(uint32_t id) {
 
 static struct Tcm {
     bool     p1718 = false, p0700 = false, armed = false;
-    uint32_t rx = 0, lost = 0;
+    uint32_t rx = 0, lost = 0, destroyed = 0;
     std::deque<uint64_t> recent;   // arrival times, for the sliding window
 } T;
+
+/* The engine ECU as a CAN transmitter, with the protocol's fault confinement:
+ * +8 on its transmit error counter for every attempt destroyed, -1 for every
+ * frame that gets through, bus-off at 256. Recovery is quick for the first few
+ * bus-offs and slow after that, the way automotive ECUs treat a bus they keep
+ * losing (AUTOSAR CanSM: fast then slow recovery). While it is bus-off nobody
+ * receives its broadcasts - the TCM included. */
+static struct Ecm {
+    uint32_t tec = 0;
+    uint64_t offUntil = 0, last = 0;
+    int      recent = 0;
+    uint32_t total = 0;
+} E;
+
+static void ecmBusOff(uint64_t now) {
+    if (now - E.last > 10000000) E.recent = 0;        // 10 s clean: quick recovery again
+    E.recent++; E.total++; E.last = now; E.tec = 0;
+    E.offUntil = now + (E.recent <= 5 ? 10000 : 1000000);
+    simLog('W', "SIM-ECM: driven bus-off (#%u, %s recovery)", (unsigned)E.total,
+           E.recent <= 5 ? "quick" : "slow");
+}
 
 static constexpr uint64_t TCM_WINDOW_US = 1500000;  // 1.5 s
 static constexpr size_t   TCM_MIN_RX    = 30;       // ~150/s healthy; a real gap is far below
 
 TcmView sim::tcm() {
-    return { T.p1718, T.p0700, (uint32_t)T.rx, (uint32_t)T.lost, (uint32_t)T.recent.size(), T.armed };
+    return { T.p1718, T.p0700, (uint32_t)T.rx, (uint32_t)T.lost, (uint32_t)T.recent.size(), T.armed,
+             T.destroyed, E.total };
 }
 
-/** A received receive-error: REC climbs, and the controller flags it (which is
- *  exactly what destroys the frame for the other modules). */
-static void rxError() {
+/** Would the master's controller put an ACTIVE (dominant) error flag on the
+ *  wire for an error it detected in a frame it only receives? */
+static bool masterFlagsActive() {
+    if (!C.installed || C.state != TWAI_STATE_RUNNING || C.inReset || !C.txAttached) return false;
+    if (C.rec >= 128 || C.tec >= 128) return false;      // error-passive: recessive flags only
+    // NORMAL: as the standard says. LISTEN_ONLY: the erratum - it flags anyway.
+    return C.mode == TWAI_MODE_NORMAL || C.mode == TWAI_MODE_LISTEN_ONLY;
+}
+
+/** The master's controller detected an error in a frame it was receiving. */
+static void masterDetects(bool flaggedActive) {
     C.busErrors++;
-    C.rec += 8;
     raiseAlert(TWAI_ALERT_BUS_ERROR);
+    if (C.mode == TWAI_MODE_LISTEN_ONLY) return;       // counters frozen in listen-only
+    // +1 for the error, +8 more when after its own (primary) flag it sees the
+    // other nodes' secondary flags: the rule that makes the node which alone
+    // sees an error the first to go error-passive.
+    C.rec += flaggedActive ? 9 : 1;
     if (C.rec >= 96)  raiseAlert(TWAI_ALERT_ABOVE_ERR_WARN);
     if (C.rec >= 128) raiseAlert(TWAI_ALERT_ERR_PASS);
 }
 
-/** True when the master, as a normal-mode node on a marginal link, corrupts
- *  this ECM broadcast frame with an error flag before the TCM can receive it. */
-static bool masterCorruptsRx() {
-    return faults.rxCorruptRate > 0 && C.installed && C.state == TWAI_STATE_RUNNING &&
-           C.mode == TWAI_MODE_NORMAL && urand() < faults.rxCorruptRate;
-}
-
-/** Run the TCM's view of one ECM broadcast frame about to go on the bus.
- *  @return true if the frame survived (deliver it), false if it was destroyed. */
+/**
+ * One ECM broadcast frame goes onto the bus, as the TCM (and the master) see
+ * it. On a marginal link the master misreads it - and every retransmission of
+ * it. While the master's error flags are active and reach the wire, each
+ * attempt is destroyed for every module and the ECM retransmits; the loop ends
+ * when the master goes error-passive (its REC outruns the ECM's TEC) or the ECM
+ * is driven bus-off (a frozen REC never does).
+ * @return true if the master receives the frame (deliver it to the controller).
+ */
 static bool tcmSee(const twai_message_t &m) {
     if (!isEcmToTcm(m.identifier)) return true;
-    if (masterCorruptsRx()) {
-        rxError();
-        T.lost++;
-        return false;                       // destroyed on the bus, TCM included
+    const uint64_t now = simrtos::nowUs();
+    if (now < E.offUntil) { T.lost++; return false; }  // the ECM is bus-off
+    const bool misread = faults.rxCorruptRate > 0 && C.installed && C.state == TWAI_STATE_RUNNING &&
+                         !C.inReset && urand() < faults.rxCorruptRate;
+    if (misread) {
+        while (masterFlagsActive()) {                  // this attempt destroyed on the wire
+            masterDetects(true);
+            T.destroyed++;
+            E.tec += 8;
+            if (E.tec >= 256) { ecmBusOff(now); T.lost++; return false; }
+        }
+        masterDetects(false);      // flagged recessively, or not at all: the frame gets through
     }
+    if (E.tec) E.tec--;
     T.rx++;
-    T.recent.push_back(simrtos::nowUs());
-    return true;
+    T.recent.push_back(now);
+    return !misread;               // the master did not get the frame it misread
 }
 
 /** Latch P1718 when the ECM's broadcasts thin out on an otherwise live bus. */
@@ -596,6 +668,10 @@ static void ssmFrame(const twai_message_t &m) {
 esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
     if (!C.installed) return ESP_ERR_INVALID_STATE;
     if (C.mode == TWAI_MODE_LISTEN_ONLY) return ESP_ERR_NOT_SUPPORTED;
+    if (!C.txAttached) {
+        simLog('E', "SIM-BUG: transmit with the TX pad routed away from the controller");
+        return ESP_FAIL;
+    }
     if (C.state != TWAI_STATE_RUNNING) return ESP_ERR_INVALID_STATE;
     transmitted.push_back({simrtos::nowUs(), *m});
     if (faults.errorPerOwnFrame > 0 && urand() < faults.errorPerOwnFrame) {
@@ -637,7 +713,7 @@ static void busTask(void *) {
         if (faults.idleErrorsPerSec > 0 && C.installed && C.state == TWAI_STATE_RUNNING &&
             urand() < faults.idleErrorsPerSec * (now - lastIdle) / 1e6) {
             C.busErrors++;
-            C.rec++;
+            if (C.mode != TWAI_MODE_LISTEN_ONLY) C.rec++;    // frozen in listen-only
             raiseAlert(TWAI_ALERT_BUS_ERROR);
         }
         lastIdle = now;
@@ -661,4 +737,15 @@ static void busTask(void *) {
 void sim::start() {
     s_startUs = simrtos::nowUs();
     simrtos::createTask(busTask, "bus", nullptr, 20);
+}
+
+/* ── register-level access (hal/twai_ll.h), as the master's erratum fix uses ── */
+twai_dev_t TWAI;
+void twai_ll_enter_reset_mode(twai_dev_t *) { C.inReset = true; }
+void twai_ll_exit_reset_mode(twai_dev_t *)  { C.inReset = false; }
+bool twai_ll_is_in_reset_mode(twai_dev_t *) { return C.inReset; }
+uint32_t twai_ll_get_rec(twai_dev_t *)      { return C.rec; }
+void twai_ll_set_rec(twai_dev_t *, uint32_t rec) {
+    if (!C.inReset) { simLog('E', "SIM-BUG: REC written outside reset mode (ignored by the hardware)"); return; }
+    C.rec = rec;
 }

@@ -74,6 +74,18 @@ static void runUntil(double untilS) {
     while (tNow() < untilS && !sim::sleepEntered) loop();
 }
 
+/** Merge settings into the stored config file before boot, as if they had
+ *  been saved from the portal on an earlier drive. */
+static void portalPostBeforeBoot(const char *json) {
+    JsonDocument cfg, add;
+    deserializeJson(cfg, simfs::files["/config.json"]);
+    deserializeJson(add, json);
+    for (JsonPairConst kv : add.as<JsonObjectConst>()) cfg[kv.key()] = kv.value();
+    std::string out;
+    serializeJson(cfg, out);
+    simfs::files["/config.json"] = out;
+}
+
 /** Apply a settings change exactly as the portal's POST handler does. */
 static void portalPost(const char *json) {
     JsonDocument d;
@@ -1038,10 +1050,12 @@ static void scRxGuardTrickle() {
 }
 
 /**
- * A moderate marginal link: a few per cent of the ECM's frames. REC never
- * climbs (a good frame winds it down faster than a flagged one winds it up), so
- * the receive-error counter alone would let this run for ever, destroying tens
- * of frames a second. The error rate in the guard window catches it.
+ * A moderate marginal link: a few per cent of the ECM's frames. The first frame
+ * the master misreads costs a burst of retransmissions - it flags every one -
+ * and CAN's fault confinement drives its REC past the guard's level within that
+ * burst (+9 per flag), so the guard trips on the first misread and the damage
+ * stops at one burst. (The error-rate criterion is the backstop for errors that
+ * do not come in bursts.)
  */
 static void scRxGuardModerate() {
     loadCarConfig();
@@ -1052,14 +1066,85 @@ static void scRxGuardModerate() {
     MasterStats st; masterGetStats(st);
     uint16_t rec = 0, inWin = 0;
     const int trips = evCount(EVT_RX_TRIP, &rec, nullptr, &inWin);
-    check(trips == 1 && rec < 96 && inWin >= 60,
-          "tripped on the error rate, not on REC", fmt("%d trips, REC %u, %u errors in the window", trips, rec, inWin));
+    check(trips == 1, "tripped on the first misread burst", fmt("%d trips, REC %u, %u errors in the window", trips, rec, inWin));
+    check(tcm().destroyed <= 20 && tcm().ecmBusOffs == 0, "one burst of retransmissions at most, the ECM never bus-off",
+          fmt("%u destroyed, %u ECM bus-offs", tcm().destroyed, tcm().ecmBusOffs));
     check(st.rxGuardSilent && controller().mode == TWAI_MODE_LISTEN_ONLY, "controller listen-only");
     check(!tcm().p1718, "the TCM never set P1718 (moderate loss does not gap the frames)",
           fmt("%u destroyed", tcm().ecmLost));
     check(tcm().ecmLost < 400, "the corruption was stopped within the window", fmt("%u destroyed", tcm().ecmLost));
     check(txCount(anyFrame, 32, 45) == 0, "nothing transmitted since");
     check(unexpectedErrors("receive-error guard") == 0 && simBugs() == 0, "no other errors");
+}
+
+/**
+ * THE LISTEN-ONLY ERRATUM (what the car showed after the 2026-09-26 flash: 100 000+
+ * errors with the master listen-only, and the MIL sooner than before). On the
+ * ESP32-S3 a listen-only controller still sends active error flags, and its
+ * frozen REC keeps it error-active: before listenOnlyErratumFix it destroyed
+ * every retransmission of a frame it misread until the ECM was bus-off. SILENT
+ * mode on a marginal link must not touch the bus at all.
+ */
+static void scLomErratumSilent() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":4})");
+    faults.rxCorruptRate = 0.05;                    // misreads from the first frame
+    boot();
+    runUntil(120);
+    MasterStats st; masterGetStats(st);
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY, "listen-only (SILENT)");
+    check(controller().rec == 128, "error-passive: REC set to 128 and frozen there", fmt("REC %u", controller().rec));
+    check(!sim::txPadOnController(), "TX pad taken from the controller while it listens");
+    check(st.busErrors > 50, "the master does see the misreads", fmt("%u errors", st.busErrors));
+    check(tcm().destroyed == 0 && tcm().ecmBusOffs == 0, "not one frame destroyed, the ECM never bus-off",
+          fmt("%u destroyed, %u ECM bus-offs", tcm().destroyed, tcm().ecmBusOffs));
+    check(!tcm().p1718 && !tcm().p0700, "no P1718, no P0700");
+    check(transmitted.empty(), "nothing transmitted", fmt("%zu", transmitted.size()));
+    const sim::Shown *rx = shown(METRIC_ID_MASTER_CAN_RX);
+    check(rx && rx->value > 100, "still listening", fmt("%.0f frames/s", rx ? rx->value : -1.0f));
+    commonChecks();
+}
+
+/** The car's own case: its settings, a marginal link from the start - through
+ *  the settle wait (listen-only), the first normal-mode contact (the guard
+ *  trips) and on, listen-only, for the rest of a three-minute drive. */
+static void scLomErratumDrive() {
+    loadCarConfig();
+    faults.rxCorruptRate = 0.05;
+    boot();
+    runUntil(9.9);
+    check(tcm().destroyed == 0, "nothing destroyed during the settle wait", fmt("%u", tcm().destroyed));
+    runUntil(180);
+    MasterStats st; masterGetStats(st);
+    check(st.rxGuardSilent && controller().mode == TWAI_MODE_LISTEN_ONLY, "the receive-error guard put it listen-only");
+    check(controller().rec == 128 && !sim::txPadOnController(), "...error-passive, TX pad off the controller",
+          fmt("REC %u", controller().rec));
+    check(tcm().destroyed <= 20, "at most one burst destroyed (the first normal-mode misread)",
+          fmt("%u destroyed", tcm().destroyed));
+    check(tcm().ecmBusOffs == 0, "the ECM never driven bus-off", fmt("%u", tcm().ecmBusOffs));
+    check(!tcm().p1718 && !tcm().p0700, "no P1718, no P0700");
+    check(unexpectedErrors("receive-error guard") == 0 && simBugs() == 0, "no other errors");
+}
+
+/** Why the firmware before the settle wait took far longer to set the MIL: in
+ *  normal mode CAN's fault confinement works - on each misread the master's REC
+ *  outruns the ECM's TEC and it goes error-passive before the ECM reaches
+ *  bus-off, so sparse misreads cost retransmissions, never the ECM. (Frequent
+ *  ones still add up on the ECM - its TEC only winds down on its own frames -
+ *  which is what the receive-error guard is for. In listen-only, before the
+ *  erratum fix, every single misread drove the ECM bus-off.) */
+static void scNormalConfinement() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"rx_guard":false,"start_delay_s":0})");
+    boot();
+    runUntil(10);
+    faults.rxCorruptRate = 0.002;                   // a misread every few seconds
+    runUntil(130);
+    check(controller().mode == TWAI_MODE_NORMAL, "normal mode throughout (guards off)");
+    check(tcm().destroyed > 0, "retransmissions were destroyed", fmt("%u", tcm().destroyed));
+    check(tcm().ecmBusOffs == 0, "yet the ECM was never bus-off: the master backed off first",
+          fmt("%u", tcm().ecmBusOffs));
+    check(!tcm().p1718, "no P1718 at this misread rate");
 }
 
 /** The likeliest moment for the trip is the first normal-mode contact with a
@@ -1128,6 +1213,9 @@ static double minObdGapMs(double fromS, double toS) {
  */
 static void scPacingP2can() {
     loadCarConfig();
+    JsonDocument stored;
+    deserializeJson(stored, simfs::files["/config.json"]);
+    const int storedTo = stored["obd_to"] | 80;
     ecu.replyLatencyUs = 35000;
     boot();
     runUntil(30);
@@ -1137,7 +1225,7 @@ static void scPacingP2can() {
     check(txCount(isObdReq, 12, 30) > 20, "requests continue - spread over time, none dropped",
           fmt("%llu", (unsigned long long)txCount(isObdReq, 12, 30)));
     check(shown(METRIC_ID_COOLANT_TEMP) != nullptr, "the late replies are still decoded");
-    check(Cfg.obdTimeoutMs == 20, "the stored obd_to is untouched", fmt("%u", Cfg.obdTimeoutMs));
+    check(Cfg.obdTimeoutMs == storedTo, "the stored obd_to is untouched", fmt("%u (stored %d)", Cfg.obdTimeoutMs, storedTo));
     portalPost(R"({"obd_p2can":0})");
     runUntil(50);
     const double gap0 = minObdGapMs(35, 50);
@@ -1147,6 +1235,23 @@ static void scPacingP2can() {
     portalPost(R"({"obd_p2can":50})");
     JsonDocument d; deserializeJson(d, simfs::files["/config.json"]);
     check((d["obd_p2can"] | -1) == 50, "saved in the file", fmt("%d", d["obd_p2can"] | -1));
+}
+
+/** The same P2CAN rule in AUTO mode, where SSM2 shares the bus. The cool-down
+ *  counts from when a request really went out, not from when the poller asked
+ *  for the bus - an SSM2 exchange in front of it can hold the bus for tens of
+ *  ms, which with the car's 2026-09-26 settings (obd_to 25, obd_gap 20) left
+ *  a 45 ms gap behind an unanswered request. */
+static void scPacingP2canAuto() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":0,"obd_to":25,"obd_gap":20})");
+    ecu.replyLatencyUs = 35000;
+    boot();
+    runUntil(40);
+    check(txCount([](const twai_message_t &m) { return isSsm(m); }, 12, 40) > 0, "SSM2 shares the bus");
+    const double gap = minObdGapMs(12, 40);
+    check(gap >= 49.5, "after an unanswered request the next still waits for P2CAN", fmt("min gap %.1f ms", gap));
+    check(txCount(isObdReq, 12, 40) > 20, "requests continue", fmt("%llu", (unsigned long long)txCount(isObdReq, 12, 40)));
 }
 
 /** The overall request budget: an adjustable ceiling on requests per second
@@ -1302,8 +1407,10 @@ static const Scenario SCENARIOS[] = {
     {"device_config", scDeviceConfig, 0},
     {"tcm_p1718", scTcmP1718, 0}, {"tcm_p1718_optout", scTcmP1718Optout, 0},
     {"rx_guard_trickle", scRxGuardTrickle, 0}, {"rx_guard_moderate", scRxGuardModerate, 0},
-    {"rx_guard_prompt", scRxGuardPrompt, 0}, {"busoff_guard_off", scBusOffGuardOff, 0},
-    {"pacing_p2can", scPacingP2can, 0},
+    {"rx_guard_prompt", scRxGuardPrompt, 0},
+    {"lom_erratum_silent", scLomErratumSilent, 0}, {"lom_erratum_drive", scLomErratumDrive, 0},
+    {"normal_confinement", scNormalConfinement, 0}, {"busoff_guard_off", scBusOffGuardOff, 0},
+    {"pacing_p2can", scPacingP2can, 0}, {"pacing_p2can_auto", scPacingP2canAuto, 0},
     {"budget", scBudget, 0}, {"no_functional", scNoFunctional, 0},
     {"crank_reset", scCrankReset, 0}, {"evlog", scEvlog, 0},
     {"tx_hold", scTxHold, 0}, {"tx_hold_off", scTxHoldOff, 0},
