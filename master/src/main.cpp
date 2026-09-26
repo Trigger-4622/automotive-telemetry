@@ -35,6 +35,7 @@
 #include <LittleFS.h>
 #include "driver/twai.h"
 #include "driver/gpio.h"
+#include "hal/twai_ll.h"
 
 #include "MasterPacket.h"
 #include "CanDecoderConfig.h"
@@ -1042,6 +1043,11 @@ enum AskResult : uint8_t {
  * count against the ECU, or SSM2 holding the bus for a moment would look
  * like an ECU that does not speak OBD-II.
  */
+/** millis() when obdAsk() last put a request on the bus. Pacing counts from
+ *  here, not from when the poller asked for the bus: in AUTO an SSM2 exchange
+ *  can hold the bus for tens of ms first. */
+static uint32_t s_obdSentAtMs = 0;
+
 static AskResult obdAsk(uint8_t pid, uint32_t waitMs, bool functional) {
     if (!diagBusLock(250)) return ASK_BUSY;
     xSemaphoreTake(s_obdSem, 0);            // clear a stale give
@@ -1049,6 +1055,7 @@ static AskResult obdAsk(uint8_t pid, uint32_t waitMs, bool functional) {
     s_obdWaitPhys = !functional;
     s_obdWaitPid = pid;
     const bool sent = obdRequest(pid, functional);
+    if (sent) s_obdSentAtMs = millis();
     const bool got = sent && xSemaphoreTake(s_obdSem, pdMS_TO_TICKS(waitMs)) == pdTRUE;
     s_obdWaitPid = 0xFF;
     diagBusUnlock();
@@ -1258,9 +1265,11 @@ static void obdPollTask(void *) {
                     wait = max(wait, s_obdCooldownMs - sinceTimeout);
                 if (wait) vTaskDelay(pdMS_TO_TICKS(wait));
             }
-            const uint32_t sendMs = millis();
             const AskResult r = obdAsk(p.pid, Cfg.obdTimeoutMs);
-            s_reqLastSendMs = sendMs;
+            // Both paces count from when the request really went out (see
+            // s_obdSentAtMs); a request that never went out counts for neither.
+            const uint32_t sendMs = s_obdSentAtMs;
+            if (r != ASK_BUSY) s_reqLastSendMs = sendMs;
             if (r == ASK_NO_REPLY || r == ASK_NRC) {
                 s_obdCooldownMs = 0;             // never a half-updated hold-off
                 s_obdCooldownAt = sendMs;
@@ -1352,18 +1361,64 @@ static void sleepCheck();
  * do is drive the pin recessive the instant it starts, and latch it recessive
  * across deep sleep. Opt out of the sleep latch with tx_hold.
  */
+/**
+ * @brief Take the TX pad away from the CAN controller and drive it recessive.
+ *
+ * The level goes into the GPIO latch first and the pad becomes a GPIO output
+ * second (gpio_set_direction routes it to the latch, away from the controller's
+ * TX signal). The other way round - pinMode, then digitalWrite - the pad shows
+ * the latch's reset value, 0 = dominant, for the moment in between. The next
+ * twai_driver_install() routes the pad back to the controller.
+ */
+static void txPadRecessive() {
+    gpio_set_level((gpio_num_t)CAN_TX_GPIO, 1);
+    gpio_set_direction((gpio_num_t)CAN_TX_GPIO, GPIO_MODE_OUTPUT);
+}
 static void txRecessiveBoot() {
     gpio_hold_dis((gpio_num_t)CAN_TX_GPIO);   // release any latch from before sleep
-    pinMode(CAN_TX_GPIO, OUTPUT);
-    digitalWrite(CAN_TX_GPIO, HIGH);          // recessive = bus idle
+    txPadRecessive();                         // recessive = bus idle
     gpio_pullup_en((gpio_num_t)CAN_TX_GPIO);  // and pulled up should the pin float
 }
 static void txRecessiveForSleep() {
     if (!Cfg.txRecessiveHold) return;
-    pinMode(CAN_TX_GPIO, OUTPUT);
-    digitalWrite(CAN_TX_GPIO, HIGH);
+    txPadRecessive();
     gpio_hold_en((gpio_num_t)CAN_TX_GPIO);    // latch it high for the whole sleep
     gpio_deep_sleep_hold_en();
+}
+
+/**
+ * @brief Espressif's listen-only erratum - fixed here, because the Arduino core
+ *        this builds on is compiled without ESP-IDF's own fix.
+ *
+ * On the ESP32, S2, S3 and C3 a TWAI controller in listen-only mode still sends
+ * an ACTIVE error flag - six dominant bits, which destroy the frame for every
+ * module on the bus - whenever it detects an error in a frame. Listen-only also
+ * freezes the error counters, and twai_start() leaves REC at 0, so the
+ * controller stays error-active for as long as it listens. On a link where it
+ * misreads a frame it destroys every retransmission of it and never backs off:
+ * a normal-mode node's REC climbs past 127 within ~15 tries and makes it
+ * error-passive (harmless) before the sender's TEC reaches bus-off, but a
+ * frozen REC never does, so the SENDER is driven bus-off instead - on this car
+ * the engine ECU, whose broadcasts the transmission ECU then loses: P1718. This
+ * is why the master showed 100 000+ errors in listen-only and set the MIL faster
+ * than the firmware before it, which stayed in normal mode throughout: the
+ * settle wait and the receive-error guard had made listen-only the mode it
+ * falls back to exactly when the link is bad.
+ *
+ * ESP-IDF's fix (CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM, "not set" in the
+ * Arduino core's sdkconfig) sets REC to 128 before leaving reset mode: the
+ * controller is error-passive, its error flags are recessive, and the frozen
+ * counter keeps it there. The same is done here straight after twai_start() -
+ * REC can only be written in reset mode. And setupTwai() takes the TX pad away
+ * from the controller for as long as it listens, so nothing it does can reach
+ * the transceiver whatever the silicon gets up to.
+ */
+static void listenOnlyErratumFix() {
+    twai_ll_enter_reset_mode(&TWAI);
+    twai_ll_set_rec(&TWAI, 128);
+    twai_ll_exit_reset_mode(&TWAI);
+    const uint32_t rec = twai_ll_get_rec(&TWAI);
+    if (rec < 128) log_e("listen-only erratum fix did not take (REC %u)", (unsigned)rec);
 }
 
 /* ═══════════════════════════ FreeRTOS tasks ══════════════════════════════ */
@@ -1379,7 +1434,10 @@ static void twaiRxTask(void *) {
     for (;;) {
         if (s_twaiShutdown) {
             // Going to sleep: the driver goes, and so does this task's use of it.
+            // The TX pad leaves the controller first, recessive, so no state the
+            // stopping controller passes through can reach the bus.
             xSemaphoreTake(s_twaiCtl, portMAX_DELAY);
+            txPadRecessive();
             twai_stop();
             twai_driver_uninstall();
             s_twaiDown = true;
@@ -1391,6 +1449,7 @@ static void twaiRxTask(void *) {
             // tear the driver down and bring it back in another mode.
             xSemaphoreTake(s_twaiCtl, portMAX_DELAY);
             s_twaiReinstall = false;
+            txPadRecessive();                // off the bus while it changes
             twai_stop();
             twai_driver_uninstall();
             setupTwai(s_twaiWantSilent);
@@ -1653,10 +1712,16 @@ static void busGuardTask(void *) {
         uint32_t alerts = 0;
         twai_status_info_t st = {};
         bool haveStatus = false, wentBusOff = false;
+        // The mode the status below belongs to, read under the same lock the
+        // RX task holds to reinstall: s_twaiSilentNow itself can change the
+        // moment the lock is released, and a listen-only REC (frozen at 128 by
+        // listenOnlyErratumFix) judged as a normal-mode one looks like a storm.
+        bool stSilent = false;
         xSemaphoreTake(s_twaiCtl, portMAX_DELAY);
         if (twai_read_alerts(&alerts, pdMS_TO_TICKS(100)) != ESP_ERR_INVALID_STATE &&
             twai_get_status_info(&st) == ESP_OK) {
             haveStatus = true;
+            stSilent = s_twaiSilentNow;
             if (!s_twaiReinstall) {
                 if (st.state == TWAI_STATE_BUS_OFF) {
                     wentBusOff = true;
@@ -1704,7 +1769,7 @@ static void busGuardTask(void *) {
                  * traffic, whatever REC says. (Not counted in listen-only, where
                  * an error we see is one we cannot signal.)
                  */
-                if (ctrlRunning && !s_twaiSilentNow) {
+                if (ctrlRunning && !stSilent) {
                     const uint32_t now = millis();
                     if (now - rxWinStart > Cfg.guardWindowS * 1000UL) { rxWinStart = now; rxWinErrs = 0; }
                     rxWinErrs += delta;
@@ -1735,7 +1800,7 @@ static void busGuardTask(void *) {
          * winds back down on every good frame, so this only fires on a real
          * storm, not the odd stray error. Opt out with rx_guard.
          */
-        if (Cfg.rxGuardEnabled && !s_rxGuardSilent && !s_twaiSilentNow &&
+        if (Cfg.rxGuardEnabled && !s_rxGuardSilent && !stSilent &&
             ctrlRunning && st.rx_error_counter >= Cfg.rxGuardRec) {
             s_rxGuardSilent = true;
             evLog(EV_RX_TRIP, (uint16_t)st.rx_error_counter,
@@ -1746,7 +1811,7 @@ static void busGuardTask(void *) {
             rxWinErrs = 0;
         }
 
-        const bool passive = st.state == TWAI_STATE_RUNNING && st.tx_error_counter >= 128;
+        const bool passive = st.state == TWAI_STATE_RUNNING && !stSilent && st.tx_error_counter >= 128;
         if (passive && !wasPassive)
             log_w("TWAI error-passive (TEC %u, REC %u)", (unsigned)st.tx_error_counter,
                   (unsigned)st.rx_error_counter);
@@ -1815,6 +1880,7 @@ static void enterDeepSleep() {
     for (int i = 0; i < 50 && !s_twaiDown; i++) vTaskDelay(pdMS_TO_TICKS(10));
     if (!s_twaiDown) {                   // RX task stuck: do it anyway
         xSemaphoreTake(s_twaiCtl, pdMS_TO_TICKS(500));
+        txPadRecessive();
         twai_stop();
         twai_driver_uninstall();
     }
@@ -2032,9 +2098,10 @@ void masterResetSignalVerify() {
 /**
  * @brief Install and start the TWAI driver.
  *
- * Runs in listen-only mode when the diagnostic mode is SILENT. Listen-only is
- * electrically incapable of disturbing the vehicle bus and is the correct
- * mode for first contact with an unfamiliar car.
+ * Runs in listen-only mode when the diagnostic mode is SILENT, while the bus
+ * settles, and after a guard trip. Listen-only is incapable of disturbing the
+ * vehicle bus only because of listenOnlyErratumFix() and the TX pad being taken
+ * from the controller: on this silicon the mode alone still sends error flags.
  */
 static void setupTwai(bool silent) {
     twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
@@ -2082,10 +2149,19 @@ static void setupTwai(bool silent) {
     }
     twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-    if (twai_driver_install(&g, &t, &f) != ESP_OK || twai_start() != ESP_OK) {
+    if (twai_driver_install(&g, &t, &f) != ESP_OK) {
         log_e("TWAI init failed — check CAN_TX/RX_GPIO wiring");
         return;
     }
+    // Listen-only: the TX pad is taken from the controller before it starts,
+    // and it is made error-passive as soon as it has (listenOnlyErratumFix).
+    if (silent) txPadRecessive();
+    if (twai_start() != ESP_OK) {
+        twai_driver_uninstall();
+        log_e("TWAI init failed — check CAN_TX/RX_GPIO wiring");
+        return;
+    }
+    if (silent) listenOnlyErratumFix();
     s_twaiSilentNow = silent;
     log_i("TWAI up (%s mode) at %u kbit/s, sample point %s",
           silent ? "SILENT/listen-only" : "NORMAL", Cfg.bitrateKbps,

@@ -7,6 +7,72 @@ installed, never before; the terminator on the transceiver module is removed;
 the codes come back sometimes at the start of a drive and sometimes after 30
 to 60 minutes of driving.
 
+## Update 2026-09-26: why the first fix made it worse
+
+After the flash the car showed 100 000+ bus errors with the master
+listen-only, and the MIL came on sooner than with the firmware before. With
+the master unplugged: no MIL. The cause is in the ESP32-S3 itself.
+
+**Espressif's listen-only erratum.** On the ESP32, S2, S3 and C3, a TWAI
+controller in listen-only mode still transmits an *active* error flag - six
+dominant bits, which destroy the frame for every module - whenever it detects
+an error in a frame. Listen-only also *freezes* the error counters, and
+`twai_start()` leaves REC at 0, so the controller stays error-active for as
+long as it listens. ESP-IDF has a fix (`CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM`,
+"not set" in the Arduino core's `sdkconfig`), and its Kconfig help names the
+ESP32-S3 among the chips whose listen-only controller still sends dominant
+error bits (ESP-IDF v4.4.7, `components/driver/Kconfig` and
+`components/hal/twai_hal.c`, `twai_hal_start`).
+
+**Why that is worse than normal mode.** CAN's fault confinement is built so
+that a node which alone sees errors backs off: each of its error flags adds 9
+to its REC while the sender's TEC gains 8, so within ~15 tries it is
+error-passive (its flags become recessive and harmless) - long before the
+sender reaches bus-off at 256. With REC frozen at 0 that never happens: the
+master destroys every retransmission of a frame it misreads and the *sender*
+- the engine ECU - is driven bus-off. The TCM loses the ECM: P1718, at once.
+
+**Why the first fix walked into it.** The settle wait (listen-only for 10 s at
+every start) and the receive-error guard (listen-only for the rest of the
+drive once the master misreads frames) both used listen-only as the safe
+place. On a link where the master misreads frames - which the guard tripping
+proves this one does - that made the master destroy the ECM's frames from the
+first misread onward. The firmware before stayed in normal mode, where fault
+confinement limited the damage: it needed frequent misreads to add up, hence
+"30 to 60 minutes".
+
+**The fix** (`listenOnlyErratumFix()` and `setupTwai()` in `src/main.cpp`):
+Espressif's workaround - REC set to 128 in reset mode right after
+`twai_start()`, error-passive and frozen there - and, on top, the TX pad taken
+away from the controller and held recessive for as long as it listens, so
+nothing it does can reach the transceiver. The TX pin is now always set level
+first, output second (the old `pinMode`-then-`digitalWrite` put a dominant
+glitch on the bus at every boot), and the pad leaves the controller before
+the driver is stopped or uninstalled.
+
+**Also fixed:** the P2CAN wait counted from when the poller asked for the bus,
+not from when the request went out; in AUTO an SSM2 exchange holds the bus
+first, so with the car's current `obd_to` 25 / `obd_gap` 20 the gap behind an
+unanswered request was 45 ms, not 50 (`pacing_p2can_auto`).
+
+**Proof in the simulator**, which now models the erratum, frozen counters, TX
+pad routing and CAN fault confinement (the ECM goes bus-off at TEC 256 with
+quick-then-slow recovery): on the firmware as flashed, `tcm_p1718` shows the
+guard switching to listen-only and then the ECM driven bus-off about once a
+second - 5 993 attempts destroyed, P1718 - and `rx_guard_prompt` shows the ECM
+bus-off within 10 ms during the settle wait. With the fix: listen-only on a
+marginal link destroys nothing (`lom_erratum_silent`: 887 misreads seen, 0
+destroyed, no P1718) and a full drive with the car's settings costs at most
+one burst at the first normal-mode misread (`lom_erratum_drive`).
+
+**What remains is physical.** The master misreads frames the rest of the car
+reads fine - that is what trips the guard. The listen-only error count in the
+portal is now an honest measure of it (one error per misread, no cascade).
+The wiring checks in the flash checklist, and the 87.5 % sample point
+(`can_sp875`), are the ways to bring it down.
+
+---
+
 This file is the diagnosis, what was changed, the flash checklist and the
 test plan. The simulator work is in `test_host/tests/scenarios.cpp`
 (`tcm_p1718` and the scenarios after it) and the firmware changes in

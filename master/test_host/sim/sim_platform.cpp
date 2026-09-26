@@ -195,6 +195,7 @@ namespace sim {
 int  gpioHoldEnabled = 0;
 bool txDrivenHigh = false;
 bool txConfiguredOut = false;
+int  txGlitches = 0;
 }
 
 esp_reset_reason_t esp_reset_reason() { return (esp_reset_reason_t)sim::resetReason; }
@@ -205,7 +206,14 @@ void      gpio_deep_sleep_hold_en()  {}
 void      gpio_deep_sleep_hold_dis() {}
 esp_err_t gpio_pullup_en(gpio_num_t) { return ESP_OK; }
 
-void pinMode(uint8_t, uint8_t mode) { if (mode == OUTPUT) sim::txConfiguredOut = true; }
+void pinMode(uint8_t, uint8_t mode) {
+    if (mode == OUTPUT) { sim::txConfiguredOut = true; sim::txPadFromGpio(); }
+}
+esp_err_t gpio_set_level(gpio_num_t, uint32_t level) { sim::txDrivenHigh = level != 0; return ESP_OK; }
+esp_err_t gpio_set_direction(gpio_num_t, gpio_mode_t mode) {
+    if (mode & GPIO_MODE_OUTPUT) { sim::txConfiguredOut = true; sim::txPadFromGpio(); }
+    return ESP_OK;
+}
 void digitalWrite(uint8_t, uint8_t val) { sim::txDrivenHigh = (val == HIGH); }
 int  digitalRead(uint8_t) { return sim::txDrivenHigh ? HIGH : LOW; }
 
