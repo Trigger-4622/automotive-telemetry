@@ -3,7 +3,9 @@
 Generate LVGL v8 binary background assets for the 480x272 dash cluster.
 
 Run:  python tools/make_assets.py        (writes into data/assets/)
-Then: pio run -t uploadfs
+Then: build the firmware (the tiles are compiled in) and upload a .bin from
+the studio's Assets tab - never `pio run -t uploadfs` on a display in use,
+it replaces the layout on it.
 
 Output format
 -------------
@@ -336,7 +338,8 @@ def emit_tiles():
         lines.append("    {}_map,".format(name))
         lines.append("};")
         lines.append("")
-    with open(SRC_HEADER, "w") as f:
+    # UTF-8 and LF whatever the PC: the header has non-ASCII in its comments.
+    with open(SRC_HEADER, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines))
     print("  {:<16} {:>7,} bytes  ({} tiles)".format(
         "src/Textures.h", os.path.getsize(SRC_HEADER), len(tiles)))
@@ -351,7 +354,7 @@ def main():
     emit_tiles()
     print("Done. Tiles are compiled in (layout key \"texture\"); the .bin files "
           "are for uploads (layout key \"background_asset\") — see README for "
-          "the cost difference. Run: pio run -t uploadfs")
+          "the cost difference. Upload a .bin from the studio's Assets tab.")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@
 
 #include "HardwareConfig.h"
 
+#include <driver/gpio.h>
+
 ButtonManager Button;
 
 /** @brief Candidate GPIOs probed by discovery. */
@@ -22,6 +24,12 @@ void ButtonManager::begin(int pin, bool discovery, const Callbacks &cbs) {
     _pin       = pin;
     _discovery = discovery;
     _startedMs = millis();
+    // Not a GPIO on this chip (a typo in button_gpio): it would read as held
+    // for good.
+    if (_pin >= 0 && !GPIO_IS_VALID_GPIO(_pin)) {
+        log_w("button_gpio %d is not a GPIO on this chip - button off", _pin);
+        _pin = -1;
+    }
 
     _candCount = kScanCount;
     for (size_t i = 0; i < kScanCount; i++) _cand[i].gpio = kScanPins[i];
@@ -36,6 +44,11 @@ void ButtonManager::begin(int pin, bool discovery, const Callbacks &cbs) {
     delay(5);
     _lastRaw       = (_pin >= 0) && digitalRead(_pin) == LOW;
     _stablePressed = _lastRaw;
+    // Down already at boot - held, or a pin that sits low: it must be let go
+    // before it counts. Taken as a press from time 0, it fired the long press
+    // (config mode, telemetry off) the moment the debounce was over.
+    _longFired     = _lastRaw;
+    _pressT0       = millis();
     _lastEdgeMs    = millis();
 
     log_i("Button on GPIO%d, discovery %s (%u candidates)", _pin,

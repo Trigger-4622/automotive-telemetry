@@ -12,7 +12,8 @@
  *
  *  This is a different animal from the 1.28" round board:
  *    - QSPI, not plain SPI — four data lines, no separate D/C pin, command
- *      bytes travel in-band. LovyanGFX's Panel_NV3041A handles that itself.
+ *      bytes travel in-band. Arduino_GFX's NV3041A driver handles that
+ *      (DisplayManager.h says why not LovyanGFX here).
  *    - Landscape, not circular — no corner masking, no chapter ring, and far
  *      more room, which is what the extra screen types exist to use.
  *    - PSRAM — so the UI can afford things the C3 could not.
@@ -66,12 +67,11 @@
 #define LCD_BL_PWM_FREQ 12000    /**< Backlight PWM frequency [Hz]            */
 
 /**
- * Display colour inversion, applied explicitly after panel init.
+ * Display colour inversion.
  *
- * Must be set through @ref DisplayManager::begin (`invertDisplay`), NOT via
- * the LovyanGFX panel config: Panel_NV3041A overrides setInvert and ignores
- * `_cfg.invert`, so that field is inert on this controller no matter what it
- * is set to. The panel comes out of its init sequence showing inverted
+ * Passed to Arduino_NV3041A as its `ips` flag in @ref DisplayManager::begin,
+ * which is what applies inversion on this panel - there is no separate invert
+ * call afterwards. The panel comes out of its init sequence showing inverted
  * colours, so this is 1.
  *
  * Symptom if wrong: a white background with dark text, while every position

@@ -18,6 +18,7 @@
 #include "FS.h"
 #include "LittleFS.h"
 #include "WebServer.h"
+#include "WiFi.h"
 #include "host.h"
 
 // White-box access to the singletons' state, for checks only.
@@ -153,6 +154,257 @@ static std::map<std::string, std::function<void()>> &registry() {
 struct Reg { Reg(const char *n, std::function<void()> f) { registry()[n] = f; } };
 #define SCENARIO(name) \
     static void sc_##name(); static Reg reg_##name(#name, sc_##name); static void sc_##name()
+
+/* ─────────────────────────── from the code review ──────────────────────── */
+
+/* LVGL's meter and chart work in whole numbers. A dial or a trend of a small
+ * fractional range - boost in bar, the battery in volts - must still move in
+ * fine steps: measured here as where the needle and the last point sit within
+ * their own scale, whatever units the widget runs in. */
+SCENARIO(fractional_meter_and_chart) {
+    JsonDocument d = shippedLayout();
+    JsonArray s = d["screens"].to<JsonArray>();
+    JsonObject m = s.add<JsonObject>();
+    m["type"] = "meter_gauge"; m["metric_id"] = "0x1001"; m["label"] = "BOOST";
+    m["units"] = "bar"; m["decimals"] = 2; m["min"] = -1; m["max"] = 2;
+    m["major_tick_every"] = 0.5;
+    JsonObject c = s.add<JsonObject>();
+    c["type"] = "chart"; c["metric_id"] = "0x0142"; c["label"] = "BATT"; c["units"] = "V";
+    c["min"] = 11; c["max"] = 15; c["sample_ms"] = 100;
+    boot(d);
+    car.set(METRIC_ID_BOOST, 0.73f);
+    car.set(METRIC_ID_BATT_VOLTAGE, 12.34f);
+    run(3000);
+
+    const GaugeBinding &mb = UI._screens[0].bindings[0];
+    const lv_meter_scale_t *sc = mb.needle->scale;
+    const float frac = (float)(mb.lastNeedleVal - sc->min) / (float)(sc->max - sc->min);
+    const float want = (0.73f + 1.0f) / 3.0f;
+    CHECK(fabsf(frac - want) < 0.01f, "the needle sits at 0.73 bar: %.3f of the dial, want %.3f",
+          frac, want);
+
+    const GaugeBinding &cb = UI._screens[1].bindings[0];
+    const uint16_t cnt = lv_chart_get_point_count(cb.chart);
+    const lv_coord_t last = cb.series->y_points[(cb.series->start_point + cnt - 1) % cnt];
+    const lv_chart_t *ch = (const lv_chart_t *)cb.chart;
+    const float cfrac = (float)(last - ch->ymin[0]) / (float)(ch->ymax[0] - ch->ymin[0]);
+    const float cwant = (12.34f - 11.0f) / 4.0f;
+    CHECK(fabsf(cfrac - cwant) < 0.01f, "the trend holds 12.34 V: %.3f of the range, want %.3f",
+          cfrac, cwant);
+    shot("fractional_meter");
+}
+
+/* A lerp_speed above 1 in the layout would carry a needle past its value, and
+ * above 2 swing it further every frame. */
+SCENARIO(lerp_speed_clamped) {
+    JsonDocument d = shippedLayout();
+    d["global"]["lerp_speed"] = 5;
+    boot(d);
+    GaugeBinding *rpm = nullptr;
+    for (auto &b : UI._screens[UI._active].bindings)
+        if (b.metricId == METRIC_ID_RPM) { rpm = &b; break; }
+    if (!rpm) { CHECK(false, "no RPM binding on the first screen"); return; }
+    car.set(METRIC_ID_RPM, 1000);
+    run(1500);
+    car.set(METRIC_ID_RPM, 3000);
+    float peak = 0;
+    for (int i = 0; i < 150; i++) { run(20); peak = fmaxf(peak, rpm->lastValue); }
+    CHECK(peak <= 3000.5f, "the needle never passes the value it heads for (%.0f)", peak);
+    CHECK(rpm->lastValue > 2990.0f, "and still gets there (%.0f)", rpm->lastValue);
+}
+
+/* A layout.json that will not load - cut short, or too big for the memory
+ * there is at that moment - is kept as layout.bad, not overwritten: it holds
+ * the screens and the touch calibration. */
+SCENARIO(unreadable_layout_kept) {
+    const std::string cut = "{\"version\":2,\"screens\":[{\"type\":\"dash\"";
+    hostfs::files["/layout.json"] = cut;
+    host::lvglInit();
+    Config.begin();
+    CHECK(hostfs::files.count("/layout.bad") && hostfs::files["/layout.bad"] == cut,
+          "the unreadable layout is kept as /layout.bad");
+    CHECK(Config.layout()["screens"].as<JsonArray>().size() > 0,
+          "and the display runs on the built-in one");
+}
+
+/* A layout with no screens would be refused at the next boot - and replaced
+ * by the built-in one. So the studio's save refuses it now. */
+SCENARIO(empty_layout_refused) {
+    boot();
+    Config.enterConfigMode();
+    const std::string before = hostfs::files["/layout.json"];
+    Config._server.request(HTTP_POST, "/api/layout", "{\"version\":2,\"screens\":[]}");
+    CHECK(Config._server.code == 400, "a layout without screens is refused (%d)", Config._server.code);
+    CHECK(hostfs::files["/layout.json"] == before, "and the saved one is untouched");
+}
+
+/* An infinite value must not reach the store: it would stick as the peak for
+ * good, since a peak only ever rises. */
+SCENARIO(non_finite_ignored) {
+    boot();
+    car.set(METRIC_ID_RPM, 2000);
+    run(500);
+    car.set(METRIC_ID_RPM, INFINITY);
+    run(300);
+    car.set(METRIC_ID_RPM, 2500);
+    run(500);
+    MetricSample s;
+    CHECK(Telemetry.peek(METRIC_ID_RPM, s) && isfinite(s.peak) && isfinite(s.value),
+          "value and peak stay finite (%g, peak %g)", s.value, s.peak);
+}
+
+#if LCD_WIDTH != LCD_HEIGHT
+/* The colour sliders show a test pattern and come back to the portal's screen
+ * after each pause: that screen is built once, not once per return (each was
+ * a screenful of LVGL heap, never freed). And a touch calibration started from
+ * the studio ends back on it, not on the gauges - frozen while the portal
+ * runs. */
+SCENARIO(config_screen_reused) {
+    boot();
+    Config.enterConfigMode();
+    UI.showConfigScreen(Config.apSsid(), Config.apIP().c_str());
+    run(1000);
+    const lv_obj_t *cfg = lv_scr_act();
+    size_t used0 = 0;
+    for (int i = 0; i < 6; i++) {
+        UI.showColorPreview();
+        run(7000);                                    // the pattern times out
+        if (i == 0) used0 = host::heapReport().pcUsed;
+    }
+    CHECK(lv_scr_act() == cfg, "back on the portal's own screen");
+    const size_t used = host::heapReport().pcUsed;
+    CHECK(used <= used0 + 256, "no screen left behind per return (%zu -> %zu B)", used0, used);
+    UI.startTouchCalibration();
+    run(500);
+    UI.onCalibrationDrag(300, 0);
+    UI.onCalibrationDrag(0, 200);
+    run(2000);
+    CHECK(!UI._calActive && lv_scr_act() == cfg,
+          "a calibration from the studio ends on the portal's screen");
+    UI.startTouchCalibration();
+    run(500);
+    UI.nextScreen();                                  // the BOOT button: cancelled
+    run(1000);
+    CHECK(!UI._calActive && lv_scr_act() == cfg, "and so does one cancelled");
+    shot("config_screen");
+}
+
+/* No touch calibration: the cluster asks for it - but it must not hold the
+ * gauges hostage when touch does not work. The BOOT button, or a minute
+ * without an answer, gives the gauges back, and they run. */
+SCENARIO(calibration_escape) {
+    boot();
+    UI.startTouchCalibration();
+    run(1000);
+    CHECK(UI._calActive, "the wizard is up");
+    UI.nextScreen();                                  // the BOOT button's short press
+    run(500);
+    CHECK(!UI._calActive, "the BOOT button ends it");
+    CHECK(lv_scr_act() == UI._screens[UI._active].scr, "and shows the gauges");
+    UI.startTouchCalibration();
+    run(61000);
+    CHECK(!UI._calActive, "a minute without an answer ends it too");
+    CHECK(lv_scr_act() == UI._screens[UI._active].scr, "back on the gauges");
+    GaugeBinding *rpm = nullptr;
+    for (auto &b : UI._screens[UI._active].bindings)
+        if (b.metricId == METRIC_ID_RPM) { rpm = &b; break; }
+    car.set(METRIC_ID_RPM, 3000);
+    run(2000);
+    CHECK(rpm && rpm->lastValue > 2900.0f, "and they move again (%.0f)", rpm ? rpm->lastValue : -1.0f);
+}
+#endif
+
+#if LCD_WIDTH != LCD_HEIGHT
+/* The touch calibration is measured on the device and written straight to
+ * flash. A studio page opened before that still holds the old one - and its
+ * next Save must not put it back. */
+SCENARIO(touch_cal_survives_studio_save) {
+    boot();
+    Config.enterConfigMode();
+    std::string stale;
+    serializeJson(Config.layout(), stale);             // what the open page holds
+    TouchCal c;
+    c.hx = 0.25f; c.hy = 0.75f; c.vx = -0.5f; c.vy = 0.5f; c.hLen = 321; c.vLen = 123;
+    c.valid = true;
+    Config.saveTouchCal(c);                            // measured on the device
+    Config._server.request(HTTP_POST, "/api/layout", stale);   // the page saves
+    CHECK(Config._server.code == 200, "saved (%d)", Config._server.code);
+    JsonDocument saved;
+    deserializeJson(saved, hostfs::files["/layout.json"]);
+    CHECK(fabsf((saved["global"]["touch_cal"]["hx"] | 0.0f) - 0.25f) < 1e-4f &&
+          (saved["global"]["touch_cal"]["hlen"] | 0.0f) == 321.0f,
+          "the device's calibration stands (hx %g)", saved["global"]["touch_cal"]["hx"] | 0.0f);
+    CHECK(fabsf(Config.touchCal().hx - 0.25f) < 1e-4f, "in memory too");
+}
+#endif
+
+/* The studio is the only way into the display's settings, and it needs the
+ * config AP: a channel, name or password the AP cannot take must not keep it
+ * from starting. */
+SCENARIO(config_ap_always_starts) {
+    JsonDocument d = shippedLayout();
+    d["network"]["wifi_channel"] = 0;
+    d["network"]["ap_ssid"] = "";
+    d["network"]["ap_password"] = std::string(70, 'x');
+    boot(d);
+    Config.enterConfigMode();
+    CHECK(WiFi.apUp, "the config AP is up (name '%s', channel %d, key of %zu)",
+          WiFi.apSsid.c_str(), WiFi.apChannel, WiFi.apPass.size());
+    CHECK(WiFi.apSsid == CONFIG_AP_SSID, "under the built-in name ('%s')", WiFi.apSsid.c_str());
+    CHECK(WiFi.apChannel == 1 && WiFi.apPass.empty(), "on channel 1, open (%d, key of %zu)",
+          WiFi.apChannel, WiFi.apPass.size());
+}
+
+/* No filesystem at all - a partition table without the data partition: the
+ * gauges still run, on the built-in layout. */
+SCENARIO(no_filesystem_still_gauges) {
+    hostfs::mountNever = true;
+    host::lvglInit();
+    Config.begin();
+    Telemetry.begin(Config.emaAlpha(), Config.staleMs());
+    UI.begin();
+    run(2500);
+    CHECK(UI._screens.size() > 1, "the built-in screens are up (%zu)", UI._screens.size());
+}
+
+/* An asset that cannot be stored whole is reported and leaves no half image
+ * behind; an upload without a file name is refused. */
+SCENARIO(asset_upload_failures) {
+    boot();
+    Config.enterConfigMode();
+    const std::string img(5000, '\x5A');
+    Config._server.upload("/api/asset", "bg.bin", img);
+    CHECK(Config._server.code == 200 && hostfs::files.count("/assets/bg.bin") &&
+          hostfs::files["/assets/bg.bin"].size() == img.size(),
+          "an upload is stored whole (%d)", Config._server.code);
+    hostfs::writeBudget = 3000;                       // flash full part-way through
+    Config._server.upload("/api/asset", "big.bin", img);
+    hostfs::writeBudget = -1;
+    CHECK(Config._server.code == 400, "flash full is reported (%d)", Config._server.code);
+    CHECK(!hostfs::files.count("/assets/big.bin"), "and no half image is kept");
+    Config._server.upload("/api/asset", "../", img);
+    CHECK(Config._server.code == 400, "an upload without a name is refused (%d)",
+          Config._server.code);
+    Config._server.upload("/api/asset", "cut.bin", img, true);
+    CHECK(!hostfs::files.count("/assets/cut.bin"), "an aborted upload leaves nothing");
+    Config._server.request(HTTP_POST, "/api/asset");
+    CHECK(Config._server.code == 400, "nor does a POST without a file pass (%d)",
+          Config._server.code);
+}
+
+/* A tick spacing far finer than a dial can draw is thinned out to what LVGL
+ * draws each frame, as any fine one is. */
+SCENARIO(meter_tiny_ticks) {
+    JsonDocument d = shippedLayout();
+    JsonArray s = d["screens"].to<JsonArray>();
+    JsonObject m = s.add<JsonObject>();
+    m["type"] = "meter_gauge"; m["metric_id"] = "0x010C"; m["label"] = "RPM";
+    m["min"] = 0; m["max"] = 8000; m["major_tick_every"] = 1e-6;
+    boot(d);
+    const GaugeBinding &b = UI._screens[0].bindings[0];
+    const unsigned n = b.needle ? (unsigned)b.needle->scale->tick_cnt : 0u;
+    CHECK(n == 41, "41 ticks, the most a dial gets (%u)", n);
+}
 
 /* Boot on the shipped layout, visit every screen, and watch LVGL's heap:
  * running out at boot is an assert, and the display simply hangs. */

@@ -119,6 +119,10 @@ struct GaugeBinding {
     float      maxV = 100;          /**< Scale maximum (always > minV).      */
     WidgetKind kind = WidgetKind::Arc;  /**< Which widget family renders it. */
     float      tickLabelDiv = 1;    /**< meter: divide tick labels (x1000)   */
+    /** Meter and chart: they run in units of 1/unit. LVGL's meter and chart
+     *  are integer-valued, so a 0-1.6 bar dial would have two needle positions
+     *  and an 11-15 V trend five levels (see intUnitFor). A power of ten. */
+    float      unit = 1;
     ValueFmt   fmt = ValueFmt::Number;  /**< How the readout is written.     */
     bool       inlineUnits = false; /**< Readout carries its units: "63 %". */
 
@@ -729,9 +733,6 @@ private:
 
     /** @name Diagnostics screen
      *  @{ */
-    /** @brief Rows: Link, Rate, Drops, Seq, Heap, PSRAM, Uptime, GPIO.
-     *  Two more than the round board's six — landscape has the room, and
-     *  PSRAM presence is worth seeing on a board that depends on it. */
     /** @name Touch calibration wizard
      *  @{ */
     lv_obj_t   *_calScreen  = nullptr;  /**< Wizard screen.                 */
@@ -740,18 +741,30 @@ private:
     lv_obj_t   *_calArrow   = nullptr;  /**< Direction glyph.               */
     uint8_t     _calStep    = 0;        /**< 0 = horizontal, 1 = vertical.  */
     bool        _calActive  = false;    /**< Wizard has the display.        */
+    uint32_t    _calSinceMs = 0;        /**< When it took it.               */
+    /** Unanswered this long, the wizard gives the gauges back. */
+    static constexpr uint32_t CAL_TIMEOUT_MS = 60000;
+    /** @brief Leave the wizard without a new mapping (BOOT button, timeout). */
+    void cancelTouchCalibration();
+    /** @brief The screen after the wizard: the portal's while it runs (the
+     *  wizard can be started from the studio), else the gauges. */
+    void leaveCalibration();
     int16_t     _calHdx = 0, _calHdy = 0;  /**< Measured left->right drag.  */
     /** @} */
 
     /** @name Colour preview
      *  @{ */
     lv_obj_t   *_previewScreen = nullptr;  /**< Colour test pattern.        */
+    lv_obj_t   *_configScreen  = nullptr;  /**< The portal's, built once.   */
     lv_timer_t *_previewTimer  = nullptr;  /**< Returns to the AP screen.   */
     String      _cfgSsid, _cfgIp;          /**< Remembered for the restore. */
     /** @brief Preview expiry — restores the AP screen. */
     static void previewTimerCb(lv_timer_t *t);
     /** @} */
 
+    /** @brief Rows: Link, Rate, Drops, Seq, Heap, PSRAM, Uptime, GPIO.
+     *  Two more than the round board's six — landscape has the room, and
+     *  PSRAM presence is worth seeing on a board that depends on it. */
     static constexpr int DIAG_ROWS = 8;
     lv_obj_t *_diagVals[DIAG_ROWS]     = {};  /**< Value labels.             */
     char      _diagLast[DIAG_ROWS][24] = {};  /**< Change guards.            */

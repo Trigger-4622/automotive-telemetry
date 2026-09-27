@@ -22,11 +22,14 @@ The only shared coupling is the packed contract in
 pio run -t upload
 ```
 
-Then flash the filesystem (layout + Gauge Studio web app) — required once:
+No filesystem upload: the Gauge Studio page is compiled into the firmware,
+and a first boot writes a built-in layout by itself. For the full example,
+paste `data/layout.json` into the studio's **Raw JSON** tab and Save.
 
-```bash
-pio run -t uploadfs
-```
+> **Never run `pio run -t uploadfs` on a display in use.** It replaces the
+> whole LittleFS partition - the layout, the uploaded backgrounds and (on the
+> cluster) the touch calibration with it. Upload backgrounds from the studio's
+> **Assets** tab instead.
 
 Serial console runs on the board's native USB-C (115200).
 
@@ -110,10 +113,10 @@ LittleFS on *every* repaint, so prefer `bg_grad` (free) or `texture`
 | `platformio.ini`, `partitions_custom.csv` | Slave build config, 2 MB LittleFS partition |
 | `include/HardwareConfig.h` | **All** pins & board constants (single source of truth) |
 | `include/MasterPacket.h` | ESP-NOW data contract (metric registry, flags, packing) |
-| `include/lv_conf.h` | LVGL v8.3 configuration |
+| `include/lv_conf.h` | LVGL v8 configuration |
 | `src/` | `main` + `DisplayManager` `TouchManager` `NetworkManager` `ConfigManager` `UIBuilder` `TelemetryStore` |
-| `data/layout.json` | Annotated example layout (tach, coolant, electrical, powertrain, overview, diag) |
-| `data/www/index.html` | Gauge Studio single-page app (served from LittleFS) |
+| `data/layout.json` | Annotated example layout (dash, tach, coolant, electrical, powertrain, overview, diag) |
+| `data/www/index.html` | Gauge Studio single-page app (compiled into the firmware by `tools/embed_studio.py`) |
 | `data/assets/*.bin` | Uploadable backgrounds: carbon weave, brushed metal, HUD rings |
 | `src/ui/Textures.h` | **Generated** — compiled-in textures and the GT dial face |
 | `tools/make_assets.py` | Regenerates both (`python tools/make_assets.py`) |

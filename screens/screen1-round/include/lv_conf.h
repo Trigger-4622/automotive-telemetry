@@ -24,8 +24,10 @@
  * MEMORY SETTINGS
  *====================*/
 /* Internal TLSF pool for all LVGL objects/styles/anims.
- * The dynamic gauge engine builds every screen at boot; 48 KB comfortably
- * fits ~6 screens of arcs/meters/labels on the C3's 400 KB SRAM. */
+ * The dynamic gauge engine builds every screen at boot. The shipped layout
+ * needs about 32 KB of these 56 (test_host/run.py works the device's figure
+ * out from its 32-bit struct sizes); running out is a null pointer and a
+ * reboot, not an error message. */
 #define LV_MEM_CUSTOM      0
 #define LV_MEM_SIZE        (56U * 1024U)
 

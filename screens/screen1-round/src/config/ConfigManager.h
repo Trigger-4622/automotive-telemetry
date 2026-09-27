@@ -6,7 +6,8 @@
  *        captive-portal DNS + web server + REST/upload API.
  *
  * Normal operation : filesystem + layout only; the radio belongs to ESP-NOW.
- * Config mode      : entered via 5 s touch hold. ESP-NOW is stopped first,
+ * Config mode      : entered via a 5 s touch hold or a 2.5 s BOOT-button
+ *                    hold (GESTURE_HOLD_CONFIG_MS, BUTTON_LONGPRESS_MS). ESP-NOW is stopped first,
  *                    then this module raises an open AP (CONFIG_AP_SSID),
  *                    captive-portal DNS, and serves the single-page Gauge
  *                    Studio. The page is compiled into the firmware
@@ -96,7 +97,12 @@ public:
      *  hand-edited layout that omits a key still boots.
      *  @{ */
     float    emaAlpha()    { return _layout["global"]["smoothing_alpha"] | 0.35f; }
-    float    lerpSpeed()   { return _layout["global"]["lerp_speed"]      | 0.18f; }
+    /** @return Needle glide per UI tick, 0.01-1: above 1 a needle passes its
+     *          value, and above 2 it swings further every frame. */
+    float    lerpSpeed()   {
+        const float v = _layout["global"]["lerp_speed"] | 0.18f;
+        return v < 0.01f ? 0.01f : (v > 1.0f ? 1.0f : v);
+    }
     /** @return Metric age before it renders as "--" [ms]. */
     uint32_t staleMs()     { return _layout["global"]["stale_timeout_ms"]| 1500;  }
     /** @return Screen-transition duration [ms]. */
@@ -128,9 +134,12 @@ public:
     /**
      * @return ESP-NOW channel, 1-13. **Must match the master**; a mismatch
      *         means no frames are received at all, with no error anywhere.
+     *         Out of range is taken as the nearest: the config AP would not
+     *         start on a channel that does not exist.
      */
     uint8_t wifiChannel() {
-        return _layout["network"]["wifi_channel"] | TELEMETRY_WIFI_CHANNEL;
+        const int c = _layout["network"]["wifi_channel"] | (int)TELEMETRY_WIFI_CHANNEL;
+        return (uint8_t)(c < 1 ? 1 : (c > 13 ? 13 : c));
     }
     /**
      * @return Master MAC to accept frames from, as "AA:BB:CC:DD:EE:FF", or an
@@ -138,13 +147,26 @@ public:
      *         vehicles or a bench master are in range of each other.
      */
     const char *masterMac() { return _layout["network"]["master_mac"] | ""; }
-    /** @return SSID of the configuration access point. */
-    const char *apSsid() { return _layout["network"]["ap_ssid"] | CONFIG_AP_SSID; }
+    /**
+     * @return SSID of the configuration access point: the built-in one when
+     *         the layout's is empty or longer than the 32 bytes Wi-Fi allows.
+     *         The AP would not start, and the studio - the only way into these
+     *         settings - would be out of reach.
+     */
+    const char *apSsid() {
+        const char *s = _layout["network"]["ap_ssid"] | CONFIG_AP_SSID;
+        const size_t n = strlen(s);
+        return n == 0 || n > 32 ? CONFIG_AP_SSID : s;
+    }
     /**
      * @return Password for the configuration AP. Fewer than 8 characters
-     *         leaves the network open, since WPA2 cannot use a shorter key.
+     *         leaves the network open, since WPA2 cannot use a shorter key;
+     *         so do more than 63, which it cannot use either.
      */
-    const char *apPassword() { return _layout["network"]["ap_password"] | CONFIG_AP_PASS; }
+    const char *apPassword() {
+        const char *p = _layout["network"]["ap_password"] | CONFIG_AP_PASS;
+        return strlen(p) > 63 ? "" : p;
+    }
     /** @} */
 
     /** @name Appearance
@@ -181,6 +203,8 @@ private:
      * @return false when nothing was written.
      */
     bool writeLayoutText(const String &body);
+    /** @brief The same, from a buffer (a layout re-serialised on the device). */
+    bool writeLayoutText(const char *text, size_t len);
 
     /**
      * @brief Finish an atomic write: check its length, then rename it in.
@@ -227,6 +251,10 @@ private:
     WebServer _server{80};   /**< Gauge Studio HTTP server.                 */
     DNSServer _dns;          /**< Captive-portal DNS; answers everything.   */
     File      _uploadFile;   /**< Destination of an in-flight asset upload. */
+    String    _uploadPath;   /**< ...and its path, to remove a partial one.  */
+    /** Why the last upload failed, for its reply; nullptr when it did not.
+     *  "no file" until an upload starts: a POST without one is refused. */
+    const char *_uploadErr = "no file";
 };
 
 /** @brief Global configuration singleton. */

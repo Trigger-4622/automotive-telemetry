@@ -64,12 +64,14 @@ std::vector<std::string> dirs = {"/"};
 long writeBudget       = -1;
 bool renameNoOverwrite = false;
 bool mountFails        = false;
+bool mountNever        = false;
 }
 fs::FS LittleFS;
 
 using namespace hostfs;
 
 bool fs::FS::begin(bool formatOnFail, const char *, uint8_t, const char *) {
+    if (mountNever) return false;
     if (mountFails) {
         if (!formatOnFail) return false;
         files.clear();
