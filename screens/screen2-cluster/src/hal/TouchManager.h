@@ -188,6 +188,7 @@ private:
     uint32_t _contactT0   = 0;
     uint32_t _pressT0     = 0;
     uint8_t  _emptyFrames = 0;
+    uint32_t _lastFreshMs = 0;                /**< Last frame the panel sent.*/
     bool     _spent       = false;
     int16_t  _startRawX = 0, _startRawY = 0;  /**< Origin, raw units.       */
     int16_t  _rawX = 0, _rawY = 0;            /**< Latest raw coordinates.  */

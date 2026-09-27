@@ -49,11 +49,14 @@ type is misconfigured.
 pio run -t upload
 ```
 
-Then the filesystem (layout + Dash Studio), required once:
+No filesystem upload: the Gauge Studio page is compiled into the firmware,
+and a first boot writes a built-in layout by itself. For the full example,
+paste `data/layout.json` into the studio's **Raw JSON** tab and Save.
 
-```bash
-pio run -t uploadfs
-```
+> **Never run `pio run -t uploadfs` on a display in use.** It replaces the
+> whole LittleFS partition - the layout, the uploaded backgrounds and (on the
+> cluster) the touch calibration with it. Upload backgrounds from the studio's
+> **Assets** tab instead.
 
 ## Board gotchas worth knowing
 

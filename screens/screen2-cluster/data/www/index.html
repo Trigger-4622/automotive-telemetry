@@ -259,12 +259,14 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
       mismatch produces silence rather than an error, which is a miserable
       thing to debug &mdash; if the link is down, check this first. A MAC
       filter only matters when more than one master is in range, since
-      ESP-NOW broadcasts carry no notion of which network they belong to.</p>
+      ESP-NOW broadcasts carry no notion of which network they belong to. The
+      master sends from another address with its own Wi-Fi switched off at
+      boot &mdash; set the filter again after changing that.</p>
       <div class="grid2">
         <label class="f">Config AP name
-          <input id="setApSsid" onchange="nSet('ap_ssid',this)"></label>
+          <input id="setApSsid" maxlength="32" onchange="nSet('ap_ssid',this)"></label>
         <label class="f">Config AP password
-          <input id="setApPass" placeholder="under 8 chars = open network"
+          <input id="setApPass" maxlength="63" placeholder="under 8 chars = open network"
             onchange="nSet('ap_password',this)"></label>
       </div>
       <p class="hint">WPA2 needs at least 8 characters; anything shorter leaves
@@ -513,16 +515,51 @@ let clusterPart='dial';
 
 const $=q=>document.querySelector(q);
 const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';
-  setTimeout(()=>t.style.display='none',2200);};
+  clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2200);};
 const scr=()=>layout&&layout.screens[sel];
+/* Text for innerHTML and attribute values: a label with a quote or a "<" in
+   it must neither end the attribute nor start a tag. */
+const esc = v => String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                              .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+/* A form field's value as the layout stores it. An emptied number field is
+   "not set" (undefined): the firmware's default then applies - as it does in
+   the preview - instead of a 0 nobody typed. */
+function fieldVal(el){
+  if(el.type==='checkbox')return el.checked;
+  if(el.type==='number'||el.dataset.num==='1'){
+    if(String(el.value).trim()==='')return undefined;
+    const v=parseFloat(el.value);return isFinite(v)?v:undefined;
+  }
+  return el.value;
+}
+/* Store v under o[k]; undefined removes the key (see fieldVal). */
+function putVal(o,k,v){if(v===undefined)delete o[k];else o[k]=v;}
+/* The device's reply as a message: its "error", else the status. */
+async function replyError(r){
+  const t=await r.text().catch(()=>'');
+  try{return JSON.parse(t).error||t||('HTTP '+r.status);}catch(e){return t||('HTTP '+r.status);}
+}
 
 /* ─────────────────────────────── bootstrap ─────────────────────────────── */
+/* True while the page shows the demo layout because the display's own could
+   not be read: saving it would replace every screen on the display. */
+let demoLayout=false;
 async function boot(){
-  try{
-    layout=await fetch('/api/layout').then(r=>r.json());
+  // The display answers one request at a time, so one that fails may only
+  // have met a busy moment: ask again before calling it offline.
+  for(let i=0;i<3&&!layout;i++){
+    if(i)await new Promise(ok=>setTimeout(ok,600));
+    try{
+      const r=await fetch('/api/layout');
+      const j=r.ok?await r.json():null;
+      if(j&&typeof j==='object'&&!Array.isArray(j))layout=j;
+    }catch(e){}
+  }
+  if(layout){
     $('#devStatus').textContent='device connected';
     $('#devStatus').classList.add('up');
-  }catch(e){
+  }else{
+    demoLayout=true;
     $('#devStatus').textContent='offline (demo layout)';
     layout={version:1,global:{},screens:[{id:'demo',type:'arc_gauge',
       metric_id:'0x010C',label:'RPM',units:'rpm',decimals:0,min:0,max:8000,
@@ -552,21 +589,9 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
 /* ───────────────────────────── settings tab ────────────────────────────── */
 function glob(){ if(!layout.global)layout.global={}; return layout.global; }
 function net(){ if(!layout.network)layout.network={}; return layout.network; }
-function gSet(key,el){
-  let v=el.type==='checkbox'?el.checked:el.value;
-  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
-  glob()[key]=v;
-}
-function nSet(key,el){
-  let v=el.type==='checkbox'?el.checked:el.value;
-  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
-  net()[key]=v;
-}
-function wSet(key,el){
-  let v=el.type==='checkbox'?el.checked:el.value;
-  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
-  wd()[key]=v;
-}
+function gSet(key,el){ putVal(glob(),key,fieldVal(el)); }
+function nSet(key,el){ putVal(net(),key,fieldVal(el)); }
+function wSet(key,el){ putVal(wd(),key,fieldVal(el)); }
 /* Copy the MAC we are actually receiving from into the peer filter. */
 function useHeardMac(){
   const m=$('#heardMac').dataset.mac||'';
@@ -586,14 +611,15 @@ const CALIB = [['color_gain_r','Red','#ff6b6b'],
 let calibTimer = null;
 async function touchCal(){
   try{
-    await fetch('/api/touchcal',{method:'POST'});
-    toast('Look at the display and follow the prompts');
+    const r=await fetch('/api/touchcal',{method:'POST'});
+    toast(r.ok?'Look at the display and follow the prompts'
+              :'Calibration not started: '+await replyError(r));
   }catch(e){ toast('Device not reachable'); }
 }
 function calibRender(){
   const g=glob(), host=$('#calibRows');
   host.innerHTML=CALIB.map(([k,name,col])=>{
-    const v=(g[k]??1).toFixed(2);
+    const v=(Number(g[k]??1)||1).toFixed(2);
     return `<label class="f" style="margin-bottom:14px">
       <span style="color:${col}">${name}</span>
       <span id="${k}_v" style="float:right;color:var(--text)">${v}</span>
@@ -615,11 +641,11 @@ function calibReset(){
 async function calibPush(){
   const g=glob();
   try{
-    await fetch('/api/calib',{method:'POST',
+    const r=await fetch('/api/calib',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({r:g.color_gain_r??1,g:g.color_gain_g??1,
                            b:g.color_gain_b??1})});
-    $('#calibNote').textContent='live on the panel';
+    $('#calibNote').textContent=r.ok?'live on the panel':'the display refused it';
   }catch(e){ $('#calibNote').textContent='device not reachable'; }
 }
 
@@ -674,15 +700,14 @@ function wdAdd(){
 function wdDel(i){wd().items.splice(i,1);renderWatchdog();}
 /* Resolve "0.warning.value" style paths inside watchdog.items */
 function wdSet(path,el){
-  let v=el.type==='checkbox'?el.checked:el.value;
-  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
+  const v=fieldVal(el);
   const seg=path.split('.');let o=wd().items;
   for(let i=0;i<seg.length-1;i++){
     const k=isNaN(+seg[i])?seg[i]:+seg[i];
     if(o[k]==null)o[k]={};
     o=o[k];
   }
-  o[seg[seg.length-1]]=v;
+  putVal(o,seg[seg.length-1],v);
   renderWatchdogSummaries();
 }
 /* Enable/disable a whole tier by adding or removing its object. */
@@ -712,7 +737,7 @@ function wdTierFields(i,tier,t){
       </div><div class="grid2">
       ${fld('Color',`<input type="color" value="${t.color||(crit?'#FF1744':'#FFC400')}"
         oninput="wdSet('${i}.${tier}.color',this)">`)}
-      ${crit?fld('Headline',`<input value="${t.overlay_text||''}"
+      ${crit?fld('Headline',`<input value="${esc(t.overlay_text)}"
         placeholder="e.g. ENGINE OVERHEAT"
         oninput="wdSet('${i}.critical.overlay_text',this)">`):''}
       </div>`:'<p class="hint">Not guarded at this level.</p>'}
@@ -745,19 +770,21 @@ function renderWatchdog(){
     d.className='card';d.style.marginBottom='12px';
     d.innerHTML=`
       <div style="display:flex;align-items:center;gap:10px">
-        <h2 style="margin:0">${it.label||KNOWN[it.metric_id]||'metric'}</h2>
+        <h2 style="margin:0">${esc(it.label||KNOWN[it.metric_id]||'metric')}</h2>
         <small id="wdsum${i}" style="color:var(--muted)">${wdSummary(it)}</small>
         <button class="b danger" style="margin-left:auto"
           onclick="wdDel(${i})">Remove</button>
       </div>
       <div class="grid2" style="margin-top:10px">
         ${fld('Metric',`<select oninput="wdSet('${i}.metric_id',this)">
+          ${KNOWN[it.metric_id]?'':`<option value="${esc(it.metric_id)}" selected
+            >${esc(it.metric_id||'choose…')}</option>`}
           ${Object.entries(KNOWN).map(([k,v])=>
             `<option value="${k}" ${k===it.metric_id?'selected':''}>${k} — ${v}</option>`
           ).join('')}</select>`)}
-        ${fld('Display name',`<input value="${it.label||''}"
+        ${fld('Display name',`<input value="${esc(it.label)}"
           oninput="wdSet('${i}.label',this)">`)}
-        ${fld('Units',`<input value="${it.units||''}"
+        ${fld('Units',`<input value="${esc(it.units)}"
           oninput="wdSet('${i}.units',this)">`)}
         ${fld('Decimals',`<input type="number" min="0" max="3" data-num="1"
           value="${it.decimals??0}" oninput="wdSet('${i}.decimals',this)">`)}
@@ -780,7 +807,7 @@ function renderList(){
   layout.screens.forEach((s,i)=>{
     const d=document.createElement('div');
     if(i===sel)d.classList.add('sel');
-    d.innerHTML=`<span>${s.id||('screen '+(i+1))}</span><small>${s.type}</small>`;
+    d.innerHTML=`<span>${esc(s.id||('screen '+(i+1)))}</span><small>${esc(s.type)}</small>`;
     d.onclick=()=>{sel=i;cellSel=0;renderList();renderEditor();draw();};
     el.appendChild(d);
   });
@@ -802,18 +829,17 @@ function moveScreen(d){const j=sel+d;
 /* ───────────────────────────── property editor ─────────────────────────── */
 function fld(lbl,inner){return `<label class="f">${lbl}${inner}</label>`;}
 function inp(path,val,type='text',extra=''){
-  return `<input type="${type}" value="${val??''}" ${extra}
+  return `<input type="${type}" value="${esc(val)}" ${extra}
           oninput="setVal('${path}',this)">`;}
 function metricSel(path,val){
   let o=Object.entries(KNOWN).map(([k,v])=>
     `<option value="${k}" ${k===val?'selected':''}>${k} — ${v}</option>`).join('');
   return `<select oninput="setVal('${path}',this)">
-          <option value="${val}" ${KNOWN[val]?'':'selected'}>${val||'choose…'}</option>${o}</select>`;}
+          ${KNOWN[val]?'':`<option value="${esc(val)}" selected>${esc(val||'choose…')}</option>`}${o}</select>`;}
 
 /* Resolve "a.b.2.c" paths into layout.screens[sel] and coerce types. */
 function setVal(path,el){
-  let v=el.type==='checkbox'?el.checked:el.value;
-  if(el.type==='number'||el.dataset.num==='1')v=parseFloat(v)||0;
+  const v=fieldVal(el);
   const seg=path.split('.');let o=scr();
   for(let i=0;i<seg.length-1;i++){
     const k=isNaN(+seg[i])?seg[i]:+seg[i];
@@ -821,7 +847,7 @@ function setVal(path,el){
     o=o[k];
   }
   const last=seg[seg.length-1];
-  o[isNaN(+last)?last:+last]=v;
+  putVal(o,isNaN(+last)?last:+last,v);
   if(path==='type'){normalizeType();renderEditor();}
   renderList();draw();
 }
@@ -937,7 +963,7 @@ function renderEditor(){
     h+=`<fieldset><legend>Which part</legend><div class="btnrow">
       <select onchange="clusterPart=this.value;renderEditor();draw()">
       ${opts.map(([v,t])=>`<option value="${v}" ${clusterPart===v?'selected':''}
-        >${t}</option>`).join('')}</select>
+        >${esc(t)}</option>`).join('')}</select>
       <button class="b" onclick="if((scr().side||[]).length<4){scr().side.push(
         {metric_id:'0x0105',label:'NEW',units:'',decimals:0,min:0,max:100});
         clusterPart='side.'+(scr().side.length-1);renderEditor();draw();}"
@@ -969,7 +995,7 @@ function renderEditor(){
     h+=`<fieldset><legend>Cells (2 or 4)</legend><div class="btnrow">
       <select onchange="cellSel=+this.value;renderEditor();draw()">
       ${cells.map((c,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
-        Cell ${i+1}: ${c.label||'?'}</option>`).join('')}</select>
+        Cell ${i+1}: ${esc(c.label||'?')}</option>`).join('')}</select>
       <button class="b" onclick="if((scr().cells||[]).length<4){scr().cells.push(
         {metric_id:'0x010C',label:'NEW',units:'',decimals:0,min:0,max:100});
         cellSel=scr().cells.length-1;renderEditor();draw();}">＋</button>
@@ -988,7 +1014,7 @@ function renderEditor(){
       <div class="btnrow">
       <select onchange="cellSel=+this.value;renderEditor();draw()">
       ${rows.map((c,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
-        ${isBars?'Bar':'Row'} ${i+1}: ${c.label||'?'}</option>`).join('')}</select>
+        ${isBars?'Bar':'Row'} ${i+1}: ${esc(c.label||'?')}</option>`).join('')}</select>
       <button class="b" onclick="if((scr().rows||[]).length<${cap}){
         scr().rows.push({metric_id:'0x010C',label:'New',units:'',decimals:0,
         min:0,max:100});
@@ -1010,7 +1036,7 @@ function renderEditor(){
       ${fld('Y max',inp('max',s.max??100,'number','step="any" data-num="1"'))}
       </div>
       <p class="hint">Visible window = points &times; sample ms
-      (${((s.points??120)*(s.sample_ms??1000)/1000).toFixed(0)} s). All traces
+      (${(chartPoints(s)*(s.sample_ms??1000)/1000).toFixed(0)} s). All traces
       share this one Y range, so only overlay metrics on a comparable
       scale.</p></fieldset>`;
     if(multi){
@@ -1018,7 +1044,7 @@ function renderEditor(){
       h+=`<fieldset><legend>Traces (max 4)</legend><div class="btnrow">
         <select onchange="cellSel=+this.value;renderEditor();draw()">
         ${ser.map((v,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
-          Trace ${i+1}: ${v.label||'?'}</option>`).join('')}</select>
+          Trace ${i+1}: ${esc(v.label||'?')}</option>`).join('')}</select>
         <button class="b" onclick="if(scr().series.length<4){scr().series.push(
           {metric_id:'0x0104',label:'NEW',units:'%',decimals:0,color:'#69F0AE'});
           cellSel=scr().series.length-1;renderEditor();draw();}">＋</button>
@@ -1129,22 +1155,22 @@ function pvFace(x,cx,cy){
 }
 /* The round tach's scale: minor and major ticks, numerals, zones, needle, cap. */
 function pvDial(x,cx,cy,o,v){
-  const R=118,min=o.min??0,max=o.max??100,span=(max-min)||1,every=o.every||span/8;
+  const sc=dialTicks(o.min??0,o.max??100,o.every,o.div||1);
+  const R=118,min=sc.min,max=sc.max,span=max-min;
   const st=o.start??135,sw=o.sweep??270,ang=q=>(st+sw*((q-min)/span))*D2R;
   x.lineCap='butt';
   (o.zones||[]).forEach(([a,b,c])=>{
     if(b<=a)return;x.strokeStyle=c;x.lineWidth=6;
     x.beginPath();x.arc(cx,cy,R-3,ang(Math.max(min,a)),ang(Math.min(max,b)));x.stroke();
   });
-  const minor=every/4;
-  for(let q=min;q<=max+1e-6;q+=minor){
-    const a=ang(q),k=(q-min)/every,maj=Math.abs(k-Math.round(k))<1e-6,L=maj?14:8;
-    x.strokeStyle=maj?PV.textDim:PV.dim;x.lineWidth=maj?3:2;
+  sc.ticks.forEach(({q,major,text})=>{
+    const a=ang(q),L=major?14:8;
+    x.strokeStyle=major?PV.textDim:PV.dim;x.lineWidth=major?3:2;
     x.beginPath();x.moveTo(cx+Math.cos(a)*R,cy+Math.sin(a)*R);
     x.lineTo(cx+Math.cos(a)*(R-L),cy+Math.sin(a)*(R-L));x.stroke();
-    if(maj)pvText(x,Math.round(q/(o.div||1)),cx+Math.cos(a)*(R-33),cy+Math.sin(a)*(R-33),
-                  '14px system-ui',PV.textDim,'center','middle');
-  }
+    if(major)pvText(x,text,cx+Math.cos(a)*(R-33),cy+Math.sin(a)*(R-33),
+                    '14px system-ui',PV.textDim,'center','middle');
+  });
   const a=ang(Math.max(min,Math.min(max,v)));
   x.strokeStyle=o.needle||PV.needle;x.lineWidth=4;
   x.beginPath();x.moveTo(cx,cy);x.lineTo(cx+Math.cos(a)*(R-16),cy+Math.sin(a)*(R-16));x.stroke();
@@ -1274,7 +1300,7 @@ function draw(){
     });
   }else if(s.type==='chart'){
     pvHeader(x,title||'TREND');
-    const cw=W-2*M,ch=BOT-TOP,pts=s.points??120;
+    const cw=W-2*M,ch=BOT-TOP,pts=chartPoints(s);
     pvCard(x,M,TOP,cw,ch);
     pvText(x,Math.round(pts*(s.sample_ms??1000)/1000)+' s',M+cw-12,TOP+8,'12px system-ui',PV.dim,'right','top');
     const L=M+12,R=M+cw-12,T=TOP+26,B=TOP+ch-52;
@@ -1363,29 +1389,73 @@ function draw(){
     x.fillText(headline,cx-38,cy+30);
   }
 }
+/* A dial's scale as the firmware builds it (UIBuilder.cpp: dialScale on the
+   cluster, buildMeterGauge on the round board): LVGL's meter spreads n ticks
+   evenly - never more than 41, however fine the spacing asked for - and every
+   per-th one is major, labelled with the line's value in whole meter units,
+   divided back for display. q is each tick's value, text its label. */
+function dialTicks(min,max,every,div){
+  if(!(max>min))max=min+1;
+  const span=max-min,big=Math.max(Math.abs(min),Math.abs(max));
+  let unit=1;while(span*unit<200&&big*unit*10<=1e8&&unit<10000)unit*=10;
+  if(!(every>0))every=span/8;
+  let per=4;const count=()=>Math.min(1000,Math.round(span/(every/per))+1);
+  let n=count();while(n>41&&per>1){per/=2;n=count();}
+  n=Math.max(2,Math.min(41,n||2));
+  const whole=v=>Math.sign(v)*Math.round(Math.abs(v));      // lroundf
+  const lo=whole(min*unit),hi=whole(max*unit),d=unit*(div>1?div:1),out=[];
+  for(let i=0;i<n;i++){
+    const u=Math.trunc(i*(hi-lo)/(n-1))+lo,major=i%per===0;
+    let text='';
+    if(major){
+      const v=u/d;
+      text=d<=1?String(u):Math.abs(v-Math.round(v))<0.005?String(Math.round(v))
+          :Math.abs(v*10-Math.round(v*10))<0.05?v.toFixed(1):v.toFixed(2);
+    }
+    out.push({q:u/unit,major,text});
+  }
+  return {min,max,ticks:out};
+}
+/* A trend's point count as the firmware clamps it. */
+function chartPoints(s){
+  const [def,most]=BOARD==='cluster'?[120,240]:[60,120];
+  return Math.max(10,Math.min(most,Math.trunc(Number(s.points??def))||10));
+}
 function state(o,v){
   if(!o||!o.thresholds)return'ok';
-  const t=o.thresholds,hit=(th)=>th&&th.value!=null&&
-    (th.direction==='below'?v<=th.value:v>=th.value);
+  // A tier without a value trips at 0, as the firmware reads it.
+  const t=o.thresholds,hit=(th)=>th&&
+    (th.direction==='below'?v<=(th.value??0):v>=(th.value??0));
   return hit(t.critical)?'crit':hit(t.warning)?'warn':'ok';
 }
 
 /* ───────────────────────────── persistence ─────────────────────────────── */
 async function saveLayout(rebootAfter){
+  if(demoLayout&&!confirm('The display\'s own layout could not be read, so this is '+
+      'the demo one. Saving it replaces every screen on the display. Save anyway?'))
+    return;
   try{
     const r=await fetch('/api/layout',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify(layout)});
-    if(!r.ok)throw new Error((await r.json()).error||r.status);
+    if(!r.ok)throw new Error(await replyError(r));
+    demoLayout=false;
     toast('Layout saved ✔');
-    if(rebootAfter){await fetch('/api/reboot',{method:'POST'});
-      toast('Rebooting — reconnect to the display network');}
-  }catch(e){toast('Save failed: '+e.message);}
+  }catch(e){toast('Save failed: '+e.message);return;}
+  if(rebootAfter){
+    // The display restarts as it answers, which may cut the reply short.
+    try{await fetch('/api/reboot',{method:'POST'});}catch(e){}
+    toast('Rebooting — reconnect to the display network');
+  }
 }
 function applyJson(){
-  try{layout=JSON.parse($('#jsonEd').value);sel=0;cellSel=0;renderAll();
-      toast('Applied — remember to Save');}
-  catch(e){toast('JSON error: '+e.message);}
+  let j;
+  try{j=JSON.parse($('#jsonEd').value);}
+  catch(e){return toast('JSON error: '+e.message);}
+  if(!j||typeof j!=='object'||Array.isArray(j)||!Array.isArray(j.screens)||!j.screens.length)
+    return toast('Not applied: a layout needs a "screens" list with at least one screen');
+  layout=j;sel=0;cellSel=0;demoLayout=false;renderAll();
+  toast('Applied — remember to Save');
 }
 
 /* ───────────────────────────── assets ──────────────────────────────────── */
@@ -1395,8 +1465,9 @@ async function loadAssets(){
     const tb=$('#assetTable tbody');tb.innerHTML='';
     (d.assets||[]).forEach(a=>{
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td>/assets/${a.name}</td><td>${(a.size/1024).toFixed(1)} KB</td>
-        <td><button class="b danger" onclick="delAsset('${a.name}')">✕</button></td>`;
+      tr.innerHTML=`<td>/assets/${esc(a.name)}</td><td>${(a.size/1024).toFixed(1)} KB</td>
+        <td><button class="b danger" data-name="${esc(a.name)}"
+          onclick="delAsset(this.dataset.name)">✕</button></td>`;
       tb.appendChild(tr);
     });
   }catch(e){toast('Asset list failed');}
@@ -1404,11 +1475,18 @@ async function loadAssets(){
 async function uploadAsset(){
   const f=$('#assetFile').files[0];if(!f)return toast('Choose a file first');
   const fd=new FormData();fd.append('file',f);
-  await fetch('/api/asset',{method:'POST',body:fd});
-  toast('Uploaded ✔');loadAssets();
+  try{
+    const r=await fetch('/api/asset',{method:'POST',body:fd});
+    toast(r.ok?'Uploaded ✔':'Upload failed: '+await replyError(r));
+  }catch(e){toast('Upload failed: device not reachable');}
+  loadAssets();
 }
 async function delAsset(n){
-  await fetch('/api/asset/delete?name='+encodeURIComponent(n),{method:'POST'});
+  if(!confirm('Delete /assets/'+n+'? A screen that shows it goes without.'))return;
+  try{
+    const r=await fetch('/api/asset/delete?name='+encodeURIComponent(n),{method:'POST'});
+    if(!r.ok)toast('Delete failed: '+await replyError(r));
+  }catch(e){toast('Delete failed: device not reachable');}
   loadAssets();
 }
 
@@ -1437,9 +1515,13 @@ async function pollSystem(){
       'while display is in config mode (ESP-NOW paused).</td></tr>';
   }catch(e){/* device busy */}
 }
-async function resetPeaks(){await fetch('/api/peaks/reset',{method:'POST'});
-  toast('Peaks reset');}
-async function reboot(){await fetch('/api/reboot',{method:'POST'});
+async function resetPeaks(){
+  try{const r=await fetch('/api/peaks/reset',{method:'POST'});
+    toast(r.ok?'Peaks reset':'Reset failed: '+await replyError(r));}
+  catch(e){toast('Device not reachable');}}
+async function reboot(){
+  // The display restarts as it answers, which may cut the reply short.
+  try{await fetch('/api/reboot',{method:'POST'});}catch(e){}
   toast('Rebooting…');}
 
 /* Which board this studio configures: decides the dash preview's geometry
@@ -1501,8 +1583,6 @@ const LAMPS = [
 const LAMP_NUM = ['threshold','hysteresis','debounce_ms','hold_ms','popup_speed',
                   'popup_secs','blink_speed','decimals'];
 const openLamps = new Set();
-const esc = v => String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
-                              .replace(/"/g,'&quot;');
 
 function warn(){
   if(!layout.warnings||typeof layout.warnings!=='object')
@@ -1520,14 +1600,11 @@ function lampEff(key){
   const o=warn().lamps[key];
   return Object.assign(lampDefault(key),typeof o==='boolean'?{enabled:o}:(o||{}));
 }
-function wnSet(k,el){
-  let v=el.type==='checkbox'?el.checked:el.value;
-  if(el.dataset.num==='1'){v=parseFloat(v);if(!isFinite(v))v=0;}
-  warn()[k]=v;
-}
+function wnSet(k,el){ putVal(warn(),k,fieldVal(el)); }
 function lampSet(key,field,el){
   let v=el.type==='checkbox'?el.checked:el.value;
-  if(LAMP_NUM.includes(field)){v=parseFloat(v);if(!isFinite(v))v=0;}
+  // An emptied number is the lamp's default again.
+  if(LAMP_NUM.includes(field)){v=parseFloat(v);if(!isFinite(v))v=lampDefault(key)[field];}
   const L=warn().lamps;
   if(typeof L[key]==='boolean')L[key]={enabled:L[key]};
   if(!L[key])L[key]={};

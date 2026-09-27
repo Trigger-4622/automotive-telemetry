@@ -7,6 +7,181 @@ installed, never before; the terminator on the transceiver module is removed;
 the codes come back sometimes at the start of a drive and sometimes after 30
 to 60 minutes of driving.
 
+## Update 2026-09-27, later: where the errors come from - measure it on the next drive
+
+With errors let pass the master can no longer destroy anyone's frame, but it
+still misreads frames the rest of the car reads fine, and it still loses those
+values. What the car has shown about that so far:
+
+- Listen-only, before the TEC fix: about a million errors a session. Inflated
+  (the controller counting its own unheard error flags); it says nothing about
+  how often the master really misreads.
+- Normal mode: the receive error counter went from 0 to 99-132 within
+  13-150 ms of every switch - errors on a large share of frames.
+- The evidence log: three brown-out resets. The 3.3 V rail sags hard at times.
+
+What the search turned up (web, Espressif docs and issues, other projects):
+
+- No ESP32-S3 TWAI erratum beyond the listen-only one (fixed). The S3 cannot
+  read CAN FD frames - irrelevant on a 2009 car.
+- "Long critical sections or higher-priority interrupts cause bus errors" (an
+  Espressif-side remark): on this controller a late interrupt loses frames to
+  a FIFO overrun; it cannot corrupt bits on the wire. Not the cause.
+- arduino-esp32 #9191 (S3; one message always failed; the Arduino-CAN timing
+  worked) is still unresolved upstream. Its timing is the default here
+  (`can_timing` 2), not yet tried on the car.
+- The "GPIO5 breaks Wi-Fi" report is an ESP32-S2 custom board, not this DevKit.
+- The firmware never changes the CPU or APB clock: the CAN bit rate cannot drift.
+- Wi-Fi transmit current spikes sag an ESP32's 3.3 V rail - the usual cause
+  of brown-outs - and the SN65HVD230 is specified down to 3.0 V only. The
+  master's own radio making its transceiver misread fits the brown-outs.
+
+The causes left, and what tells them apart:
+
+| Cause | Missed frames | Errors vs the radio | Normal vs listen-only |
+|---|---|---|---|
+| 3.3 V rail sagging under the radio | every module's IDs | far above chance | the same |
+| The tap: stub, ground, transceiver Rs pin | one module's IDs more than others | chance | the same |
+| The master's own transceiver driving the bus (ACK) | every module's | chance | more in normal mode |
+| Bit timing against this bus | frames with long runs of equal bits (some IDs) | chance | the same |
+
+Two measurements now give those columns, on the Bus tab under "What the
+errors are" → "Where they come from" (and a `[link ]` serial line):
+
+- **Missed frames per ID and mode** (`missAccount`). The car's broadcasts are
+  periodic, so a gap of whole periods in an ID is a frame the master misread.
+  Anything that makes the master deaf for a moment - a flash write (the CAN
+  interrupt waits for it), a TEC write, a reinstall, a full queue - calls
+  `masterBusBlind()`, and a gap across it is not counted. Simulator: every
+  missed frame was a real misread (a clean link: 0 of 6 411), in listen-only
+  and normal mode alike (`link_misses`).
+- **Bus errors against the radio** (`radioNoteErrors`): the share of errors
+  while an ESP-NOW broadcast was on air or within 3 ms of it, against the share
+  of the time the radio is that busy. Simulator: a link fault lands near the
+  radio by chance (9.8 % against 11.1 %); a radio that disturbs the CAN side
+  puts 100 % of its errors there against 14 % (`link_radio`).
+
+The simulator's car now sends on its own clock, 0.5 % off the master's, as
+separate crystals do; on one shared clock the radio locked to the car's
+frames. That exposed a learner weakness: a switch sample right after a flip
+could pair the new state with a frame still showing the old one, and whether
+a flip cost the sample before or after it depended on how they lined up - the
+brake switch matched at phi 0.960 against the 0.95 needed. Both are dropped
+now; it matches at 1.000.
+
+**Test plan for the next drive** (errors let pass, requests on):
+
+1. 10 minutes driving. Screenshot the Bus tab card.
+2. Advanced → Radio transmit power 2 dBm; 10 more minutes; screenshot. (The
+   displays sit a metre away; 2 dBm reaches them.)
+3. Optional: Settings, both requests off (listen-only) for 10 minutes;
+   screenshot.
+
+If the errors sit near the radio, or fall at 2 dBm: the supply - give the
+transceiver its own clean 3.3 V (or a low-noise LDO) and decouple it
+(10 µF + 100 nF at its pins). If the misses concentrate on a few IDs: that
+module's link at the tap - stub length, ground to OBD pin 5 (signal ground),
+Rs pin to GND. Neither: `can_timing` 1 or 0 for a drive, to compare.
+
+## Update 2026-09-27: "let errors pass", from the first bit
+
+Passive transmit mode is now called what it does: **Let errors pass**
+(`tx_passive`, on by default) - the master never sends an error frame. A frame
+it reads as bad it drops for itself; the other modules acknowledge it and it
+reaches them untouched. The normal acknowledgement of good frames is unchanged.
+
+It had one gap: `twai_start()` clears the error counters, so for the moment
+between starting the controller and setting TEC it was error-active - at boot,
+after the settle wait, after a bus-off restart and on every return from
+listen-only. The simulator now counts every moment the controller is on the
+bus able to send an active error flag, and found the gap three times in one
+drive (`error_frames_never`). `twaiGoLive()` closes it: the TX pad stays a
+recessive GPIO while the controller starts, and goes back to it only once TEC
+is set. Result: zero.
+
+The portal's **Safe bus settings** (Maintenance) puts the bus behaviour alone
+back to the defaults - requests on (Auto), errors let pass, 87.5 % with triple
+sampling, both guards, P2CAN 50 ms, the 10 s wait after power-on - and keeps
+the bitrate, the request pacing, the displays, Wi-Fi and every learned value.
+Factory reset clears learned values too; its prompt now says so.
+
+## Update 2026-09-26, night: passive transmit mode - transmit without ever destroying a frame
+
+A node cannot be told to stop acknowledging while it transmits: in Espressif's
+words only listen-only disables acknowledgements, and it disables transmitting
+with them; "no-ACK" mode only stops *requiring* an acknowledgement. Nor can a
+node acknowledge "only if another module does" - every receiver drives the same
+single ACK bit at the same moment. But the acknowledgement was never the harm:
+the master acknowledges only frames it received correctly, and a dominant ACK
+merely joins the others'. The harm is the **active error flag** it sends for a
+frame it thinks is bad.
+
+An **error-passive** node (TEC or REC >= 128) sends only passive, recessive
+error flags, which cannot destroy anyone's frame - while it still transmits,
+receives and acknowledges. REC cannot hold it there (every good frame winds
+REC down), but TEC only moves when the node itself transmits. So **passive
+mode** (`tx_passive`, on by default) sets TEC to 220 whenever the controller
+starts in normal mode, and before each request tops it back up if the
+master's own successful frames have brought it below 170 - four transmit
+errors of headroom before bus-off at 256. With it, the receive-error guard
+stands down: there is nothing left for it to protect. In the simulator, a link
+misreading 30 % of the engine ECU's frames - far worse than the car - with the
+car's own settings: 4 783 misreads, 0 frames destroyed, the ECM never bus-off,
+no P1718, and OBD-II requests running throughout (`passive_marginal`).
+
+## Update 2026-09-26, evening: the errors were being miscounted, and the timing
+
+With the erratum fix on, the car behaved in silent mode, but the portal showed
+**1 021 263 bus errors in one session** with the master listen-only - about
+one per frame at 1 174 frames/s - and **error counters 0 / 0**. The MIL came
+back whenever the master was allowed to transmit.
+
+**The count was inflated, by the listen-only fix itself.** A controller that
+really misread that many frames would have lost them (it received all 1 174/s)
+and its REC would have climbed. REC 0 in listen-only means the REC 128 set at
+start did not hold - a good frame winds REC down - so the controller was
+error-active again, and with its TX pad detached it read its own error flag
+back recessive, took that for a bit error, flagged again, and counted every
+round. Now `listenOnlyErratumFix()` also sets **TEC to 128**, which cannot move
+in listen-only (it only changes when the controller transmits), so the
+controller stays error-passive. In the simulator, with REC drifting as on the
+car, 887 misreads now count as 887 errors; without the TEC write, 6 923
+(`lom_rec_drift`).
+
+**The real errors, in normal mode, point at the bit timing.** Every switch to
+normal mode took REC from 0 to 99-132 within 13-150 ms (the evidence log): the
+controller finds fault with nearly every frame the moment it takes part - and
+in normal mode each fault is an error flag that destroys the frame for the
+whole car. The firmware used the ESP-IDF preset for 500 kbit/s: sample point
+80 %, SJW 3, **one sample per bit**. Vehicle buses are specified at 87.5 %
+(SAE J1939/J2284), and the Arduino-CAN library programs the ESP32 for 500
+kbit/s at 87.5 %, SJW 2, with **triple sampling** (three samples, majority
+vote, so a spike or ringing edge is outvoted). arduino-esp32 issue #9191 is an
+ESP32-S3 on a car where the ESP-IDF driver produced bus errors into bus-off
+while Arduino-CAN on the same hardware did not. That profile is now the
+default: **`can_timing` 2** (1 = 87.5 % single sample, 0 = the ESP-IDF preset;
+your stored `can_sp875` is kept and only applies with 0).
+
+**No more guessing: the controller now says what each error is.** The TWAI
+error-code-capture register holds the type, direction and frame segment of
+the latest error; it is sampled on every error and tallied per mode - portal
+Bus tab "What the errors are", and `[errs ]` lines in the serial log. Bit
+errors *while sending* in the ACK slot mean our own transceiver is not driving
+the bus properly (its supply - the master has browned out three times in the
+car - its ground, or its mode pin: the SN65HVD230's pin 8 must go straight to
+ground; through 100 kΩ its loop delay is up to 920 ns, and pulled high its
+driver is off). Stuff, form or CRC errors *while receiving* mean the link or
+the timing.
+
+**Radio power** now defaults to 13 dBm (`radio_dbm`): the displays are a metre
+or two away, and a lower power draws smaller current bursts from the supply
+the transceiver shares.
+
+**Next drive:** after the flash, stay listen-only a few minutes and read "What
+the errors are" (now an honest count), then switch to OBD-II with the
+receive-error guard **on** and read it again. If normal mode still collects
+errors, the table says which of the causes above it is.
+
 ## Update 2026-09-26: why the first fix made it worse
 
 After the flash the car showed 100 000+ bus errors with the master
@@ -203,15 +378,18 @@ the TX line is not latched.
 
 ## Flash checklist (on your PC)
 
-1. `git fetch && git checkout claude/p1718-check-engine-light-ha776b`.
+1. `git fetch`, check out the branch that holds the change, `git pull --ff-only`.
 2. Full backup first: `esptool.py --chip esp32s3 read_flash 0 0x1000000 master-backup.bin`,
    then `esptool.py --chip esp32s3 verify_flash 0 master-backup.bin`.
 3. Check the partition table the build uses matches the board
    (`platformio.ini`: 16 MB, LittleFS) — a wrong one boot-loops.
 4. Plain `pio run -d master -t upload`. Never `uploadfs`.
 5. Read the settings back: open the portal, Advanced → "Everything, as JSON"
-   → Download, and compare with `test_host/fixtures/car_config_2026-09-25.json`
-   (the same 18 signals, 72 SSM rows, 66 PIDs, `obd_to` 20, `guard` false).
+   → Download, and compare with the `config.json` taken out of step 2's backup
+   (`python tools/littlefs_read.py` on the LittleFS partition) - the same
+   values, signal for signal. Before the upload, `device_config` with
+   `DEVICE_CONFIG=<that file>` shows the new firmware loads it with 0
+   differences.
 6. Hardware while you are there: a 10 kΩ pull-up from the transceiver's TXD
    to 3V3; the transceiver GND to OBD pin 4/5; stub under 30 cm.
 7. Portal → Settings: "Receive-error guard" on (it is, by default); Advanced:

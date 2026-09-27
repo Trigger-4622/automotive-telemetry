@@ -10,6 +10,7 @@
 #include <lvgl.h>
 
 #include <LittleFS.h>
+#include <string>
 #include <WiFi.h>
 
 #include "HardwareConfig.h"
@@ -21,6 +22,8 @@ ConfigManager Config;
 static constexpr const char *LAYOUT_PATH = "/layout.json";
 /** Written first, then renamed over LAYOUT_PATH — see persistLayout(). */
 static constexpr const char *LAYOUT_TMP  = "/layout.tmp";
+/** Where a layout that would not load is kept, rather than overwritten. */
+static constexpr const char *LAYOUT_BAD  = "/layout.bad";
 
 /** Filesystem partition label. MUST match the Name column of the filesystem
  *  row in partitions_custom.csv — Arduino's LittleFS locates its partition by
@@ -95,6 +98,8 @@ void ConfigManager::begin() {
         if (!LittleFS.begin(true, "/littlefs", 10, FS_PARTITION_LABEL)) {
             log_e("LittleFS unavailable: no data partition labelled '%s'",
                   FS_PARTITION_LABEL);
+            // The gauges still run, on the built-in layout; only saving is out.
+            deserializeJson(_layout, DEFAULT_LAYOUT);
             return;
         }
     }
@@ -105,9 +110,23 @@ void ConfigManager::begin() {
     if (!LittleFS.exists("/assets")) LittleFS.mkdir("/assets");
 
     if (!loadLayout()) {
+        // Kept, not overwritten: a layout that will not load may only be cut
+        // short, or too big for the memory there is right now, and it holds
+        // the screens and the touch calibration. The studio serves it back at
+        // /layout.bad.
+        if (LittleFS.exists(LAYOUT_PATH)) {
+            LittleFS.remove(LAYOUT_BAD);
+            if (LittleFS.rename(LAYOUT_PATH, LAYOUT_BAD))
+                log_w("layout.json unreadable - kept as %s", LAYOUT_BAD);
+        }
         log_w("layout.json missing/corrupt — writing built-in default");
         writeDefaultLayout();
-        loadLayout();
+        if (!loadLayout()) {
+            // Not even that could be written (the filesystem is full): run on
+            // it from memory rather than on no screens at all.
+            log_e("layout: built-in default not writable - running on it from memory");
+            deserializeJson(_layout, DEFAULT_LAYOUT);
+        }
     }
     if (migrateLayout()) {
         log_i("layout: updated to version 2 (warning lamps, dash screen)");
@@ -179,6 +198,14 @@ bool ConfigManager::writeLayoutText(const String &body) {
     return commitLayoutTmp(written, body.length());
 }
 
+bool ConfigManager::writeLayoutText(const char *text, size_t len) {
+    File f = LittleFS.open(LAYOUT_TMP, "w");
+    if (!f) return false;
+    const size_t written = f.write(reinterpret_cast<const uint8_t *>(text), len);
+    f.close();
+    return commitLayoutTmp(written, len);
+}
+
 bool ConfigManager::migrateLayout() {
     if ((_layout["version"] | 1) >= 2) return false;
 
@@ -222,8 +249,9 @@ void ConfigManager::enterConfigMode() {
     WiFi.mode(WIFI_AP);
     // WPA2 has an 8-character minimum; anything shorter must be an open
     // network rather than silently failing to start the AP.
-    if (strlen(pass) >= 8) WiFi.softAP(ssid, pass, wifiChannel());
-    else                   WiFi.softAP(ssid, nullptr, wifiChannel());
+    const bool secured = strlen(pass) >= 8;
+    if (!WiFi.softAP(ssid, secured ? pass : nullptr, wifiChannel()))
+        log_e("Config AP '%s' did not start", ssid);
 
     _apIP = WiFi.softAPIP().toString();
     _dns.start(53, "*", WiFi.softAPIP());   // captive portal: answer everything
@@ -231,7 +259,7 @@ void ConfigManager::enterConfigMode() {
     _server.begin();
     _configMode = true;
     log_i("Config AP '%s' (%s) up at %s", ssid,
-          strlen(pass) >= 8 ? "protected" : "open", _apIP.c_str());
+          secured ? "protected" : "open", _apIP.c_str());
 }
 
 void ConfigManager::loop() {
@@ -285,13 +313,28 @@ void ConfigManager::setupRoutes() {
         const String &body = _server.arg("plain");
         JsonDocument probe;                       // validate before persisting
         DeserializationError err = deserializeJson(probe, body);
-        if (err || !probe["screens"].is<JsonArray>()) {
+        // No screens at all is refused too: the next boot would reject it and
+        // put the built-in layout - and no touch calibration - in its place.
+        if (err || !probe["screens"].is<JsonArray>() ||
+            probe["screens"].as<JsonArray>().size() == 0) {
             _server.send(400, "application/json",
                          String("{\"error\":\"invalid layout: ") +
-                         (err ? err.c_str() : "screens[] missing") + "\"}");
+                         (err ? err.c_str() : "no screens") + "\"}");
             return;
         }
-        if (!writeLayoutText(body)) {
+        /*
+         * The touch calibration is measured on the device and written straight
+         * to flash (saveTouchCal). A page that loaded the layout before that
+         * sends the old one back with its next Save: the device's stands.
+         */
+        std::string merged;
+        JsonVariantConst mine = _layout["global"]["touch_cal"];
+        if (!mine.isNull() && probe["global"]["touch_cal"] != mine) {
+            probe["global"]["touch_cal"] = mine;
+            serializeJsonPretty(probe, merged);
+        }
+        if (!(merged.empty() ? writeLayoutText(body)
+                             : writeLayoutText(merged.c_str(), merged.size()))) {
             _server.send(500, "application/json", "{\"error\":\"fs write\"}");
             return;
         }
@@ -371,7 +414,15 @@ void ConfigManager::setupRoutes() {
     });
 
     _server.on("/api/asset", HTTP_POST,
-               [this]() { sendJsonOk(); },
+               [this]() {
+                   // The upload handler has run to its end: say how it went.
+                   if (_uploadErr)
+                       _server.send(400, "application/json",
+                                    String("{\"error\":\"") + _uploadErr + "\"}");
+                   else
+                       sendJsonOk();
+                   _uploadErr = "no file";            // until the next one starts
+               },
                [this]() { handleAssetUpload(); });
 
     _server.on("/api/asset/delete", HTTP_POST, [this]() {
@@ -413,20 +464,38 @@ void ConfigManager::setupRoutes() {
 void ConfigManager::handleAssetUpload() {
     HTTPUpload &up = _server.upload();
     if (up.status == UPLOAD_FILE_START) {
+        _uploadErr = nullptr;
         String name = up.filename;
         int slash = name.lastIndexOf('/');         // basename only
         if (slash >= 0) name = name.substring(slash + 1);
         name.replace("..", "");
-        _uploadFile = LittleFS.open("/assets/" + name, "w");
+        if (!name.length()) {                  // nothing left of the name
+            log_w("Asset upload refused: no file name");
+            _uploadErr = "no file name";
+            return;
+        }
+        _uploadPath = "/assets/" + name;
+        _uploadFile = LittleFS.open(_uploadPath, "w");
+        if (!_uploadFile) _uploadErr = "cannot create the file";
         log_i("Asset upload start: %s", name.c_str());
     } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (_uploadFile) _uploadFile.write(up.buf, up.currentSize);
+        if (_uploadFile && _uploadFile.write(up.buf, up.currentSize) != up.currentSize) {
+            // Flash full. An image cut short draws garbage: none is kept.
+            _uploadFile.close();
+            LittleFS.remove(_uploadPath);
+            _uploadErr = "flash full";
+            log_e("Asset upload: flash full - %s not kept", _uploadPath.c_str());
+        }
     } else if (up.status == UPLOAD_FILE_END) {
         if (_uploadFile) {
             _uploadFile.close();
             log_i("Asset upload done: %u bytes", (unsigned)up.totalSize);
         }
     } else if (up.status == UPLOAD_FILE_ABORTED) {
-        if (_uploadFile) _uploadFile.close();
+        if (_uploadFile) {
+            _uploadFile.close();
+            LittleFS.remove(_uploadPath);          // half an image is no image
+        }
+        _uploadErr = "upload aborted";
     }
 }

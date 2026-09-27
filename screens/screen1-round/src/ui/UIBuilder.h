@@ -107,6 +107,10 @@ struct GaugeBinding {
     float      maxV = 100;          /**< Scale maximum (always > minV).      */
     WidgetKind kind = WidgetKind::Arc;  /**< Which widget family renders it. */
     float      tickLabelDiv = 1;    /**< meter: divide tick labels (x1000)   */
+    /** Meter and chart: they run in units of 1/unit. LVGL's meter and chart
+     *  are integer-valued, so a 0-1.6 bar dial would have two needle positions
+     *  and an 11-15 V trend five levels (see intUnitFor). A power of ten. */
+    float      unit = 1;
     ValueFmt   fmt = ValueFmt::Number;  /**< How the readout is written.     */
     bool       inlineUnits = false; /**< Readout carries its units: "63 %". */
 

@@ -15,6 +15,10 @@ Needs `g++` (WinLibs GCC: `winget install BrechtSanders.WinLibs.POSIX.UCRT`) and
 `pio run` done once (for ArduinoJson in `.pio/libdeps`). Debug a failure with
 `gdb --args test_host/build/sim.exe <scenario>`.
 
+`device_config` replays every settings file read off the car (`fixtures/`, one
+run each, shown as `device_config[<file>]`); `DEVICE_CONFIG=path` replays
+another one instead. The P1718 scenarios drive with the first fixture.
+
 | Part | What it is |
 | --- | --- |
 | `mocks/` | Arduino, FreeRTOS, TWAI, LittleFS, Wi-Fi/ESP-NOW headers, same API as ESP-IDF 4.4 |

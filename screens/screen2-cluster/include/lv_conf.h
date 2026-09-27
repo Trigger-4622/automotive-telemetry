@@ -48,8 +48,8 @@
  * This stays in INTERNAL RAM rather than PSRAM on purpose: it holds LVGL's
  * object tree and style data, which is walked constantly during layout and
  * redraw. Latency matters more than capacity here, and the S3 has 512 KB to
- * draw on. PSRAM's size advantage pays off for the image cache below, which
- * is read in big sequential runs. */
+ * draw on. (PSRAM's size would pay off for an image cache, read in big
+ * sequential runs - none is configured.) */
 #define LV_MEM_CUSTOM      0
 /* 80 KB. The shipped layout - eight screens including the dash - needs about
  * 61 KB here (measured by test_host/run.py, which works out the device's

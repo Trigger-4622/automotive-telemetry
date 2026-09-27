@@ -1,14 +1,15 @@
 /**
  * @file main.cpp
- * @brief ESP32-C3 Round Telemetry Display — Slave Node entry point.
+ * @brief ESP32-S3 4.3" Dash Cluster (JC4827W543) — Slave Node entry point.
  *
  * Boot sequence:
  *   1. ConfigManager  — mount LittleFS, load layout.json
- *   2. DisplayManager — GC9A01 + LVGL up
- *   3. TouchManager   — CST816S + gesture callbacks
+ *   2. DisplayManager — NV3041A (QSPI) + LVGL up
+ *   3. TouchManager   — GT911 + gesture callbacks, measured touch mapping
  *   4. UIBuilder      — build screens from the layout
  *   5. NetworkManager — ESP-NOW listener on the telemetry channel
- *   6. Startup needle sweep
+ *   6. Startup needle sweep, or the touch calibration wizard when the
+ *      mapping has never been measured
  *
  * Runtime contexts:
  *   - Arduino loop : LVGL rendering, touch, web portal (config mode)
@@ -17,7 +18,7 @@
  * Controls:
  *   swipe left/right — change screen        swipe up   — day/night override
  *   tap              — toggle peak values   swipe down — reset peaks
- *   5 s touch hold   — enter config AP      5 s hold (in config) — reboot
+ *   3 s touch hold   — enter config AP      3 s hold (in config) — reboot
  *   BOOT button tap  — next screen          BOOT button 2.5 s — config AP
  */
 #include <Arduino.h>

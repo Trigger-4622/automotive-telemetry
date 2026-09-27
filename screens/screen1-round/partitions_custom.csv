@@ -2,8 +2,8 @@
 # Custom 4 MB partition table — ESP32-C3 Round Telemetry Display (Slave Node)
 # -----------------------------------------------------------------------------
 # No OTA (single factory app) to maximize room for the app AND a large
-# LittleFS partition holding: /layout.json, /www/* (Gauge Studio SPA),
-# /assets/* (user-uploaded gauge backgrounds & icons).
+# LittleFS partition holding /layout.json and /assets/* (user-uploaded gauge
+# backgrounds & icons). The Gauge Studio page is compiled into the app.
 #
 # NAMING — do not "fix" this to something more descriptive:
 #   * The Name column is the partition LABEL. Arduino's LittleFS.begin() finds

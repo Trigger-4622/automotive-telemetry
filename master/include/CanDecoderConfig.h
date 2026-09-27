@@ -40,6 +40,9 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define CAN_TX_GPIO         5     /**< ESP32 TWAI TX  → transceiver CTX/TXD  */
 #define CAN_RX_GPIO         4     /**< ESP32 TWAI RX  ← transceiver CRX/RXD  */
+#define BOOT_BUTTON_GPIO    0     /**< The DevKit's BOOT button, active low:
+                                       held 3 s, it switches a portal that
+                                       was switched off (portal_on) back on. */
 #define NIGHT_LDR_GPIO      6     /**< Optional LDR divider for night
                                        detection — see NIGHT_SOURCE below.
                                        Must be an ADC1 pin: on the ESP32-S3

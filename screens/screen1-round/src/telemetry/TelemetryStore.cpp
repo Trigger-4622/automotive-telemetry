@@ -13,8 +13,13 @@ void TelemetryStore::begin(float emaAlpha, uint32_t staleTimeoutMs) {
 }
 
 TelemetryStore::Slot *TelemetryStore::find(uint16_t id) {
-    for (auto &s : _slots)
-        if (s.used && s.id == id) return &s;
+    // Slots are claimed in order and never given back, so the first free one
+    // ends the search: a packet's lookups (under the spinlock, interrupts off)
+    // cost the metrics heard, not all MAX_SLOTS.
+    for (auto &s : _slots) {
+        if (!s.used) return nullptr;
+        if (s.id == id) return &s;
+    }
     return nullptr;
 }
 
@@ -35,7 +40,7 @@ TelemetryStore::Slot *TelemetryStore::findOrAlloc(uint16_t id) {
             return &s;
         }
     }
-    return nullptr;            // >32 distinct metrics on air — ignore extras
+    return nullptr;            // every slot in use — ignore extras
 }
 
 void TelemetryStore::ingestRaw(const uint8_t *mac, const uint8_t *data, int len) {
@@ -72,6 +77,9 @@ void TelemetryStore::ingestRaw(const uint8_t *mac, const uint8_t *data, int len)
     // ---- metric ingestion ---------------------------------------------------
     for (uint8_t i = 0; i < pkt->metric_count; i++) {
         const MetricEntry &e = pkt->metrics[i];
+        // Not a number, or infinite: no value at all. An infinity would stick
+        // as the peak for good (a peak only rises) and poison the average.
+        if (!isfinite(e.value)) continue;
         Slot *s = findOrAlloc(e.metric_id);
         if (!s) continue;
 

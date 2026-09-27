@@ -179,6 +179,7 @@ size_t HardwareSerialMock::printf(const char *fmt, ...) {
     const int n = std::vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     if (sim::verbose) std::printf("%s", msg);
+    if (sim::serialOut.size() < 200000) sim::serialOut += msg;     // for the scenarios
     return n > 0 ? (size_t)n : 0;
 }
 size_t HardwareSerialMock::println(const char *s) { if (sim::verbose) std::printf("%s\n", s); return 0; }
@@ -186,7 +187,11 @@ size_t HardwareSerialMock::print(const char *s) { if (sim::verbose) std::printf(
 
 EspClassMock ESP;
 uint32_t EspClassMock::getFreeHeap() { return sim::heapFree; }
-void EspClassMock::restart() { std::printf("*** ESP.restart()\n"); std::_Exit(5); }
+void EspClassMock::restart() {
+    if (sim::restartReturns) { sim::restarts++; std::printf("*** ESP.restart() (expected)\n"); return; }
+    std::printf("*** ESP.restart()\n");
+    std::_Exit(5);
+}
 int analogRead(uint8_t) { return 2000; }
 
 /* ─────────────── reset reason, GPIO hold, digital IO ─────────────── */
@@ -196,6 +201,12 @@ int  gpioHoldEnabled = 0;
 bool txDrivenHigh = false;
 bool txConfiguredOut = false;
 int  txGlitches = 0;
+int  radioQdbm = 0;
+bool bootButtonDown = false;
+bool restartReturns = false;
+int  restarts = 0;
+std::string serialOut;
+TimingView timing = {};
 }
 
 esp_reset_reason_t esp_reset_reason() { return (esp_reset_reason_t)sim::resetReason; }
@@ -210,11 +221,16 @@ void pinMode(uint8_t, uint8_t mode) {
     if (mode == OUTPUT) { sim::txConfiguredOut = true; sim::txPadFromGpio(); }
 }
 esp_err_t gpio_set_level(gpio_num_t, uint32_t level) { sim::txDrivenHigh = level != 0; return ESP_OK; }
+esp_err_t esp_wifi_set_max_tx_power(int8_t power) { sim::radioQdbm = power; return ESP_OK; }
 esp_err_t gpio_set_direction(gpio_num_t, gpio_mode_t mode) {
     if (mode & GPIO_MODE_OUTPUT) { sim::txConfiguredOut = true; sim::txPadFromGpio(); }
     return ESP_OK;
 }
 void digitalWrite(uint8_t, uint8_t val) { sim::txDrivenHigh = (val == HIGH); }
+int gpio_get_level(gpio_num_t pin) {
+    if (pin == 0) return sim::bootButtonDown ? 0 : 1;   // pulled up, pressed = low
+    return sim::txDrivenHigh ? 1 : 0;
+}
 int  digitalRead(uint8_t) { return sim::txDrivenHigh ? HIGH : LOW; }
 
 /* ═════════════════════════════ LittleFS ═════════════════════════════════ */
@@ -290,11 +306,14 @@ static bool s_haveSeq = false;
 esp_err_t esp_now_init() { s_espInit = true; return ESP_OK; }
 esp_err_t esp_now_deinit() { s_espInit = false; return ESP_OK; }
 esp_err_t esp_now_add_peer(const esp_now_peer_info_t *) { return ESP_OK; }
+static esp_now_send_cb_t s_sendCb = nullptr;
+esp_err_t esp_now_register_send_cb(esp_now_send_cb_t cb) { s_sendCb = cb; return ESP_OK; }
 
 /* A display's view: validate the packet exactly as the slaves do, then merge. */
 esp_err_t esp_now_send(const uint8_t *, const uint8_t *data, size_t len) {
     if (!s_espInit) return ESP_FAIL;
     if (len > 250) { sim::espBadPackets++; return ESP_FAIL; }
+    sim::radioQueue(len, s_sendCb);             // on air, whatever it carries
     const MasterTelemetryPacket *p = (const MasterTelemetryPacket *)data;
     if (!telemetry_packet_valid(p, (int)len) || len != TELEMETRY_PACKET_SIZE(p->metric_count)) {
         sim::espBadPackets++;

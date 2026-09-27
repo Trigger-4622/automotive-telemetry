@@ -20,3 +20,6 @@ typedef enum { GPIO_MODE_DISABLE = 0, GPIO_MODE_INPUT = 1, GPIO_MODE_OUTPUT = 2,
 esp_err_t gpio_set_level(gpio_num_t pin, uint32_t level);
 /** GPIO_MODE_OUTPUT routes the pad to the GPIO latch - away from any peripheral. */
 esp_err_t gpio_set_direction(gpio_num_t pin, gpio_mode_t mode);
+/** The pad's level: GPIO0 is the BOOT button (sim::bootButtonDown), any
+ *  other pin the TX line. */
+int gpio_get_level(gpio_num_t pin);

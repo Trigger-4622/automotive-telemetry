@@ -91,6 +91,27 @@ static void formatValue(char *out, size_t n, float v, uint8_t decimals) {
 }
 
 /**
+ * @brief The factor that turns a fractional scale into whole numbers.
+ *
+ * LVGL's meter and chart are integer-valued: a -1..2 bar dial would have four
+ * needle positions and an 11..15 V trend five levels. They run in units of
+ * 1/unit instead - the smallest power of ten giving about 200 steps across the
+ * range, as long as the largest value still fits @p limit.
+ */
+static float intUnitFor(float minV, float maxV, float limit) {
+    const float span = maxV - minV, big = fmaxf(fabsf(minV), fabsf(maxV));
+    float u = 1;
+    while (span * u < 200.0f && big * u * 10.0f <= limit && u < 10000.0f) u *= 10.0f;
+    return u;
+}
+/** @brief @p v in a meter's or chart's integer units (see intUnitFor). */
+static int32_t inUnits(float v, float unit) { return (int32_t)lroundf(v * unit); }
+/** @brief ...clamped to what a chart point can hold. */
+static lv_coord_t chartPoint(float v, float unit) {
+    return (lv_coord_t)constrain(inUnits(v, unit), (int32_t)-32000, (int32_t)32000);
+}
+
+/**
  * @brief Create a styled, aligned label in one call.
  * @param parent Container to attach to.
  * @param txt    Initial text.
@@ -130,17 +151,28 @@ static void animBorderOpa(void *obj, int32_t v) {
 /** @} */
 
 /**
- * @brief Draw-time hook rewriting meter tick labels (8000 rpm shown as "8").
- * @param e LVGL draw event; its user_data points at the binding's divisor.
+ * @brief Draw-time hook rewriting meter tick labels: back from the meter's
+ *        integer units (GaugeBinding::unit), and divided for display (8000 rpm
+ *        shown as "8").
+ * @param e LVGL draw event; its user_data is the GaugeBinding.
  */
 static void meterTickLabelCb(lv_event_t *e) {
     auto *dsc = lv_event_get_draw_part_dsc(e);
     if (dsc->class_p != &lv_meter_class || dsc->type != LV_METER_DRAW_PART_TICK)
         return;
     if (!dsc->text) return;
-    float div = *(float *)lv_event_get_user_data(e);
+    const auto *b = static_cast<const GaugeBinding *>(lv_event_get_user_data(e));
+    const float div = b->unit * (b->tickLabelDiv > 1.0f ? b->tickLabelDiv : 1.0f);
     if (div <= 1.0f) return;
-    lv_snprintf(dsc->text, 16, "%d", (int)lroundf(dsc->value / div));
+    const float v = dsc->value / div;
+    // As few decimals as the tick needs: "8", "0.5", "0.25". (LVGL's own
+    // printf has no floats; the C library's does.)
+    if (fabsf(v - roundf(v)) < 0.005f)
+        snprintf(dsc->text, 16, "%d", (int)lroundf(v));
+    else if (fabsf(v * 10.0f - roundf(v * 10.0f)) < 0.05f)
+        snprintf(dsc->text, 16, "%.1f", v);
+    else
+        snprintf(dsc->text, 16, "%.2f", v);
 }
 
 /** @name Lamp images
@@ -439,10 +471,11 @@ void UIBuilder::parseCommon(GaugeBinding &b, JsonObject cfg) {
     b.metricId = parseMetricId(cfg["metric_id"]);
     b.label    = String(cfg["label"] | "");
     b.units    = String(cfg["units"] | "");
-    b.decimals = cfg["decimals"] | 0;
+    b.decimals = (uint8_t)constrain((int)(cfg["decimals"] | 0), 0, 6);
     b.minV     = cfg["min"] | 0.0f;
     b.maxV     = cfg["max"] | 100.0f;
     if (b.maxV <= b.minV) b.maxV = b.minV + 1;    // never divide by zero
+    b.unit     = intUnitFor(b.minV, b.maxV, 1e8f);  // meters; charts set their own
 
     JsonObject th = cfg["thresholds"];
     if (!th.isNull()) {
@@ -455,7 +488,7 @@ void UIBuilder::parseThreshold(ThresholdCfg &t, JsonObject cfg, bool critical) {
     if (cfg.isNull()) return;
     t.enabled = true;
     t.value   = cfg["value"] | 0.0f;
-    t.hyst    = cfg["hysteresis"] | 0.0f;
+    t.hyst    = fabsf(cfg["hysteresis"] | 0.0f);   // a band, either way
     t.above   = strcmp(cfg["direction"] | "above", "below") != 0;
     t.color   = colorFromHex(cfg["color"] | "",
                              critical ? lv_color_hex(UI_CRIT)
@@ -538,7 +571,9 @@ void UIBuilder::buildMeterGauge(ScreenDef &sd, JsonObject cfg) {
     // than letting a wide range explode the count.
     int minorPerMajor = 4;
     auto countTicks = [&] {
-        return (int)roundf((b.maxV - b.minV) / (majorEvery / minorPerMajor)) + 1;
+        // In float first: an absurdly fine spacing would overflow an int.
+        const float n = roundf((b.maxV - b.minV) / (majorEvery / minorPerMajor)) + 1.0f;
+        return n > 1000.0f ? 1000 : (int)n;
     };
     int tickCnt = countTicks();
     while (tickCnt > 41 && minorPerMajor > 1) {
@@ -561,29 +596,29 @@ void UIBuilder::buildMeterGauge(ScreenDef &sd, JsonObject cfg) {
                              lv_color_hex(UI_DIM));
     lv_meter_set_scale_major_ticks(meter, scale, minorPerMajor, 3, 14,
                                    lv_color_hex(UI_TEXT_DIM), 12);
-    lv_meter_set_scale_range(meter, scale, (int32_t)b.minV, (int32_t)b.maxV,
-                             angleRange, startAngle);
+    lv_meter_set_scale_range(meter, scale, inUnits(b.minV, b.unit),
+                             inUnits(b.maxV, b.unit), angleRange, startAngle);
 
     // Colored warning / critical zones behind the needle
     if (b.warn.enabled && b.warn.above) {
         auto *zone = lv_meter_add_arc(meter, scale, 6, b.warn.color, 0);
-        lv_meter_set_indicator_start_value(meter, zone, (int32_t)b.warn.value);
+        lv_meter_set_indicator_start_value(meter, zone, inUnits(b.warn.value, b.unit));
         lv_meter_set_indicator_end_value(meter, zone,
-            (int32_t)(b.crit.enabled ? b.crit.value : b.maxV));
+            inUnits(b.crit.enabled ? b.crit.value : b.maxV, b.unit));
     }
     if (b.crit.enabled && b.crit.above) {
         auto *zone = lv_meter_add_arc(meter, scale, 6, b.crit.color, 0);
-        lv_meter_set_indicator_start_value(meter, zone, (int32_t)b.crit.value);
-        lv_meter_set_indicator_end_value(meter, zone, (int32_t)b.maxV);
+        lv_meter_set_indicator_start_value(meter, zone, inUnits(b.crit.value, b.unit));
+        lv_meter_set_indicator_end_value(meter, zone, inUnits(b.maxV, b.unit));
     }
 
     b.needle = lv_meter_add_needle_line(meter, scale, 4, b.normalColor, -16);
-    lv_meter_set_indicator_value(meter, b.needle, (int32_t)b.minV);
+    lv_meter_set_indicator_value(meter, b.needle, inUnits(b.minV, b.unit));
 
     // Divided tick labels ("8" instead of "8000") via draw-part hook.
-    if (b.tickLabelDiv > 1.0f)
+    if (b.tickLabelDiv > 1.0f || b.unit > 1.0f)
         lv_obj_add_event_cb(meter, meterTickLabelCb, LV_EVENT_DRAW_PART_BEGIN,
-                            &b.tickLabelDiv);
+                            &b);
 
     /*
      * The readout stack sits below the hub. Keep it high enough that the round
@@ -722,6 +757,7 @@ void UIBuilder::buildChart(ScreenDef &sd, JsonObject cfg) {
     parseCommon(b, cfg);
     b.kind        = WidgetKind::Chart;
     b.chartPeriod = cfg["sample_ms"] | 1000;
+    b.unit        = intUnitFor(b.minV, b.maxV, 30000.0f);   // a point is 16-bit
     b.normalColor = colorFromHex(cfg["color"] | "", lv_color_hex(UI_ACCENT));
 
     const uint16_t points = constrain((int)(cfg["points"] | 60), 10, 120);
@@ -732,7 +768,7 @@ void UIBuilder::buildChart(ScreenDef &sd, JsonObject cfg) {
     lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(chart, points);
     lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y,
-                       (lv_coord_t)b.minV, (lv_coord_t)b.maxV);
+                       chartPoint(b.minV, b.unit), chartPoint(b.maxV, b.unit));
     // SHIFT scrolls old samples left as new ones arrive — a strip chart.
     lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
     lv_chart_set_div_line_count(chart, 4, 0);
@@ -768,10 +804,11 @@ void UIBuilder::dashPart(GaugeBinding &b, JsonVariant v, uint16_t id,
     b.metricId = o["metric_id"].isNull() ? id : parseMetricId(o["metric_id"]);
     b.label    = String(o["label"] | label);
     b.units    = String(o["units"] | units);
-    b.decimals = o["decimals"] | dec;
+    b.decimals = (uint8_t)constrain((int)(o["decimals"] | dec), 0, 6);
     b.minV     = o["min"] | minV;
     b.maxV     = o["max"] | maxV;
     if (b.maxV <= b.minV) b.maxV = b.minV + 1;
+    b.unit     = intUnitFor(b.minV, b.maxV, 1e8f);
     JsonObject th = o["thresholds"];
     if (!th.isNull()) {
         parseThreshold(b.warn, th["warning"], false);
@@ -984,7 +1021,7 @@ void UIBuilder::parseWatchdog() {
         w.metricId = parseMetricId(it["metric_id"]);
         w.label    = String(it["label"] | "");
         w.units    = String(it["units"] | "");
-        w.decimals = it["decimals"] | 0;
+        w.decimals = (uint8_t)constrain((int)(it["decimals"] | 0), 0, 6);
         w.popup    = it["popup"] | true;   // false = police it silently
         parseThreshold(w.warn, it["warning"],  false);
         parseThreshold(w.crit, it["critical"], true);
@@ -1077,7 +1114,7 @@ void UIBuilder::tick() {
             if (b.chart && b.series && usable &&
                 now - b.lastChartMs >= b.chartPeriod) {
                 b.lastChartMs = now;
-                lv_chart_set_next_value(b.chart, b.series, (lv_coord_t)lroundf(s.raw));
+                lv_chart_set_next_value(b.chart, b.series, chartPoint(s.raw, b.unit));
             }
 
             if (visible) renderBinding(b, shown, usable, ok ? s.peak : 0);
@@ -1186,7 +1223,7 @@ void UIBuilder::setGaugeValue(GaugeBinding &b, float v) {
     if (b.meter && b.needle) {
         // lv_meter_set_indicator_value invalidates unconditionally, so this
         // guard is what keeps a parked needle from redrawing 50×/second.
-        const int32_t nv = (int32_t)lroundf(v);
+        const int32_t nv = inUnits(v, b.unit);
         if (nv != b.lastNeedleVal) {
             b.lastNeedleVal = nv;
             lv_meter_set_indicator_value(b.meter, b.needle, nv);
@@ -1746,7 +1783,7 @@ static size_t collectLamps(const Telltales &lamps, bool forStrip,
     size_t mid = m;
     more = 0;
     if (mid > room) {
-        mid  = forStrip ? room - 1 : room;
+        mid  = (forStrip && room > 0) ? room - 1 : room;   // a slot for "+N"
         more = (int)(m - mid);
     }
     if (left >= 0) slots[n++] = left;
@@ -2143,7 +2180,10 @@ void UIBuilder::showConfigScreen(const char *ssid, const char *ip) {
     snprintf(url, sizeof(url), "http://%s", ip);
     makeLabel(root, url, &lv_font_montserrat_16,
               lv_color_hex(UI_ACCENT), LV_ALIGN_CENTER, 0, 22);
-    makeLabel(root, "Hold 5s to reboot", &lv_font_montserrat_12,
+    char hold[32];                                // the board's own hold time
+    snprintf(hold, sizeof(hold), "Hold %us to reboot",
+             (unsigned)(GESTURE_HOLD_CONFIG_MS / 1000));
+    makeLabel(root, hold, &lv_font_montserrat_12,
               lv_color_hex(UI_DIM), LV_ALIGN_BOTTOM_MID, 0, -34);
 
     lv_scr_load_anim(scr, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);

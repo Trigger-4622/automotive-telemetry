@@ -31,11 +31,14 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <freertos/semphr.h>
+#include <algorithm>
 #include <vector>
 #include <LittleFS.h>
 #include "driver/twai.h"
 #include "driver/gpio.h"
 #include "hal/twai_ll.h"
+#include "esp_rom_gpio.h"
+#include "soc/gpio_sig_map.h"
 
 #include "MasterPacket.h"
 #include "CanDecoderConfig.h"
@@ -226,6 +229,7 @@ static void evSaveNow() {
         r.add(snap[i].ms); r.add(snap[i].type); r.add(snap[i].act);
         r.add(snap[i].a);  r.add(snap[i].b);
     }
+    masterBusStall();                            // the flash write holds the CAN interrupt off
     File f = LittleFS.open(EV_TMP, "w");
     if (f) {
         const size_t expected = measureJson(d);
@@ -266,6 +270,9 @@ static MasterMetric *findSlot(uint16_t id) {
 }
 
 void publishMetric(uint16_t id, float value, uint8_t source) {
+    // A NaN would also defeat the broadcaster's change test (NaN != NaN) and
+    // go out every burst.
+    if (!isfinite(value)) return;
     const uint32_t now = millis();
     portENTER_CRITICAL(&s_metricMux);
     MasterMetric *slot = findSlot(id);
@@ -438,6 +445,11 @@ static volatile bool     s_twaiDown       = false;  /**< ...and it has.         
 /** Held around anything that stops, starts or reinstalls the driver, so the
  *  bus-off recovery can never restart a controller that is being replaced. */
 static SemaphoreHandle_t s_twaiCtl = nullptr;
+/** Held around every change to the controller's registers or driver - the
+ *  reinstall, the bus-off restart and the passive-mode TEC top-up. Unlike
+ *  s_twaiCtl it is never held while waiting for an alert, so a lower-priority
+ *  request task gets it at once. Order: s_twaiCtl before s_twaiReg. */
+static SemaphoreHandle_t s_twaiReg = nullptr;
 
 /** @brief Milliseconds of guard pause left (0 = not paused). */
 static uint32_t guardPauseLeft() {
@@ -532,9 +544,19 @@ static void guardTrip(const char *why) {
     evLog(EV_TX_TRIP, s_guardTrips, s_guardSilent ? 1 : 0);
 }
 
+static void txPassiveTopUp();
+
 bool diagBusLock(uint32_t timeoutMs) {
     if (!diagGuardOk()) return false;
-    return s_busMutex && xSemaphoreTake(s_busMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+    if (!(s_busMutex && xSemaphoreTake(s_busMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE)) return false;
+    // Asked again: the guard may have tripped, or listen-only begun, while we
+    // waited for the bus.
+    if (!diagGuardOk()) {
+        xSemaphoreGive(s_busMutex);
+        return false;
+    }
+    txPassiveTopUp();                // nothing of ours in flight now
+    return true;
 }
 void diagBusUnlock() { if (s_busMutex) xSemaphoreGive(s_busMutex); }
 
@@ -572,6 +594,19 @@ struct CanIdCount {
     uint8_t  data[8];    /**< Last payload.                        */
     uint8_t  changed[8]; /**< Bits that have toggled since reset.  */
     uint32_t lastMs;     /**< millis() of the last frame.          */
+    /** @name Missed frames (missAccount)
+     *  @{ */
+    uint32_t lastUs;      /**< micros() of the last frame.                  */
+    uint32_t periodUs;    /**< Its period as learned; 0 = not yet.          */
+    uint16_t regular;     /**< Gaps within 30 % of the period.              */
+    uint16_t irregular;   /**< Gaps that fit no whole number of periods.    */
+    uint32_t blindSeen;   /**< s_blindEpoch at the last frame.              */
+    uint32_t stallSeen;   /**< s_stallEpoch at the last frame.              */
+    bool     skipNext;    /**< The last frame was timed late: its gap too.  */
+    uint32_t missed[2];   /**< Its frames the master did not receive, by
+                               mode: [0] normal, [1] listen-only.           */
+    uint32_t expected[2]; /**< Its frames due over the same gaps.           */
+    /** @} */
 };
 static CanIdCount s_census[MAX_CENSUS] = {};
 static volatile uint8_t s_censusUsed = 0;
@@ -588,6 +623,101 @@ void masterCountTx() { s_canTxCount++; }
 static volatile bool    s_censusFull = false;
 static volatile bool    s_censusResetReq = false;
 
+/* ═════════════════════════ frames the master missed ══════════════════════
+ *
+ * Most of the car's broadcasts are periodic, so a frame the master misread -
+ * rejected by its controller with a bus error while the rest of the car took
+ * it - shows as a gap of two or more periods in that ID. Counted per ID, that
+ * says whose frames the master cannot read and how often, in listen-only and
+ * normal mode alike, without trusting an error counter: with errors let pass
+ * (tx_passive) a misread frame is simply dropped, and the gap is all that is
+ * left of it.
+ *
+ * A gap only counts if the master was listening throughout. Anything that
+ * makes it deaf for a moment calls masterBusBlind() - a reinstall, a TEC write
+ * (reset mode), a flash write (the cache is off, and the CAN interrupt with
+ * it), frames dropped for a full queue - and a gap across one is left out,
+ * its missing and its expected frames both.
+ */
+static volatile uint32_t s_blindEpoch = 0;
+/** ...and a stall: the frames around it were timed late (a flash write held
+ *  the CAN interrupt off, or the queue overflowed), so the gaps next to it say
+ *  nothing about the rhythm either. */
+static volatile uint32_t s_stallEpoch = 0;
+void masterBusBlind() { s_blindEpoch = s_blindEpoch + 1; }
+void masterBusStall() { s_stallEpoch = s_stallEpoch + 1; masterBusBlind(); }
+
+/** Frames received and bus errors counted, by mode: [0] normal, [1] listen-only. */
+static volatile uint32_t s_rxByMode[2]  = {0, 0};
+static volatile uint32_t s_errByMode[2] = {0, 0};
+
+/** Periodic enough to judge: 20 regular gaps, no more than one in eight not. */
+static bool idPeriodic(const CanIdCount &c) {
+    return c.regular >= 20 && c.irregular * 8u <= c.regular;
+}
+/** Diagnostic requests and replies come when asked, not on a clock. */
+static bool idOnRequest(const CanIdCount &c) {
+    return !c.extd && c.id >= 0x7DF && c.id <= 0x7EF;
+}
+
+/** No car broadcast repeats faster than this. Frames of one ID closer than
+ *  that are a burst out of the receive queue, not their rhythm (see below). */
+static constexpr uint32_t MIN_PERIOD_US = 2000;
+
+/**
+ * @brief Book the gap before this frame of @p c (see above).
+ *
+ * Frames are timed as the RX task takes them from the queue, not as they
+ * crossed the wire. After a stall - a flash write holding the CAN interrupt
+ * off - the queued ones come out microseconds apart, the first of them late,
+ * and the gap after it short. None of those gaps is the ID's rhythm: learning
+ * from them taught periods of microseconds, after which every real gap looked
+ * like a pause and the ID was never judged again. So a gap across a stall, a
+ * gap inside a burst, and the gap after either are all skipped.
+ *
+ * @param silent Listen-only now: the mode the gap is booked under.
+ */
+static void missAccount(CanIdCount &c, uint32_t nowUs, bool silent) {
+    const uint32_t gap = nowUs - c.lastUs;
+    const uint32_t epoch = s_blindEpoch, stall = s_stallEpoch;
+    const bool blind = epoch != c.blindSeen, stalled = stall != c.stallSeen;
+    c.blindSeen = epoch;
+    c.stallSeen = stall;
+    if (stalled || gap < MIN_PERIOD_US) { c.skipNext = true; return; }   // timed late, or a burst
+    if (c.skipNext) { c.skipNext = false; return; }      // it began at a frame timed late
+    const uint64_t g = gap, p = c.periodUs;             // 64-bit: slow IDs cannot overflow
+    const auto relearn = [&]() { c.periodUs = gap; c.regular = c.irregular = 0; };
+    // Learning: a shorter gap is the shorter period, and a far longer one says
+    // the first guess was wrong (or the bus paused) - start over from it.
+    if (!p || (c.regular < 20 && (g * 10 < p * 7 || g > p * 11))) { relearn(); return; }
+    if (g > p * 11) return;                             // a pause, not ours to judge
+    if (c.regular == 0xFFFF || c.irregular == 0xFFFF) { // halved together: the ratio counts,
+        c.regular /= 2;                                 // and a long drive must not tip it
+        c.irregular /= 2;
+    }
+    const uint8_t m = silent ? 1 : 0;
+    if (g * 10 >= p * 7 && g * 10 <= p * 13) {          // on time
+        c.regular++;
+        c.periodUs = (uint32_t)((int64_t)p + ((int64_t)g - (int64_t)p) / 16);  // its real rate
+        if (!blind && idPeriodic(c)) c.expected[m]++;
+        return;
+    }
+    if (g * 10 > p * 13) {
+        const uint64_t k = (g + p / 2) / p;             // periods in the gap
+        const uint64_t off = g > k * p ? g - k * p : k * p - g;
+        if (k >= 2 && k <= 10 && off * 10 <= p * 3) {   // whole periods: k - 1 missing
+            if (!blind && idPeriodic(c)) {
+                c.missed[m]   += (uint32_t)(k - 1);
+                c.expected[m] += (uint32_t)k;
+            }
+            return;
+        }
+    }
+    // Sooner than its period, or no whole number of them. An ID that keeps
+    // doing it has changed its rate, or never had one: learn it again.
+    if (++c.irregular * 4 > c.regular) relearn();
+}
+
 /** @brief Carry out a census reset asked for by the portal (RX task only). */
 static void censusServiceReset() {
     if (!s_censusResetReq) return;
@@ -603,6 +733,7 @@ static void censusServiceReset() {
  */
 static void censusAdd(const twai_message_t &msg) {
     const uint8_t dlc = msg.data_length_code > 8 ? 8 : msg.data_length_code;
+    const uint32_t nowUs = micros();
     for (uint8_t i = 0; i < s_censusUsed; i++) {
         CanIdCount &c = s_census[i];
         if (c.id == msg.identifier && c.extd == (bool)msg.extd) {
@@ -613,6 +744,8 @@ static void censusAdd(const twai_message_t &msg) {
                 c.data[b] = msg.data[b];
             }
             c.lastMs = millis();
+            if (!idOnRequest(c)) missAccount(c, nowUs, s_twaiSilentNow);
+            c.lastUs = nowUs;
             return;
         }
     }
@@ -626,6 +759,14 @@ static void censusAdd(const twai_message_t &msg) {
     memcpy(c.data, msg.data, dlc);
     memset(c.changed, 0, 8);
     c.lastMs = millis();
+    c.lastUs = nowUs;
+    c.periodUs = 0;
+    c.regular = c.irregular = 0;
+    c.blindSeen = s_blindEpoch;
+    c.stallSeen = s_stallEpoch;
+    c.skipNext  = false;
+    memset(c.missed, 0, sizeof(c.missed));
+    memset(c.expected, 0, sizeof(c.expected));
     s_censusUsed++;
 }
 
@@ -1344,6 +1485,8 @@ void masterUpdateDerived() {
 }
 
 static void setupTwai(bool silent);
+static void errKindAdd(uint8_t code, bool silent, uint32_t errors);
+static void applyRadioPower();
 
 /** @brief Sleep the master when the bus has been quiet long enough.
  *  Defined further down, next to the rest of the sleep handling. */
@@ -1367,12 +1510,18 @@ static void sleepCheck();
  * The level goes into the GPIO latch first and the pad becomes a GPIO output
  * second (gpio_set_direction routes it to the latch, away from the controller's
  * TX signal). The other way round - pinMode, then digitalWrite - the pad shows
- * the latch's reset value, 0 = dominant, for the moment in between. The next
- * twai_driver_install() routes the pad back to the controller.
+ * the latch's reset value, 0 = dominant, for the moment in between.
+ * txPadAttach() - or the next twai_driver_install() - routes the pad back to
+ * the controller.
  */
 static void txPadRecessive() {
     gpio_set_level((gpio_num_t)CAN_TX_GPIO, 1);
     gpio_set_direction((gpio_num_t)CAN_TX_GPIO, GPIO_MODE_OUTPUT);
+}
+/** Give the TX pad back to the controller: the very call twai_driver_install()
+ *  routes it with (after gpio_config, which txPadRecessive() has done). */
+static void txPadAttach() {
+    esp_rom_gpio_connect_out_signal(CAN_TX_GPIO, TWAI_TX_IDX, false, false);
 }
 static void txRecessiveBoot() {
     gpio_hold_dis((gpio_num_t)CAN_TX_GPIO);   // release any latch from before sleep
@@ -1385,6 +1534,49 @@ static void txRecessiveForSleep() {
     gpio_hold_en((gpio_num_t)CAN_TX_GPIO);    // latch it high for the whole sleep
     gpio_deep_sleep_hold_en();
 }
+
+/** @name Passive transmit mode (Cfg.txPassive)
+ *  TEC is set this high right after the controller starts in normal mode,
+ *  and topped up whenever the node's own successful frames (-1 each) have
+ *  brought it down to the low mark. 220 leaves room for four transmit errors
+ *  (+8 each) before bus-off at 256.
+ *  @{ */
+static constexpr uint32_t TEC_PASSIVE     = 220;
+static constexpr uint32_t TEC_PASSIVE_LOW = 170;
+/** TEC writes of ours - the passive-mode top-ups, the start in normal mode,
+ *  the listen-only fix - so busGuardTask never takes the jump for an error in
+ *  our own frame. */
+static volatile uint32_t s_tecWrites = 0;
+/** Set TEC (reset mode for a moment: a frame being received is lost to us).
+ *  Only with nothing of ours queued or on the wire - the caller makes sure. */
+static void tecSet(uint32_t tec) {
+    masterBusBlind();                // a frame arriving now is lost to us
+    s_tecWrites = s_tecWrites + 1;
+    twai_ll_enter_reset_mode(&TWAI);
+    twai_ll_set_tec(&TWAI, tec);
+    twai_ll_exit_reset_mode(&TWAI);
+}
+
+/**
+ * @brief Passive mode: bring TEC back up before a request goes out.
+ *
+ * Called by diagBusLock() once the caller holds the bus mutex - every request
+ * and SSM2 exchange takes it first, so nothing of ours is queued or on the
+ * wire. The register lock keeps it clear of a reinstall or a bus-off restart.
+ * Our own successful frames wind TEC down by one each; from TEC_PASSIVE to the
+ * low mark is fifty frames, so a top-up every few requests keeps it passive.
+ */
+static void txPassiveTopUp() {
+    if (!Cfg.txPassive || s_twaiSilentNow || !s_twaiReg) return;
+    if (xSemaphoreTake(s_twaiReg, pdMS_TO_TICKS(40)) != pdTRUE) return;
+    twai_status_info_t st;
+    if (!s_twaiReinstall && !s_twaiSilentNow && twai_get_status_info(&st) == ESP_OK &&
+        st.state == TWAI_STATE_RUNNING && st.msgs_to_tx == 0 && st.tx_error_counter < TEC_PASSIVE_LOW) {
+        tecSet(TEC_PASSIVE);
+    }
+    xSemaphoreGive(s_twaiReg);
+}
+/** @} */
 
 /**
  * @brief Espressif's listen-only erratum - fixed here, because the Arduino core
@@ -1414,11 +1606,48 @@ static void txRecessiveForSleep() {
  * the transceiver whatever the silicon gets up to.
  */
 static void listenOnlyErratumFix() {
+    /*
+     * TEC as well as REC. REC alone did not hold on the car: with errors
+     * streaming, the portal showed REC back at 0 in listen-only - a good frame
+     * winds REC down (from above 127 straight to 119..127, then by one) - and
+     * an error-active controller whose error flags the detached TX pad keeps
+     * off the bus reads its own flag back recessive, calls that a bit error,
+     * flags again, and counts every round: the million errors a drive. TEC
+     * moves only when the controller transmits, which it never does in
+     * listen-only, so TEC 128 keeps it error-passive for good.
+     */
+    s_tecWrites = s_tecWrites + 1;
     twai_ll_enter_reset_mode(&TWAI);
+    twai_ll_set_tec(&TWAI, 128);
     twai_ll_set_rec(&TWAI, 128);
     twai_ll_exit_reset_mode(&TWAI);
-    const uint32_t rec = twai_ll_get_rec(&TWAI);
-    if (rec < 128) log_e("listen-only erratum fix did not take (REC %u)", (unsigned)rec);
+    const uint32_t tec = twai_ll_get_tec(&TWAI);
+    if (tec < 128) log_e("listen-only erratum fix did not take (TEC %u)", (unsigned)tec);
+}
+
+/**
+ * @brief Start the controller with its TX pad kept off the bus until the
+ *        controller is in the state it is meant to be in there.
+ *
+ * twai_start() clears both error counters, and a controller with both below
+ * 128 is error-active: an error it detects, it answers with six dominant bits
+ * that destroy the frame for every module. So the pad is a recessive GPIO
+ * while the controller starts and goes back to it only after that - once it
+ * is error-passive with errors let pass (TEC_PASSIVE), or at once when that is
+ * switched off. In listen-only it never goes back (listenOnlyErratumFix).
+ * Every start goes through here: boot, a mode switch, the restart after
+ * bus-off.
+ */
+static bool twaiGoLive(bool silent) {
+    txPadRecessive();
+    if (twai_start() != ESP_OK) return false;
+    if (silent) {
+        listenOnlyErratumFix();
+        return true;
+    }
+    if (Cfg.txPassive) tecSet(TEC_PASSIVE);
+    txPadAttach();
+    return true;
 }
 
 /* ═══════════════════════════ FreeRTOS tasks ══════════════════════════════ */
@@ -1431,16 +1660,19 @@ static void listenOnlyErratumFix() {
  */
 static void twaiRxTask(void *) {
     twai_message_t msg;
+    uint8_t noDriver = 0;                    /**< 200 ms passes without a driver. */
     for (;;) {
         if (s_twaiShutdown) {
             // Going to sleep: the driver goes, and so does this task's use of it.
             // The TX pad leaves the controller first, recessive, so no state the
             // stopping controller passes through can reach the bus.
             xSemaphoreTake(s_twaiCtl, portMAX_DELAY);
+            xSemaphoreTake(s_twaiReg, portMAX_DELAY);
             txPadRecessive();
             twai_stop();
             twai_driver_uninstall();
             s_twaiDown = true;
+            xSemaphoreGive(s_twaiReg);
             xSemaphoreGive(s_twaiCtl);
             for (;;) vTaskDelay(portMAX_DELAY);
         }
@@ -1448,23 +1680,36 @@ static void twaiRxTask(void *) {
             // Only this task consumes the driver's queue, so only it may
             // tear the driver down and bring it back in another mode.
             xSemaphoreTake(s_twaiCtl, portMAX_DELAY);
+            xSemaphoreTake(s_twaiReg, portMAX_DELAY);
             s_twaiReinstall = false;
+            masterBusBlind();
             txPadRecessive();                // off the bus while it changes
             twai_stop();
             twai_driver_uninstall();
             setupTwai(s_twaiWantSilent);
+            xSemaphoreGive(s_twaiReg);
             xSemaphoreGive(s_twaiCtl);
         }
         censusServiceReset();
         const esp_err_t rr = twai_receive(&msg, pdMS_TO_TICKS(200));
         if (rr == ESP_ERR_INVALID_STATE) {
-            // No driver (install failed): returning at once, this loop would
-            // hold core 1 at top priority and starve everything else on it.
+            // No driver (install failed: memory, an interrupt, the timing).
+            // Returning at once, this loop would hold core 1 at top priority
+            // and starve everything else on it. Nothing else would ever install
+            // it again - busGuardTask sees no driver and waits - so every 2 s it
+            // is tried here, listen-only; the guard switches it on from there.
             vTaskDelay(pdMS_TO_TICKS(200));
+            if (++noDriver >= 10 && !s_twaiReinstall) {
+                noDriver = 0;
+                s_twaiWantSilent = true;
+                s_twaiReinstall  = true;
+            }
             continue;
         }
+        noDriver = 0;
         if (rr != ESP_OK) continue;
         s_canFramesRx++;
+        s_rxByMode[s_twaiSilentNow ? 1 : 0]++;
         const uint32_t rxMs = millis();
         // The first frame since boot, or after the bus was quiet, is the bus
         // coming up: the settle wait counts from it. Written before
@@ -1505,6 +1750,74 @@ static void twaiRxTask(void *) {
             else                verifySample(i, val);
         }
     }
+}
+
+/* ══════════════════════ bus errors against the radio ═════════════════════
+ *
+ * One 3.3 V rail feeds the ESP32 and the CAN transceiver, and the radio draws
+ * its biggest current spikes while it transmits - the kind that browned the
+ * master out on the car. If the transceiver misreads while the rail sags, the
+ * bus errors bunch up around the display broadcasts. So each error is checked
+ * against the radio: transmitting, or within RADIO_TAIL_US of it (the rail
+ * recovering, and the guard task waking)? Errors that have nothing to do with
+ * the radio land that close to it about as often as the radio is that busy,
+ * which is measured alongside.
+ */
+static constexpr uint32_t RADIO_TAIL_US = 3000;
+static portMUX_TYPE s_radioMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_radioInFlight   = 0;  /**< Packets handed over, not yet sent.   */
+static uint32_t s_radioBurstUs    = 0;  /**< When the current burst began.        */
+static uint32_t s_radioHotUntilUs = 0;  /**< End of the last one + RADIO_TAIL_US. */
+static uint64_t s_radioHotUs      = 0;  /**< Hot time while the bus was up.       */
+static uint64_t s_radioSeenUs     = 0;  /**< Bus-up time, on the same clock.      */
+static volatile uint32_t s_errNearRadio = 0, s_errRadioChecked = 0;
+
+/** @brief A packet goes to the radio (broadcastTask, before esp_now_send). */
+static void radioTxBegin() {
+    portENTER_CRITICAL(&s_radioMux);
+    if (s_radioInFlight++ == 0) s_radioBurstUs = micros();
+    portEXIT_CRITICAL(&s_radioMux);
+}
+/** @brief esp_now_send refused it: it never reached the air. */
+static void radioTxAbort() {
+    portENTER_CRITICAL(&s_radioMux);
+    if (s_radioInFlight) s_radioInFlight--;
+    portEXIT_CRITICAL(&s_radioMux);
+}
+/** @brief The radio has sent a packet (ESP-NOW send callback, Wi-Fi task). */
+static void onEspNowSent(const uint8_t *, esp_now_send_status_t) {
+    const uint32_t now = micros();
+    const bool alive = diagBusAlive();
+    portENTER_CRITICAL(&s_radioMux);
+    if (s_radioInFlight && --s_radioInFlight == 0) {
+        const uint32_t until = now + RADIO_TAIL_US;
+        // Only what the last burst's tail has not already counted.
+        const uint32_t from = (int32_t)(s_radioHotUntilUs - s_radioBurstUs) > 0 ? s_radioHotUntilUs
+                                                                                : s_radioBurstUs;
+        if (alive && (int32_t)(until - from) > 0) s_radioHotUs += until - from;
+        s_radioHotUntilUs = until;
+    }
+    portEXIT_CRITICAL(&s_radioMux);
+}
+/** @brief Book @p n bus errors against the radio (busGuardTask, as they arrive). */
+static void radioNoteErrors(uint32_t n) {
+    const uint32_t now = micros();
+    portENTER_CRITICAL(&s_radioMux);
+    const bool hot = s_radioInFlight || (int32_t)(s_radioHotUntilUs - now) > 0;
+    portEXIT_CRITICAL(&s_radioMux);
+    s_errRadioChecked = s_errRadioChecked + n;
+    if (hot) s_errNearRadio = s_errNearRadio + n;
+}
+/** @brief Bus-up time for the hot share (busGuardTask, every pass). */
+static void radioObserve(bool alive) {
+    static uint32_t last = 0;
+    const uint32_t now = micros();
+    portENTER_CRITICAL(&s_radioMux);
+    if (alive && last) s_radioSeenUs += now - last;
+    // A send whose callback never came must not leave the radio "hot" for good.
+    if (s_radioInFlight && now - s_radioBurstUs > 200000) s_radioInFlight = 0;
+    portEXIT_CRITICAL(&s_radioMux);
+    last = now;
 }
 
 /**
@@ -1568,8 +1881,10 @@ static void broadcastTask(void *) {
             pkt.metric_count = n;
             memcpy(pkt.metrics, &fresh[off], n * sizeof(MetricEntry));
 
+            radioTxBegin();
             const bool sent = esp_now_send(BCAST, (const uint8_t *)&pkt,
                                            TELEMETRY_PACKET_SIZE(n)) == ESP_OK;
+            if (!sent) radioTxAbort();
             if (sent) { s_espnowFrames++; s_espnowMetrics += n; }
             else      { s_espnowFailed++; }
 
@@ -1591,11 +1906,8 @@ static void broadcastTask(void *) {
 }
 
 /**
- * @brief Night detection (LDR or vehicle data), bus-health metrics, sleep,
- *        and the TWAI health watchdog.
- *
- * The bus-off recovery here is what stops a transient short or a derailed bus
- * from permanently bricking the bridge. Never returns.
+ * @brief Night detection (LDR or vehicle data), bus-health metrics and sleep.
+ *        (Bus-off recovery lives in busGuardTask.) Never returns.
  */
 static void housekeepingTask(void *) {
     for (;;) {
@@ -1657,7 +1969,8 @@ static void housekeepingTask(void *) {
  * ours. Never returns.
  */
 static void busGuardTask(void *) {
-    uint32_t lastErrCount = 0, lastTec = 0, winStart = 0, winErrs = 0, lastSwitch = 0;
+    uint32_t lastErrCount = 0, lastTec = 0, winStart = 0, winErrs = 0, lastSwitch = 0, lastTecWrites = 0;
+    uint32_t lastDropped = 0;                 /**< Queue-full + FIFO-overrun drops.   */
     uint32_t rxWinStart = 0, rxWinErrs = 0;   /**< Receive-side errors, per window. */
     bool     wasPassive = false, wasSettling = false;
     bool     ctrlRunning = false;             /**< Last status read said RUNNING. */
@@ -1717,19 +2030,30 @@ static void busGuardTask(void *) {
         // moment the lock is released, and a listen-only REC (frozen at 128 by
         // listenOnlyErratumFix) judged as a normal-mode one looks like a storm.
         bool stSilent = false;
+        uint8_t ecc = 0;                     // the latest error's kind (see errKindAdd)
+        uint32_t tecWrites = 0;              // our TEC writes, as of this status
         xSemaphoreTake(s_twaiCtl, portMAX_DELAY);
-        if (twai_read_alerts(&alerts, pdMS_TO_TICKS(100)) != ESP_ERR_INVALID_STATE &&
-            twai_get_status_info(&st) == ESP_OK) {
-            haveStatus = true;
-            stSilent = s_twaiSilentNow;
-            if (!s_twaiReinstall) {
-                if (st.state == TWAI_STATE_BUS_OFF) {
-                    wentBusOff = true;
-                    twai_initiate_recovery();
-                } else if (st.state == TWAI_STATE_STOPPED) {
-                    twai_start();             // recovery finished
+        if (twai_read_alerts(&alerts, pdMS_TO_TICKS(20)) != ESP_ERR_INVALID_STATE) {
+            // Under the register lock, which every TEC write of ours holds: the
+            // status and the count of those writes then belong together, so a
+            // write can never slip between them and pass for an error of ours.
+            xSemaphoreTake(s_twaiReg, portMAX_DELAY);
+            if (twai_get_status_info(&st) == ESP_OK) {
+                haveStatus = true;
+                stSilent = s_twaiSilentNow;
+                tecWrites = s_tecWrites;
+                ecc = (uint8_t)(TWAI.error_code_capture_reg.val & 0xFF);
+                if (!s_twaiReinstall &&
+                    (st.state == TWAI_STATE_BUS_OFF || st.state == TWAI_STATE_STOPPED)) {
+                    if (st.state == TWAI_STATE_BUS_OFF) {
+                        wentBusOff = true;
+                        twai_initiate_recovery();
+                    } else {
+                        twaiGoLive(s_twaiSilentNow);   // recovery finished: counters at 0
+                    }
                 }
             }
+            xSemaphoreGive(s_twaiReg);
         }
         xSemaphoreGive(s_twaiCtl);
         if (!haveStatus) {                   // driver being reinstalled
@@ -1737,14 +2061,24 @@ static void busGuardTask(void *) {
             continue;
         }
         ctrlRunning = st.state == TWAI_STATE_RUNNING;
+        radioObserve(diagBusAlive());
+        // Frames dropped for a full queue or FIFO: the master was deaf to them,
+        // and the ones it kept were late.
+        const uint32_t dropped = st.rx_missed_count + st.rx_overrun_count;
+        if (dropped != lastDropped) { lastDropped = dropped; masterBusStall(); }
 
         const uint32_t delta = st.bus_error_count - lastErrCount;
         lastErrCount = st.bus_error_count;
         // The transmit error counter only rises for errors in frames this
-        // controller was sending: that is ours beyond doubt.
-        const bool tecRose = st.tx_error_counter > lastTec;
+        // controller was sending: that is ours beyond doubt. Our own TEC
+        // writes raise it too (a top-up, the start after listen-only); a pass
+        // that saw one of those cannot tell, so it blames nothing.
+        const bool tecRose = tecWrites == lastTecWrites && st.tx_error_counter > lastTec;
+        lastTecWrites = tecWrites;
         lastTec = st.tx_error_counter;
         if (delta && delta < 10000) {        // (a reinstall resets the count)
+            errKindAdd(ecc, stSilent, delta);
+            radioNoteErrors(delta);
             if (tecRose) {
                 s_errWhileTx += delta;
                 const uint32_t now = millis();
@@ -1769,7 +2103,9 @@ static void busGuardTask(void *) {
                  * traffic, whatever REC says. (Not counted in listen-only, where
                  * an error we see is one we cannot signal.)
                  */
-                if (ctrlRunning && !stSilent) {
+                // (Not while error-passive: our flags are recessive then and
+                // cannot destroy anyone's frame - passive mode's whole point.)
+                if (ctrlRunning && !stSilent && st.tx_error_counter < 128) {
                     const uint32_t now = millis();
                     if (now - rxWinStart > Cfg.guardWindowS * 1000UL) { rxWinStart = now; rxWinErrs = 0; }
                     rxWinErrs += delta;
@@ -1800,7 +2136,7 @@ static void busGuardTask(void *) {
          * winds back down on every good frame, so this only fires on a real
          * storm, not the odd stray error. Opt out with rx_guard.
          */
-        if (Cfg.rxGuardEnabled && !s_rxGuardSilent && !stSilent &&
+        if (Cfg.rxGuardEnabled && !s_rxGuardSilent && !stSilent && st.tx_error_counter < 128 &&
             ctrlRunning && st.rx_error_counter >= Cfg.rxGuardRec) {
             s_rxGuardSilent = true;
             evLog(EV_RX_TRIP, (uint16_t)st.rx_error_counter,
@@ -1811,7 +2147,8 @@ static void busGuardTask(void *) {
             rxWinErrs = 0;
         }
 
-        const bool passive = st.state == TWAI_STATE_RUNNING && !stSilent && st.tx_error_counter >= 128;
+        const bool passive = st.state == TWAI_STATE_RUNNING && !stSilent && !Cfg.txPassive &&
+                             st.tx_error_counter >= 128;
         if (passive && !wasPassive)
             log_w("TWAI error-passive (TEC %u, REC %u)", (unsigned)st.tx_error_counter,
                   (unsigned)st.rx_error_counter);
@@ -1880,6 +2217,7 @@ static void enterDeepSleep() {
     for (int i = 0; i < 50 && !s_twaiDown; i++) vTaskDelay(pdMS_TO_TICKS(10));
     if (!s_twaiDown) {                   // RX task stuck: do it anyway
         xSemaphoreTake(s_twaiCtl, pdMS_TO_TICKS(500));
+        xSemaphoreTake(s_twaiReg, pdMS_TO_TICKS(500));
         txPadRecessive();
         twai_stop();
         twai_driver_uninstall();
@@ -1947,6 +2285,81 @@ static void logWakeCause() {
  * snapshots provide without handing out the underlying storage.
  */
 
+/* ═══════════════════ what the controller says went wrong ════════════════
+ *
+ * The TWAI error-code-capture register holds the type, direction and frame
+ * segment of the latest bus error. Sampled whenever the error count has moved
+ * (busGuardTask, under the driver lock) and tallied per mode, it tells what the
+ * controller objects to, which a bare count cannot: a bit error while sending
+ * in the ACK slot points at the transceiver or its supply, stuff or form errors
+ * while receiving at the link or the bit timing. Portal Bus tab, serial log.
+ */
+struct ErrKindSlot { uint8_t code; bool silent; uint32_t samples, errors; };
+static constexpr size_t ERRKIND_MAX = 12;
+static ErrKindSlot s_errKinds[ERRKIND_MAX] = {};
+static portMUX_TYPE s_errKindMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void errKindAdd(uint8_t code, bool silent, uint32_t errors) {
+    portENTER_CRITICAL(&s_errKindMux);
+    ErrKindSlot *hit = nullptr, *least = &s_errKinds[0];
+    for (auto &k : s_errKinds) {
+        if (k.samples && k.code == code && k.silent == silent) { hit = &k; break; }
+        if (k.samples < least->samples) least = &k;
+    }
+    if (!hit) { hit = least; *hit = {code, silent, 0, 0}; }   // the rarest makes room
+    hit->samples++;
+    hit->errors += errors;
+    s_errByMode[silent ? 1 : 0] += errors;
+    portEXIT_CRITICAL(&s_errKindMux);
+}
+
+size_t masterErrorKinds(ErrKindView *out, size_t max) {
+    ErrKindSlot copy[ERRKIND_MAX];
+    portENTER_CRITICAL(&s_errKindMux);
+    memcpy(copy, s_errKinds, sizeof(copy));
+    portEXIT_CRITICAL(&s_errKindMux);
+    size_t n = 0;
+    for (const auto &k : copy) if (k.samples) n++;
+    std::sort(copy, copy + ERRKIND_MAX, [](const ErrKindSlot &a, const ErrKindSlot &b) {
+        return a.errors > b.errors;
+    });
+    n = min(n, max);
+    for (size_t i = 0; i < n; i++) out[i] = {copy[i].code, copy[i].silent, copy[i].samples, copy[i].errors};
+    return n;
+}
+
+void errKindText(uint8_t code, char *buf, size_t len) {
+    static const char *TYPE[] = {"bit error", "form error", "stuff error", "error"};
+    const char *seg;
+    switch (code & 0x1F) {
+        case 0x03: seg = "start of frame"; break;
+        case 0x02: case 0x06: case 0x07: case 0x0F: case 0x0E: seg = "identifier"; break;
+        case 0x04: case 0x05: case 0x0C: case 0x0D: case 0x09: seg = "control bits"; break;
+        case 0x0B: seg = "length code"; break;
+        case 0x0A: seg = "data field"; break;
+        case 0x08: seg = "CRC sequence"; break;
+        case 0x18: seg = "CRC delimiter"; break;
+        case 0x19: seg = "ACK slot"; break;
+        case 0x1B: seg = "ACK delimiter"; break;
+        case 0x1A: seg = "end of frame"; break;
+        case 0x12: seg = "intermission"; break;
+        case 0x11: seg = "active error flag"; break;
+        case 0x16: seg = "passive error flag"; break;
+        case 0x13: seg = "dominant bits after an error flag"; break;
+        case 0x17: seg = "error delimiter"; break;
+        case 0x1C: seg = "overload flag"; break;
+        default:   seg = "segment ?"; break;
+    }
+    snprintf(buf, len, "%s %s in %s", TYPE[code >> 6], (code & 0x20) ? "receiving" : "sending", seg);
+}
+
+/** Radio transmit power, from the setting (esp_wifi: quarter-dBm units). */
+static uint8_t s_radioDbmApplied = 0;
+static void applyRadioPower() {
+    s_radioDbmApplied = Cfg.radioDbm;
+    esp_wifi_set_max_tx_power((int8_t)(Cfg.radioDbm * 4));
+}
+
 void masterGetStats(MasterStats &out) {
     Ssm2Status ss;
     ssm2GetStatus(ss);
@@ -1992,6 +2405,46 @@ void masterGetStats(MasterStats &out) {
         out.rxMissed  = st.rx_missed_count;
         out.rxOverrun = st.rx_overrun_count;
     }
+    for (int m = 0; m < 2; m++) {
+        out.rxByMode[m]  = s_rxByMode[m];
+        out.errByMode[m] = s_errByMode[m];
+        out.missed[m] = out.expected[m] = 0;
+    }
+    const uint8_t n = s_censusUsed;
+    for (uint8_t i = 0; i < n; i++) {
+        const CanIdCount &c = s_census[i];
+        if (!idPeriodic(c) || idOnRequest(c)) continue;
+        for (int m = 0; m < 2; m++) { out.missed[m] += c.missed[m]; out.expected[m] += c.expected[m]; }
+    }
+    out.errNearRadio    = s_errNearRadio;
+    out.errRadioChecked = s_errRadioChecked;
+    portENTER_CRITICAL(&s_radioMux);
+    const uint64_t hot = s_radioHotUs, seen = s_radioSeenUs;
+    portEXIT_CRITICAL(&s_radioMux);
+    out.radioHotPermille = seen ? (uint16_t)std::min<uint64_t>(1000, hot * 1000 / seen) : 0;
+}
+
+size_t masterMissedIds(MissView *out, size_t max) {
+    size_t w = 0;
+    const uint8_t n = s_censusUsed;
+    for (uint8_t i = 0; i < n; i++) {
+        const CanIdCount &c = s_census[i];
+        if (!idPeriodic(c) || idOnRequest(c) || !(c.expected[0] + c.expected[1])) continue;
+        MissView v = {c.id, c.extd, (c.periodUs + 500) / 1000, {c.missed[0], c.missed[1]},
+                      {c.expected[0], c.expected[1]}};
+        // Insertion into the top max, most missed first (then the busiest).
+        const auto more = [](const MissView &a, const MissView &b) {
+            const uint32_t ma = a.missed[0] + a.missed[1], mb = b.missed[0] + b.missed[1];
+            return ma != mb ? ma > mb : a.expected[0] + a.expected[1] > b.expected[0] + b.expected[1];
+        };
+        size_t at = w;
+        while (at > 0 && more(v, out[at - 1])) at--;
+        if (at >= max) continue;
+        for (size_t k = (w < max ? w : max - 1); k > at; k--) out[k] = out[k - 1];
+        out[at] = v;
+        if (w < max) w++;
+    }
+    return w;
 }
 
 size_t masterCensusRaw(CensusView *out, size_t max) {
@@ -2077,6 +2530,11 @@ void masterEventLogClear() {
     portEXIT_CRITICAL(&s_evMux);
 }
 
+void masterBeforeRestart() {
+    Cfg.serviceSave();               // a save another task asked for
+    evSaveNow();                     // and the evidence log's last few seconds
+}
+
 void masterResetCensus() {
     // Done by the RX task: clearing the table under it while it appends a new
     // identifier would leave a half-written row behind the new count.
@@ -2134,38 +2592,43 @@ static void setupTwai(bool silent) {
         default:   t = TWAI_TIMING_CONFIG_500KBITS();  break;
     }
     /*
-     * Sample point. The driver's presets sample at 80 % of the bit; many
-     * vehicle buses are specified nearer 87.5 %. A node that samples early
-     * on a bus with slow edges sees errors nobody else sees - and in normal
-     * mode it signals them, corrupting everyone's frames. Selectable from the
-     * portal for exactly that case: 16 time quanta, 14 before the sample.
+     * Sample point and sampling. The ESP-IDF presets sample once, at 80 % of
+     * the bit (SJW 3). Vehicle buses are specified at 87.5 % (SAE J1939 /
+     * J2284), and a node that samples early or once on a stub with ringing
+     * reads errors nobody else sees - and in normal mode it flags every one,
+     * destroying the frame for the whole car. The default (canTiming 2) is the
+     * timing the Arduino-CAN library programs on the ESP32, which works on
+     * cars where the ESP-IDF preset produced bus errors (arduino-esp32 #9191):
+     * 16 time quanta, 14 before the sample (87.5 %), SJW 2, and triple
+     * sampling - three samples per bit, decided by majority, so a spike or a
+     * ringing edge is outvoted instead of read as a bit. canTiming 0 keeps
+     * the ESP-IDF preset (with the older 87.5 % switch, canSample875).
      */
-    if (Cfg.canSample875 && Cfg.bitrateKbps != 1000) {
+    const bool late = Cfg.bitrateKbps != 1000 && (Cfg.canTiming >= 1 || Cfg.canSample875);
+    if (late) {
         t.brp   = 80000 / (16 * Cfg.bitrateKbps);   // APB 80 MHz: 500k -> 10
         t.tseg_1 = 13;
         t.tseg_2 = 2;
         t.sjw    = 2;
-        t.triple_sampling = false;
     }
+    t.triple_sampling = Cfg.canTiming == 2 && Cfg.bitrateKbps != 1000;
     twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g, &t, &f) != ESP_OK) {
         log_e("TWAI init failed — check CAN_TX/RX_GPIO wiring");
         return;
     }
-    // Listen-only: the TX pad is taken from the controller before it starts,
-    // and it is made error-passive as soon as it has (listenOnlyErratumFix).
-    if (silent) txPadRecessive();
-    if (twai_start() != ESP_OK) {
+    // The TX pad is off the controller while it starts (twaiGoLive).
+    if (!twaiGoLive(silent)) {
         twai_driver_uninstall();
         log_e("TWAI init failed — check CAN_TX/RX_GPIO wiring");
         return;
     }
-    if (silent) listenOnlyErratumFix();
     s_twaiSilentNow = silent;
-    log_i("TWAI up (%s mode) at %u kbit/s, sample point %s",
+    log_i("TWAI up (%s mode) at %u kbit/s, sample point %s%s%s",
           silent ? "SILENT/listen-only" : "NORMAL", Cfg.bitrateKbps,
-          Cfg.canSample875 && Cfg.bitrateKbps != 1000 ? "87.5%" : "80%");
+          late ? "87.5%" : "80%", t.triple_sampling ? ", triple sampling" : "",
+          !silent && Cfg.txPassive ? ", errors let pass (no error frames)" : "");
 }
 
 /**
@@ -2202,6 +2665,7 @@ static void setupEspNow() {
     peer.ifidx   = viaAp ? WIFI_IF_AP : WIFI_IF_STA;
     peer.encrypt = false;        // broadcast frames cannot be encrypted
     esp_now_add_peer(&peer);
+    esp_now_register_send_cb(onEspNowSent);   // when each packet has gone (radio timing)
     /*
      * Print our own MAC. The slaves can filter on it (network.master_mac in
      * their layout) so a second CAN node, or someone else's project on the
@@ -2234,6 +2698,7 @@ void setup() {
     s_busMutex = xSemaphoreCreateMutex();
     s_obdSem   = xSemaphoreCreateBinary();
     s_twaiCtl  = xSemaphoreCreateMutex();
+    s_twaiReg  = xSemaphoreCreateMutex();
     s_evSaveMutex = xSemaphoreCreateMutex();
 
     // Configuration first: TWAI mode, bitrate and the ESP-NOW channel are all
@@ -2256,6 +2721,7 @@ void setup() {
     // registers its peer against whichever interface that leaves running.
     Portal.begin();
     setupEspNow();
+    applyRadioPower();
 
     // CAN work pinned to core 1; Wi-Fi stack lives on core 0.
     xTaskCreatePinnedToCore(twaiRxTask,      "twai_rx",   6144, nullptr, 10, nullptr, 1);
@@ -2265,6 +2731,37 @@ void setup() {
     xTaskCreatePinnedToCore(busGuardTask,    "busguard",  3072, nullptr,  9, nullptr, 1);
     ssm2Begin();
     learnerBegin();
+}
+
+/**
+ * @brief The way back into a portal that was switched off (portal_on false):
+ *        the BOOT button held for 3 s switches it on again and restarts.
+ *
+ * Nothing else reaches the settings then - there is no serial console, and
+ * the configuration survives a reflash by design. Acts only while the portal
+ * is off, so a master that has it on is not touched.
+ */
+static void portalRescueCheck() {
+    static uint32_t downSince = 0;
+    static bool pinReady = false;
+    if (Cfg.portalOn) { downSince = 0; return; }
+    if (!pinReady) {
+        gpio_set_direction((gpio_num_t)BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
+        gpio_pullup_en((gpio_num_t)BOOT_BUTTON_GPIO);
+        pinReady = true;
+    }
+    if (gpio_get_level((gpio_num_t)BOOT_BUTTON_GPIO) != 0) { downSince = 0; return; }
+    const uint32_t now = millis();
+    if (!downSince) { downSince = now | 1; return; }
+    if (now - downSince < 3000) return;
+    log_w("BOOT held 3 s: the portal is switched back on - restarting");
+    Cfg.lock();
+    Cfg.portalOn = true;
+    Cfg.unlock();
+    Cfg.save();
+    masterBeforeRestart();
+    ESP.restart();
+    downSince = 0;                   // (only the simulator comes back here)
 }
 
 /**
@@ -2311,10 +2808,33 @@ void loop() {
                                    "/" + ss.total + " params)").c_str() : "",
                       s_obdActive ? "active" : (s_obdAnswers == 2 ? "no answer" : "idle"));
         censusPrint();
+        {
+            // What the controller says the errors are (see errKindAdd).
+            ErrKindView ek[2];
+            const size_t nk = masterErrorKinds(ek, 2);
+            for (size_t i = 0; i < nk; i++) {
+                char txt[64];
+                errKindText(ek[i].code, txt, sizeof(txt));
+                Serial.printf("[errs ] %s, %s: %u errors\n", txt,
+                              ek[i].silent ? "listen-only" : "normal mode", (unsigned)ek[i].errors);
+            }
+            // Where they come from: frames missed per mode, and the radio.
+            MasterStats ls;
+            masterGetStats(ls);
+            if (ls.expected[0] || ls.expected[1] || ls.errRadioChecked)
+                Serial.printf("[link ] missed %u of %u normal, %u of %u listen-only | "
+                              "errors near the radio %u of %u (radio busy %u.%u%%)\n",
+                              (unsigned)ls.missed[0], (unsigned)ls.expected[0],
+                              (unsigned)ls.missed[1], (unsigned)ls.expected[1],
+                              (unsigned)ls.errNearRadio, (unsigned)ls.errRadioChecked,
+                              ls.radioHotPermille / 10, ls.radioHotPermille % 10);
+        }
     }
     Portal.loop();
+    if (Cfg.radioDbm != s_radioDbmApplied) applyRadioPower();
     Cfg.serviceSave();
     evService();
+    portalRescueCheck();
     delay(10);
 }
 

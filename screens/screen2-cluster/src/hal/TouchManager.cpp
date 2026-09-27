@@ -216,10 +216,28 @@ void TouchManager::readCb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     static_cast<TouchManager *>(drv->user_data)->handleRead(data);
 }
 
+/** A contact the panel has sent nothing about for this long is over. */
+static constexpr uint32_t TOUCH_LOST_MS = 500;
+
 void TouchManager::handleRead(lv_indev_data_t *data) {
     int16_t rx = _rawX, ry = _rawY;
     bool touched = false, fresh = false;
     const uint32_t now = millis();
+
+    /*
+     * A release is one frame with no finger in it. Lose that frame to an I2C
+     * error and the panel - silent once nothing touches it - never sends
+     * another, so the press stayed down until the next touch, which was then
+     * measured from this one's start: a phantom swipe. A finger on the glass
+     * streams frames (a hold depends on it), so silence this long means the
+     * contact is over. Ended as it stands: no tap or swipe is guessed from it.
+     */
+    if (_phase != Phase::Idle && now - _lastFreshMs > TOUCH_LOST_MS) {
+        _phase      = Phase::Idle;
+        _spent      = false;
+        _travelFrac = 0;
+        _emptyFrames = 0;
+    }
 
     if (!readPanel(rx, ry, touched, fresh)) {
         // A dropped I2C read is not a lift. Hold state.
@@ -231,6 +249,7 @@ void TouchManager::handleRead(lv_indev_data_t *data) {
     }
 
     if (fresh) {
+        _lastFreshMs = now;
         if (touched) {
             _emptyFrames = 0;
             _rawX = rx;

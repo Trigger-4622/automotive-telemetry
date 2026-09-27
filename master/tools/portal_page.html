@@ -123,6 +123,10 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="tile"><div class="k">Frames</div><div class="v" id="bFps">–</div><div class="s" id="bIds">&nbsp;</div></div>
  </div>
  <p class="say" id="bSay"></p>
+ <div class="card" id="ekCard" hidden><h2>What the errors are <small>from the CAN controller itself</small></h2>
+  <p class="say" style="margin:0 0 8px">Every bus error, the controller records its type, whether it was sending or receiving, and where in the frame it happened. Errors while <b>sending</b> in the ACK slot mean our own transceiver is not driving the bus as it should (supply, ground, its mode pin); errors while <b>receiving</b> in the data or CRC mean the link or the bit timing.</p>
+  <div class="wrap"><table><thead><tr><th>Error</th><th>Mode</th><th>Count</th></tr></thead><tbody id="ekTab"></tbody></table></div>
+  <div id="lkBox"></div></div>
  <div class="card" id="teach"><h2>Teach by doing <small>for what the ECU cannot report</small></h2>
   <p class="say" style="margin:0 0 10px">Turn signals, doors, handbrake, steering, wheel speeds… Pick what you are about to
    operate, press Start and follow the steps. The master finds the bits or bytes that followed you.</p>
@@ -170,6 +174,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="f"><div class="l"><b>Allow OBD-II requests</b><span>asks the engine ECU for values it does not broadcast</span></div><input type="checkbox" id="sObd"></div>
   <div class="f"><div class="l"><b>Allow Subaru SSM2 requests</b><span>only for what OBD-II cannot give: knock, A/F learning, switches</span></div><input type="checkbox" id="sSsm"></div>
   <div class="f"><div class="l"><b>Learn automatically</b><span>matches requested values to bus traffic, then stops requesting them</span></div><input type="checkbox" data-k="learn"></div>
+  <div class="f"><div class="l"><b>Let errors pass</b><span>never sends an error frame: a frame the master reads as bad is dropped by the master alone and reaches every other module untouched. It still requests, receives and acknowledges good frames</span></div><input type="checkbox" data-k="tx_passive"></div>
   <div class="f"><div class="l"><b>Bus guard</b><span>pauses requests if bus errors follow our frames</span></div><input type="checkbox" data-k="guard"></div>
   <div class="f"><div class="l"><b>Receive-error guard</b><span>switches to listen-only if our controller starts corrupting other modules' frames (a receive-error storm) — the protection against the transmission ECU losing the engine ECU's messages</span></div><input type="checkbox" data-k="rx_guard"></div>
   <div class="f"><div class="l"><b>Wait after power-on</b><span>seconds of listening only while the car's bus settles, before the first request · 0 = no wait</span></div><input type="number" data-k="start_delay_s" min="0" max="300"></div>
@@ -187,9 +192,11 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
  <div class="card"><h2>Connection <small>reboot to apply</small></h2>
   <div class="f"><div class="l"><b>CAN bitrate</b><span>500 kbit/s on the OBD port</span></div>
    <select data-k="bitrate_kbps"><option value="125">125 kbit/s</option><option value="250">250 kbit/s</option><option value="500">500 kbit/s</option><option value="1000">1 Mbit/s</option></select></div>
+  <div class="f"><div class="l"><b>CAN bit timing</b><span>87.5 % with triple sampling rides out spikes a single 80 % sample reads as errors</span></div>
+   <select data-k="can_timing"><option value="2">87.5 %, triple sampling (recommended)</option><option value="1">87.5 %</option><option value="0">ESP-IDF preset (80 %)</option></select></div>
   <div class="f"><div class="l"><b>Display channel</b><span>must match every display</span></div><input type="number" data-k="wifi_channel" min="1" max="13"></div>
-  <div class="f"><div class="l"><b>Wi-Fi name</b></div><input data-k="ap_ssid" data-t="str"></div>
-  <div class="f"><div class="l"><b>Wi-Fi password</b><span>8+ characters, or empty for open</span></div><input data-k="ap_pass" data-t="str"></div>
+  <div class="f"><div class="l"><b>Wi-Fi name</b><span>1-32 characters</span></div><input data-k="ap_ssid" data-t="str" maxlength="32"></div>
+  <div class="f"><div class="l"><b>Wi-Fi password</b><span>8-63 characters, or empty for open</span></div><input data-k="ap_pass" data-t="str" maxlength="63"></div>
  </div>
  <div class="card"><h2>Maintenance</h2>
   <p class="say" id="sEcu" style="margin:0 0 10px"></p>
@@ -197,7 +204,8 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
    <button class="b" onclick="post('/api/learn/reset','Learning restarted')">Restart learning</button>
    <button class="b" onclick="if(confirm('Delete every automatically learned value?'))post('/api/learn/forget','Learned values deleted',()=>load(true))">Forget learned values</button>
    <button class="b" onclick="post('/api/reboot','Rebooting')">Reboot</button>
-   <button class="b d" onclick="if(confirm('Restore factory settings and reboot?'))post('/api/defaults','Restored - rebooting')">Factory reset</button>
+   <button class="b p" onclick="if(confirm('Put the CAN bus settings back to the safe defaults and reboot?\n\nRequests on (Auto), errors let pass, 87.5 % triple sampling, both guards on, P2CAN 50 ms, 10 s wait after power-on.\n\nKept: the bitrate, your request pacing, displays, Wi-Fi and every learned value.'))post('/api/bus_defaults','Safe bus settings - rebooting')">Safe bus settings</button>
+   <button class="b d" onclick="if(confirm('Restore factory settings and reboot?\n\nThis also deletes every learned value. For the bus settings alone, use Safe bus settings.'))post('/api/defaults','Restored - rebooting')">Factory reset</button>
   </div>
   <p class="say" style="margin:10px 0 0">Every other setting is on the <a href="#" onclick="go('adv');return false" class="acc">Advanced</a> tab.</p></div>
 </section>
@@ -260,9 +268,23 @@ function fillBound(){
  document.querySelectorAll('[data-k]').forEach(el=>{const v=C[el.dataset.k];if(v===undefined)return;
   if(el.type==='checkbox')el.checked=!!v;else if(document.activeElement!==el)el.value=v});
  const t=MODE_TOG[C.diag_mode]||[1,1];$('#sObd').checked=!!t[0];$('#sSsm').checked=!!t[1]}
+/* Settings that would lock this page away: the AP will not start without a
+   name, nor with a key WPA2 cannot use; and with the Wi-Fi off at boot only
+   the BOOT button brings the page back. */
+function refused(k,v){
+ const len=s=>new TextEncoder().encode(s).length;
+ if(k==='ap_ssid'&&(!len(v)||len(v)>32))return'The Wi-Fi name takes 1 to 32 characters';
+ if(k==='ap_pass'&&len(v)>63)return'The Wi-Fi password takes at most 63 characters';
+ if(k==='ap_pass'&&len(v)&&len(v)<8)toast('Under 8 characters the Wi-Fi stays open');
+ if(k==='portal_on'&&v===false&&!confirm('Switch this Wi-Fi off at boot?\n\nThis page is then out of reach. '+
+   'To get it back, hold the master\'s BOOT button for 3 seconds while it runs (ignition on).'))return'Wi-Fi kept on';
+ return''}
 document.addEventListener('change',e=>{
  const el=e.target;
- if(el.dataset&&el.dataset.k){const v=parseEl(el);if(v!==undefined){C[el.dataset.k]=v;fillBound();setDirty(true)}return}
+ if(el.dataset&&el.dataset.k){const v=parseEl(el);
+  const why=v===undefined?'':refused(el.dataset.k,v);
+  if(why){toast(why);if(el.type==='checkbox')el.checked=!!C[el.dataset.k];else el.value=C[el.dataset.k]??'';return}
+  if(v!==undefined){C[el.dataset.k]=v;fillBound();setDirty(true)}return}
  if(el.id==='sObd'||el.id==='sSsm'){C.diag_mode=togToMode($('#sObd').checked,$('#sSsm').checked);fillBound();setDirty(true);return}
  if(el.closest('#t-src')&&!['adv','oAll','mAll'].includes(el.id))setDirty(true)});
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b),clone=o=>JSON.parse(JSON.stringify(o));
@@ -282,7 +304,7 @@ async function load(soft){
  LOADED=true;fillBound();
  if(!inside('#t-src'))renderSources();
  if(TAB==='adv'&&!inside('#t-adv')){renderAdv();jsonShow()}}
-const REBOOT_KEYS=['bitrate_kbps','wifi_channel','ap_ssid','ap_pass','portal_on','can_sp875'];
+const REBOOT_KEYS=['bitrate_kbps','wifi_channel','ap_ssid','ap_pass','portal_on','can_sp875','can_timing'];
 const RO_KEYS=['cfg_ver','ecu_id','ecu_sys_id','ecu_flags'];
 const sigKey=s=>[s.can_id,s.ext?1:0,s.start,s.len,s.be?1:0,s.metric].join(':');
 /* Three-way merge of the signal table: what the master holds now, plus exactly
@@ -347,8 +369,11 @@ const ADV=[
   ['rx_guard_errs','…or receive errors within the guard window that trip it','num','',1,250]]],
  ['CAN controller',[
   ['bitrate_kbps','Bitrate','sel',[[125,'125 kbit/s'],[250,'250 kbit/s'],[500,'500 kbit/s'],[1000,'1 Mbit/s']],1],
-  ['can_sp875','Late sample point (87.5 %)','bool',null,null,null,null,1]]],
+  ['tx_passive','Let errors pass: never send an error frame','bool'],
+  ['can_timing','Bit timing','sel',[[2,'87.5 %, triple sampling (recommended)'],[1,'87.5 %'],[0,'ESP-IDF preset (80 %)']],1],
+  ['can_sp875','With the ESP-IDF preset: 87.5 % instead','bool',null,null,null,null,1]]],
  ['Displays',[
+  ['radio_dbm','Radio transmit power','num','dBm - lower draws less from the supply',2,20],
   ['broadcast_ms','Send every','num','ms',20,1000],
   ['keepalive_ms','Re-send unchanged values every','num','ms',50,1400],
   ['metric_ttl_ms','Drop a value after','num','ms',200,10000],
@@ -362,8 +387,8 @@ const ADV=[
   ['tx_hold','Hold the CAN TX line recessive across sleep','bool']]],
  ['Network',[
   ['wifi_channel','Display channel','num','1–13',1,13,1,1],
-  ['ap_ssid','Wi-Fi name','str',null,null,null,null,1],
-  ['ap_pass','Wi-Fi password','str','8+ characters or empty',null,null,null,1],
+  ['ap_ssid','Wi-Fi name','str','1–32 characters',null,32,null,1],
+  ['ap_pass','Wi-Fi password','str','8–63 characters or empty',null,63,null,1],
   ['portal_on','Start this Wi-Fi at boot','bool',null,null,null,null,1]]]];
 function renderAdv(){
  $('#advBody').innerHTML=ADV.map(([title,rows])=>`<div class="card"><h2>${title}</h2>`+rows.map(r=>{
@@ -371,7 +396,7 @@ function renderAdv(){
   let input;
   if(type==='bool')input=`<input type="checkbox" data-k="${k}">`;
   else if(type==='sel')input=`<select data-k="${k}">${a.map(o=>`<option value="${o[0]}">${esc(o[1])}</option>`).join('')}</select>`;
-  else if(type==='str')input=`<input data-k="${k}" data-t="str">`;
+  else if(type==='str')input=`<input data-k="${k}" data-t="str"${max?` maxlength="${max}"`:''}>`;
   else input=`<input type="number" data-k="${k}"${min!=null?` min="${min}"`:''}${max!=null?` max="${max}"`:''}${step?` step="${step}"`:''}>`;
   const hint=type==='num'||type==='str'?(a?`<span>${esc(a)}</span>`:''):'';
   return`<div class="f"><div class="l"><b>${esc(label)}${tag}</b>${hint}</div>${input}</div>`}).join('')+'</div>').join('');
@@ -480,8 +505,32 @@ async function pollBus(){
    <td class="hx">${by}${used.length?` <span class="tag raw">${esc(used.join(', '))}</span>`:''}</td>
    <td><button class="b s" onclick="mapOpen(${c.id},${c.ext?1:0})">Map</button></td></tr>`}).join('')||'<tr><td colspan="4" class="empty">Nothing heard yet.</td></tr>';
  if(MAP)mapPrev()}
+const EK_SEG={3:'start of frame',2:'identifier',6:'identifier',7:'identifier',15:'identifier',14:'identifier',
+ 4:'control bits',5:'control bits',12:'control bits',13:'control bits',9:'control bits',11:'length code',10:'data field',
+ 8:'CRC sequence',24:'CRC delimiter',25:'ACK slot',27:'ACK delimiter',26:'end of frame',18:'intermission',
+ 17:'active error flag',22:'passive error flag',19:'dominant bits after an error flag',23:'error delimiter',28:'overload flag'};
+function ekText(c){return['bit error','form error','stuff error','error'][c>>6]+' while '+((c&32)?'receiving':'sending')+' in '+(EK_SEG[c&31]||'segment '+(c&31))}
+/* Where the errors come from: the car's regular frames the master missed
+   (a gap in an ID's rhythm is a frame it misread), by mode, and the errors
+   checked against our own radio. */
+function renderLink(d){
+ const k=d.bus.link;if(!k){$('#lkBox').innerHTML='';return false}
+ const pc=(a,b)=>b?(100*a/b).toFixed(a&&100*a/b<1?2:1)+' %':'–';
+ const modes=[['Normal mode',0],['Listen-only',1]].filter(([,i])=>k.exp[i]||k.rx[i]);
+ let h='';
+ if(modes.length)h+='<h3 style="margin:14px 0 6px">Where they come from</h3><p class="say" style="margin:0 0 8px">'+modes.map(([n,i])=>
+  `<b>${n}</b>: missed ${k.miss[i]} of ${k.exp[i]} of the car's regular frames (${pc(k.miss[i],k.exp[i])}); ${k.rx[i]?(1000*k.err[i]/k.rx[i]).toFixed(1):'–'} bus errors per 1000 frames`).join('<br>')+'</p>';
+ if(k.chk>=20){const near=100*k.near/k.chk,hot=k.hot/10;
+  h+=`<p class="say" style="margin:0 0 8px">${near.toFixed(0)} % of ${k.chk} bus errors came while our radio was transmitting or within 3 ms of it, and it is that busy ${hot.toFixed(0)} % of the time. `+
+   (near>=30&&near>=2*hot?'<span class="warn">Far above chance: the radio is disturbing the CAN side - its 3.3 V supply or ground. Try Advanced → Radio transmit power 2 dBm and compare.</span>':'About chance: the radio is not what causes them.')+'</p>'}
+ if(k.ids&&k.ids.length)h+='<div class="wrap"><table><thead><tr><th>ID</th><th>Every</th><th>Missed</th><th>Share</th></tr></thead><tbody>'+
+  k.ids.map(r=>`<tr><td>${r.x?'ext ':''}${hex(r.i,3)}</td><td>${r.p} ms</td><td>${r.m} of ${r.e}</td><td>${pc(r.m,r.e)}</td></tr>`).join('')+'</tbody></table></div>'+
+  '<p class="say" style="margin:8px 0 0">Misses on one module\'s IDs only: the link to that module, where the master taps in. Spread over every module: the master\'s own side - supply, ground, transceiver. More in normal mode than listen-only: its own transceiver driving the bus upsets it.</p>';
+ $('#lkBox').innerHTML=h;return !!h}
 function renderBusTiles(){
  const d=L;
+ const ks=d.bus.kinds||[];const lk=renderLink(d);$('#ekCard').hidden=!ks.length&&!lk;
+ $('#ekTab').innerHTML=ks.map(k=>`<tr><td>${ekText(k.c)}</td><td>${k.s?'listen-only':'normal'}</td><td>${k.n}</td></tr>`).join('');
  $('#bErrTx').textContent=d.bus.err_tx;$('#bErrTx').className='v '+(d.bus.err_tx?'crit':'ok');
  $('#bErrTxS').textContent=`${d.bus.err_idle} while we were quiet`;
  const g=d.guard;$('#gCard').hidden=!(g.silent||g.pause);
@@ -494,7 +543,7 @@ function renderBusTiles(){
  bar.style.background=RATES.load>70?'var(--crit)':RATES.load>50?'var(--warn)':'var(--ok)';
  $('#bTx').textContent=RATES.tx.toFixed(0);
  $('#bErr').textContent=d.bus.err;$('#bErr').className='v '+(RATES.errs>0?'crit':d.bus.err?'warn':'ok');
- $('#bErrS').textContent=`error counters ${d.bus.tec} / ${d.bus.rec}`;
+ $('#bErrS').textContent=`error counters ${d.bus.tec} / ${d.bus.rec}`+(C.tx_passive&&!d.silent&&d.bus.tec>=128?' (high on purpose: errors let pass)':'');
  $('#bFps').textContent=(RATES.fps||0).toFixed(0)+'/s';$('#bIds').textContent=d.bus.ids+' different IDs';
  let s;
  if(!d.bus.alive)s='No traffic.';
@@ -677,7 +726,7 @@ function updateSourceText(){
  $('#oSub').textContent=o.answers===1?`ECU supports ${o.supported} PIDs · ${o.active?'active':'idle'} · ${o.physical?'engine ECU only':'all ECUs'}`:o.answers===2?'the ECU does not answer':'not asked yet';
  $('#mSub').textContent=(s.init?`ECU supports ${s.supported} of ${s.total} · ${s.active?(s.rate||0).toFixed(0)+' requests/s, '+s.batch+' values each':'idle — OBD-II covers it'}`:s.answers===2?'the ECU does not answer':'waits for OBD-II')+
   (s.refused?` · ${s.refused} refused by the ECU`:'')+(s.last_err?` · last problem: ${s.last_err}`:'');
- $('#sEcu').innerHTML=s.ecu_id?`ECU <b>${s.ecu_id}</b> · SYS ${s.sys_id} · ${s.flags} capability bytes${s.init?'':' (remembered)'} · this master ${esc(L.mac)}`:`This master ${esc(L.mac)}`}
+ $('#sEcu').innerHTML=s.ecu_id?`ECU <b>${esc(s.ecu_id)}</b> · SYS ${esc(s.sys_id)} · ${s.flags} capability bytes${s.init?'':' (remembered)'} · this master ${esc(L.mac)}`:`This master ${esc(L.mac)}`}
 
 /* ───────────── diagnostics: the evidence log ───────────── */
 const EVN={0:'Boot',1:'Bus up',2:'Bus settled',3:'Bus guard trip',4:'Receive-error guard',5:'Bus-off',6:'Sleep',7:'Resumed'};
@@ -713,6 +762,8 @@ async function poll(){
  let d;try{d=await fetch('/api/live').then(r=>r.json())}catch(e){
   const c=$('#conn');c.className='pill crit';c.lastChild.textContent='offline';return}
  const now=Date.now();
+ // The master restarted (its counters went back): no rate from across that.
+ if(PREV&&(d.bus.rx<PREV.rx||d.bus.tx<PREV.tx||d.bus.err<PREV.err))PREV=null;
  if(PREV){const dt=(now-PREV.t)/1000;if(dt>0){
   RATES.fps=(d.bus.rx-PREV.rx)/dt;RATES.tx=(d.bus.tx-PREV.tx)/dt;RATES.errs=d.bus.err-PREV.err;
   RATES.load=100*((d.bus.bits-PREV.bits)+(d.bus.tx-PREV.tx)*125)/(dt*(d.bus.bitrate||500)*1000)}}

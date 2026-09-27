@@ -6,6 +6,8 @@
 
 #include <Arduino.h>
 
+#include <algorithm>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <string>
@@ -65,6 +67,34 @@ public:
         for (auto &r : routes_)
             if (r.uri == uri && (r.m == m || r.m == HTTP_ANY)) { r.h(); return true; }
         if (notFound_) notFound_();
+        return false;
+    }
+
+    /** Harness: a multipart upload of @p data as @p filename - the upload
+     *  handler in the chunks the real server hands over, then the route's own
+     *  handler (which the real server skips after an abort). */
+    bool upload(const std::string &uri, const std::string &filename,
+                const std::string &data, bool abort = false) {
+        code = 0; body.clear(); headers.clear(); contentType.clear();
+        uri_ = uri; args_.clear();
+        for (auto &r : routes_) {
+            if (r.uri != uri || r.m != HTTP_POST || !r.up) continue;
+            upload_ = HTTPUpload();
+            upload_.filename = String(filename.c_str());
+            upload_.status = UPLOAD_FILE_START;
+            r.up();
+            for (size_t at = 0; at < data.size(); at += sizeof upload_.buf) {
+                upload_.currentSize = std::min(sizeof upload_.buf, data.size() - at);
+                memcpy(upload_.buf, data.data() + at, upload_.currentSize);
+                upload_.totalSize += upload_.currentSize;
+                upload_.status = UPLOAD_FILE_WRITE;
+                r.up();
+            }
+            upload_.status = abort ? UPLOAD_FILE_ABORTED : UPLOAD_FILE_END;
+            r.up();
+            if (!abort) r.h();
+            return true;
+        }
         return false;
     }
 

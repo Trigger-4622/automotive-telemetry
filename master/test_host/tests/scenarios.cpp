@@ -982,6 +982,7 @@ static int unexpectedErrors(const char *allowed) {
  */
 static void scTcmP1718() {
     loadCarConfig();
+    portalPostBeforeBoot(R"({"tx_passive":false})");   // active mode: the guard's case
     boot();
     runUntil(20);                                   // settle over, requests running
     check(tcm().armed && !tcm().p1718, "the TCM is receiving the ECM's broadcasts",
@@ -1021,6 +1022,7 @@ static void scTcmP1718() {
  *  what the guard prevents, and turning it off is the owner's choice. */
 static void scTcmP1718Optout() {
     loadCarConfig();
+    portalPostBeforeBoot(R"({"tx_passive":false})");   // active mode: the guard's case
     boot();
     portalPost(R"({"rx_guard":false})");
     runUntil(20);
@@ -1059,6 +1061,7 @@ static void scRxGuardTrickle() {
  */
 static void scRxGuardModerate() {
     loadCarConfig();
+    portalPostBeforeBoot(R"({"tx_passive":false})");   // active mode: the guard's case
     boot();
     runUntil(20);
     faults.rxCorruptRate = 0.05;                    // ~7 of the ECM's 150 frames/s
@@ -1110,6 +1113,7 @@ static void scLomErratumSilent() {
  *  trips) and on, listen-only, for the rest of a three-minute drive. */
 static void scLomErratumDrive() {
     loadCarConfig();
+    portalPostBeforeBoot(R"({"tx_passive":false})");   // active mode: the guard's case
     faults.rxCorruptRate = 0.05;
     boot();
     runUntil(9.9);
@@ -1135,7 +1139,7 @@ static void scLomErratumDrive() {
  *  erratum fix, every single misread drove the ECM bus-off.) */
 static void scNormalConfinement() {
     loadCarConfig();
-    portalPostBeforeBoot(R"({"rx_guard":false,"start_delay_s":0})");
+    portalPostBeforeBoot(R"({"rx_guard":false,"start_delay_s":0,"tx_passive":false})");
     boot();
     runUntil(10);
     faults.rxCorruptRate = 0.002;                   // a misread every few seconds
@@ -1147,11 +1151,512 @@ static void scNormalConfinement() {
     check(!tcm().p1718, "no P1718 at this misread rate");
 }
 
+/**
+ * What the car showed after the listen-only fix: REC back at 0 in listen-only
+ * and a million errors a drive. If REC is not frozen there (a good frame winds
+ * it down), REC 128 alone does not keep the controller error-passive, and an
+ * error-active controller with its TX pad detached counts rounds of its own
+ * unheard error flag as bus errors. TEC 128 holds - TEC only moves when it
+ * transmits - so every error counted is one real misread.
+ */
+static void scLomRecDrift() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":4})");
+    faults.lomRecCounts = true;
+    faults.rxCorruptRate = 0.05;
+    boot();
+    runUntil(120);
+    MasterStats st; masterGetStats(st);
+    check(controller().tec == 128, "TEC 128 in listen-only, and it stays there", fmt("TEC %u", controller().tec));
+    check(controller().rec < 128, "REC drifted down on good frames, as on the car", fmt("REC %u", controller().rec));
+    check(tcm().misreads > 50, "the master misread frames", fmt("%u misreads", tcm().misreads));
+    check(st.busErrors == tcm().misreads, "one error counted per misread - no rounds of unheard flags",
+          fmt("%u errors for %u misreads", st.busErrors, tcm().misreads));
+    check(tcm().destroyed == 0 && !tcm().p1718, "nothing destroyed, no P1718");
+    commonChecks();
+}
+
+/** The default bit timing: the Arduino-CAN profile - 87.5 %, SJW 2, triple sampling. */
+static void scTimingDefault() {
+    boot();
+    runUntil(2);
+    check(std::fabs(sim::timing.samplePct - 87.5) < 0.1 && sim::timing.sjw == 2 && sim::timing.triple,
+          "87.5 %, SJW 2, triple sampling by default",
+          fmt("%.1f %%, SJW %d, triple %d", sim::timing.samplePct, sim::timing.sjw, sim::timing.triple));
+    check(Cfg.canTiming == 2, "can_timing defaults to 2");
+    check(simBugs() == 0, "timing registers valid for the controller");
+}
+/** can_timing 0 keeps the ESP-IDF preset: 80 %, SJW 3, single sample. */
+static void scTimingIdf() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"can_timing":0})";
+    boot();
+    runUntil(2);
+    check(std::fabs(sim::timing.samplePct - 80.0) < 0.1 && sim::timing.sjw == 3 && !sim::timing.triple,
+          "ESP-IDF preset: 80 %, SJW 3, single sample",
+          fmt("%.1f %%, SJW %d, triple %d", sim::timing.samplePct, sim::timing.sjw, sim::timing.triple));
+}
+/** The older 87.5 % switch still works with the ESP-IDF preset profile. */
+static void scTimingSp875Legacy() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"can_timing":0,"can_sp875":true})";
+    boot();
+    runUntil(2);
+    check(std::fabs(sim::timing.samplePct - 87.5) < 0.1 && !sim::timing.triple,
+          "can_sp875 with the preset profile: 87.5 %, single sample",
+          fmt("%.1f %%, triple %d", sim::timing.samplePct, sim::timing.triple));
+}
+
+/** The error classifier: what the controller says each error was. */
+static void scErrorKinds() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"rx_guard":false,"start_delay_s":0})");
+    boot();
+    runUntil(10);
+    faults.rxCorruptRate = 0.05;                     // misreads while receiving
+    runUntil(30);
+    faults.rxCorruptRate = 0;
+    faults.errorPerOwnFrame = 0.2;                   // errors in our own requests
+    runUntil(33);
+    faults.errorPerOwnFrame = 0;
+    ErrKindView ek[6];
+    const size_t n = masterErrorKinds(ek, 6);
+    bool rx = false, tx = false;
+    for (size_t i = 0; i < n; i++) {
+        if (ek[i].code == 0xAA && !ek[i].silent && ek[i].errors > 0) rx = true;
+        if (ek[i].code == 0x0A && !ek[i].silent) tx = true;
+    }
+    check(n >= 2 && rx, "misreads recorded as stuff errors while receiving, in the data field", fmt("%zu kinds", n));
+    check(tx, "our own failed frames recorded as bit errors while sending");
+    check(n && ek[0].code == 0xAA, "sorted by count, the misreads first");
+    char txt[64];
+    errKindText(0xAA, txt, sizeof(txt));
+    check(std::string(txt) == "stuff error receiving in data field", "readable for the portal and the log", txt);
+    errKindText(0x19, txt, sizeof(txt));
+    check(std::string(txt) == "bit error sending in ACK slot", "the ACK-slot case reads as such", txt);
+    check(sim::serialOut.find("[errs ] stuff error receiving in data field, normal mode") != std::string::npos,
+          "the serial heartbeat lists them");
+}
+
+/** Radio transmit power: 13 dBm by default, and a change applies live. */
+static void scRadioPower() {
+    boot();
+    runUntil(2);
+    check(sim::radioQdbm == 52, "13 dBm at boot", fmt("%d quarter-dBm", sim::radioQdbm));
+    portalPost(R"({"radio_dbm":8})");
+    runUntil(3);
+    check(sim::radioQdbm == 32, "a change from the portal applies without a reboot", fmt("%d", sim::radioQdbm));
+    portalPost(R"({"radio_dbm":99})");
+    check(Cfg.radioDbm == 20, "clamped to 20 dBm", fmt("%u", Cfg.radioDbm));
+}
+
+/**
+ * PASSIVE MODE, the default. The link the car has - the master misreading a
+ * large share of the ECM's frames - with the car's settings, requests running
+ * the whole time: the controller is kept error-passive, so every error flag it
+ * sends is recessive and not one frame is destroyed, the ECM is never driven
+ * bus-off, the TCM never loses it, and requests are never stopped for it.
+ */
+static void scPassiveMarginal() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":2})");     // transmitting, whatever else the file says
+    boot();
+    runUntil(15);
+    check(controller().mode == TWAI_MODE_NORMAL && controller().tec >= 128,
+          "normal mode, error-passive from the start", fmt("TEC %u", controller().tec));
+    faults.rxCorruptRate = 0.3;                      // far worse than the car
+    uint32_t minTec = 999;
+    for (double t = 16; t <= 120; t += 0.5) {       // TEC stays passive throughout
+        runUntil(t);
+        if (controller().mode == TWAI_MODE_NORMAL) minTec = std::min(minTec, controller().tec);
+    }
+    MasterStats st; masterGetStats(st);
+    check(minTec >= 128, "TEC never fell below 128 (topped up between requests)", fmt("lowest %u", minTec));
+    check(tcm().misreads > 1000, "the master misread plenty", fmt("%u misreads", tcm().misreads));
+    check(tcm().destroyed == 0 && tcm().ecmBusOffs == 0, "not one frame destroyed, the ECM never bus-off",
+          fmt("%u destroyed, %u bus-offs", tcm().destroyed, tcm().ecmBusOffs));
+    check(!tcm().p1718 && !tcm().p0700, "no P1718, no P0700");
+    check(!st.rxGuardSilent && controller().mode == TWAI_MODE_NORMAL, "requests never stopped for it");
+    check(txCount([](const twai_message_t &m) { return isObd(m); }, 100, 120) > 50, "OBD-II requests running at the end",
+          fmt("%llu in 20 s", (unsigned long long)txCount([](const twai_message_t &m) { return isObd(m); }, 100, 120)));
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "requested values still reach the displays", info);
+    check(st.errWhileTx == 0, "no misread blamed on our own frames (top-ups are not errors)", fmt("%u", st.errWhileTx));
+    int passiveLogs = 0;
+    for (const auto &l : logLines) if (l.find("TWAI error-passive") != std::string::npos) passiveLogs++;
+    check(passiveLogs == 0, "no 'error-passive' warnings for the intended state");
+    commonChecks();
+}
+
+/** Passive mode off: back to an error-active node (TEC 0 in normal mode). */
+static void scPassiveOff() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"tx_passive":false})";
+    boot();
+    runUntil(15);
+    check(controller().mode == TWAI_MODE_NORMAL && controller().tec < 128, "error-active when switched off",
+          fmt("TEC %u", controller().tec));
+    check(!Cfg.txPassive, "the setting is off");
+    check(sim::activeFlagStarts >= 1, "able to send error frames, as asked (and the simulator sees it)",
+          fmt("%d", sim::activeFlagStarts));
+}
+
+/**
+ * LET ERRORS PASS (tx_passive, the default): the master never sends an error
+ * frame. Its controller is never on the bus able to send an ACTIVE error flag -
+ * the six dominant bits that destroy a frame for every module - not while the
+ * bus settles, not when it goes from listening to requesting, not after a
+ * bus-off restart, and not on a switch to listen-only and back, although every
+ * start clears the counters that keep it error-passive.
+ */
+static void scErrorFramesNever() {
+    s_keepSettle = true;                              // no file: every default
+    boot();
+    runUntil(8);
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY, "listening while the bus settles");
+    runUntil(20);
+    check(controller().mode == TWAI_MODE_NORMAL && controller().tec >= 128, "then requesting, error-passive",
+          fmt("TEC %u", controller().tec));
+    check(txCount(isRequest, 10, 20) > 0, "requests went out");
+    faults.busOffNow = true;
+    runUntil(22);
+    check(controller().state == TWAI_STATE_RUNNING && controller().mode == TWAI_MODE_NORMAL &&
+          controller().tec >= 128, "restarted after a bus-off, error-passive again", fmt("TEC %u", controller().tec));
+    portalPost(R"({"diag_mode":4})");                 // to listen-only...
+    runUntil(26);
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY, "listen-only when asked");
+    portalPost(R"({"diag_mode":0})");                 // ...and back
+    runUntil(32);
+    check(controller().mode == TWAI_MODE_NORMAL && controller().tec >= 128, "requesting again, error-passive",
+          fmt("TEC %u", controller().tec));
+    faults.rxCorruptRate = 0.3;                       // a bad link from here on
+    runUntil(90);
+    check(sim::activeFlagStarts == 0, "never on the bus able to send an error frame",
+          fmt("%d times", sim::activeFlagStarts));
+    check(tcm().misreads > 100 && tcm().destroyed == 0, "every frame it misread passed untouched",
+          fmt("%u misread, %u destroyed", tcm().misreads, tcm().destroyed));
+    check(!tcm().p1718 && !tcm().p0700, "no P1718, no P0700");
+    check(txCount(isRequest, 60, 90) > 0, "still requesting (after the bus-off pause)",
+          fmt("%llu", (unsigned long long)txCount(isRequest, 60, 90)));
+    commonChecks();
+}
+
+/**
+ * SAFE BUS SETTINGS (portal, Maintenance): the settings on the master in the
+ * car - listen only, both guards off, no P2CAN wait - and on top of them errors
+ * flagged, the ESP-IDF timing and no TX hold, put back to the bus defaults in
+ * one go. It transmits and receives again with errors let pass, and nothing
+ * else changes: the bitrate, the pacing the user tuned, the displays, Wi-Fi
+ * and every learned signal stay as they were.
+ */
+static void scBusDefaults() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":4,"rx_guard":false,"guard":false,"obd_p2can":0,"start_delay_s":5,
+        "tx_passive":false,"can_timing":0,"tx_hold":false,"obd_to":25,"obd_gap":20,"req_max_hz":40})");
+    boot();
+    runUntil(12);
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY, "the stored settings only listen");
+    JsonDocument before, after;
+    Cfg.toJson(before);
+    Cfg.loadBusDefaults();                            // what /api/bus_defaults does
+    Cfg.save();                                       // before its reboot
+    Cfg.toJson(after);
+    static const char *BUS[] = {"diag_mode", "tx_passive", "can_timing", "can_sp875", "guard", "guard_errs",
+                                "guard_win", "guard_pause", "guard_trips", "rx_guard", "rx_guard_rec",
+                                "rx_guard_errs", "obd_p2can", "start_delay_s", "tx_hold"};
+    check(after["diag_mode"] == DIAG_MODE_AUTO && after["tx_passive"] == true && after["can_timing"] == 2 &&
+          after["guard"] == true && after["rx_guard"] == true && after["obd_p2can"] == 50 &&
+          after["start_delay_s"] == BUS_SETTLE_S && after["tx_hold"] == true,
+          "the bus settings are the defaults: requests on, errors let pass, 87.5 % triple, guards, P2CAN");
+    std::string changed;
+    int kept = 0;
+    for (JsonPairConst kv : before.as<JsonObjectConst>()) {
+        bool bus = false;
+        for (const char *k : BUS) if (!std::strcmp(kv.key().c_str(), k)) bus = true;
+        if (bus) continue;
+        std::string a, b;
+        serializeJson(kv.value(), a);
+        serializeJson(after[kv.key()], b);
+        if (a != b) changed += std::string(kv.key().c_str()) + " ";
+        else kept++;
+    }
+    check(changed.empty() && kept > 30, "everything else kept: bitrate, pacing, displays, Wi-Fi, tables",
+          changed.empty() ? fmt("%d settings and tables unchanged", kept) : changed);
+    check(after["signals"].size() > 0 && after["obd_to"] == 25 && after["req_max_hz"] == 40,
+          "learned signals and the tuned pacing among them",
+          fmt("%u signals", (unsigned)after["signals"].size()));
+    JsonDocument file;
+    deserializeJson(file, simfs::files["/config.json"]);
+    check(file["diag_mode"] == DIAG_MODE_AUTO && file["tx_passive"] == true && file["obd_to"] == 25,
+          "saved: what the reboot reads back");
+    runUntil(30);
+    check(controller().mode == TWAI_MODE_NORMAL && controller().tec >= 128,
+          "transmitting again, errors let pass", fmt("TEC %u", controller().tec));
+    check(txCount(isRequest, 20, 30) > 0, "requests going out",
+          fmt("%llu", (unsigned long long)txCount(isRequest, 20, 30)));
+    check(sim::activeFlagStarts == 0, "never able to send an error frame", fmt("%d", sim::activeFlagStarts));
+    commonChecks();
+}
+
+/** The misses on the ECM's IDs (the frames the fault misreads) and on the rest. */
+static void ecmMisses(uint32_t &ecm, uint32_t &other, int &idsHit) {
+    MissView mv[32];
+    const size_t n = masterMissedIds(mv, 32);
+    ecm = other = 0;
+    idsHit = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t m = mv[i].missed[0] + mv[i].missed[1];
+        if (m) idsHit++;
+        if (mv[i].id == 0x231 || mv[i].id == 0x232) ecm += m; else other += m;
+    }
+}
+
+/**
+ * WHERE THE ERRORS COME FROM. The master counts, per ID, the car's periodic
+ * frames it did not receive - a gap of whole periods is a frame it misread -
+ * and checks each bus error against its own radio. A link that misreads the
+ * ECM's frames, in listen-only and then in normal mode: the misses are exactly
+ * the ECM's IDs and add up to what it misread, nothing else is missed, a
+ * clean link misses nothing, and the errors land near the radio no more
+ * often than chance.
+ */
+static void scLinkMisses() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5})";   // every default
+    boot();
+    runUntil(20);
+    MasterStats st;
+    masterGetStats(st);
+    check(st.missed[0] == 0 && st.expected[0] > 1000, "a clean link: nothing missed",
+          fmt("%u of %u", st.missed[0], st.expected[0]));
+    portalPost(R"({"diag_mode":4})");                 // listen-only...
+    runUntil(22);
+    faults.rxCorruptRate = 0.05;
+    const uint32_t mis0 = tcm().misreads;
+    runUntil(50);
+    const uint32_t misLom = tcm().misreads - mis0;
+    masterGetStats(st);
+    check(st.missed[1] > 0 && st.missed[1] <= misLom, "listen-only: the misreads show as missed frames",
+          fmt("%u missed, %u misread", st.missed[1], misLom));
+    faults.rxCorruptRate = 0;
+    portalPost(R"({"diag_mode":0})");                 // ...then normal mode
+    runUntil(54);
+    faults.rxCorruptRate = 0.05;
+    const uint32_t mis1 = tcm().misreads;
+    masterGetStats(st);
+    const uint32_t n0Miss = st.missed[0], n0Exp = st.expected[0];   // the clean start aside
+    runUntil(82);
+    const uint32_t misNormal = tcm().misreads - mis1;
+    masterGetStats(st);
+    uint32_t ecm, other;
+    int idsHit;
+    ecmMisses(ecm, other, idsHit);
+    const uint32_t misread = misLom + misNormal;
+    check(ecm >= misread * 7 / 10 && ecm <= misread, "the missed frames are the ECM frames it misread",
+          fmt("%u missed on 0x231/0x232, %u misread", ecm, misread));
+    check(other == 0, "no other ID missed", fmt("%u", other));
+    const double rN = 100.0 * (st.missed[0] - n0Miss) / std::max<uint32_t>(1, st.expected[0] - n0Exp);
+    const double rL = 100.0 * st.missed[1] / std::max<uint32_t>(1, st.expected[1]);
+    check(st.missed[0] > 0 && rN < 2 * rL && rL < 2 * rN, "the same link reads the same in both modes",
+          fmt("normal %.2f %%, listen-only %.2f %%", rN, rL));
+    const double near = 100.0 * st.errNearRadio / std::max<uint32_t>(1, st.errRadioChecked);
+    const double hot  = st.radioHotPermille / 10.0;
+    check(st.errRadioChecked > 100 && std::fabs(near - hot) < 5 && hot > 2,
+          "errors that have nothing to do with the radio land near it only by chance",
+          fmt("%.1f %% of %u errors near the radio, radio that busy %.1f %% of the time", near,
+              st.errRadioChecked, hot));
+    check(st.rxByMode[0] > 0 && st.rxByMode[1] > 0 && st.errByMode[1] > 0,
+          "frames and errors booked by mode", fmt("%u/%u frames, %u/%u errors", st.rxByMode[0],
+              st.rxByMode[1], st.errByMode[0], st.errByMode[1]));
+    commonChecks();
+}
+
+/**
+ * The same instruments on a master whose radio disturbs its CAN side: the
+ * errors bunch up around the display broadcasts, far above chance, and the
+ * misses are spread over every module's IDs - the signature of the master's
+ * own supply, not of one module's link.
+ */
+static void scLinkRadio() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5})";
+    boot();
+    runUntil(20);
+    faults.radioCorruptRate = 0.5;
+    runUntil(80);
+    MasterStats st;
+    masterGetStats(st);
+    const double near = 100.0 * st.errNearRadio / std::max<uint32_t>(1, st.errRadioChecked);
+    const double hot  = st.radioHotPermille / 10.0;
+    check(sim::radioMisreads > 100 && st.errRadioChecked >= sim::radioMisreads * 9 / 10,
+          "the radio-borne misreads were counted as bus errors",
+          fmt("%llu misread, %u errors", (unsigned long long)sim::radioMisreads, st.errRadioChecked));
+    check(near > 90 && near > 3 * hot, "the errors bunch up around the radio, far above chance",
+          fmt("%.0f %% near the radio, radio that busy %.0f %% of the time", near, hot));
+    uint32_t ecm, other;
+    int idsHit;
+    ecmMisses(ecm, other, idsHit);
+    check(idsHit >= 5 && other > ecm / 2, "missed frames spread over every module's IDs",
+          fmt("%d IDs, %u on the ECM's, %u on the rest", idsHit, ecm, other));
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isRequest, 70, 80) > 0,
+          "still requesting throughout");
+    commonChecks();
+}
+
+/**
+ * A driver install that fails - out of memory, no free interrupt - must not
+ * leave the master deaf until a reboot. A failed switch is retried by the
+ * guard (the mode it wants still differs from the one installed), but the
+ * install at boot into normal mode was retried by nothing.
+ */
+static void scNoDriverRetry() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5})";   // boot() adds start_delay_s 0: normal at once
+    faults.installFailures = 1;                       // the install at boot fails
+    boot();
+    runUntil(1);
+    check(!controller().installed, "the install at boot failed: no driver");
+    runUntil(8);
+    check(controller().installed && controller().mode == TWAI_MODE_NORMAL,
+          "installed again within seconds, and requesting");
+    check(txCount(isRequest, 6, 8) > 0, "requests going out",
+          fmt("%llu", (unsigned long long)txCount(isRequest, 6, 8)));
+    faults.installFailures = 1;                       // and a failed switch recovers too
+    portalPost(R"({"diag_mode":4})");
+    runUntil(12);
+    check(controller().installed && controller().mode == TWAI_MODE_LISTEN_ONLY, "listen-only as asked");
+    portalPost(R"({"diag_mode":0})");
+    runUntil(20);
+    check(controller().mode == TWAI_MODE_NORMAL, "back to normal");
+    check(simBugs() == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+
+/**
+ * The start in normal mode after listen-only writes TEC (128 -> 220). That is
+ * not an error in a frame of ours: errors that happen to arrive in the same
+ * moment must not be booked against our frames, nor trip the bus guard.
+ */
+static void scTecWriteNotOurs() {
+    s_keepSettle = true;                              // no file: the settle wait, guard on
+    boot();
+    runUntil(5);
+    check(controller().mode == TWAI_MODE_LISTEN_ONLY, "listening while the bus settles");
+    while (controller().mode != TWAI_MODE_NORMAL && tNow() < 20) runUntil(tNow() + 0.001);
+    faults.idleErrorsPerSec = 2000;                   // errors not of ours, right at the switch
+    runUntil(tNow() + 0.1);
+    faults.idleErrorsPerSec = 0;
+    runUntil(tNow() + 1);
+    MasterStats st;
+    masterGetStats(st);
+    check(st.errWhileTx == 0, "no error booked against our frames", fmt("%u", st.errWhileTx));
+    check(st.guardTrips == 0, "no bus-guard trip", fmt("%u", st.guardTrips));
+}
+
+/**
+ * A flash write holds the CAN interrupt off, and the frames queued meanwhile
+ * come out microseconds apart. The missed-frame count must not learn that
+ * burst as an ID's rhythm - early, while it still learns the periods, or
+ * later - nor count the stall as misses.
+ */
+static void scLinkBursts() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5})";
+    faults.rxStallEveryMs = 700;                      // from the start: during learning too
+    faults.rxStallMs = 60;
+    boot();
+    runUntil(40);
+    MasterStats st;
+    masterGetStats(st);
+    check(st.missed[0] == 0, "the stalls are not taken for misses", fmt("%u", st.missed[0]));
+    MissView mv[32];
+    const size_t n = masterMissedIds(mv, 32);
+    int slow = 0;                                     // the 50 and 100 ms IDs: learned after 0.7 s
+    for (size_t i = 0; i < n; i++)
+        if (mv[i].periodMs >= 45 && mv[i].periodMs <= 110 && mv[i].expected[0] > 50) slow++;
+    check(slow >= 5, "every 50-100 ms ID still has its rhythm", fmt("%d of 5", slow));
+    faults.rxCorruptRate = 0.05;
+    const uint32_t mis0 = tcm().misreads;
+    runUntil(80);
+    uint32_t ecm, other;
+    int idsHit;
+    ecmMisses(ecm, other, idsHit);
+    const uint32_t misread = tcm().misreads - mis0;
+    check(ecm >= misread * 6 / 10 && ecm <= misread, "misreads still counted between the stalls",
+          fmt("%u missed, %u misread", ecm, misread));
+    check(other == 0, "and nothing else", fmt("%u", other));
+}
+
+/**
+ * A Wi-Fi name or password the AP cannot take locks the portal - the only way
+ * into the settings - away for good: refused, the old one kept. A password
+ * longer than 31 characters used to be cut short, so the AP's was no longer
+ * the one typed.
+ */
+static void scPortalApSafe() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5})";
+    boot();
+    runUntil(2);
+    portalPost(R"({"ap_ssid":""})");
+    check(!strcmp(Cfg.apSsid, MasterConfig::AP_SSID_DEFAULT), "an empty Wi-Fi name is refused",
+          Cfg.apSsid);
+    const std::string pw40(40, 'k'), pw70(70, 'k');
+    portalPost((R"({"ap_pass":")" + pw40 + "\"}").c_str());
+    check(pw40 == Cfg.apPass, "a 40-character password is kept whole", fmt("%zu", strlen(Cfg.apPass)));
+    portalPost((R"({"ap_pass":")" + pw70 + "\"}").c_str());
+    check(pw40 == Cfg.apPass, "one WPA2 cannot use (70) is refused", fmt("%zu", strlen(Cfg.apPass)));
+    portalPost(R"({"ap_ssid":"Legacy B4 master"})");
+    check(!strcmp(Cfg.apSsid, "Legacy B4 master"), "a proper name is taken", Cfg.apSsid);
+    JsonDocument d;
+    deserializeJson(d, simfs::files["/config.json"]);
+    check(d["ap_pass"].as<std::string>() == pw40, "and saved as typed");
+}
+
+/**
+ * The portal switched off (portal_on) takes the only way into the settings
+ * with it: there is no serial console, and the configuration survives a
+ * reflash. BOOT held for 3 s brings it back; a short press does nothing, and
+ * with the portal on the button is not even looked at.
+ */
+static void scPortalRescue() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"portal_on":false})";
+    boot();
+    sim::restartReturns = true;
+    runUntil(5);
+    sim::bootButtonDown = true;                       // a short press
+    runUntil(6.5);
+    sim::bootButtonDown = false;
+    runUntil(8);
+    check(sim::restarts == 0 && !Cfg.portalOn, "a short press of BOOT does nothing");
+    sim::bootButtonDown = true;
+    runUntil(12);
+    sim::bootButtonDown = false;
+    check(sim::restarts == 1, "BOOT held 3 s restarts the master", fmt("%d restarts", sim::restarts));
+    JsonDocument d;
+    deserializeJson(d, simfs::files["/config.json"]);
+    check(d["portal_on"] == true, "with the portal on for the next boot");
+    sim::bootButtonDown = true;
+    runUntil(20);
+    check(sim::restarts == 1, "with the portal on, BOOT is left alone", fmt("%d restarts", sim::restarts));
+    check(simBugs() == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+
+/** SSM2 and OBD-II together, heavy traffic: the top-up keeps up, and a
+ *  bus-off recovery comes back passive. */
+static void scPassiveBusOff() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"diag_mode":3,"rx_guard":false,"guard":false})";
+    boot();
+    runUntil(20);
+    faults.busOffNow = true;                         // (the sim forces it while running normal)
+    runUntil(25);
+    check(controller().state == TWAI_STATE_RUNNING && controller().mode == TWAI_MODE_NORMAL,
+          "recovered from bus-off, still requesting");
+    check(controller().tec >= 128, "error-passive again after the recovery", fmt("TEC %u", controller().tec));
+    uint32_t minTec = 999;
+    for (double t = 26; t <= 60; t += 0.25) { runUntil(t); minTec = std::min(minTec, controller().tec); }
+    check(minTec >= 128, "TEC held up under SSM2 + OBD-II traffic", fmt("lowest %u", minTec));
+    check(txCount(anyFrame, 40, 60) > 100, "both engines kept requesting",
+          fmt("%llu frames", (unsigned long long)txCount(anyFrame, 40, 60)));
+}
+
 /** The likeliest moment for the trip is the first normal-mode contact with a
  *  marginal link, right after the settle wait - and the switch back to
  *  listen-only must not wait for the 2 s mode-switch throttle. */
 static void scRxGuardPrompt() {
     loadCarConfig();
+    portalPostBeforeBoot(R"({"tx_passive":false})");   // active mode: the guard's case
     boot();
     runUntil(5);
     faults.rxCorruptRate = 0.9;                     // marginal from the start (no effect while listen-only)
@@ -1409,7 +1914,16 @@ static const Scenario SCENARIOS[] = {
     {"rx_guard_trickle", scRxGuardTrickle, 0}, {"rx_guard_moderate", scRxGuardModerate, 0},
     {"rx_guard_prompt", scRxGuardPrompt, 0},
     {"lom_erratum_silent", scLomErratumSilent, 0}, {"lom_erratum_drive", scLomErratumDrive, 0},
-    {"normal_confinement", scNormalConfinement, 0}, {"busoff_guard_off", scBusOffGuardOff, 0},
+    {"normal_confinement", scNormalConfinement, 0},
+    {"lom_rec_drift", scLomRecDrift, 0}, {"passive_marginal", scPassiveMarginal, 0},
+    {"passive_off", scPassiveOff, 0}, {"passive_busoff", scPassiveBusOff, 0},
+    {"error_frames_never", scErrorFramesNever, 0}, {"bus_defaults", scBusDefaults, 0},
+    {"link_misses", scLinkMisses, 0}, {"link_radio", scLinkRadio, 0},
+    {"no_driver_retry", scNoDriverRetry, 0}, {"tec_write_not_ours", scTecWriteNotOurs, 0},
+    {"link_bursts", scLinkBursts, 0}, {"timing_default", scTimingDefault, 0},
+    {"portal_ap_safe", scPortalApSafe, 0}, {"portal_rescue", scPortalRescue, 0},
+    {"timing_idf", scTimingIdf, 0}, {"timing_sp875_legacy", scTimingSp875Legacy, 0},
+    {"error_kinds", scErrorKinds, 0}, {"radio_power", scRadioPower, 0}, {"busoff_guard_off", scBusOffGuardOff, 0},
     {"pacing_p2can", scPacingP2can, 0}, {"pacing_p2can_auto", scPacingP2canAuto, 0},
     {"budget", scBudget, 0}, {"no_functional", scNoFunctional, 0},
     {"crank_reset", scCrankReset, 0}, {"evlog", scEvlog, 0},

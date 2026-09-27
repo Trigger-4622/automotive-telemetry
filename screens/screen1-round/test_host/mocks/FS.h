@@ -22,6 +22,8 @@ extern long writeBudget;
 extern bool renameNoOverwrite;
 /** When true, begin() fails the first mount (corrupt partition). */
 extern bool mountFails;
+/** When true, every mount fails (no data partition at all). */
+extern bool mountNever;
 }
 
 namespace fs {
