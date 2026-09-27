@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "driver/twai.h"
+#include "esp_now.h"
 
 namespace sim {
 
@@ -51,6 +52,31 @@ struct BusFaults {
      * never backs off, and the ECM is driven bus-off instead.
      */
     double   rxCorruptRate = 0;
+    /**
+     * What the car showed after the listen-only fix: REC back at 0 in
+     * listen-only with errors streaming. With this set, REC is not frozen in
+     * listen-only (a good frame winds it down, an error winds it up), and an
+     * error-active controller whose TX pad is detached reads its own active
+     * error flag back recessive, calls it a bit error and flags again - each
+     * round counted as a bus error (+8 on REC per round, or 32 rounds if the
+     * counters do not move) - the inflated counts the portal showed.
+     */
+    bool     lomRecCounts = false;
+    /**
+     * The master's radio disturbs its own CAN side - a 3.3 V rail sagging under
+     * the transmit current: while a display broadcast is on air, the master
+     * misreads this fraction of the frames on the bus (whoever sent them).
+     */
+    double   radioCorruptRate = 0;
+    /** The next this many twai_driver_install() calls fail (ESP_ERR_NO_MEM). */
+    int      installFailures = 0;
+    /**
+     * A flash write holding the CAN interrupt off: every rxStallEveryMs the
+     * received frames stay in the controller for rxStallMs, then come out in
+     * one burst. The stall is announced to the master the way its own flash
+     * writes do it (masterBusBlind).
+     */
+    uint32_t rxStallEveryMs = 0, rxStallMs = 0;
 };
 
 extern EcuConfig ecu;
@@ -89,12 +115,19 @@ struct TcmView {
     bool     armed;        ///< Has seen the ECM healthy at least once.
     uint32_t destroyed;    ///< ECM transmission attempts destroyed on the wire.
     uint32_t ecmBusOffs;   ///< Times the ECM was driven bus-off.
+    uint32_t misreads;     ///< ECM frames the master misread (each counts once).
 };
 TcmView tcm();
 
 /** Reset reason esp_reset_reason() returns (default power-on). A scenario sets
  *  it to ESP_RST_BROWNOUT to replay a reboot during cranking. */
 extern int resetReason;
+/** The BOOT button (GPIO0) held down. */
+extern bool bootButtonDown;
+/** ESP.restart(): false (the default) ends the run as a failure (exit 5); true
+ *  counts it in @ref restarts and carries on, for a scenario that expects it. */
+extern bool restartReturns;
+extern int  restarts;
 
 /** CAN-TX recessive hold observation. gpioHoldPin/Enabled track gpio_hold_en on
  *  the TX pin (latched high across sleep); txDrivenHigh is its driven level. */
@@ -102,6 +135,20 @@ extern int  gpioHoldEnabled;   ///< Net hold count on the TX pin (>0 = latched).
 extern bool txDrivenHigh;      ///< Last level driven onto the TX pin.
 extern bool txConfiguredOut;   ///< TX was configured as a recessive output.
 extern int  txGlitches;        ///< Times a GPIO (not the controller) drove TX dominant.
+/** The master's radio: each ESP-NOW packet is on air for its length at
+ *  1 Mbit/s plus preamble; the send callback fires when it is done. */
+void radioQueue(size_t len, esp_now_send_cb_t cb);
+extern uint64_t radioMisreads; ///< Frames misread because the radio was on air.
+/** Times the master's controller came onto the bus able to send an ACTIVE
+ *  (dominant) error flag: running, error-active, its TX pad routed to it. With
+ *  errors let pass (tx_passive) this never happens - not at a start, not after
+ *  the settle wait, not after a bus-off restart. */
+extern int  activeFlagStarts;
+extern int  radioQdbm;         ///< Last esp_wifi_set_max_tx_power() value (quarter dBm).
+extern std::string serialOut;  ///< Everything written with Serial.printf.
+/** The bit timing the last twai_driver_install() was given. */
+struct TimingView { double samplePct; int sjw; bool triple; };
+extern TimingView timing;
 /** The TX pad was switched to a plain GPIO output, away from the controller
  *  (gpio_set_direction / pinMode): the pad now shows the GPIO latch's level. */
 void txPadFromGpio();

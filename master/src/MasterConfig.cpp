@@ -3,6 +3,7 @@
  * @brief LittleFS-backed runtime configuration.
  */
 #include "MasterConfig.h"
+#include "MasterTelemetry.h"
 
 #include <LittleFS.h>
 #include <algorithm>
@@ -183,27 +184,38 @@ void MasterConfig::reseedTables() {
     unlock();
 }
 
+void MasterConfig::loadBusDefaults() {
+    lock();
+    diagMode        = DIAG_MODE_DEFAULT;
+    txPassive       = true;
+    canTiming       = 2;
+    canSample875    = false;
+    guardEnabled    = true; guardErrs = 3; guardWindowS = 10; guardPauseS = 30; guardTrips = 3;
+    rxGuardEnabled  = true; rxGuardRec = 96; rxGuardErrs = 60;
+    obdP2CanMs      = 50;
+    startDelayS     = BUS_SETTLE_S;
+    txRecessiveHold = true;
+    unlock();
+}
+
 void MasterConfig::loadDefaults() {
     lock();
-    diagMode    = DIAG_MODE_DEFAULT;
+    loadBusDefaults();
     broadcastMs = BROADCAST_PERIOD_MS;
     metricTtlMs = METRIC_TTL_MS;
     nightSource = NIGHT_SOURCE;
     bitrateKbps = CAN_BITRATE_KBPS;
     wifiChannel = TELEMETRY_WIFI_CHANNEL;
-    strlcpy(apSsid, "Telemetry-Master-Config", sizeof(apSsid));
+    strlcpy(apSsid, AP_SSID_DEFAULT, sizeof(apSsid));
     apPass[0] = '\0';
     portalOn  = true;
     ssmGapMs    = 100;
     ssmBatchMax = 33;
-    canSample875 = false;
+    radioDbm     = 13;
     ssmSwitches = true;
     learnEnabled = true;
-    guardEnabled = true; guardErrs = 3; guardWindowS = 10; guardPauseS = 30; guardTrips = 3;
-    rxGuardEnabled = true; rxGuardRec = 96; rxGuardErrs = 60; txRecessiveHold = true;
-    startDelayS = BUS_SETTLE_S;
     learnR2 = 0.985f; learnMinN = 40; learnSteady = 0.10f; learnPhi = 0.95f; verifyN = 30;
-    obdGapMs = 8; obdTimeoutMs = 80; obdP2CanMs = 50; reqMaxHz = 0; obdAddressing = 0;
+    obdGapMs = 8; obdTimeoutMs = 80; reqMaxHz = 0; obdAddressing = 0;
     ssmTimeoutMs = 1000; coverMs = 2500;
     keepaliveMs = 300; sourceHoldMs = 500; ldrDark = NIGHT_LDR_DARK_ADC; ldrLight = NIGHT_LDR_LIGHT_ADC;
     sleepEnabled = true;
@@ -431,6 +443,7 @@ bool MasterConfig::saveLocked() {
      * A half-written table would be parsed as a valid but wrong config, which
      * is a far nastier failure than simply keeping the old settings.
      */
+    masterBusStall();                // the flash write holds the CAN interrupt off
     File f = LittleFS.open(CFG_TMP, "w");
     if (!f) {
         log_e("config: cannot open %s for writing", CFG_TMP);
@@ -479,6 +492,9 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["ssm_switches"] = ssmSwitches;
     doc["learn"]        = learnEnabled;
     doc["can_sp875"]    = canSample875;
+    doc["can_timing"]   = canTiming;
+    doc["tx_passive"]   = txPassive;
+    doc["radio_dbm"]    = radioDbm;
     doc["guard"]        = guardEnabled;
     doc["guard_errs"]   = guardErrs;
     doc["guard_win"]    = guardWindowS;
@@ -601,6 +617,9 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     ssmSwitches = v["ssm_switches"]  | ssmSwitches;
     learnEnabled = v["learn"]        | learnEnabled;
     canSample875 = v["can_sp875"]    | canSample875;
+    canTiming    = (uint8_t)jint(v["can_timing"], canTiming, 0, 2);
+    txPassive    = v["tx_passive"]    | txPassive;
+    radioDbm     = (uint8_t)jint(v["radio_dbm"], radioDbm, 2, 20);
     guardEnabled = v["guard"]        | guardEnabled;
     guardErrs    = v["guard_errs"]   | guardErrs;
     guardWindowS = v["guard_win"]    | guardWindowS;
@@ -657,10 +676,21 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     if (sleepIdleS < 10) sleepIdleS = 10;
     if (wifiChannel < 1 || wifiChannel > 13) wifiChannel = TELEMETRY_WIFI_CHANNEL;
 
-    if (v["ap_ssid"].is<const char *>())
-        strlcpy(apSsid, v["ap_ssid"].as<const char *>(), sizeof(apSsid));
-    if (v["ap_pass"].is<const char *>())
-        strlcpy(apPass, v["ap_pass"].as<const char *>(), sizeof(apPass));
+    // A name or password the AP cannot take would lock the portal - the only
+    // way into these settings - away: refused, and the old one kept. (Cut
+    // short to fit, a password would no longer be the one typed.)
+    if (v["ap_ssid"].is<const char *>()) {
+        const char *s = v["ap_ssid"].as<const char *>();
+        if (*s && strlen(s) < sizeof(apSsid)) strlcpy(apSsid, s, sizeof(apSsid));
+        else log_w("config: Wi-Fi name refused - it takes 1-%u characters",
+                   (unsigned)(sizeof(apSsid) - 1));
+    }
+    if (v["ap_pass"].is<const char *>()) {
+        const char *s = v["ap_pass"].as<const char *>();
+        if (strlen(s) < sizeof(apPass)) strlcpy(apPass, s, sizeof(apPass));
+        else log_w("config: Wi-Fi password refused - it takes up to %u characters",
+                   (unsigned)(sizeof(apPass) - 1));
+    }
     if (v["ecu_id"].is<const char *>())
         strlcpy(ecuId, v["ecu_id"].as<const char *>(), sizeof(ecuId));
     if (v["ecu_sys_id"].is<const char *>())

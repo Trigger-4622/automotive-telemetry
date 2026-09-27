@@ -15,6 +15,10 @@
 #include "Arduino.h"
 #include "sim.h"
 #include "hal/twai_ll.h"
+#include "esp_rom_gpio.h"
+#include "soc/gpio_sig_map.h"
+#include "CanDecoderConfig.h"
+#include "MasterTelemetry.h"
 
 namespace sim {
 EcuConfig ecu;
@@ -45,8 +49,35 @@ static struct Ctrl {
     int waitingRx = 0, waitingAlerts = 0;
     uint64_t recoveryDoneAt = 0;
     bool txAttached = false;   ///< The controller's TX signal drives the pad.
+    uint64_t rxHoldUntil = 0;  ///< Frames stay queued until then (a stall).
     bool inReset = false;      ///< Reset mode: off the bus, error counters writable.
 } C;
+
+static void flagCheck();
+static bool masterFlagsActive();
+static void masterDetects(bool flaggedActive);
+
+/* ── the master's radio, on air (the ESP-NOW mock hands packets over) ── */
+static uint64_t s_airFrom = 0, s_airUntil = 0;
+static std::deque<std::pair<uint64_t, esp_now_send_cb_t>> s_airDone;
+uint64_t sim::radioMisreads = 0;
+void sim::radioQueue(size_t len, esp_now_send_cb_t cb) {
+    const uint64_t now = simrtos::nowUs();
+    const uint64_t air = 300 + (uint64_t)len * 8;      // 1 Mbit/s, plus preamble
+    if (now >= s_airUntil) s_airFrom = now;
+    s_airUntil = std::max(now, s_airUntil) + air;
+    if (cb) s_airDone.push_back({s_airUntil, cb});
+}
+static bool radioOnAir(uint64_t now) { return now >= s_airFrom && now < s_airUntil; }
+/** The send callbacks due by @p now, as the Wi-Fi task would call them. */
+static void radioCallbacks(uint64_t now) {
+    static const uint8_t BC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    while (!s_airDone.empty() && s_airDone.front().first <= now) {
+        const esp_now_send_cb_t cb = s_airDone.front().second;
+        s_airDone.pop_front();
+        cb(BC, ESP_NOW_SEND_SUCCESS);
+    }
+}
 
 static void txGlitch(const char *why) {
     sim::txGlitches++;
@@ -56,6 +87,7 @@ static void txGlitch(const char *why) {
 void sim::txPadFromGpio() {
     if (!sim::txDrivenHigh) txGlitch("pad switched to a GPIO output while its latch is low");
     C.txAttached = false;
+    flagCheck();
 }
 bool sim::txPadOnController() { return C.txAttached; }
 
@@ -69,6 +101,10 @@ static void raiseAlert(uint32_t a) {
 esp_err_t twai_driver_install(const twai_general_config_t *g, const twai_timing_config_t *t,
                               const twai_filter_config_t *) {
     if (C.installed) return ESP_ERR_INVALID_STATE;
+    if (faults.installFailures > 0) {
+        faults.installFailures--;
+        return ESP_ERR_NO_MEM;
+    }
     // The timing must give the bitrate the master thinks it set (APB 80 MHz).
     const uint32_t tq = 1u + t->tseg_1 + t->tseg_2;
     const uint32_t rate = 80000000u / (t->brp * tq);
@@ -92,6 +128,8 @@ esp_err_t twai_driver_install(const twai_general_config_t *g, const twai_timing_
     C.alertsEnabled = g->alerts_enabled;
     C.rxLen = g->rx_queue_len;
     reinstalls++;
+    sim::timing = { 100.0 * (1 + t->tseg_1) / tq, (int)t->sjw, t->triple_sampling };
+    flagCheck();
     simLog('D', "SIM: TWAI installed, %s, %u bit/s, sample %.1f%%",
            g->mode == TWAI_MODE_LISTEN_ONLY ? "listen-only" : "normal", rate,
            100.0 * (1 + t->tseg_1) / tq);
@@ -121,6 +159,7 @@ esp_err_t twai_start() {
     // is built without it.)
     C.tec = C.rec = 0;
     C.inReset = false;
+    flagCheck();
     return ESP_OK;
 }
 
@@ -129,6 +168,7 @@ esp_err_t twai_stop() {
     C.state = TWAI_STATE_STOPPED;
     C.inReset = true;
     C.rx.clear();
+    flagCheck();
     return ESP_OK;
 }
 
@@ -155,10 +195,14 @@ esp_err_t twai_receive(twai_message_t *m, TickType_t ticks) {
     const uint64_t deadline = ticks == portMAX_DELAY ? simrtos::FOREVER : simrtos::nowUs() + simTicksUs(ticks);
     for (;;) {
         if (!C.installed) return ESP_ERR_INVALID_STATE;
-        if (!C.rx.empty()) { *m = C.rx.front(); C.rx.pop_front(); return ESP_OK; }
-        if (ticks == 0 || simrtos::nowUs() >= deadline) return ESP_ERR_TIMEOUT;
+        const uint64_t now = simrtos::nowUs();
+        if (!C.rx.empty() && now >= C.rxHoldUntil) { *m = C.rx.front(); C.rx.pop_front(); return ESP_OK; }
+        if (ticks == 0 || now >= deadline) return ESP_ERR_TIMEOUT;
+        // Held (a stall): wake when it ends, or at the deadline.
+        uint64_t until = deadline;
+        if (!C.rx.empty() && C.rxHoldUntil > now) until = std::min(until, C.rxHoldUntil);
         C.waitingRx++;
-        simrtos::block(&C.rxw, deadline == simrtos::FOREVER ? deadline : deadline - simrtos::nowUs());
+        simrtos::block(&C.rxw, until == simrtos::FOREVER ? until : until - now);
         C.waitingRx--;
     }
 }
@@ -196,13 +240,19 @@ static void schedule(uint64_t atUs, const twai_message_t &m) { s_pending.emplace
 
 static void deliver(const twai_message_t &m) {
     if (!C.installed || C.state != TWAI_STATE_RUNNING || C.inReset) return;
+    if (faults.radioCorruptRate > 0 && radioOnAir(simrtos::nowUs()) && urand() < faults.radioCorruptRate) {
+        sim::radioMisreads++;
+        masterDetects(masterFlagsActive());   // errors let pass: lost to the master only
+        return;
+    }
     // A frame received without a bus error winds the receive-error counter back
     // down, as a real controller does (ISO 11898-1: by 1, or from above 127 to
     // 119..127) - so a trickle of stray errors keeps REC near zero, and only a
     // storm drives it up. Listen-only mode freezes the counters.
-    if (C.mode != TWAI_MODE_LISTEN_ONLY) {
+    if (C.mode != TWAI_MODE_LISTEN_ONLY || faults.lomRecCounts) {
         if (C.rec > 127) C.rec = 120;
         else if (C.rec) C.rec--;
+        flagCheck();
     }
     if (C.rx.size() >= C.rxLen) { C.rxMissed++; raiseAlert(TWAI_ALERT_RX_QUEUE_FULL); return; }
     C.rx.push_back(m);
@@ -222,7 +272,7 @@ static bool isEcmToTcm(uint32_t id) {
 
 static struct Tcm {
     bool     p1718 = false, p0700 = false, armed = false;
-    uint32_t rx = 0, lost = 0, destroyed = 0;
+    uint32_t rx = 0, lost = 0, destroyed = 0, misreads = 0;
     std::deque<uint64_t> recent;   // arrival times, for the sliding window
 } T;
 
@@ -252,7 +302,7 @@ static constexpr size_t   TCM_MIN_RX    = 30;       // ~150/s healthy; a real ga
 
 TcmView sim::tcm() {
     return { T.p1718, T.p0700, (uint32_t)T.rx, (uint32_t)T.lost, (uint32_t)T.recent.size(), T.armed,
-             T.destroyed, E.total };
+             T.destroyed, E.total, T.misreads };
 }
 
 /** Would the master's controller put an ACTIVE (dominant) error flag on the
@@ -264,11 +314,39 @@ static bool masterFlagsActive() {
     return C.mode == TWAI_MODE_NORMAL || C.mode == TWAI_MODE_LISTEN_ONLY;
 }
 
+int sim::activeFlagStarts = 0;
+static bool s_couldFlag = false;
+/** Count each time the controller becomes able to flag actively. Called
+ *  wherever its state, counters or pad routing change. */
+static void flagCheck() {
+    const bool could = masterFlagsActive();
+    if (could && !s_couldFlag) sim::activeFlagStarts++;
+    s_couldFlag = could;
+}
+
+/** Latch an error in the error-code-capture register, as the controller does. */
+static void eccLatch(int errc, int dir, int seg) {
+    TWAI.error_code_capture_reg.val = (uint32_t)((errc << 6) | (dir << 5) | seg);
+}
+
 /** The master's controller detected an error in a frame it was receiving. */
 static void masterDetects(bool flaggedActive) {
     C.busErrors++;
+    eccLatch(2, 1, 0x0A);                              // stuff error, receiving, data field
     raiseAlert(TWAI_ALERT_BUS_ERROR);
-    if (C.mode == TWAI_MODE_LISTEN_ONLY) return;       // counters frozen in listen-only
+    if (C.mode == TWAI_MODE_LISTEN_ONLY) {
+        // An error-active listen-only controller with its TX pad detached
+        // flags into a line that stays recessive: a bit error in its own
+        // flag, and again, each round counted (see faults.lomRecCounts).
+        if (faults.lomRecCounts && !C.txAttached) {
+            for (int round = 0; round < 32 && C.rec < 128 && C.tec < 128; round++) {
+                C.busErrors++;
+                eccLatch(0, 1, 0x11);                  // bit error in its own active flag
+                C.rec += 8;
+            }
+        }
+        if (!faults.lomRecCounts) return;              // counters frozen in listen-only
+    }
     // +1 for the error, +8 more when after its own (primary) flag it sees the
     // other nodes' secondary flags: the rule that makes the node which alone
     // sees an error the first to go error-passive.
@@ -293,6 +371,7 @@ static bool tcmSee(const twai_message_t &m) {
     const bool misread = faults.rxCorruptRate > 0 && C.installed && C.state == TWAI_STATE_RUNNING &&
                          !C.inReset && urand() < faults.rxCorruptRate;
     if (misread) {
+        T.misreads++;
         while (masterFlagsActive()) {                  // this attempt destroyed on the wire
             masterDetects(true);
             T.destroyed++;
@@ -363,7 +442,8 @@ Truth sim::truth() {
 
 static uint8_t s_cnt = 0;
 
-static void carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
+/** @return When the next broadcast is due. */
+static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
     const Truth v = truth();
     struct Def { uint32_t id; uint32_t periodUs; };
     static const Def DEFS[] = {{0x002, 10000}, {0x231, 10000}, {0x232, 20000}, {0x252, 20000},
@@ -372,7 +452,13 @@ static void carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
     for (const Def &d : DEFS) {
         uint64_t &due = next[d.id];
         if (due > now) continue;
-        due = now + d.periodUs;
+        // On its own clock, as an ECU sends it; a clock more than a period
+        // behind (the bus was silenced) starts again from now. The car's
+        // modules run on their own crystals, not the master's: 0.5 % apart
+        // here, so the master's radio does not lock to the car's frames the
+        // way a single simulated clock would make it.
+        const uint64_t per = d.periodUs * 1005 / 1000;
+        due = due && now - due < per ? due + per : now + per;
         s_cnt++;
         twai_message_t m = {};
         const double t = elapsedS();
@@ -414,6 +500,8 @@ static void carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
         }
         if (tcmSee(m)) deliver(m);      // the TCM watches the ECM's broadcasts
     }
+    uint64_t soonest = UINT64_MAX;
+    for (const Def &d : DEFS) soonest = std::min(soonest, next[d.id]);
     // Stress: many more identifiers than the census holds, each at 20 Hz,
     // spread over time as a real bus would carry them (not in one burst).
     static uint64_t extraLast = 0;
@@ -425,6 +513,7 @@ static void carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
         for (int k = 0; k < n; k++, extraNext = (extraNext + 1) % faults.extraIds)
             deliver(frame(0x500 + extraNext, {(uint8_t)extraNext, s_cnt, 0, 0, 0, 0, 0, 0}));
     }
+    return soonest;
 }
 
 /* ═══════════════════════════ OBD-II responders ═══════════════════════════ */
@@ -676,6 +765,7 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
     transmitted.push_back({simrtos::nowUs(), *m});
     if (faults.errorPerOwnFrame > 0 && urand() < faults.errorPerOwnFrame) {
         C.busErrors++;
+        eccLatch(0, 0, 0x0A);                              // bit error, sending, data field
         C.tec += 8;
         raiseAlert(TWAI_ALERT_BUS_ERROR);
         if (C.tec >= 128) raiseAlert(TWAI_ALERT_ERR_PASS);
@@ -687,6 +777,7 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
     } else if (C.tec) {
         C.tec--;
     }
+    flagCheck();
     if (m->identifier == 0x7DF || m->identifier == 0x7E0) {
         if (m->data[0] == 0x02 && m->data[1] == 0x01) obdRequest(m->identifier, m->data[2]);
         else if (m->identifier == 0x7E0 && ecu.ssmEnabled) ssmFrame(*m);
@@ -706,13 +797,24 @@ static void busTask(void *) {
             s_pending.erase(s_pending.begin());
             deliver(m);
         }
-        if (!faults.silenceBus) carFrames(now, next);
+        radioCallbacks(now);
+        if (faults.rxStallEveryMs && faults.rxStallMs) {
+            static uint64_t nextStall = 0;
+            if (!nextStall) nextStall = now + faults.rxStallEveryMs * 1000ull;
+            if (now >= nextStall) {
+                nextStall = now + faults.rxStallEveryMs * 1000ull;
+                C.rxHoldUntil = now + faults.rxStallMs * 1000ull;
+                masterBusStall();                  // as the master's own flash writes do
+            }
+        }
+        const uint64_t nextCar = faults.silenceBus ? UINT64_MAX : carFrames(now, next);
         tcmEvaluate(now);
         for (int i = 0; i < faults.burstFramesPerMs * 5; i++)          // 5 ms per pass
             deliver(frame(0x600 + (i & 0x3F), {(uint8_t)i, 0, 0, 0, 0, 0, 0, 0}));
         if (faults.idleErrorsPerSec > 0 && C.installed && C.state == TWAI_STATE_RUNNING &&
             urand() < faults.idleErrorsPerSec * (now - lastIdle) / 1e6) {
             C.busErrors++;
+            eccLatch(1, 1, 0x1B);                          // form error, receiving, ACK delimiter
             if (C.mode != TWAI_MODE_LISTEN_ONLY) C.rec++;    // frozen in listen-only
             raiseAlert(TWAI_ALERT_BUS_ERROR);
         }
@@ -722,14 +824,17 @@ static void busTask(void *) {
             C.tec = 256;
             C.state = TWAI_STATE_BUS_OFF;
             raiseAlert(TWAI_ALERT_BUS_OFF);
+            flagCheck();
         }
         if (C.installed && C.state == TWAI_STATE_RECOVERING && now >= C.recoveryDoneAt) {
             C.state = TWAI_STATE_STOPPED;
             C.tec = C.rec = 0;
             raiseAlert(TWAI_ALERT_BUS_RECOVERED);
+            flagCheck();
         }
-        uint64_t wake = now + 5000;
+        uint64_t wake = std::min(now + 5000, nextCar);
         if (!s_pending.empty()) wake = std::min(wake, s_pending.begin()->first);
+        if (!s_airDone.empty()) wake = std::min(wake, s_airDone.front().first);
         simrtos::sleepUs(std::max<uint64_t>(wake, now + 100) - now);
     }
 }
@@ -742,9 +847,32 @@ void sim::start() {
 /* ── register-level access (hal/twai_ll.h), as the master's erratum fix uses ── */
 twai_dev_t TWAI;
 void twai_ll_enter_reset_mode(twai_dev_t *) { C.inReset = true; }
-void twai_ll_exit_reset_mode(twai_dev_t *)  { C.inReset = false; }
+void twai_ll_exit_reset_mode(twai_dev_t *)  { C.inReset = false; flagCheck(); }
+
+/**
+ * The GPIO matrix routing the TX pad back to the controller, as
+ * twai_driver_install() does it (gpio_config, then this call with the TWAI TX
+ * signal). The master uses it once the controller is in its bus state.
+ */
+void esp_rom_gpio_connect_out_signal(uint32_t gpio, uint32_t signal, bool outInv, bool oenInv) {
+    if (gpio != CAN_TX_GPIO || signal != TWAI_TX_IDX || outInv || oenInv) {
+        simLog('E', "SIM-BUG: unexpected GPIO routing (pad %u, signal %u, inv %d/%d)",
+               (unsigned)gpio, (unsigned)signal, outInv, oenInv);
+        return;
+    }
+    if (!C.installed) simLog('E', "SIM-BUG: TX pad given to an uninstalled controller");
+    if (C.installed && C.mode == TWAI_MODE_LISTEN_ONLY)
+        simLog('E', "SIM-BUG: TX pad given to a listen-only controller (the erratum reaches the bus)");
+    C.txAttached = true;
+    flagCheck();
+}
 bool twai_ll_is_in_reset_mode(twai_dev_t *) { return C.inReset; }
 uint32_t twai_ll_get_rec(twai_dev_t *)      { return C.rec; }
+uint32_t twai_ll_get_tec(twai_dev_t *)      { return C.tec; }
+void twai_ll_set_tec(twai_dev_t *, uint32_t tec) {
+    if (!C.inReset) { simLog('E', "SIM-BUG: TEC written outside reset mode (ignored by the hardware)"); return; }
+    C.tec = tec;
+}
 void twai_ll_set_rec(twai_dev_t *, uint32_t rec) {
     if (!C.inReset) { simLog('E', "SIM-BUG: REC written outside reset mode (ignored by the hardware)"); return; }
     C.rec = rec;

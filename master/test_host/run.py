@@ -88,9 +88,14 @@ def scenarios(env):
     return [l.strip() for l in r.stdout.splitlines()[1:] if l.strip()]
 
 
-def run_one(name, env, verbose):
+def run_one(name, env, verbose, config=None):
+    """Run one scenario; @p config, when given, is the DEVICE_CONFIG for it and
+    part of its label."""
     t = time.time()
     args = [EXE, name] + (["-v"] if verbose else [])
+    if config:
+        env = dict(env, DEVICE_CONFIG=config)
+        name = "%s[%s]" % (name, os.path.splitext(os.path.basename(config))[0])
     try:
         r = subprocess.run(args, capture_output=not verbose, text=True, env=env, timeout=600)
     except subprocess.TimeoutExpired:
@@ -112,12 +117,21 @@ def main():
     verbose = "-v" in sys.argv
     env = build()
     # device_config replays a settings file read from the car's master (no
-    # passwords in it); DEVICE_CONFIG=path tests another one.
+    # passwords in it) - every one in fixtures/, unless DEVICE_CONFIG=path
+    # names another. The scenarios that drive with the car's settings (the
+    # P1718 ones) use the first.
+    fixtures = sorted(glob.glob(os.path.join(HERE, "fixtures", "*.json")))
+    mine = os.environ.get("DEVICE_CONFIG")
     env.setdefault("DEVICE_CONFIG", os.path.join(HERE, "fixtures", "car_config_2026-09-25.json"))
-    names = args or scenarios(env)
+    runs = []
+    for n in args or scenarios(env):
+        if n == "device_config" and not mine and fixtures:
+            runs += [(n, f) for f in fixtures]
+        else:
+            runs.append((n, None))
     failed = []
     with cf.ThreadPoolExecutor(max_workers=1 if verbose else (os.cpu_count() or 4)) as ex:
-        for name, code, out, dt in ex.map(lambda n: run_one(n, env, verbose), names):
+        for name, code, out, dt in ex.map(lambda r: run_one(r[0], env, verbose, r[1]), runs):
             print(f"\n=== {name} ({dt:.1f} s) ===")
             if out:
                 print(out.rstrip())

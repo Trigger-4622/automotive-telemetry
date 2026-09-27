@@ -125,7 +125,40 @@ struct MasterStats {
     bool     guardSilent;  /**< A guard forced the controller to listen-only.*/
     bool     rxGuardSilent;/**< The receive-error guard did, specifically.  */
     /** @} */
+    /** @name Link quality: where the errors come from (main.cpp: missAccount,
+     *  radioNoteErrors). Index [0] normal mode, [1] listen-only.
+     *  @{ */
+    uint32_t rxByMode[2];     /**< Frames received.                            */
+    uint32_t errByMode[2];    /**< Bus errors counted.                         */
+    uint32_t missed[2];       /**< Periodic frames the master did not receive. */
+    uint32_t expected[2];     /**< Periodic frames due over the same gaps.     */
+    uint32_t errNearRadio;    /**< Bus errors while the radio was transmitting
+                                   or within 3 ms of it.                       */
+    uint32_t errRadioChecked; /**< Bus errors checked against the radio.       */
+    uint16_t radioHotPermille;/**< Share of bus-up time it was that busy, ‰.   */
+    /** @} */
 };
+
+/** @brief One periodic CAN ID's missed frames (main.cpp: missAccount). */
+struct MissView {
+    uint32_t id;
+    bool     extd;
+    uint32_t periodMs;     /**< Its period, as learned.                  */
+    uint32_t missed[2];    /**< [0] normal mode, [1] listen-only.        */
+    uint32_t expected[2];  /**< Frames due over the gaps counted.        */
+};
+/** @brief The periodic IDs, most missed frames first. */
+size_t masterMissedIds(MissView *out, size_t max);
+
+/**
+ * @brief The master is deaf to the bus for a moment - a flash write (the CAN
+ *        interrupt waits for it), a reset-mode register write, a reinstall.
+ *        Gaps across it are not counted as missed frames.
+ */
+void masterBusBlind();
+/** @brief ...and a stall: the frames around it were also timed late (a flash
+ *         write holds the CAN interrupt off). The gaps next to it are skipped. */
+void masterBusStall();
 
 /** @brief One entry of the persistent evidence log, for the portal. */
 struct EvView {
@@ -193,6 +226,10 @@ size_t masterGetMetrics(MetricViewM *out, size_t max);
 /** @brief Forget every identifier seen so far, for a clean capture. */
 void masterResetCensus();
 
+/** @brief Before a restart from the portal: write a pending config save and
+ *         the evidence log, which are otherwise flushed only every few seconds. */
+void masterBeforeRestart();
+
 /** @brief Restart verification: counters cleared, VERIFIED/REJECTED entries
  *         return to AUTO. */
 void masterResetSignalVerify();
@@ -208,6 +245,23 @@ void masterCountTx();
 
 /** @brief Census snapshot in arrival order (no sorting), for the learner. */
 size_t masterCensusRaw(CensusView *out, size_t max);
+
+/**
+ * @brief One kind of bus error the controller reported, from its error-code
+ *        capture register: code = type << 6 | direction << 5 | segment
+ *        (type 0 bit, 1 form, 2 stuff, 3 other; direction 0 = while
+ *        transmitting, 1 = while receiving; segment = where in the frame).
+ */
+struct ErrKindView {
+    uint8_t  code;     /**< The ECC register's low byte.                  */
+    bool     silent;   /**< Seen while listen-only (else a normal node).  */
+    uint32_t samples;  /**< Times it was the latest error when sampled.   */
+    uint32_t errors;   /**< Errors counted alongside those samples.       */
+};
+/** @brief The error kinds seen this session, most errors first. */
+size_t masterErrorKinds(ErrKindView *out, size_t max);
+/** @brief Short text for an error kind, e.g. "bit error sending in ACK slot". */
+void errKindText(uint8_t code, char *buf, size_t len);
 
 /**
  * @brief Extract a bit field from a payload with the signal decoder's rules.

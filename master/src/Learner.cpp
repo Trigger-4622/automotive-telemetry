@@ -178,9 +178,11 @@ bool s_fullLogged = false, s_tableFullLogged = false;
  * change around it; the one right before a change is dropped. That covers the
  * lag whenever the polling interval is longer than the reply takes, which it
  * is for both engines. Holding a sample means holding each field's value as
- * it was then.
+ * it was then. A switch drops the one right after a flip as well (settled):
+ * there the frame can still show the old state, and whether a flip costs the
+ * sample before or after it depends on how frame and reading line up.
  */
-struct Pend { bool valid; bool yb; float yc; uint32_t band; };
+struct Pend { bool valid; bool yb; float yc; uint32_t band; bool settled; };
 Pend     s_apend[NA_MAX] = {}, s_bpend[NB_MAX] = {};
 float   *s_px  = nullptr;   /**< [cand * NA_MAX + slot]: field, NAN = frame missing. */
 uint8_t *s_pbx = nullptr;   /**< [slot * s_bBytes + bit/8]: bit value held.       */
@@ -482,13 +484,18 @@ void sampleBit(size_t bi, float y, const CensusView *cen, size_t n) {
     if (yb && r.ones < 65535) r.ones++;
     r.lastMs = millis();
 
-    // The held sample counts only if the switch did not flip since: the one
-    // right before a flip may pair the old state with a frame that already
-    // shows the new one (see Pend).
+    // The held sample counts only if the switch held its state on both sides
+    // of it: the one right before a flip may pair the old state with a frame
+    // that already shows the new one, and the one right after it the new
+    // state with a frame that still shows the old - the frame and the ECU's
+    // reading are never taken at the same moment (see Pend). Which of the two
+    // a flip costs depends on how they happen to line up, so both are left
+    // out rather than one.
     Pend &p = s_bpend[bi];
-    if (p.valid && same) commitBits(bi, p.yb);
-    p.valid = true;
-    p.yb    = yb;
+    if (p.valid && p.settled && same) commitBits(bi, p.yb);
+    p.valid   = true;
+    p.yb      = yb;
+    p.settled = same;
     uint8_t *vx = &s_pbx[bi * s_bBytes], *vv = &s_pbv[bi * s_bBytes];
     for (size_t i = 0; i < s_nb; i++) {
         BitCand &b = s_b[i];

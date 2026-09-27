@@ -47,15 +47,24 @@ void WebPortal::begin() {
      * connects to the portal — with no error anywhere to explain it.
      */
     WiFi.mode(WIFI_AP);
-    const bool secured = strlen(Cfg.apPass) >= 8;
-    WiFi.softAP(Cfg.apSsid, secured ? Cfg.apPass : nullptr, Cfg.wifiChannel);
+    bool secured = strlen(Cfg.apPass) >= 8;
+    const char *ssid = Cfg.apSsid;
+    if (!WiFi.softAP(ssid, secured ? Cfg.apPass : nullptr, Cfg.wifiChannel)) {
+        // A name or key the AP will not take must not lock the only way into
+        // these settings away: the built-in name, open, instead.
+        log_e("portal: AP '%s' would not start - '%s', open, instead", ssid,
+              MasterConfig::AP_SSID_DEFAULT);
+        ssid = MasterConfig::AP_SSID_DEFAULT;
+        secured = false;
+        WiFi.softAP(ssid, nullptr, Cfg.wifiChannel);
+    }
 
     s_dns.start(53, "*", WiFi.softAPIP());
     setupRoutes();
     s_server.begin();
     _running = true;
 
-    log_i("portal up: SSID '%s' (%s) at %s, channel %u", Cfg.apSsid,
+    log_i("portal up: SSID '%s' (%s) at %s, channel %u", ssid,
           secured ? "WPA2" : "open", WiFi.softAPIP().toString().c_str(),
           Cfg.wifiChannel);
 }
@@ -164,6 +173,43 @@ void WebPortal::setupRoutes() {
         b["missed"]  = st.rxMissed + st.rxOverrun;
         b["err_tx"]  = st.errWhileTx;
         b["err_idle"] = st.errIdle;
+        {
+            // What the controller says the errors are: code, mode, count.
+            ErrKindView ek[6];
+            const size_t nk = masterErrorKinds(ek, 6);
+            JsonArray ka = b["kinds"].to<JsonArray>();
+            for (size_t i = 0; i < nk; i++) {
+                JsonObject k = ka.add<JsonObject>();
+                k["c"] = ek[i].code;
+                k["s"] = ek[i].silent;
+                k["n"] = ek[i].errors;
+            }
+        }
+
+        {
+            // Where the errors come from: missed frames by mode, the radio.
+            JsonObject lk = b["link"].to<JsonObject>();
+            JsonArray rx = lk["rx"].to<JsonArray>(), er = lk["err"].to<JsonArray>();
+            JsonArray mi = lk["miss"].to<JsonArray>(), ex = lk["exp"].to<JsonArray>();
+            for (int m = 0; m < 2; m++) {
+                rx.add(st.rxByMode[m]); er.add(st.errByMode[m]);
+                mi.add(st.missed[m]);   ex.add(st.expected[m]);
+            }
+            lk["near"] = st.errNearRadio;
+            lk["chk"]  = st.errRadioChecked;
+            lk["hot"]  = st.radioHotPermille;
+            MissView mv[6];
+            const size_t nm = masterMissedIds(mv, 6);
+            JsonArray ia = lk["ids"].to<JsonArray>();
+            for (size_t i = 0; i < nm; i++) {
+                JsonObject o = ia.add<JsonObject>();
+                o["i"] = mv[i].id;
+                o["x"] = mv[i].extd;
+                o["p"] = mv[i].periodMs;
+                o["m"] = mv[i].missed[0] + mv[i].missed[1];
+                o["e"] = mv[i].expected[0] + mv[i].expected[1];
+            }
+        }
 
         JsonObject g = doc["guard"].to<JsonObject>();
         g["trips"]  = st.guardTrips;
@@ -327,15 +373,29 @@ void WebPortal::setupRoutes() {
         sendOk();
     });
 
+    // "Safe bus settings": the bus behaviour alone back to its defaults
+    // (MasterConfig::loadBusDefaults) - learned values, pacing, displays and
+    // Wi-Fi stay. Rebooted like a factory reset: the bit timing needs it.
+    s_server.on("/api/bus_defaults", HTTP_POST, []() {
+        Cfg.loadBusDefaults();
+        Cfg.save();
+        masterBeforeRestart();
+        sendOk();
+        delay(300);
+        ESP.restart();
+    });
+
     s_server.on("/api/defaults", HTTP_POST, []() {
         Cfg.loadDefaults();
         Cfg.save();
+        masterBeforeRestart();
         sendOk();
         delay(300);
         ESP.restart();
     });
 
     s_server.on("/api/reboot", HTTP_POST, []() {
+        masterBeforeRestart();
         sendOk();
         delay(300);
         ESP.restart();

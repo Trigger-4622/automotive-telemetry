@@ -418,11 +418,14 @@ static ExResult exchange(const uint8_t *req, size_t len, uint8_t svc,
 
 /* ───────────────────────────────── init ──────────────────────────────────── */
 
-static bool ssm2Init() {
+/** @return EX_OK, EX_FAIL - or EX_BUSY: the bus was not free, the ECU was not asked. */
+static ExResult ssm2Init() {
     const uint8_t req[1] = { SSM_CMD_INIT };
     uint8_t rsp[1 + 3 + 5 + sizeof(s_flags)];
     size_t got;
-    if (exchange(req, 1, SSM_RSP_INIT, rsp, sizeof(rsp), got) != EX_OK || got < 9) return false;
+    const ExResult r = exchange(req, 1, SSM_RSP_INIT, rsp, sizeof(rsp), got);
+    if (r == EX_BUSY) return EX_BUSY;
+    if (r != EX_OK || got < 9) return EX_FAIL;
     if (got != 41 && got != 57 && got != 105)
         log_w("SSM2: init reply is %u bytes (FreeSSM expects 41/57/105) - using it anyway",
               (unsigned)got);
@@ -448,13 +451,15 @@ static bool ssm2Init() {
     hexStr(s_flags, s_flagCount, fl, sizeof(fl));
     log_i("SSM2: ECU answered - SYS %s ROM %s, %u capability bytes", sys, rom, s_flagCount);
 
+    Cfg.lock();                          // the portal serialises them under it
     if (strcmp(Cfg.ecuId, rom) || strcmp(Cfg.ecuSysId, sys) || strcmp(Cfg.ecuFlags, fl)) {
         strlcpy(Cfg.ecuId, rom, sizeof(Cfg.ecuId));
         strlcpy(Cfg.ecuSysId, sys, sizeof(Cfg.ecuSysId));
         strlcpy(Cfg.ecuFlags, fl, sizeof(Cfg.ecuFlags));
         Cfg.requestSave();
     }
-    return true;
+    Cfg.unlock();
+    return EX_OK;
 }
 
 /* ─────────────────────────────── scheduling ──────────────────────────────── */
@@ -750,7 +755,10 @@ static void ssm2Task(void *) {
             const uint32_t backoff = s_initFails < 3 ? 1000 : 15000;
             if (millis() - s_lastInitTry >= backoff) {
                 s_lastInitTry = millis();
-                const bool ok = ssm2Init();
+                const ExResult ir = ssm2Init();
+                // Bus busy: the ECU was never asked - not a failure of its. Soon again.
+                if (ir == EX_BUSY) { s_lastInitTry = millis() - backoff + 200; vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+                const bool ok = ir == EX_OK;
                 s_initFails = ok ? 0 : (uint8_t)min(s_initFails + 1, 200);
                 if (ok) { s_okStreak = s_failStreak = 0; }
                 if (ok || s_initFails >= 2) diagReportSsm(ok);

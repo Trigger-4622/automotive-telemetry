@@ -32,7 +32,10 @@ ESP-NOW broadcasting on channel 1 via AP, this master is 9A:A3:16:EB:F9:34
 
 Paste it into each display's Settings → `network.master_mac` if you want them
 to ignore everything else on the channel. Optional, but it stops a second CAN
-project injecting into your gauges.
+project injecting into your gauges. With its Wi-Fi switched off at boot
+(Advanced → *Start this Wi-Fi at boot*) the master sends from its station MAC
+instead - the boot line says which - so set the filter again after changing
+that, or leave it empty.
 
 ## 1. Plug in — it configures itself
 
@@ -120,3 +123,9 @@ chip itself is microamps.
   The portal's Diagnostics tab keeps the evidence (reset reasons, guard trips).
 - **Silent** mode (CAN tab) makes the controller electrically incapable of
   transmitting, for first contact with an unfamiliar bus.
+- The portal is the only way into the settings (there is no serial console,
+  and they survive a reflash). Switched its Wi-Fi off at boot? Hold the
+  board's **BOOT** button for 3 seconds while the master runs (ignition on):
+  it switches the Wi-Fi back on and restarts. A Wi-Fi name or password the
+  access point cannot use is refused when saved, and should the AP still not
+  start, it comes up as `Telemetry-Master-Config`, open.

@@ -131,6 +131,10 @@ public:
      *  delete learned signals. */
     static constexpr uint8_t CFG_VERSION = 5;
 
+    /** The portal's Wi-Fi name out of the box, and its fallback when the AP
+     *  will not start under the configured one. */
+    static constexpr const char *AP_SSID_DEFAULT = "Telemetry-Master-Config";
+
     /** @brief Load from LittleFS, falling back to the compiled defaults. */
     void begin();
 
@@ -154,8 +158,22 @@ public:
      */
     bool mergeNewDefaults();
 
-    /** @brief Reset every field to the compiled defaults (does not save). */
+    /** @brief Reset every field to the compiled defaults (does not save).
+     *  Clears what was learned as well (the tables are re-seeded). */
     void loadDefaults();
+
+    /**
+     * @brief Only the settings that decide how the master behaves on the car's
+     *        bus, back to their defaults (does not save).
+     *
+     * The combination that transmits and receives and cannot break the bus:
+     * requests on (AUTO), errors let pass (no error frames), 87.5 % with triple
+     * sampling, both guards on, the P2CAN wait, the settle wait after power-on,
+     * and the TX line held recessive across sleep. Not the bitrate (it is the
+     * car's), not the request pacing, and nothing learned. The portal's "Safe
+     * bus settings"; loadDefaults() starts from it.
+     */
+    void loadBusDefaults();
 
     /** @brief Re-seed only the SSM and raw-signal tables from the compiled
      *         tables, keeping everything else. */
@@ -208,7 +226,33 @@ public:
     uint8_t  ssmBatchMax = 33;     /**< Addresses per request (FreeSSM: 33).*/
     bool     ssmSwitches = true;   /**< Also read the switch bytes.        */
     bool     learnEnabled = true;  /**< Learn broadcast signals by itself. */
-    bool     canSample875 = false; /**< 87.5 % sample point (reboot).      */
+    bool     canSample875 = false; /**< 87.5 % sample point (reboot). Only
+                                        with canTiming 0, the ESP-IDF preset. */
+    /**
+     * CAN bit timing (reboot). 2, the default, is the timing the Arduino-CAN
+     * library uses on the ESP32 and the one vehicle buses are specified for:
+     * sample point 87.5 %, SJW 2, and triple sampling - every bit sampled three
+     * times and decided by majority, which rides out the spikes and ringing an
+     * 80 % single sample reads as an error. 1 is 87.5 % single-sampled; 0 is
+     * the ESP-IDF preset (80 %, SJW 3), or 87.5 % with canSample875.
+     */
+    uint8_t  canTiming   = 2;
+    /**
+     * Let errors pass: never send an error frame (the portal's name for it;
+     * "passive transmit mode" in the code). A CAN controller cannot be told to
+     * stop signalling the errors it detects, but kept error-passive its error
+     * flags are recessive - invisible on the bus - so a frame it reads as bad
+     * is dropped by the master alone and reaches every other module untouched.
+     * It still transmits, receives and acknowledges good frames. The firmware
+     * holds its TEC at 128 or above (see txPassiveTopUp) - the one counter
+     * that only moves when this node transmits - and keeps the TX pad off the
+     * controller at every start until it is (twaiGoLive).
+     */
+    bool     txPassive   = true;
+    /** Radio transmit power, dBm (2-20). The displays sit a metre or two away;
+     *  every dB less is less current drawn in bursts from the supply the CAN
+     *  transceiver shares (the master has browned out in the car). */
+    uint8_t  radioDbm    = 13;
 
     /** @name Tunables - every one editable from the portal's Advanced tab
      *  @{ */
@@ -270,8 +314,8 @@ public:
      *  @{ */
     uint16_t bitrateKbps = CAN_BITRATE_KBPS;     /**< 125, 250, 500, 1000.  */
     uint8_t  wifiChannel = TELEMETRY_WIFI_CHANNEL; /**< Must match slaves.  */
-    char     apSsid[32]  = "Telemetry-Master-Config";
-    char     apPass[32]  = "";                   /**< <8 chars = open AP.   */
+    char     apSsid[33]  = "Telemetry-Master-Config";   /**< 1-32 bytes.  */
+    char     apPass[64]  = "";   /**< 8-63 bytes; fewer = open AP.          */
     bool     portalOn    = true;                 /**< Raise the AP at boot. */
     /** @} */
 
