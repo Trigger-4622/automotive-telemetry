@@ -11,8 +11,11 @@ that must stay in sync"). Changes nothing; exit code 1 lists what to fix.
    (src/WebPortal.cpp from tools/portal_page.html), the Gauge Studio metric
    catalogue (from MasterPacket.h), and the studio page compiled into each
    screen (src/config/StudioPage.h from data/www/index.html).
+3. What the studio page copies from the firmware: the warning-lamp symbols
+   (tools/telltale_icons.json) and the preview's colours (include/Palette.h).
 """
 import gzip
+import json
 import os
 import re
 import subprocess
@@ -94,6 +97,30 @@ def studio_page(screen):
            "run python %s/tools/embed_studio.py (a firmware build also does it) and commit" % screen)
 
 
+def studio_copies(screen):
+    """The studio draws the lamps and the preview the way the firmware does:
+    the same symbols, and only colours from the palette."""
+    page = read(screen + "/data/www/index.html").decode("utf-8")
+    m = re.search(r"const ICONS = (\{.*?\});\n", page, re.S)
+    try:
+        same_icons = m is not None and \
+            json.loads(m.group(1)) == json.loads(read(screen + "/tools/telltale_icons.json"))
+    except ValueError:
+        same_icons = False
+    report(same_icons, "%s: the studio's lamp symbols match tools/telltale_icons.json" % screen,
+           "copy tools/telltale_icons.json into the ICONS constant of data/www/index.html")
+    palette = {int(v, 16) for v in re.findall(r"#define\s+UI_\w+\s+0x([0-9A-Fa-f]{6})",
+                                              read(screen + "/include/Palette.h").decode("utf-8"))}
+    used = set()
+    for name in ("PV", "TONES"):
+        m = re.search(r"const %s\s*=\s*\{(.*?)\};" % name, page, re.S)
+        if m:
+            used |= {int(v, 16) for v in re.findall(r"'#([0-9A-Fa-f]{6})'", m.group(1))}
+    stray = sorted("#%06X" % c for c in used - palette)
+    report(bool(used) and not stray, "%s: the studio preview's colours are Palette.h colours" % screen,
+           "not in the palette: %s - the round board's scheme is the reference" % ", ".join(stray))
+
+
 def main():
     print("identical copies")
     same(["master/include/MasterPacket.h", S1 + "/include/MasterPacket.h",
@@ -114,6 +141,10 @@ def main():
                 "Gauge Studio metric catalogue matches MasterPacket.h")
     for s in (S1, S2):
         studio_page(s)
+
+    print("what the studio copies from the firmware")
+    for s in (S1, S2):
+        studio_copies(s)
 
     if problems:
         print("\n%d problem(s):" % len(problems))

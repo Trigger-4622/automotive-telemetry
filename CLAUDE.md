@@ -14,9 +14,9 @@ README.md for the layout. Three standalone PlatformIO projects:
 python scripts/test_all.py                    # everything: sync checks + the three harnesses
 python scripts/test_all.py sync master        # or any of: sync master screen1 screen2
 python scripts/check_sync.py                  # just the copies-and-generated-files rules below
-python master/test_host/run.py [scenario] [-v]                 # master in a simulated car
+python master/test_host/run.py [scenario] [-v]                 # master in a simulated car (device_config: every fixture)
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
-python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster)
+python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
@@ -49,8 +49,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   New keys get defaults when absent; do not bump `CFG_VERSION` without a
   migration that touches only what changed, and never re-seed tables for a
   newer version (that once erased every learned signal). The harness scenario
-  `device_config` replays the real car's file
-  (`master/test_host/fixtures/`) and must show 0 differences.
+  `device_config` replays every settings file read off the car
+  (`master/test_host/fixtures/`) and must show 0 differences for each.
 - **Colours: the round screen's cyan scheme is the reference.**
   `include/Palette.h` is identical in both screens; an amber re-theme was
   rejected outright. Match the round board, don't redesign it.
@@ -73,6 +73,9 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   the studio metric catalogue in `screens/*/data/www/index.html` (from
   MasterPacket.h via known_catalogue.py), and `screens/*/src/config/StudioPage.h`
   (from `data/www/index.html`; every firmware build regenerates it).
+- Copied into the studio page by hand: the lamp symbols (`ICONS` in
+  `data/www/index.html` = `tools/telltale_icons.json`), and its preview's
+  colours (`PV`, `TONES`) must all be `Palette.h` colours.
 
 ## Platform traps
 
@@ -98,21 +101,63 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   never goes error-passive and drives the sender bus-off instead (it made the
   car's MIL worse on 2026-09-26). ESP-IDF's fix
   (`CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM`) is off in the Arduino core, so
-  `listenOnlyErratumFix()` in main.cpp sets REC to 128 after `twai_start()`
-  and `setupTwai()` takes the TX pad from the controller while it listens.
-  Every listen-only install must keep both. Change the TX pin only with
+  `listenOnlyErratumFix()` in main.cpp sets TEC and REC to 128 after
+  `twai_start()` (REC alone drifted back to 0 on the car; TEC cannot move in
+  listen-only) and `setupTwai()` takes the TX pad from the controller while it
+  listens. Every listen-only install must keep both.
+- **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
+  the code): the master never sends an error frame. A controller cannot stop
+  signalling errors, or acknowledging, while it transmits (only listen-only
+  does that), but kept error-passive (TEC >= 128) its error flags are recessive
+  and cannot destroy another module's frame. `twai_start()` clears the
+  counters, so `twaiGoLive()` starts the controller with the TX pad off it and
+  gives the pad back only once TEC is 220 - every start goes through it: boot,
+  a mode switch, the bus-off restart (`error_frames_never` proves no start
+  leaves a window). `diagBusLock()` tops TEC up (under `s_twaiReg`, never
+  `s_twaiCtl`, which the guard task holds while it waits) before a request
+  whenever our own frames have wound it below 170. The receive-error guard
+  stands down while TEC >= 128.
+- **Safe bus settings** (portal Maintenance, `/api/bus_defaults`,
+  `MasterConfig::loadBusDefaults()`, which `loadDefaults()` starts from): the
+  bus behaviour alone back to the defaults that transmit, receive and cannot
+  break the bus. Keeps the bitrate, pacing, displays, Wi-Fi and everything
+  learned - Factory reset does not (`bus_defaults`).
+- **CAN bit timing** (`can_timing`, default 2): 87.5 % sample point, SJW 2 and
+  triple sampling - the Arduino-CAN profile vehicle buses want; the ESP-IDF
+  preset (80 %, single sample) is 0. The portal Bus tab's "What the errors
+  are" (the controller's error-code-capture register, `masterErrorKinds`) says
+  what a bus error was - check it before guessing. Change the TX pin only with
   `txPadRecessive()` (latch high first, then output - `pinMode` first glitches
   the bus dominant). The simulator models the erratum and CAN fault
   confinement (`lom_erratum_*`, `normal_confinement`).
+- Where bus errors come from (Bus tab, "Where they come from"; serial
+  `[link ]`): missed frames per periodic ID and mode (`missAccount`), and
+  errors against the radio's air time (`radioNoteErrors`, ESP-NOW send
+  callback). Anything that makes the master deaf for a moment must call
+  `masterBusBlind()` - flash writes, reset-mode register writes, reinstalls -
+  or those gaps count as misreads (`link_misses`, `link_radio`). The
+  simulator's car sends on its own clock, 0.5 % off the master's; keep it, or
+  the radio and learner statistics lock to one shared clock.
 - ESP-NOW broadcasts are change-driven with a 300 ms keep-alive (screens drop
   a value after 1.5 s); frames/s is not a health metric, metrics/s is.
+- **The portals are the only way into the settings** (no serial console, and
+  the settings survive a reflash), so nothing may keep an AP from starting.
+  Master: a Wi-Fi name of 1-32 bytes and a password of at most 63 are enforced
+  when saved (a longer password used to be cut to 31 - not the one typed), a
+  softAP that still fails comes up as `Telemetry-Master-Config`, open, and with
+  `portal_on` false the BOOT button held 3 s switches the portal back on and
+  restarts (`portal_ap_safe`, `portal_rescue`). The master sends ESP-NOW from
+  its AP MAC with the portal up and from its station MAC without - a display's
+  `master_mac` filter must follow. Screens: a channel, name or password the AP
+  cannot take falls back to the built-in one (`config_ap_always_starts`).
 
 ## The car
 
 2009 Legacy B4, 500 kbit/s CAN on OBD pins 6/14. The ECU answers SSM2 (SYS
 A11009, ROM 5B443C4107) and OBD-II on 0x7E0/0x7E8. About 25 broadcast IDs.
-The car's saved config (`master/test_host/fixtures/`, diag mode 2 = OBD-II
-only) holds 18 signals: learned RPM 0x231, pedal/throttle 0x232, coolant
+The car's saved config (`master/test_host/fixtures/`: read back 2026-09-25
+with diag mode 2 = OBD-II only - the file the P1718 scenarios drive with - and
+2026-09-26 with diag mode 0 = Auto) holds 18 signals: learned RPM 0x231, pedal/throttle 0x232, coolant
 0x451, MAF and fuel level 0x705, intake temp 0x706; mapped by hand handbrake
 0x4B1, lights 0x351, seatbelt 0x432, steering 0x331, reverse 0x451, neutral
 0x252. Not yet taught: door, turn signals, high beam, cruise; oil pressure has
