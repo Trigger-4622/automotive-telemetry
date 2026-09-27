@@ -1167,7 +1167,8 @@ static void scLomRecDrift() {
     boot();
     runUntil(120);
     MasterStats st; masterGetStats(st);
-    check(controller().tec == 128, "TEC 128 in listen-only, and it stays there", fmt("TEC %u", controller().tec));
+    check(controller().tec >= 128, "TEC error-passive in listen-only, and it stays there",
+          fmt("TEC %u", controller().tec));
     check(controller().rec < 128, "REC drifted down on good frames, as on the car", fmt("REC %u", controller().rec));
     check(tcm().misreads > 50, "the master misread frames", fmt("%u misreads", tcm().misreads));
     check(st.busErrors == tcm().misreads, "one error counted per misread - no rounds of unheard flags",
@@ -1175,6 +1176,41 @@ static void scLomRecDrift() {
     check(tcm().destroyed == 0 && !tcm().p1718, "nothing destroyed, no P1718");
     commonChecks();
 }
+
+/**
+ * The S3 in the car read the listen-only TEC back one lower than written (128
+ * as 127) - error-active once a good frame had wound REC down, and then every
+ * misread became rounds of the controller's own unheard error flags, each
+ * counted. TEC is written well clear of 128 now, and pinned again should it
+ * wind down at all - even on a chip that loses one per frame received.
+ */
+static void lomTecHold(bool drain) {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":4})");
+    faults.lomRecCounts = true;                     // REC winds down on good frames, as on the car
+    faults.tecExitDrop  = 1;                        // TEC 128 read back as 127, as on the car
+    faults.lomTecDrain  = drain;
+    faults.rxCorruptRate = 0.05;
+    boot();
+    uint32_t minTec = 255;
+    for (double t = 1; t <= 120; t += 0.05) {
+        runUntil(t);
+        if (controller().mode == TWAI_MODE_LISTEN_ONLY && controller().state == TWAI_STATE_RUNNING)
+            minTec = std::min(minTec, controller().tec);
+    }
+    MasterStats st; masterGetStats(st);
+    check(minTec >= 128, "error-passive throughout the listen", fmt("lowest TEC %u", minTec));
+    check(tcm().misreads > 50, "the master misread frames", fmt("%u misreads", tcm().misreads));
+    check(st.busErrors <= tcm().misreads, "one error counted per misread - no rounds of unheard flags",
+          fmt("%u errors for %u misreads", st.busErrors, tcm().misreads));
+    check(drain ? st.lomRepins > 0 : st.lomRepins == 0,
+          drain ? "pinned again as it wound down" : "never needed pinning again",
+          fmt("%u times, TEC read back %u", st.lomRepins, st.lomTecRead));
+    check(tcm().destroyed == 0 && !tcm().p1718, "nothing destroyed, no P1718");
+    commonChecks();
+}
+static void scLomTecHold()  { lomTecHold(false); }
+static void scLomTecDrain() { lomTecHold(true); }
 
 /** The default bit timing: the Arduino-CAN profile - 87.5 %, SJW 2, triple sampling. */
 static void scTimingDefault() {
@@ -2158,6 +2194,7 @@ static const Scenario SCENARIOS[] = {
     {"lom_erratum_silent", scLomErratumSilent, 0}, {"lom_erratum_drive", scLomErratumDrive, 0},
     {"normal_confinement", scNormalConfinement, 0},
     {"lom_rec_drift", scLomRecDrift, 0}, {"passive_marginal", scPassiveMarginal, 0},
+    {"lom_tec_hold", scLomTecHold, 0}, {"lom_tec_drain", scLomTecDrain, 0},
     {"passive_off", scPassiveOff, 0}, {"passive_busoff", scPassiveBusOff, 0},
     {"error_frames_never", scErrorFramesNever, 0}, {"bus_defaults", scBusDefaults, 0},
     {"link_misses", scLinkMisses, 0}, {"link_radio", scLinkRadio, 0},

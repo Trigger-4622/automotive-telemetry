@@ -63,6 +63,15 @@ struct BusFaults {
      */
     bool     lomRecCounts = false;
     /**
+     * What the S3 on the car did with a TEC written in reset mode: read back
+     * one lower straight after leaving it (128 -> 127). On by default, as
+     * that is the chip in the car.
+     */
+    uint32_t tecExitDrop = 1;
+    /** A worse chip than seen: TEC winds down by one per frame received in
+     *  listen-only, the way REC does. */
+    bool     lomTecDrain = false;
+    /**
      * The master's radio disturbs its own CAN side - a 3.3 V rail sagging under
      * the transmit current: while a display broadcast is on air, the master
      * misreads this fraction of the frames on the bus (whoever sent them).

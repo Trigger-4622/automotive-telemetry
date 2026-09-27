@@ -585,7 +585,8 @@ function renderBusTiles(){
  bar.style.background=RATES.load>70?'var(--crit)':RATES.load>50?'var(--warn)':'var(--ok)';
  $('#bTx').textContent=RATES.tx.toFixed(0);
  $('#bErr').textContent=d.bus.err;$('#bErr').className='v '+(RATES.errs>0?'crit':d.bus.err?'warn':'ok');
- $('#bErrS').textContent=`error counters ${d.bus.tec} / ${d.bus.rec}`+(C.tx_passive&&!d.silent&&d.bus.tec>=128?' (high on purpose: errors let pass)':'');
+ $('#bErrS').textContent=`error counters ${d.bus.tec} / ${d.bus.rec}`+(C.tx_passive&&!d.silent&&d.bus.tec>=128?' (high on purpose: errors let pass)':'')+
+  (d.bus.lom_rp?` · listen-only kept error-passive ${d.bus.lom_rp}×`:'');
  $('#bFps').textContent=(RATES.fps||0).toFixed(0)+'/s';$('#bIds').textContent=d.bus.ids+' different IDs';
  let s;
  if(!d.bus.alive)s='No traffic.';
@@ -1094,6 +1095,8 @@ void WebPortal::setupRoutes() {
         b["missed"]  = st.rxMissed + st.rxOverrun;
         b["err_tx"]  = st.errWhileTx;
         b["err_idle"] = st.errIdle;
+        b["lom_tec"] = st.lomTecRead;
+        b["lom_rp"]  = st.lomRepins;
         {
             // What the controller says the errors are: code, mode, count.
             ErrKindView ek[6];

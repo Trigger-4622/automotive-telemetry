@@ -254,6 +254,10 @@ static void deliver(const twai_message_t &m) {
         else if (C.rec) C.rec--;
         flagCheck();
     }
+    if (C.mode == TWAI_MODE_LISTEN_ONLY && faults.lomTecDrain && C.tec) {
+        C.tec--;
+        flagCheck();
+    }
     if (C.rx.size() >= C.rxLen) { C.rxMissed++; raiseAlert(TWAI_ALERT_RX_QUEUE_FULL); return; }
     C.rx.push_back(m);
     simrtos::notify(&C.rxw);
@@ -879,8 +883,16 @@ void sim::start() {
 
 /* ── register-level access (hal/twai_ll.h), as the master's erratum fix uses ── */
 twai_dev_t TWAI;
+static bool s_tecWrittenInReset = false;
 void twai_ll_enter_reset_mode(twai_dev_t *) { C.inReset = true; }
-void twai_ll_exit_reset_mode(twai_dev_t *)  { C.inReset = false; flagCheck(); }
+void twai_ll_exit_reset_mode(twai_dev_t *)  {
+    C.inReset = false;
+    // The S3 on the car: a TEC written in reset mode reads back one lower
+    // once the controller has left it (faults.tecExitDrop).
+    if (s_tecWrittenInReset) C.tec -= std::min(C.tec, faults.tecExitDrop);
+    s_tecWrittenInReset = false;
+    flagCheck();
+}
 
 /**
  * The GPIO matrix routing the TX pad back to the controller, as
@@ -905,6 +917,7 @@ uint32_t twai_ll_get_tec(twai_dev_t *)      { return C.tec; }
 void twai_ll_set_tec(twai_dev_t *, uint32_t tec) {
     if (!C.inReset) { simLog('E', "SIM-BUG: TEC written outside reset mode (ignored by the hardware)"); return; }
     C.tec = tec;
+    s_tecWrittenInReset = true;
 }
 void twai_ll_set_rec(twai_dev_t *, uint32_t rec) {
     if (!C.inReset) { simLog('E', "SIM-BUG: REC written outside reset mode (ignored by the hardware)"); return; }
