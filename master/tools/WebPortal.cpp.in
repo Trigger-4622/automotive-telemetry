@@ -312,6 +312,10 @@ void WebPortal::setupRoutes() {
         const size_t nc = masterGetCensus(cen, 128);
         JsonArray ca = doc["census"].to<JsonArray>();
         char hx[17], chx[17];
+        // ?e=1 (teach by doing): each bit's flip counter as well, 128 hex digits.
+        const bool edges = s_server.arg("e") == "1";
+        char ehx[129];
+        uint8_t ed[64];
         for (size_t i = 0; i < nc; i++) {
             JsonObject o = ca.add<JsonObject>();
             o["id"]    = cen[i].id;
@@ -325,6 +329,10 @@ void WebPortal::setupRoutes() {
             hx[2 * cen[i].dlc] = chx[2 * cen[i].dlc] = '\0';
             o["d"] = hx;
             o["c"] = chx;
+            if (edges && masterCensusEdges(cen[i].id, cen[i].extd, ed)) {
+                for (uint8_t k = 0; k < 64; k++) snprintf(ehx + 2 * k, 3, "%02X", ed[k]);
+                o["e"] = ehx;
+            }
         }
         sendJson(doc);
     });

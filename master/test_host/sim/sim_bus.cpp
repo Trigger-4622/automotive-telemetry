@@ -442,8 +442,33 @@ Truth sim::truth() {
 
 static uint8_t s_cnt = 0;
 
+sim::Body sim::body;
+static double s_turnSince = -1;       ///< When the lamp's flashing started.
+bool sim::turnLampLit() {
+    if (!body.turnLeft) { s_turnSince = -1; return false; }
+    const double t = elapsedS();
+    if (s_turnSince < 0) s_turnSince = t;
+    return std::fmod(t - s_turnSince, 0.7) < 0.35;   // lit first, like a flasher
+}
+
+/** The body/transmission frame (see Body); due every 50 ms while enabled. */
+static void bodyFrame(uint64_t now) {
+    static uint64_t due = 0;
+    if (!body.enabled) { due = 0; return; }
+    if (due > now) return;
+    due = due && now - due < 50250 ? due + 50250 : now + 50250;
+    static uint8_t cnt = 0;
+    uint8_t lever = 7;
+    switch (body.lever) { case 'P': lever = 0; break; case 'R': lever = 1; break;
+                          case 'N': lever = 2; break; case 'D': lever = 4; break; default: break; }
+    const twai_message_t m = frame(0x3D1, {(uint8_t)(lever << 4), body.doors,
+                                           (uint8_t)(turnLampLit() ? 1 : 0), 0, 0, 0, 0, cnt++});
+    if (tcmSee(m)) deliver(m);
+}
+
 /** @return When the next broadcast is due. */
 static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
+    bodyFrame(now);
     const Truth v = truth();
     struct Def { uint32_t id; uint32_t periodUs; };
     static const Def DEFS[] = {{0x002, 10000}, {0x231, 10000}, {0x232, 20000}, {0x252, 20000},
@@ -502,6 +527,7 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
     }
     uint64_t soonest = UINT64_MAX;
     for (const Def &d : DEFS) soonest = std::min(soonest, next[d.id]);
+    if (body.enabled) soonest = std::min<uint64_t>(soonest, now + 50250);
     // Stress: many more identifiers than the census holds, each at 20 Hz,
     // spread over time as a real bus would carry them (not in one burst).
     static uint64_t extraLast = 0;

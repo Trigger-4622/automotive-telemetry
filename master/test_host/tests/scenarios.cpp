@@ -1895,6 +1895,193 @@ static void scTxHoldOff() {
 }
 
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
+/* ───────────── body values: flashing, positions, derived ───────────── */
+
+/** A signal on the simulated body frame 0x3D1, as the portal saves one. */
+static std::string bodySig(uint16_t metric, int start, int len, const char *map = nullptr) {
+    return fmt(R"({"can_id":%u,"ext":false,"start":%d,"len":%d,"be":false,"signed":false,"scale":1,)"
+               R"("offset":0,"metric":%u,"mode":1,"ref":0,"learned":false,"name":"t%s%s})",
+               0x3D1u, start, len, (unsigned)metric, map ? "\",\"map\":" : "\"", map ? map : "");
+}
+static std::string sigFile(std::initializer_list<std::string> sigs) {
+    std::string a;                         // (not fmt: its buffer is 256 bytes)
+    for (const auto &x : sigs) a += (a.empty() ? "" : ",") + x;
+    return "{\"cfg_ver\":" + std::to_string((int)MasterConfig::CFG_VERSION) + ",\"signals\":[" + a + "]}";
+}
+/** A metric the displays show now (fresh), and what it reads. */
+static bool shownNow(uint16_t id, double &v) {
+    const sim::Shown *s = shown(id);
+    if (!s || (simrtos::nowUs() - s->tUs) / 1e3 >= 1500) return false;
+    v = s->value;
+    return true;
+}
+
+/**
+ * Teach by doing needs a flashing turn signal's flashes counted: on for only
+ * part of the ON step, it never looks like a switch. The census counts every
+ * flip of every bit, frame by frame - whatever rate the phone polls at.
+ */
+static void scTeachFlips() {
+    body.enabled = true;
+    boot();
+    uint8_t a[64], b[64], c[64], d[64];
+    runUntil(3);
+    check(masterCensusEdges(0x3D1, false, a), "the body frame is in the census");
+    runUntil(7);                                         // OFF, 4 s
+    masterCensusEdges(0x3D1, false, b);
+    body.turnLeft = true;                                // ON, 4 s: the lamp flashes
+    runUntil(11);
+    masterCensusEdges(0x3D1, false, c);
+    body.turnLeft = false;                               // OFF again
+    runUntil(15);
+    masterCensusEdges(0x3D1, false, d);
+    const auto fl = [](const uint8_t *x, const uint8_t *y, int bit) { return (uint8_t)(y[bit] - x[bit]); };
+    check(fl(a, b, 16) == 0, "the lamp's bit: no flips while off", fmt("%u", fl(a, b, 16)));
+    // Lit at once, then every 350 ms: 12 flips in 4 s.
+    check(fl(b, c, 16) >= 11 && fl(b, c, 16) <= 13, "12 flips while it flashed for 4 s",
+          fmt("%u", fl(b, c, 16)));
+    check(fl(c, d, 16) <= 1, "at most one (going dark) after it", fmt("%u", fl(c, d, 16)));
+    check(fl(b, c, 56) >= 70, "the rolling counter's low bit flips every frame", fmt("%u", fl(b, c, 56)));
+    int lever = 0;
+    for (int bit = 0; bit < 8; bit++) lever += fl(a, d, bit);
+    check(lever == 0, "the lever byte never moved", fmt("%d", lever));
+    uint8_t none[64];
+    check(!masterCensusEdges(0x7FF, false, none), "an identifier never heard has no counters");
+    commonChecks();
+}
+
+/**
+ * A value table: a gear lever field, each raw code publishing its letter; a
+ * code not in the table (the lever between positions, or in one never
+ * taught) publishes nothing. Malformed pairs in the file are dropped.
+ */
+static void scSignalTable() {
+    body.enabled = true;
+    simfs::files["/config.json"] = sigFile({
+        bodySig(METRIC_ID_GEAR_LEVER, 4, 3, "[[0,80],[1,82],[2,78],[4,68]]"),
+        bodySig(METRIC_ID_CUSTOM_1, 0, 4, R"([[16,1],[1,1],[1,2],"x",[2],[3,40000],[5,-7]])")});
+    boot();
+    Cfg.lock();
+    const RtSignal lev = Cfg.signals.size() > 0 ? Cfg.signals[0] : RtSignal{};
+    const RtSignal bad = Cfg.signals.size() > 1 ? Cfg.signals[1] : RtSignal{};
+    Cfg.unlock();
+    check(lev.nMap == 4 && lev.mapRaw[3] == 4 && lev.mapVal[3] == 'D', "the lever's table is read",
+          fmt("%u entries", lev.nMap));
+    check(bad.nMap == 2 && bad.mapRaw[0] == 1 && bad.mapVal[0] == 1 && bad.mapRaw[1] == 5 && bad.mapVal[1] == -7,
+          "out of range, duplicate and malformed pairs are dropped", fmt("%u entries", bad.nMap));
+
+    const char *seq = "PRND";
+    for (int i = 0; i < 4; i++) {
+        body.lever = seq[i];
+        runUntil(2.0 + 1.5 * i);
+        double v = 0;
+        bool ok = false;
+        v = -1;
+        ok = shownNow(METRIC_ID_GEAR_LEVER, v);
+        check(ok && v == seq[i], fmt("lever in %c: the displays read '%c'", seq[i], seq[i]).c_str(),
+              fmt("%.0f", v));
+    }
+    body.lever = 'M';                                    // code 7: not in the table
+    runUntil(10);
+    double v = 0;
+    bool ok = false;
+    check(!shownNow(METRIC_ID_GEAR_LEVER, v), "a position not in the table publishes nothing (it goes stale)",
+          fmt("%.0f", v));
+    check(!shown(METRIC_ID_CUSTOM_1), "a raw value never in its table is never published");
+
+    // Saved as it was read: the table goes back into the file.
+    JsonDocument doc;
+    Cfg.toJson(doc);
+    std::string m0, m1;
+    serializeJson(doc["signals"][0]["map"], m0);
+    serializeJson(doc["signals"][1]["map"], m1);
+    check(m0 == "[[0,80],[1,82],[2,78],[4,68]]", "the table is saved", m0);
+    check(m1 == "[[1,1],[5,-7]]", "only the valid pairs are saved", m1);
+    commonChecks();
+}
+
+/**
+ * A lever whose positions are separate bits, taught one by one as Reverse,
+ * Lever in N and Lever in D: the master puts them together as the gear
+ * lever. A field taught onto the lever itself wins over them.
+ */
+static void scDerivedLever() {
+    body.enabled = true;
+    const std::string bits[] = {bodySig(METRIC_ID_REVERSE, 4, 1), bodySig(METRIC_ID_NEUTRAL, 5, 1),
+                                bodySig(METRIC_ID_DRIVE, 6, 1)};
+    simfs::files["/config.json"] = sigFile({bits[0], bits[1], bits[2]});
+    boot();
+    runUntil(3);
+    double v = 0;
+    bool ok = false;
+    check(!shownNow(METRIC_ID_GEAR_LEVER, v), "in P, which has no bit here, the lever is not guessed");
+    const char *seq = "RND";
+    for (int i = 0; i < 3; i++) {
+        body.lever = seq[i];
+        runUntil(4.5 + 1.5 * i);
+        v = -1;
+        ok = shownNow(METRIC_ID_GEAR_LEVER, v);
+        check(ok && v == seq[i], fmt("%c from its own bit", seq[i]).c_str(),
+              fmt("%.0f", v));
+    }
+    check(sourceOf(METRIC_ID_GEAR_LEVER) == SRC_DERIVED, "published as derived", fmt("%d", sourceOf(METRIC_ID_GEAR_LEVER)));
+
+    // Now the lever's field as well: it is read straight from the bus, and wins.
+    const std::string all = sigFile({bits[0], bits[1], bits[2],
+                                     bodySig(METRIC_ID_GEAR_LEVER, 4, 3, "[[0,80],[1,82],[2,78],[4,68]]")});
+    portalPost(all.c_str());
+    body.lever = 'P';
+    runUntil(11);
+    v = -1;
+    ok = shownNow(METRIC_ID_GEAR_LEVER, v);
+    check(ok && v == 'P', "with the field taught, P reads too", fmt("%.0f", v));
+    check(sourceOf(METRIC_ID_GEAR_LEVER) == SRC_RAW, "read from the bus, not derived", fmt("%d", sourceOf(METRIC_ID_GEAR_LEVER)));
+    commonChecks();
+}
+
+/** Doors taught one by one light the "door open" lamp, unless "door open"
+ *  itself has been taught. */
+static void scDerivedDoors() {
+    body.enabled = true;
+    const std::string doors[] = {bodySig(METRIC_ID_DOOR_FL, 8, 1), bodySig(METRIC_ID_DOOR_FR, 9, 1),
+                                 bodySig(METRIC_ID_TRUNK, 12, 1), bodySig(METRIC_ID_HOOD, 13, 1)};
+    simfs::files["/config.json"] = sigFile({doors[0], doors[1], doors[2], doors[3]});
+    boot();
+    runUntil(3);
+    double v = -1;
+    bool ok = false;
+    v = -1;
+    ok = shownNow(METRIC_ID_DOOR_OPEN, v);
+    check(ok && v == 0, "all shut: door open reads 0", fmt("%.0f", v));
+    body.doors = 0x02;                                   // front right
+    runUntil(4.5);
+    v = -1;
+    ok = shownNow(METRIC_ID_DOOR_OPEN, v);
+    check(ok && v == 1, "a door open: 1", fmt("%.0f", v));
+    body.doors = 0x10;                                   // the trunk
+    runUntil(6);
+    v = -1;
+    ok = shownNow(METRIC_ID_DOOR_OPEN, v);
+    check(ok && v == 1, "the trunk open: 1", fmt("%.0f", v));
+    body.doors = 0x00;
+    runUntil(7.5);
+    v = -1;
+    ok = shownNow(METRIC_ID_DOOR_OPEN, v);
+    check(ok && v == 0, "shut again: 0", fmt("%.0f", v));
+    check(sourceOf(METRIC_ID_DOOR_OPEN) == SRC_DERIVED, "published as derived");
+
+    // "Door open" taught directly (a bit that stays 0 here): it wins.
+    const std::string all = sigFile({doors[0], doors[1], doors[2], doors[3], bodySig(METRIC_ID_DOOR_OPEN, 15, 1)});
+    portalPost(all.c_str());
+    body.doors = 0x01;
+    runUntil(10);
+    v = -1;
+    ok = shownNow(METRIC_ID_DOOR_OPEN, v);
+    check(ok && v == 0, "the taught one is what shows", fmt("%.0f", v));
+    check(sourceOf(METRIC_ID_DOOR_OPEN) == SRC_RAW, "read from the bus", fmt("%d", sourceOf(METRIC_ID_DOOR_OPEN)));
+    commonChecks();
+}
+
 static const Scenario SCENARIOS[] = {
     {"auto", scAuto, 0}, {"silent", scSilent, 0}, {"mode_switch", scModeSwitch, 0},
     {"guard", scGuard, 0}, {"guard_off", scGuardOff, 0}, {"idle_errors", scIdleErrors, 0},
@@ -1928,6 +2115,8 @@ static const Scenario SCENARIOS[] = {
     {"budget", scBudget, 0}, {"no_functional", scNoFunctional, 0},
     {"crank_reset", scCrankReset, 0}, {"evlog", scEvlog, 0},
     {"tx_hold", scTxHold, 0}, {"tx_hold_off", scTxHoldOff, 0},
+    {"teach_flips", scTeachFlips, 0}, {"signal_table", scSignalTable, 0},
+    {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
 };
 
 static const Scenario *s_sc = nullptr;

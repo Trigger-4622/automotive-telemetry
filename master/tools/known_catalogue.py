@@ -10,8 +10,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 NAMES = {
 0x1008:'Wheel FL km/h',0x1009:'Wheel FR km/h',0x100A:'Wheel RL km/h',0x100B:'Wheel RR km/h',
 0x100C:'Lateral G g',0x100D:'Longitudinal G g',0x100E:'Yaw rate °/s',
+0x100F:'Gear lever',0x1010:'Cruise set km/h',0x1011:'ATF temp °C',
 0x1201:'Left turn signal',0x1202:'Right turn signal',0x1203:'High beam',0x1204:'Door open',
 0x1205:'Handbrake',0x1206:'Seatbelt unfastened',0x1207:'Cruise active',0x1208:'Reverse',
+0x1209:'Lever in P',0x120A:'Lever in N',0x120B:'Lever in D',0x120C:'Hazard lights',
+0x120D:'Cruise main',0x120E:'Front fog',0x120F:'Rear fog',0x1210:'Door FL',0x1211:'Door FR',
+0x1212:'Door RL',0x1213:'Door RR',0x1214:'Trunk open',0x1215:'Hood open',0x1216:'VDC off',
+0x1217:'Passenger belt unfastened',
 0x3001:'Custom 1',0x3002:'Custom 2',0x3003:'Custom 3',0x3004:'Custom 4',0x3005:'Custom 5',0x3006:'Custom 6',0x3007:'Custom 7',0x3008:'Custom 8',0x3009:'Custom 9',0x300A:'Custom 10',0x300B:'Custom 11',0x300C:'Custom 12',0x300D:'Custom 13',0x300E:'Custom 14',0x300F:'Custom 15',0x3010:'Custom 16',
 0x0101:'MIL lamp',0x0301:'DTC count',0x0103:'Fuel system status',
 0x0104:'Engine load %',0x0105:'Coolant °C',0x0106:'STFT B1 %',0x0107:'LTFT B1 %',

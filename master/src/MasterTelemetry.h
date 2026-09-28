@@ -216,6 +216,13 @@ void masterGetStats(MasterStats &out);
 size_t masterGetCensus(CensusView *out, size_t max);
 
 /**
+ * @brief How often each bit of one identifier has flipped since the census
+ *        was reset: 64 counters (bit n = byte n/8, bit n%8) that wrap at 256.
+ * @return false when the identifier is not in the census.
+ */
+bool masterCensusEdges(uint32_t id, bool extd, uint8_t out[64]);
+
+/**
  * @brief Copy every metric in the store.
  * @param[out] out Destination array.
  * @param max      Capacity of @p out.

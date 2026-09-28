@@ -160,11 +160,15 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="wrap"><table><thead><tr><th>Error</th><th>Mode</th><th>Count</th></tr></thead><tbody id="ekTab"></tbody></table></div>
   <div id="lkBox"></div></div>
  <div class="card" id="teach"><h2>Teach by doing <small>for what the ECU cannot report</small></h2>
-  <p class="say" style="margin:0 0 10px">Turn signals, doors, handbrake, steering, wheel speeds… Pick what you are about to
-   operate, press Start and follow the steps. The master finds the bits or bytes that followed you.</p>
+  <p class="say" style="margin:0 0 10px">Turn signals, doors, handbrake, steering, wheel speeds, the gear lever… Pick what you are about to
+   operate, press Start and follow the steps. The master finds the bits or bytes that followed you. A flashing turn signal is
+   fine: leave it flashing through the ON step. For the gear lever, pick <b>Gear lever</b>, foot on the brake, and move it
+   through the positions as asked.</p>
   <div class="row"><select id="tM" style="flex:1;min-width:180px"></select>
-   <select id="tK"><option value="bit">On / off</option><option value="val">A moving value</option></select>
+   <select id="tK"><option value="bit">On / off</option><option value="val">A moving value</option><option value="pos">Positions</option></select>
    <button class="b p" id="tBtn" onclick="teachStart()">Start</button></div>
+  <div class="row" id="tPRow" hidden style="margin-top:8px"><span class="muted">Positions, in the order you will select them:</span>
+   <input id="tP" style="flex:1;min-width:120px" value="P R N D"></div>
   <div id="tStep"></div><div id="tRes"></div></div>
  <div class="card" id="mapCard" hidden><h2>Use a value from <span id="mapId" class="acc"></span>
    <button class="x" style="margin-left:auto" onclick="mapClose()">✕</button></h2>
@@ -271,13 +275,13 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 <div id="toast"></div>
 <script>
 'use strict';
-const META={257:["MIL lamp", "", "Status & switches", 0],259:["Fuel system status", "", "Status & switches", 0],260:["Engine load", "%", "Engine", 1],261:["Coolant", "°C", "Temperatures", 0],262:["STFT B1", "%", "Fuel & mixture", 1],263:["LTFT B1", "%", "Fuel & mixture", 1],264:["STFT B2", "%", "Fuel & mixture", 1],265:["LTFT B2", "%", "Fuel & mixture", 1],266:["Fuel press", "kPa", "Fuel & mixture", 0],267:["MAP", "kPa", "Engine", 0],268:["RPM", "rpm", "Engine", 0],269:["Speed", "km/h", "Driving", 0],270:["Timing", "°", "Engine", 1],271:["IAT", "°C", "Temperatures", 0],272:["MAF", "g/s", "Engine", 1],273:["Throttle", "%", "Engine", 1],276:["O2 B1S1", "V", "Fuel & mixture", 2],277:["O2 B1S2", "V", "Fuel & mixture", 2],280:["O2 B2S1", "V", "Fuel & mixture", 2],281:["O2 B2S2", "V", "Fuel & mixture", 2],287:["Run time", "s", "Driving", 0],289:["Dist MIL", "km", "Driving", 0],290:["Fuel rail (vac)", "kPa", "Fuel & mixture", 0],291:["Fuel rail gauge", "kPa", "Fuel & mixture", 0],292:["WB B1S1", "λ", "Fuel & mixture", 3],296:["WB B2S1", "λ", "Fuel & mixture", 3],300:["EGR cmd", "%", "Fuel & mixture", 1],301:["EGR error", "%", "Fuel & mixture", 1],302:["Evap purge", "%", "Fuel & mixture", 1],303:["Fuel level", "%", "Fuel & mixture", 1],304:["Warm-ups", "", "Driving", 0],305:["Dist cleared", "km", "Driving", 0],306:["Evap vapor", "Pa", "Fuel & mixture", 0],307:["Barometric", "kPa", "Engine", 0],308:["WB B1S1 λ (I)", "λ", "Fuel & mixture", 3],312:["WB B2S1 λ (I)", "λ", "Fuel & mixture", 3],316:["Cat temp", "°C", "Temperatures", 0],317:["Cat temp B2S1", "°C", "Temperatures", 0],318:["Cat temp B1S2", "°C", "Temperatures", 0],319:["Cat temp B2S2", "°C", "Temperatures", 0],322:["Battery", "V", "Electrical", 2],323:["Abs load", "%", "Engine", 1],324:["Cmd", "λ", "Engine", 3],325:["Rel throttle", "%", "Engine", 1],326:["Ambient", "°C", "Temperatures", 0],327:["Abs throttle B", "%", "Engine", 1],328:["Throttle C", "%", "Engine", 1],329:["Pedal D", "%", "Engine", 1],330:["Pedal E", "%", "Engine", 1],331:["Pedal F", "%", "Engine", 1],332:["Cmd throttle", "%", "Engine", 1],333:["Time MIL on", "min", "Driving", 0],334:["Time since clear", "min", "Driving", 0],337:["Fuel type", "", "Status & switches", 0],338:["Ethanol", "%", "Fuel & mixture", 1],339:["Evap abs", "kPa", "Fuel & mixture", 0],345:["Fuel rail abs", "kPa", "Fuel & mixture", 0],346:["Relative pedal", "%", "Engine", 1],347:["Hybrid SOC", "%", "Engine", 1],348:["Oil temp", "°C", "Temperatures", 0],349:["Injection timing", "°", "Fuel & mixture", 1],350:["Fuel rate", "L/h", "Fuel & mixture", 1],353:["Demand torque", "%", "Engine", 1],354:["Actual torque", "%", "Engine", 1],355:["Reference torque", "Nm", "Engine", 0],422:["Odometer", "km", "Driving", 0],769:["DTC count", "", "Status & switches", 0],788:["O2 B1S1 trim", "%", "Fuel & mixture", 1],789:["O2 B1S2 trim", "%", "Fuel & mixture", 1],792:["O2 B2S1 trim", "%", "Fuel & mixture", 1],793:["O2 B2S2 trim", "%", "Fuel & mixture", 1],804:["WB B1S1", "V", "Fuel & mixture", 2],808:["WB B2S1", "V", "Fuel & mixture", 2],820:["WB B1S1", "mA", "Fuel & mixture", 1],824:["WB B2S1", "mA", "Fuel & mixture", 1],4097:["Boost", "bar", "Engine", 2],4098:["AFR", "AFR", "Fuel & mixture", 1],4099:["Oil press", "bar", "Engine", 2],4100:["EGT", "°C", "Temperatures", 0],4101:["Gear", "", "Driving", 0],4102:["Steering", "°", "Driving", 1],4103:["Brake", "bar", "Driving", 2],4104:["Wheel FL", "km/h", "Driving", 0],4105:["Wheel FR", "km/h", "Driving", 0],4106:["Wheel RL", "km/h", "Driving", 0],4107:["Wheel RR", "km/h", "Driving", 0],4108:["Lateral G", "g", "Driving", 2],4109:["Longitudinal G", "g", "Driving", 2],4110:["Yaw rate", "°/s", "Driving", 1],4353:["Batt current", "A", "Electrical", 1],4354:["Batt SOC", "%", "Electrical", 1],4355:["Batt SOH", "%", "Electrical", 1],4356:["Batt temp", "°C", "Temperatures", 0],4357:["Alternator", "V", "Electrical", 2],4358:["Alternator", "A", "Electrical", 1],4359:["Alternator load", "%", "Electrical", 1],4360:["12V rail", "V", "Electrical", 2],4361:["Elec load", "W", "Electrical", 0],4362:["Charge status", "", "Status & switches", 0],4609:["Left turn signal", "", "Status & switches", 0],4610:["Right turn signal", "", "Status & switches", 0],4611:["High beam", "", "Status & switches", 0],4612:["Door open", "", "Status & switches", 0],4613:["Handbrake", "", "Status & switches", 0],4614:["Seatbelt unfastened", "", "Status & switches", 0],4615:["Cruise active", "", "Status & switches", 0],4616:["Reverse", "", "Status & switches", 0],7937:["Night sense", "", "System", 0],7938:["Master uptime", "s", "System", 0],7939:["CAN frames/s", "", "System", 0],7940:["CAN IDs", "", "System", 0],7941:["OBD replies/s", "", "System", 0],7942:["SSM2 exch/s", "", "System", 0],8193:["Knock corr", "°", "Engine", 1],8194:["Knock corr fine", "°", "Engine", 1],8195:["A/F learn", "%", "Fuel & mixture", 1],8196:["A/F corr", "%", "Fuel & mixture", 1],8197:["Inj duty", "%", "Fuel & mixture", 1],8198:["Target boost", "bar", "Engine", 2],8199:["Wastegate", "%", "Engine", 1],8200:["A/F corr 2", "%", "Fuel & mixture", 1],8201:["A/F learn 2", "%", "Fuel & mixture", 1],8202:["Front O2 #1", "V", "Fuel & mixture", 2],8203:["Rear O2", "V", "Fuel & mixture", 2],8204:["Front O2 #2", "V", "Fuel & mixture", 2],8205:["MAF sensor", "V", "Engine", 2],8206:["TPS", "V", "Engine", 2],8207:["Atmospheric", "kPa", "Engine", 0],8208:["Manifold rel", "kPa", "Engine", 0],8209:["Tank press", "kPa", "Engine", 0],8210:["Learned timing", "°", "Engine", 1],8211:["Accel pedal", "%", "Engine", 1],8212:["Fuel temp", "°C", "Temperatures", 0],8213:["Wastegate 2", "%", "Engine", 1],8214:["CPC duty", "%", "Fuel & mixture", 1],8215:["ISC duty", "%", "Engine", 1],8216:["A/F lean", "%", "Fuel & mixture", 1],8217:["A/F heater", "%", "Fuel & mixture", 1],8218:["ISC step", "", "Engine", 0],8219:["EGR steps", "", "Fuel & mixture", 0],8220:["Alternator duty", "%", "Electrical", 1],8221:["Fuel pump", "%", "Fuel & mixture", 1],8222:["Intake VVT R", "°", "Engine", 1],8223:["Intake VVT L", "°", "Engine", 1],8224:["Intake OCV R", "%", "Engine", 1],8225:["Intake OCV L", "%", "Engine", 1],8226:["A/F current", "mA", "Fuel & mixture", 1],8227:["Lambda", "λ", "Fuel & mixture", 3],8228:["Lambda 2", "λ", "Fuel & mixture", 3],8229:["Throttle motor", "%", "Engine", 1],8230:["Main TPS", "V", "Engine", 2],8231:["Main APS", "V", "Engine", 2],8232:["Brake boost", "kPa", "Driving", 0],8233:["Fuel HP", "MPa", "Fuel & mixture", 2],8235:["Exhaust VVT R", "°", "Engine", 1],8236:["Exhaust VVT L", "°", "Engine", 1],8237:["Rough cyl 1", "", "Engine", 0],8238:["Rough cyl 2", "", "Engine", 0],8239:["Rough cyl 3", "", "Engine", 0],8240:["Rough cyl 4", "", "Engine", 0],8241:["Inj 2 pulse", "ms", "Fuel & mixture", 2],8242:["Cold start inj", "ms", "Engine", 2],8243:["Alternator mode", "", "Status & switches", 0],8244:["Fuel sender", "V", "Fuel & mixture", 2],8245:["Radiator fan", "%", "Engine", 1],8246:["Learned ign corr", "°", "Engine", 1],8247:["Boost feedback", "%", "Engine", 1],8248:["Target RPM", "rpm", "Engine", 0],8249:["SI-Drive", "", "Status & switches", 0],8250:["Odometer (SSM)", "km", "Driving", 0],8251:["EPS current", "A", "Electrical", 1],8252:["Fuel pump", "A", "Fuel & mixture", 1],8254:["Inj 1 pulse", "ms", "Fuel & mixture", 2],8449:["Brake switch", "", "Status & switches", 0],8450:["Clutch switch", "", "Status & switches", 0],8451:["Neutral switch", "", "Status & switches", 0],8452:["A/C switch", "", "Status & switches", 0],8453:["Idle switch", "", "Status & switches", 0],8454:["Knock signal", "", "Status & switches", 0],8455:["Electrical load", "", "Status & switches", 0],8456:["Light switch", "", "Status & switches", 0],8457:["Radiator fan 1", "", "Status & switches", 0],8458:["Radiator fan 2", "", "Status & switches", 0],8459:["A/C compressor", "", "Status & switches", 0],8460:["Fuel pump relay", "", "Status & switches", 0],8461:["Oil pressure switch", "", "Status & switches", 0],8462:["Starter", "", "Status & switches", 0],8463:["Rear defogger", "", "Status & switches", 0],8464:["Blower", "", "Status & switches", 0],8465:["Wiper switch", "", "Status & switches", 0],8466:["Ignition", "", "Status & switches", 0],8467:["Stop lamp switch", "", "Status & switches", 0],8468:["Knock signal 2", "", "Status & switches", 0],12289:["Custom 1", "", "Custom", 0],12290:["Custom 2", "", "Custom", 0],12291:["Custom 3", "", "Custom", 0],12292:["Custom 4", "", "Custom", 0],12293:["Custom 5", "", "Custom", 0],12294:["Custom 6", "", "Custom", 0],12295:["Custom 7", "", "Custom", 0],12296:["Custom 8", "", "Custom", 0],12297:["Custom 9", "", "Custom", 0],12298:["Custom 10", "", "Custom", 0],12299:["Custom 11", "", "Custom", 0],12300:["Custom 12", "", "Custom", 0],12301:["Custom 13", "", "Custom", 0],12302:["Custom 14", "", "Custom", 0],12303:["Custom 15", "", "Custom", 0],12304:["Custom 16", "", "Custom", 0]};
+const META={257:["MIL lamp", "", "Status & switches", 0],259:["Fuel system status", "", "Status & switches", 0],260:["Engine load", "%", "Engine", 1],261:["Coolant", "°C", "Temperatures", 0],262:["STFT B1", "%", "Fuel & mixture", 1],263:["LTFT B1", "%", "Fuel & mixture", 1],264:["STFT B2", "%", "Fuel & mixture", 1],265:["LTFT B2", "%", "Fuel & mixture", 1],266:["Fuel press", "kPa", "Fuel & mixture", 0],267:["MAP", "kPa", "Engine", 0],268:["RPM", "rpm", "Engine", 0],269:["Speed", "km/h", "Driving", 0],270:["Timing", "°", "Engine", 1],271:["IAT", "°C", "Temperatures", 0],272:["MAF", "g/s", "Engine", 1],273:["Throttle", "%", "Engine", 1],276:["O2 B1S1", "V", "Fuel & mixture", 2],277:["O2 B1S2", "V", "Fuel & mixture", 2],280:["O2 B2S1", "V", "Fuel & mixture", 2],281:["O2 B2S2", "V", "Fuel & mixture", 2],287:["Run time", "s", "Driving", 0],289:["Dist MIL", "km", "Driving", 0],290:["Fuel rail (vac)", "kPa", "Fuel & mixture", 0],291:["Fuel rail gauge", "kPa", "Fuel & mixture", 0],292:["WB B1S1", "λ", "Fuel & mixture", 3],296:["WB B2S1", "λ", "Fuel & mixture", 3],300:["EGR cmd", "%", "Fuel & mixture", 1],301:["EGR error", "%", "Fuel & mixture", 1],302:["Evap purge", "%", "Fuel & mixture", 1],303:["Fuel level", "%", "Fuel & mixture", 1],304:["Warm-ups", "", "Driving", 0],305:["Dist cleared", "km", "Driving", 0],306:["Evap vapor", "Pa", "Fuel & mixture", 0],307:["Barometric", "kPa", "Engine", 0],308:["WB B1S1 λ (I)", "λ", "Fuel & mixture", 3],312:["WB B2S1 λ (I)", "λ", "Fuel & mixture", 3],316:["Cat temp", "°C", "Temperatures", 0],317:["Cat temp B2S1", "°C", "Temperatures", 0],318:["Cat temp B1S2", "°C", "Temperatures", 0],319:["Cat temp B2S2", "°C", "Temperatures", 0],322:["Battery", "V", "Electrical", 2],323:["Abs load", "%", "Engine", 1],324:["Cmd", "λ", "Engine", 3],325:["Rel throttle", "%", "Engine", 1],326:["Ambient", "°C", "Temperatures", 0],327:["Abs throttle B", "%", "Engine", 1],328:["Throttle C", "%", "Engine", 1],329:["Pedal D", "%", "Engine", 1],330:["Pedal E", "%", "Engine", 1],331:["Pedal F", "%", "Engine", 1],332:["Cmd throttle", "%", "Engine", 1],333:["Time MIL on", "min", "Driving", 0],334:["Time since clear", "min", "Driving", 0],337:["Fuel type", "", "Status & switches", 0],338:["Ethanol", "%", "Fuel & mixture", 1],339:["Evap abs", "kPa", "Fuel & mixture", 0],345:["Fuel rail abs", "kPa", "Fuel & mixture", 0],346:["Relative pedal", "%", "Engine", 1],347:["Hybrid SOC", "%", "Engine", 1],348:["Oil temp", "°C", "Temperatures", 0],349:["Injection timing", "°", "Fuel & mixture", 1],350:["Fuel rate", "L/h", "Fuel & mixture", 1],353:["Demand torque", "%", "Engine", 1],354:["Actual torque", "%", "Engine", 1],355:["Reference torque", "Nm", "Engine", 0],422:["Odometer", "km", "Driving", 0],769:["DTC count", "", "Status & switches", 0],788:["O2 B1S1 trim", "%", "Fuel & mixture", 1],789:["O2 B1S2 trim", "%", "Fuel & mixture", 1],792:["O2 B2S1 trim", "%", "Fuel & mixture", 1],793:["O2 B2S2 trim", "%", "Fuel & mixture", 1],804:["WB B1S1", "V", "Fuel & mixture", 2],808:["WB B2S1", "V", "Fuel & mixture", 2],820:["WB B1S1", "mA", "Fuel & mixture", 1],824:["WB B2S1", "mA", "Fuel & mixture", 1],4097:["Boost", "bar", "Engine", 2],4098:["AFR", "AFR", "Fuel & mixture", 1],4099:["Oil press", "bar", "Engine", 2],4100:["EGT", "°C", "Temperatures", 0],4101:["Gear", "", "Driving", 0],4102:["Steering", "°", "Driving", 1],4103:["Brake", "bar", "Driving", 2],4104:["Wheel FL", "km/h", "Driving", 0],4105:["Wheel FR", "km/h", "Driving", 0],4106:["Wheel RL", "km/h", "Driving", 0],4107:["Wheel RR", "km/h", "Driving", 0],4108:["Lateral G", "g", "Driving", 2],4109:["Longitudinal G", "g", "Driving", 2],4110:["Yaw rate", "°/s", "Driving", 1],4111:["Gear lever", "", "Driving", 0],4112:["Cruise set", "km/h", "Driving", 0],4113:["ATF temp", "°C", "Temperatures", 0],4353:["Batt current", "A", "Electrical", 1],4354:["Batt SOC", "%", "Electrical", 1],4355:["Batt SOH", "%", "Electrical", 1],4356:["Batt temp", "°C", "Temperatures", 0],4357:["Alternator", "V", "Electrical", 2],4358:["Alternator", "A", "Electrical", 1],4359:["Alternator load", "%", "Electrical", 1],4360:["12V rail", "V", "Electrical", 2],4361:["Elec load", "W", "Electrical", 0],4362:["Charge status", "", "Status & switches", 0],4609:["Left turn signal", "", "Status & switches", 0],4610:["Right turn signal", "", "Status & switches", 0],4611:["High beam", "", "Status & switches", 0],4612:["Door open", "", "Status & switches", 0],4613:["Handbrake", "", "Status & switches", 0],4614:["Seatbelt unfastened", "", "Status & switches", 0],4615:["Cruise active", "", "Status & switches", 0],4616:["Reverse", "", "Status & switches", 0],4617:["Lever in P", "", "Status & switches", 0],4618:["Lever in N", "", "Status & switches", 0],4619:["Lever in D", "", "Status & switches", 0],4620:["Hazard lights", "", "Status & switches", 0],4621:["Cruise main", "", "Status & switches", 0],4622:["Front fog", "", "Status & switches", 0],4623:["Rear fog", "", "Status & switches", 0],4624:["Door FL", "", "Status & switches", 0],4625:["Door FR", "", "Status & switches", 0],4626:["Door RL", "", "Status & switches", 0],4627:["Door RR", "", "Status & switches", 0],4628:["Trunk open", "", "Status & switches", 0],4629:["Hood open", "", "Status & switches", 0],4630:["VDC off", "", "Status & switches", 0],4631:["Passenger belt unfastened", "", "Status & switches", 0],7937:["Night sense", "", "System", 0],7938:["Master uptime", "s", "System", 0],7939:["CAN frames/s", "", "System", 0],7940:["CAN IDs", "", "System", 0],7941:["OBD replies/s", "", "System", 0],7942:["SSM2 exch/s", "", "System", 0],8193:["Knock corr", "°", "Engine", 1],8194:["Knock corr fine", "°", "Engine", 1],8195:["A/F learn", "%", "Fuel & mixture", 1],8196:["A/F corr", "%", "Fuel & mixture", 1],8197:["Inj duty", "%", "Fuel & mixture", 1],8198:["Target boost", "bar", "Engine", 2],8199:["Wastegate", "%", "Engine", 1],8200:["A/F corr 2", "%", "Fuel & mixture", 1],8201:["A/F learn 2", "%", "Fuel & mixture", 1],8202:["Front O2 #1", "V", "Fuel & mixture", 2],8203:["Rear O2", "V", "Fuel & mixture", 2],8204:["Front O2 #2", "V", "Fuel & mixture", 2],8205:["MAF sensor", "V", "Engine", 2],8206:["TPS", "V", "Engine", 2],8207:["Atmospheric", "kPa", "Engine", 0],8208:["Manifold rel", "kPa", "Engine", 0],8209:["Tank press", "kPa", "Engine", 0],8210:["Learned timing", "°", "Engine", 1],8211:["Accel pedal", "%", "Engine", 1],8212:["Fuel temp", "°C", "Temperatures", 0],8213:["Wastegate 2", "%", "Engine", 1],8214:["CPC duty", "%", "Fuel & mixture", 1],8215:["ISC duty", "%", "Engine", 1],8216:["A/F lean", "%", "Fuel & mixture", 1],8217:["A/F heater", "%", "Fuel & mixture", 1],8218:["ISC step", "", "Engine", 0],8219:["EGR steps", "", "Fuel & mixture", 0],8220:["Alternator duty", "%", "Electrical", 1],8221:["Fuel pump", "%", "Fuel & mixture", 1],8222:["Intake VVT R", "°", "Engine", 1],8223:["Intake VVT L", "°", "Engine", 1],8224:["Intake OCV R", "%", "Engine", 1],8225:["Intake OCV L", "%", "Engine", 1],8226:["A/F current", "mA", "Fuel & mixture", 1],8227:["Lambda", "λ", "Fuel & mixture", 3],8228:["Lambda 2", "λ", "Fuel & mixture", 3],8229:["Throttle motor", "%", "Engine", 1],8230:["Main TPS", "V", "Engine", 2],8231:["Main APS", "V", "Engine", 2],8232:["Brake boost", "kPa", "Driving", 0],8233:["Fuel HP", "MPa", "Fuel & mixture", 2],8235:["Exhaust VVT R", "°", "Engine", 1],8236:["Exhaust VVT L", "°", "Engine", 1],8237:["Rough cyl 1", "", "Engine", 0],8238:["Rough cyl 2", "", "Engine", 0],8239:["Rough cyl 3", "", "Engine", 0],8240:["Rough cyl 4", "", "Engine", 0],8241:["Inj 2 pulse", "ms", "Fuel & mixture", 2],8242:["Cold start inj", "ms", "Engine", 2],8243:["Alternator mode", "", "Status & switches", 0],8244:["Fuel sender", "V", "Fuel & mixture", 2],8245:["Radiator fan", "%", "Engine", 1],8246:["Learned ign corr", "°", "Engine", 1],8247:["Boost feedback", "%", "Engine", 1],8248:["Target RPM", "rpm", "Engine", 0],8249:["SI-Drive", "", "Status & switches", 0],8250:["Odometer (SSM)", "km", "Driving", 0],8251:["EPS current", "A", "Electrical", 1],8252:["Fuel pump", "A", "Fuel & mixture", 1],8254:["Inj 1 pulse", "ms", "Fuel & mixture", 2],8449:["Brake switch", "", "Status & switches", 0],8450:["Clutch switch", "", "Status & switches", 0],8451:["Neutral switch", "", "Status & switches", 0],8452:["A/C switch", "", "Status & switches", 0],8453:["Idle switch", "", "Status & switches", 0],8454:["Knock signal", "", "Status & switches", 0],8455:["Electrical load", "", "Status & switches", 0],8456:["Light switch", "", "Status & switches", 0],8457:["Radiator fan 1", "", "Status & switches", 0],8458:["Radiator fan 2", "", "Status & switches", 0],8459:["A/C compressor", "", "Status & switches", 0],8460:["Fuel pump relay", "", "Status & switches", 0],8461:["Oil pressure switch", "", "Status & switches", 0],8462:["Starter", "", "Status & switches", 0],8463:["Rear defogger", "", "Status & switches", 0],8464:["Blower", "", "Status & switches", 0],8465:["Wiper switch", "", "Status & switches", 0],8466:["Ignition", "", "Status & switches", 0],8467:["Stop lamp switch", "", "Status & switches", 0],8468:["Knock signal 2", "", "Status & switches", 0],12289:["Custom 1", "", "Custom", 0],12290:["Custom 2", "", "Custom", 0],12291:["Custom 3", "", "Custom", 0],12292:["Custom 4", "", "Custom", 0],12293:["Custom 5", "", "Custom", 0],12294:["Custom 6", "", "Custom", 0],12295:["Custom 7", "", "Custom", 0],12296:["Custom 8", "", "Custom", 0],12297:["Custom 9", "", "Custom", 0],12298:["Custom 10", "", "Custom", 0],12299:["Custom 11", "", "Custom", 0],12300:["Custom 12", "", "Custom", 0],12301:["Custom 13", "", "Custom", 0],12302:["Custom 14", "", "Custom", 0],12303:["Custom 15", "", "Custom", 0],12304:["Custom 16", "", "Custom", 0]};
 const $=q=>document.querySelector(q);
 const hex=(n,w)=>'0x'+Number(n).toString(16).toUpperCase().padStart(w,'0');
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const nm=id=>META[id]?META[id][0]:hex(id,4);
 const un=id=>META[id]?META[id][1]:'';
-const fmt=(id,v)=>{const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
+const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.round(v));const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
 const SRC={1:['SSM2','ssm'],2:['OBD-II','obd'],3:['calc','calc'],4:['bus','raw']};
 let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='dash',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
 function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2400)}
@@ -455,8 +459,9 @@ function hint(id){
 function field(x){
  if(!x.id)return'<span class="muted">—</span>';
  if(x.l===1)return`${hex(x.id,3)} <span class="muted">bit ${x.s}</span>`;
- const k=x.s>>3;
- return`${hex(x.id,3)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}</span>`}
+ const k=x.s>>3,tbl=x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
+ if(x.l<8&&!x.be)return`${hex(x.id,3)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
+ return`${hex(x.id,3)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
 async function learnAct(a,m){await post(`/api/learn/${a}?m=${m}`,a==='accept'?`Listening for ${nm(m)}`:`Requesting ${nm(m)} again`,()=>load(true))}
 function renderDash(){
  const d=L,live=d.metrics.filter(m=>m.age<2500);
@@ -517,12 +522,14 @@ $('#lAll').onchange=()=>L&&renderDash();
 
 /* ───────────── bus ───────────── */
 let ZP={},ZC={},ZT=0,ZHZ={},MAP=null,BUS=null;
+/*<teach-core>*/
 const hb=h=>{const b=[];for(let i=0;i<h.length;i+=2)b.push(parseInt(h.substr(i,2),16));return b};
 function extract(b,st,len,be,sg){
  let w=0n;
  if(!be){for(let i=7;i>=0;i--)w=(w<<8n)|BigInt(b[i]||0);w>>=BigInt(st)}
  else{for(let i=0;i<8;i++)w=(w<<8n)|BigInt(b[i]||0);const msb=Math.floor(st/8)*8+(7-st%8),sh=64-msb-len;w=sh>=0?(w>>BigInt(sh)):0n}
  let r=Number(w&((1n<<BigInt(len))-1n));if(sg&&len<53&&r>=2**(len-1))r-=2**len;return r}
+/*</teach-core>*/
 async function pollBus(){
  if(TAB!=='bus'||TEACH)return;
  try{BUS=await fetch('/api/bus').then(r=>r.json())}catch(e){return}
@@ -611,89 +618,192 @@ async function mapAdd(){
  mapClose()}
 
 /* ───────────── teach by doing ───────────── */
+/*<teach-core>*/
+/* The analysis is pure - payloads in, candidates out, no page state - so
+   test_host/portal_tests.js runs it in Node. */
+const POS_BOOL={P:0x1209,R:0x1208,N:0x120A,D:0x120B};   // a lever position with a bit of its own
+const TEACH_POS={0x100F:'P R N D',0x2039:'I S S#',0x1005:'N 1 2 3 4 5 R'};
+/** What a position publishes: the gear lever sends its letter's code, SI-Drive
+    the ECU's own numbers, the gear 0 for N and -1 for R. */
+function posValue(m,tok,i){
+ if(m===0x100F)return tok.charCodeAt(0);
+ if(m===0x2039){const v={S:1,'S#':2,I:3}[tok.toUpperCase()];return v===undefined?i+1:v}
+ if(m===0x1005){if(/^N$/i.test(tok))return 0;if(/^R$/i.test(tok))return -1}
+ const v=parseInt(tok,10);return isFinite(v)?v:i}
+/** A published position back as text, for the tables. */
+function posLabel(m,v){
+ if(m===0x100F)return v>32&&v<127?String.fromCharCode(v):String(v);
+ if(m===0x2039)return {1:'S',2:'S#',3:'I'}[v]||String(v);
+ if(m===0x1005)return v<0?'R':v===0?'N':String(v);
+ return String(v)}
+const bitOf=(b,bit)=>(b[bit>>3]>>(bit&7))&1;
+/** Flips of @p bit across polls: from the master's flip counters (@p E, one
+    64-entry array per poll, wrapping at 256) when it sent them - every flash
+    counted - or else between successive payloads. */
+function flipsOf(P,E,bit){
+ let n=0;
+ if(E&&E.length===P.length&&E.every(e=>e&&e.length===64)){for(let i=1;i<E.length;i++)n+=(E[i][bit]-E[i-1][bit])&255;return n}
+ for(let i=1;i<P.length;i++)n+=bitOf(P[i],bit)!==bitOf(P[i-1],bit)?1:0;return n}
+/** On/off: A and C are the OFF steps, B the ON one. */
+function teachBits(id,A,B,C,EA,EB,EC,dlc){
+ const res=[],p=(arr,bit)=>arr.filter(b=>bitOf(b,bit)).length/arr.length,haveC=C.length>=3;
+ for(let bit=0;bit<dlc*8;bit++){
+  const pa=p(A,bit),pb=p(B,bit),pc=haveC?p(C,bit):pa;
+  // A real switch holds still within each step and flips between them; a
+  // counter bit flips inside a step, so it is not steady anywhere.
+  const steady=Math.min(...[pa,pb,pc].map(x=>Math.max(x,1-x)));
+  const score=Math.min(Math.abs(pb-pa),Math.abs(pb-pc));
+  if(score>=0.7&&steady>=0.85){res.push({id,s:bit,l:1,be:false,score,inv:pb<(pa+pc)/2});continue}
+  // A turn signal flashes, so it is on for only part of the ON step and the
+  // test above never passes. It sits still through both OFF steps and flips
+  // again and again in the ON one.
+  const rest=pa<0.5?0:1;
+  if(Math.max(pa,1-pa)<0.9||Math.max(pc,1-pc)<0.9||(pc<0.5?0:1)!==rest)continue;
+  const fa=flipsOf(A,EA,bit),fb=flipsOf(B,EB,bit),fc=haveC?flipsOf(C,EC,bit):fa;
+  if(fa>1||fc>1||fb<3)continue;
+  res.push({id,s:bit,l:1,be:false,score:0.7+0.3*Math.min(1,fb/8),inv:rest===1,blink:Math.max(1,Math.round(fb/2))})}
+ return res}
+/** A moving value: A held still, B moved through its range. */
+function teachValues(id,A,B,dlc){
+ const res=[],v=a=>{const mu=a.reduce((x,y)=>x+y,0)/a.length;return a.reduce((x,y)=>x+(y-mu)**2,0)/a.length};
+ const judge=(st,len,be,sg)=>{
+  const xa=A.map(b=>extract(b,st,len,be,sg)),xb=B.map(b=>extract(b,st,len,be,sg));
+  const mn=Math.min(...xb),mx=Math.max(...xb),rng=mx-mn;if(rng<3)return null;
+  // A physical value takes many values, not a couple (a sign byte flips 00/FF).
+  if(new Set(xb).size<6)return null;
+  // It must move far more while you move it than while you hold still…
+  const moved=Math.log10((v(xb)+1)/(v(xa)+1));if(moved<1)return null;
+  // …and it must change smoothly. The same bytes read in the wrong order,
+  // or a counter beside them, jump around relative to their range.
+  let jump=0;for(let i=1;i<xb.length;i++)jump+=Math.abs(xb[i]-xb[i-1]);jump/=Math.max(1,xb.length-1);
+  const score=Math.min(moved,3)*Math.max(0,1-4*jump/rng);
+  return score>1?{id,s:st,l:len,be,sg,score,mn,mx}:null};
+ for(let k=0;k<dlc;k++){
+  const fl=[[8*k,8,false],[8*k,8,true]];
+  if(k+1<dlc)fl.push([8*k,16,false],[8*k+7,16,true]);
+  let best=null;
+  for(const [st,len,be] of fl){
+   const u=judge(st,len,be,false),sgd=judge(st,len,be,true);
+   /* A value that crosses zero wraps round as unsigned (10 → 65500), which
+      looks like a huge swing. If the signed reading is a small, continuous
+      range while the unsigned one spans nearly everything, it is signed. */
+   const full=2**len;
+   let pick=u;
+   if(sgd&&(!u||(u.mx-u.mn>0.9*full&&sgd.mx-sgd.mn<0.5*full)))pick=sgd;
+   if(pick&&(!best||pick.score>best.score))best=pick}
+  if(best)res.push(best)}
+ return res}
+/** Positions: P[j] are the payloads while the lever sat in position j (named
+    toks[j]). A position field holds still in every position and reads
+    differently in each. */
+function teachPositions(id,P,toks,dlc){
+ const res=[],np=P.length;
+ if(np<2||P.some(a=>a.length<3))return res;
+ const maj=[],stead=[];
+ for(let bit=0;bit<dlc*8;bit++){
+  const m=[],st=[];
+  for(const a of P){const f=a.filter(b=>bitOf(b,bit)).length/a.length;m.push(f>=0.5?1:0);st.push(Math.max(f,1-f))}
+  maj.push(m);stead.push(Math.min(...st))}
+ const moving=[];
+ for(let bit=0;bit<dlc*8;bit++)if(stead[bit]>=0.85&&maj[bit].some(x=>x!==maj[bit][0]))moving.push(bit);
+ if(!moving.length)return res;
+ // One field: every bit that moved, within one byte - lowest to highest, so
+ // a code that happens to differ in fewer bits for these positions still
+ // decodes a position taught later (M, 3) that uses the rest.
+ if(new Set(moving.map(b=>b>>3)).size===1){
+  const lo=Math.min(...moving),len=Math.max(...moving)-lo+1;
+  const val=b=>(b[lo>>3]>>(lo&7))&((1<<len)-1),codes=[],hold=[];
+  for(const a of P){
+   const cnt=new Map();a.forEach(b=>{const x=val(b);cnt.set(x,(cnt.get(x)||0)+1)});
+   let best=0,n=0;cnt.forEach((c,x)=>{if(c>n){n=c;best=x}});codes.push(best);hold.push(n/a.length)}
+  if(new Set(codes).size===np&&Math.min(...hold)>=0.8)
+   res.push({id,s:lo,l:len,be:false,score:1+Math.min(...hold),codes})}
+ // A position with a bit of its own - a reverse switch in one byte, park in
+ // another: that position alone, as an on/off value.
+ for(let j=0;j<np;j++){
+  const bm=POS_BOOL[(toks[j]||'').toUpperCase()];if(!bm)continue;
+  for(const bit of moving){
+   const m=maj[bit];
+   if(m.every((x,k)=>k===j||x!==m[j]))res.push({id,s:bit,l:1,be:false,score:stead[bit],inv:m[j]===0,pos:j,metric:bm})}}
+ return res}
+/** Every candidate, best first, one per stretch of bytes. @p S maps each step
+    to its polls; a poll maps an identifier to {b: payload, e: flip counters}. */
+function teachFind(kind,S,steps,toks){
+ const ids=new Set();(S[steps[0]]||[]).forEach(poll=>poll.forEach((x,id)=>ids.add(id)));
+ const res=[];
+ for(const id of ids){
+  if(id>=0x7DF&&id<=0x7EF)continue;
+  const ser=ph=>(S[ph]||[]).map(poll=>poll.get(id)).filter(Boolean);
+  if(kind==='pos'){
+   const P=steps.map(ph=>ser(ph).map(x=>x.b));
+   if(P.some(a=>a.length<3))continue;
+   res.push(...teachPositions(id,P,toks||[],Math.max(...P.flat().map(b=>b.length))));continue}
+  const A=ser('A'),B=ser('B'),Cc=ser('C');
+  if(A.length<3||B.length<3)continue;
+  const dlc=Math.max(...A.map(x=>x.b.length),...B.map(x=>x.b.length)),pl=a=>a.map(x=>x.b),ed=a=>a.map(x=>x.e);
+  if(kind==='bit')res.push(...teachBits(id,pl(A),pl(B),pl(Cc),ed(A),ed(B),ed(Cc),dlc));
+  else res.push(...teachValues(id,pl(A),pl(B),dlc))}
+ res.sort((a,b)=>b.score-a.score);
+ // One answer per stretch of bytes: drop anything overlapping a better hit.
+ const bytesOf=r=>{const k=r.s>>3;return r.l===1?[k]:r.s%8+r.l<=8?[k]:[k,k+1]};
+ const out=[];
+ for(const r of res){
+  if(r.l!==1&&out.some(t=>t.id===r.id&&t.l!==1&&bytesOf(t).some(b=>bytesOf(r).includes(b))))continue;
+  out.push(r);if(out.length>=8)break}
+ return out}
+/*</teach-core>*/
 const isSwitch=id=>(id&0xFF00)===0x1200||(id&0xFF00)===0x2100||id===0x0101;
-const TEACH_FIRST=id=>(id&0xFF00)===0x1200||(id>=0x1006&&id<=0x100E)||(id&0xFF00)===0x3000||(id&0xFF00)===0x2100;
-let TEACH=null,TRES=[];
+const TEACH_FIRST=id=>(id&0xFF00)===0x1200||(id>=0x1005&&id<=0x10FF)||(id&0xFF00)===0x3000||(id&0xFF00)===0x2100;
+let TEACH=null,TRES=[],TTOK=[];
 $('#tM').innerHTML='<optgroup label="Body, chassis and custom">'+metricOpts(0x1201,TEACH_FIRST)+'</optgroup><optgroup label="Everything else">'+metricOpts(0,id=>!TEACH_FIRST(id))+'</optgroup>';
-$('#tM').onchange=()=>{$('#tK').value=isSwitch(+$('#tM').value)?'bit':'val'};
+function teachKindShown(){$('#tPRow').hidden=$('#tK').value!=='pos'}
+$('#tM').onchange=()=>{const m=+$('#tM').value;
+ $('#tK').value=TEACH_POS[m]?'pos':isSwitch(m)?'bit':'val';
+ if(TEACH_POS[m])$('#tP').value=TEACH_POS[m];teachKindShown()};
+$('#tK').onchange=teachKindShown;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function teachStart(){
  const m=+$('#tM').value,kind=$('#tK').value;
- const phases=kind==='bit'?[['A','Leave it OFF',4000],['B','Turn it ON now, and hold it',4000],['C','Turn it OFF again',4000]]:
+ TTOK=kind==='pos'?$('#tP').value.trim().split(/[\s,]+/).filter(Boolean).slice(0,8):[];
+ if(kind==='pos'&&TTOK.length<2){toast('List at least two positions');return}
+ const phases=kind==='bit'?[['A','Leave it OFF',4000],['B','Turn it ON now, and hold it (flashing is fine)',4000],['C','Turn it OFF again',4000]]:
+  kind==='pos'?TTOK.map((t,i)=>['p'+i,`Put it in <b>${esc(t)}</b> and hold it there`,5000]):
   [['A','Hold it still',3000],['B','Move it slowly through its whole range, back and forth',9000]];
- TEACH={m,kind,S:{A:[],B:[],C:[]}};$('#tBtn').disabled=true;$('#tRes').innerHTML='';
+ // Moving a lever takes a moment: its first second and a half is not sampled.
+ const skip=kind==='pos'?1500:800;
+ TEACH={m,kind,S:{}};phases.forEach(([k])=>TEACH.S[k]=[]);$('#tBtn').disabled=true;$('#tRes').innerHTML='';
  for(const [k,txt,dur] of phases){
   const t0=Date.now();
   while(Date.now()-t0<dur){
    $('#tStep').innerHTML=`<div class="step">${txt}</div><span class="muted">${Math.ceil((dur-(Date.now()-t0))/1000)} s</span>`;
-   try{const b=await fetch('/api/bus').then(r=>r.json());
-    if(Date.now()-t0>800)TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,hb(c.d||'')])))}catch(e){}
+   try{const b=await fetch('/api/bus?e=1').then(r=>r.json());
+    if(Date.now()-t0>skip)TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])))}catch(e){}
    await sleep(60)}}
  $('#tStep').innerHTML='<div class="step">Done</div>';
- teachAnalyze();TEACH=null;$('#tBtn').disabled=false}
-function teachAnalyze(){
- const {S,kind,m}=TEACH,ids=new Set();S.A.forEach(s=>s.forEach((v,id)=>ids.add(id)));
- const ser=(ph,id)=>S[ph].map(s=>s.get(id)).filter(Boolean);
- const res=[];
- for(const id of ids){
-  if(id>=0x7DF&&id<=0x7EF)continue;
-  const A=ser('A',id),B=ser('B',id),Cc=ser('C',id);
-  if(A.length<3||B.length<3)continue;
-  const dlc=Math.max(...A.map(b=>b.length),...B.map(b=>b.length));
-  if(kind==='bit'){
-   const p=(arr,bit)=>arr.filter(b=>(b[bit>>3]>>(bit&7))&1).length/arr.length;
-   for(let bit=0;bit<dlc*8;bit++){
-    const pa=p(A,bit),pb=p(B,bit),pc=Cc.length>=3?p(Cc,bit):pa;
-    // A real switch holds still within each step and flips between them; a
-    // counter bit flips inside a step, so it is not steady anywhere.
-    const steady=Math.min(...[pa,pb,pc].map(x=>Math.max(x,1-x)));
-    const score=Math.min(Math.abs(pb-pa),Math.abs(pb-pc));
-    if(score>=0.7&&steady>=0.85)res.push({id,s:bit,l:1,be:false,score,inv:pb<(pa+pc)/2})}
-  }else{
-   const v=a=>{const mu=a.reduce((x,y)=>x+y,0)/a.length;return a.reduce((x,y)=>x+(y-mu)**2,0)/a.length};
-   const judge=(st,len,be,sg)=>{
-    const xa=A.map(b=>extract(b,st,len,be,sg)),xb=B.map(b=>extract(b,st,len,be,sg));
-    const mn=Math.min(...xb),mx=Math.max(...xb),rng=mx-mn;if(rng<3)return null;
-    // A physical value takes many values, not a couple (a sign byte flips 00/FF).
-    if(new Set(xb).size<6)return null;
-    // It must move far more while you move it than while you hold still…
-    const moved=Math.log10((v(xb)+1)/(v(xa)+1));if(moved<1)return null;
-    // …and it must change smoothly. The same bytes read in the wrong order,
-    // or a counter beside them, jump around relative to their range.
-    let jump=0;for(let i=1;i<xb.length;i++)jump+=Math.abs(xb[i]-xb[i-1]);jump/=Math.max(1,xb.length-1);
-    const score=Math.min(moved,3)*Math.max(0,1-4*jump/rng);
-    return score>1?{id,s:st,l:len,be,sg,score,mn,mx}:null};
-   for(let k=0;k<dlc;k++){
-    const fl=[[8*k,8,false],[8*k,8,true]];
-    if(k+1<dlc)fl.push([8*k,16,false],[8*k+7,16,true]);
-    let best=null;
-    for(const [st,len,be] of fl){
-     const u=judge(st,len,be,false),s=judge(st,len,be,true);
-     /* A value that crosses zero wraps round as unsigned (10 → 65500), which
-        looks like a huge swing. If the signed reading is a small, continuous
-        range while the unsigned one spans nearly everything, it is signed. */
-     const full=2**len;
-     let pick=u;
-     if(s&&(!u||(u.mx-u.mn>0.9*full&&s.mx-s.mn<0.5*full)))pick=s;
-     if(pick&&(!best||pick.score>best.score))best=pick}
-    if(best)res.push(best)}
-  }
- }
- res.sort((a,b)=>b.score-a.score);
- // One answer per stretch of bytes: drop anything overlapping a better hit.
- const bytesOf=r=>{const k=r.s>>3;return r.l===1?[k]:r.l<=8?[k]:[k,k+1]};
- TRES=[];for(const r of res){
-  if(r.l!==1&&TRES.some(t=>t.id===r.id&&t.l!==1&&bytesOf(t).some(b=>bytesOf(r).includes(b))))continue;
-  TRES.push(r);if(TRES.length>=8)break}
- if(!TRES.length){$('#tRes').innerHTML='<p class="say">Nothing on the bus followed that. Try again with a clearer on/off, or the value may not be broadcast.</p>';return}
+ teachAnalyze(phases.map(p=>p[0]));TEACH=null;$('#tBtn').disabled=false}
+function teachAnalyze(steps){
+ const {S,kind,m}=TEACH;
+ TRES=teachFind(kind,S,steps,TTOK);
+ if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}
+ const say=r=>r.codes?`${r.codes.map((c,j)=>`${esc(TTOK[j])}=${c}`).join(' ')}`:
+  r.pos!==undefined?`on only in ${esc(TTOK[r.pos])}${r.inv?' (inverted)':''} - as ${esc(nm(r.metric))}`:
+  r.l===1?(r.blink?`flashed ${r.blink} time${r.blink>1?'s':''}${r.inv?' (inverted)':''}`:`followed ${(Math.min(1,r.score)*100).toFixed(0)}%${r.inv?' (inverted)':''}`):
+  `raw ${r.mn} … ${r.mx} while moving`;
  $('#tRes').innerHTML='<p class="say" style="margin-top:8px">These followed you, best first:</p>'+TRES.map((r,i)=>
   `<div class="lr"><div class="lt"><span>${field({id:r.id,s:r.s,l:r.l,be:r.be})}${r.sg?' <span class="muted">signed</span>':''}</span>
-   <button class="b s p" onclick="teachUse(${i})">${r.l===1?'Use':'Use…'}</button></div>
-   <div class="ls"><span>${r.l===1?`followed ${(r.score*100).toFixed(0)}%${r.inv?' (inverted)':''}`:`raw ${r.mn} … ${r.mx} while moving`}</span></div></div>`).join('')}
+   <button class="b s p" onclick="teachUse(${i})">${r.l===1||r.codes?'Use':'Use…'}</button></div>
+   <div class="ls"><span>${say(r)}</span></div></div>`).join('')}
 async function teachUse(i){
- const r=TRES[i],m=+$('#tM').value;
- if(r.l===1){await addSignal({name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:1,be:false,signed:false,
-  scale:r.inv?-1:1,offset:r.inv?1:0,metric:m,mode:1,ref:0,learned:false});toast(`${nm(m)} is now read from the bus`);$('#tRes').innerHTML='';return}
+ const r=TRES[i],m=+$('#tM').value,bm=r.metric||m;
+ if((C.signals||[]).some(g=>g.metric===bm&&g.can_id===r.id&&g.start===r.s&&g.len===r.l)){toast(`${nm(bm)} is already read from there`);return}
+ if(r.codes){
+  await addSignal({name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,
+   metric:m,mode:1,ref:0,learned:false,map:r.codes.map((c,j)=>[c,posValue(m,TTOK[j],j)])});
+  toast(`${nm(m)} is now read from the bus`);$('#tRes').innerHTML='';return}
+ if(r.l===1){
+  await addSignal({name:nm(bm).slice(0,15),can_id:r.id,ext:false,start:r.s,len:1,be:false,signed:false,
+   scale:r.inv?-1:1,offset:r.inv?1:0,metric:bm,mode:1,ref:0,learned:false});
+  toast(`${nm(bm)} is now read from the bus`);if(r.metric===undefined)$('#tRes').innerHTML='';return}
  BUS=BUS||{census:[]};mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
  toast('Set the scale so the value reads right, then Use this value')}
 
@@ -709,7 +819,7 @@ function renderSources(){
  $('#sTab').innerHTML=sig.map((s,i)=>{
   const st=s.mode===3?'<span class="ok">Verified</span>':s.mode===1?'<span class="ok">In use</span>':s.mode===2?'<span class="acc">Checking…</span>':s.mode===4?'<span class="crit">Rejected</span>':'<span class="muted">Off</span>';
   const by=s.learned?' <span class="muted">(learned)</span>':'';
-  if(!adv)return`<tr><td>${esc(nm(s.metric))}${by}</td><td>${field({id:s.can_id,s:s.start,l:s.len,be:s.be})}</td><td>${st}</td><td>${curVal(s.metric)}</td>
+  if(!adv)return`<tr><td>${esc(nm(s.metric))}${by}</td><td>${field({id:s.can_id,s:s.start,l:s.len,be:s.be,map:s.map,m:s.metric})}</td><td>${st}</td><td>${curVal(s.metric)}</td>
    <td><button class="x" title="Remove" onclick="C.signals.splice(${i},1);renderSources();setDirty(true)">✕</button></td></tr>`;
   return`<tr><td><select onchange="C.signals[${i}].mode=+this.value">${SMODE.map((t,k)=>`<option value="${k}" ${s.mode===k?'selected':''}>${t}</option>`).join('')}</select></td>
    <td><select onchange="C.signals[${i}].metric=+this.value">${metricOpts(s.metric)}</select></td>
@@ -718,8 +828,9 @@ function renderSources(){
    <td><input type="number" value="${s.len}" onchange="C.signals[${i}].len=+this.value"></td>
    <td><input type="checkbox" ${s.be?'checked':''} onchange="C.signals[${i}].be=this.checked"></td>
    <td><input type="checkbox" ${s.signed?'checked':''} onchange="C.signals[${i}].signed=this.checked"></td>
-   <td><input value="${s.scale}" onchange="C.signals[${i}].scale=+this.value"></td>
-   <td><input value="${s.offset}" onchange="C.signals[${i}].offset=+this.value"></td>
+   ${s.map&&s.map.length?`<td colspan="2" class="muted">${s.map.map(p=>`${p[0]}→${esc(posLabel(s.metric,p[1]))}`).join(' ')}</td>`:
+   `<td><input value="${s.scale}" onchange="C.signals[${i}].scale=+this.value"></td>
+   <td><input value="${s.offset}" onchange="C.signals[${i}].offset=+this.value"></td>`}
    <td><input value="${s.ref?hex(s.ref,4):''}" onchange="C.signals[${i}].ref=parseInt(this.value,16)||0"></td>
    <td><button class="x" onclick="C.signals.splice(${i},1);renderSources();setDirty(true)">✕</button></td></tr>`}).join('')||
   '<tr><td colspan="5" class="empty">Nothing yet — the learner adds values here as it finds them.</td></tr>';
@@ -1097,6 +1208,10 @@ void WebPortal::setupRoutes() {
         const size_t nc = masterGetCensus(cen, 128);
         JsonArray ca = doc["census"].to<JsonArray>();
         char hx[17], chx[17];
+        // ?e=1 (teach by doing): each bit's flip counter as well, 128 hex digits.
+        const bool edges = s_server.arg("e") == "1";
+        char ehx[129];
+        uint8_t ed[64];
         for (size_t i = 0; i < nc; i++) {
             JsonObject o = ca.add<JsonObject>();
             o["id"]    = cen[i].id;
@@ -1110,6 +1225,10 @@ void WebPortal::setupRoutes() {
             hx[2 * cen[i].dlc] = chx[2 * cen[i].dlc] = '\0';
             o["d"] = hx;
             o["c"] = chx;
+            if (edges && masterCensusEdges(cen[i].id, cen[i].extd, ed)) {
+                for (uint8_t k = 0; k < 64; k++) snprintf(ehx + 2 * k, 3, "%02X", ed[k]);
+                o["e"] = ehx;
+            }
         }
         sendJson(doc);
     });

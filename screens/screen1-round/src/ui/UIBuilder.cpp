@@ -1093,6 +1093,7 @@ void UIBuilder::tick() {
     const uint32_t now = millis();
     _tickCache.clear();
     const bool reverse = reverseEngaged();
+    const int  lever   = gearLever();
     for (size_t si = 0; si < _screens.size(); si++) {
         const bool visible = (si == _active);
         for (auto &b : _screens[si].bindings) {
@@ -1102,9 +1103,12 @@ void UIBuilder::tick() {
             float shown = s.value;
             if (b.fmt == ValueFmt::Gear) {
                 // Gears are whole: a glide from 2 to 4 would show 3 on the
-                // way. And the reverse switch, where the bus has one, wins.
+                // way. The reverse switch, where the bus has one, wins; then
+                // the gear lever's letter (P R N D), except in the manual
+                // gate, where the gear itself is what the driver wants.
                 shown = s.raw;
                 if (reverse) { shown = -1; usable = true; }
+                else if (lever && !(lever == 'M' && usable && s.raw >= 1)) { shown = (float)lever; usable = true; }
             }
             evalAlarm(b, ok ? s.raw : 0, ok ? s.flags : 0, usable);
             if (usable) b.lastValue = shown;
@@ -1153,6 +1157,14 @@ bool UIBuilder::reverseEngaged() {
            (r.flags & METRIC_FLAG_VALID) && !r.stale && r.raw >= 0.5f;
 }
 
+int UIBuilder::gearLever() {
+    MetricSample r;
+    if (!Telemetry.peek(METRIC_ID_GEAR_LEVER, r) || !(r.flags & METRIC_FLAG_VALID) || r.stale)
+        return 0;
+    const long c = lroundf(r.raw);
+    return c > 32 && c < 127 ? (int)c : 0;
+}
+
 void UIBuilder::formatBinding(const GaugeBinding &b, float v, char *out,
                               size_t n) {
     if (b.fmt == ValueFmt::Gear && !isnan(v)) {
@@ -1160,6 +1172,7 @@ void UIBuilder::formatBinding(const GaugeBinding &b, float v, char *out,
         if (g < 0)       strlcpy(out, "R", n);
         else if (g == 0) strlcpy(out, "N", n);
         else if (g <= 9) snprintf(out, n, "%ld", g);
+        else if (g > 32 && g < 127 && n >= 2) { out[0] = (char)g; out[1] = '\0'; }   // a lever letter
         else             strlcpy(out, "--", n);
         return;
     }

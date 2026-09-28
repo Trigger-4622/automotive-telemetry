@@ -593,6 +593,11 @@ struct CanIdCount {
     bool     extd;       /**< 29-bit identifier.                   */
     uint8_t  data[8];    /**< Last payload.                        */
     uint8_t  changed[8]; /**< Bits that have toggled since reset.  */
+    /** Flips of each bit (bit n = byte n/8, bit n%8), counting up and
+     *  wrapping at 256. Teach-by-doing reads them twice or more a second and
+     *  takes differences: a turn signal flashing inside the ON step counts its
+     *  flashes exactly, however slowly the phone polls. */
+    uint8_t  edges[64];
     uint32_t lastMs;     /**< millis() of the last frame.          */
     /** @name Missed frames (missAccount)
      *  @{ */
@@ -740,8 +745,11 @@ static void censusAdd(const twai_message_t &msg) {
             c.count++;
             c.dlc = dlc;
             for (uint8_t b = 0; b < dlc; b++) {
-                c.changed[b] |= c.data[b] ^ msg.data[b];
+                uint8_t x = c.data[b] ^ msg.data[b];
+                c.changed[b] |= x;
                 c.data[b] = msg.data[b];
+                for (uint8_t *e = &c.edges[8 * b]; x; x >>= 1, e++)
+                    if (x & 1) (*e)++;
             }
             c.lastMs = millis();
             if (!idOnRequest(c)) missAccount(c, nowUs, s_twaiSilentNow);
@@ -758,6 +766,7 @@ static void censusAdd(const twai_message_t &msg) {
     memset(c.data, 0, 8);
     memcpy(c.data, msg.data, dlc);
     memset(c.changed, 0, 8);
+    memset(c.edges, 0, sizeof(c.edges));
     c.lastMs = millis();
     c.lastUs = nowUs;
     c.periodUs = 0;
@@ -832,10 +841,17 @@ static uint64_t extractRaw(const uint8_t *d, uint8_t dlc, const RtSignal &s) {
 
 /**
  * @brief Decode one CAN signal to its engineering value.
- * @return `raw * scale + offset`, sign-extended first when `s.isSigned`.
+ * @return `raw * scale + offset`, sign-extended first when `s.isSigned`; for a
+ *         signal with a value table, the value its raw reading maps to, or NaN
+ *         (publishes nothing) for a raw reading that is not in the table.
  */
 static float decodeSignal(const uint8_t *d, uint8_t dlc, const RtSignal &s) {
     uint64_t raw = extractRaw(d, dlc, s);
+    if (s.nMap) {
+        for (uint8_t k = 0; k < s.nMap; k++)
+            if (raw == s.mapRaw[k]) return s.mapVal[k];
+        return NAN;
+    }
     int64_t  val = (int64_t)raw;
     if (s.isSigned && s.bitLength < 64 &&
         (raw & (1ULL << (s.bitLength - 1))))
@@ -1482,6 +1498,39 @@ void masterUpdateDerived() {
         if (haveRpm && rpm > 400.0f)
             publishMetric(METRIC_ID_ALT_VOLTAGE, v, SRC_DERIVED);
     }
+
+    /*
+     * The gear lever and "a door is open", from switches taught one at a
+     * time: a lever whose positions are separate bits (P in one byte, R in
+     * another), and doors the car reports one by one. A field taught onto the
+     * lever or onto "door open" itself wins; these only stand in for it.
+     * Body frames can be slow, hence the longer freshness.
+     */
+    const uint32_t BODY_FRESH = 2500;
+    auto rawFresh = [&](uint16_t id) {
+        return metricLookup(id, v, age, src) && src == SRC_RAW && age < BODY_FRESH;
+    };
+    if (!rawFresh(METRIC_ID_GEAR_LEVER)) {
+        static const struct { uint16_t id; char c; } POS[] = {
+            { METRIC_ID_REVERSE, 'R' }, { METRIC_ID_PARK, 'P' },
+            { METRIC_ID_NEUTRAL, 'N' }, { METRIC_ID_DRIVE, 'D' } };
+        for (const auto &p : POS)
+            if (metricLookup(p.id, v, age, src) && age < BODY_FRESH && v >= 0.5f) {
+                publishMetric(METRIC_ID_GEAR_LEVER, (float)p.c, SRC_DERIVED);
+                break;
+            }
+    }
+    if (!rawFresh(METRIC_ID_DOOR_OPEN)) {
+        static const uint16_t DOORS[] = { METRIC_ID_DOOR_FL, METRIC_ID_DOOR_FR, METRIC_ID_DOOR_RL,
+                                          METRIC_ID_DOOR_RR, METRIC_ID_TRUNK, METRIC_ID_HOOD };
+        bool known = false, open = false;
+        for (uint16_t id : DOORS)
+            if (metricLookup(id, v, age, src) && age < BODY_FRESH) {
+                known = true;
+                open |= v >= 0.5f;
+            }
+        if (known) publishMetric(METRIC_ID_DOOR_OPEN, open ? 1.0f : 0.0f, SRC_DERIVED);
+    }
 }
 
 static void setupTwai(bool silent);
@@ -1744,6 +1793,7 @@ static void twaiRxTask(void *) {
             if (rs.canId != msg.identifier || rs.extended != (bool)msg.extd)
                 continue;
             const float val = decodeSignal(msg.data, msg.data_length_code, rs);
+            if (isnan(val)) continue;          // a table signal between positions
             s_verify[i].seen = true;
             s_verify[i].lastVal = val;
             if (rs.publishes()) publishMetric(rs.metricId, val, SRC_RAW);
@@ -2465,6 +2515,16 @@ uint64_t masterExtract(const uint8_t *d, uint8_t dlc, uint8_t start, uint8_t len
     RtSignal s;
     s.startBit = start; s.bitLength = len; s.bigEndian = be;
     return extractRaw(d, dlc, s);
+}
+
+bool masterCensusEdges(uint32_t id, bool extd, uint8_t out[64]) {
+    const uint8_t n = s_censusUsed;
+    for (uint8_t i = 0; i < n; i++)
+        if (s_census[i].id == id && s_census[i].extd == extd) {
+            memcpy(out, s_census[i].edges, 64);   // bytes: a torn copy is off by one flip at most
+            return true;
+        }
+    return false;
 }
 
 size_t masterGetCensus(CensusView *out, size_t max) {

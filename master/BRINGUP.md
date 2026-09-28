@@ -97,6 +97,29 @@ time — headlights on, brake pressed, gear selected — and watch which ID's
 payload moves. Add a signal, give it a **Ref** metric if the ECU reports the
 same quantity, and set it to Auto; the verifier does the rest.
 
+**Teach by doing** (Bus tab) does the watching for you:
+
+- **On / off** — switches: lights, doors, handbrake, fog lights, VDC off.
+  Turn signals and hazards too: leave the lamp flashing through the ON step.
+  The master counts every flip of every bit, frame by frame, so a bit that
+  flashes only while the lever is on is found as the flasher (the portal
+  says how many times it flashed); the screens follow the car's own flash.
+- **Positions** — the gear lever (pick *Gear lever*), SI-Drive, anything
+  with a handful of set positions. Foot on the brake, then move it through
+  the positions in the order listed (P R N D by default; add M, or 3 2 1,
+  if the lever has them) and hold each until the next is asked for. A
+  field that reads differently in every position is saved with a table of
+  what each code means. A car that reports each position as a bit of its
+  own instead (reverse here, park there) gets one on/off value per
+  position: *Lever in P*, *Reverse*, *Lever in N*, *Lever in D* - the master
+  puts those together as the gear lever, and the screens' gear shows
+  P R N D (or the gear itself in the manual gate).
+- **A moving value** — steering angle, wheel speeds, brake pressure.
+
+Doors taught one at a time (*Door FL* … *Trunk open*, *Hood open*) light
+the screens' door lamp through *Door open*, which the master sets whenever
+any of them is open - unless *Door open* itself has been taught.
+
 ## Sleep
 
 The master deep-sleeps after 90 s of bus silence and wakes on the first CAN
