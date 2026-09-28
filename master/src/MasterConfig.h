@@ -58,6 +58,10 @@
  *  share it; the learner stops proposing when it is reached. */
 static constexpr size_t MAX_RT_SIGNALS = 96;
 
+/** @brief Most entries in one signal's value table: enough for a gear lever
+ *  with a manual gate and 3-2-1 positions (P R N D M 3 2 1). */
+static constexpr uint8_t MAX_SIG_MAP = 8;
+
 /**
  * @brief One runtime-editable CAN signal definition.
  *
@@ -81,6 +85,17 @@ struct RtSignal {
     float    vtol      = 0;      /**< Verifier tolerance (0 = built-in).    */
     float    vspread   = 0;      /**< Verifier range needed (0 = built-in). */
     char     name[16]  = {0};    /**< Label, for the UI only.               */
+    /**
+     * @name Value table
+     * For a field that holds positions rather than a quantity - a gear lever,
+     * a mode switch: raw value mapRaw[i] publishes mapVal[i], and a raw value
+     * not in the table publishes nothing (between two positions, or one never
+     * taught). nMap 0 = scale and offset as usual. Saved as "map":[[raw,val]].
+     * @{ */
+    uint8_t  nMap      = 0;
+    uint16_t mapRaw[MAX_SIG_MAP] = {};
+    int16_t  mapVal[MAX_SIG_MAP] = {};
+    /** @} */
 
     /** @return true when the signal publishes. */
     bool publishes() const { return mode == SIG_ON || mode == SIG_VERIFIED; }

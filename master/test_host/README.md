@@ -9,7 +9,14 @@ python test_host/run.py                # build + every scenario (about 30 s)
 python test_host/run.py auto guard     # just these
 python test_host/run.py auto -v        # one scenario with the full firmware log
 SIM_SEED=5 python test_host/run.py     # a differently shaped drive
+python test_host/run.py portal_teach   # just the portal's teach-by-doing analysis (Node, no build)
 ```
+
+A full run ends with `portal_teach`: `portal_tests.js` runs, in Node.js, the
+portal page's own teach-by-doing analysis (every block of
+`tools/portal_page.html` marked `teach-core`) on made-up traffic - a flashing
+turn signal polled at any rate, a steady switch, a counter, a gear lever in
+one field or spread over separate bits. Node is needed on the PATH, like g++.
 
 Needs `g++` (WinLibs GCC: `winget install BrechtSanders.WinLibs.POSIX.UCRT`) and a
 `pio run` done once (for ArduinoJson in `.pio/libdeps`). Debug a failure with
@@ -26,6 +33,7 @@ another one instead. The P1718 scenarios drive with the first fixture.
 | `sim/sim_bus.cpp` | TWAI controller (modes, error counters that wind down on good frames, bus-off, alerts), the car's broadcast frames, an engine ECU speaking OBD-II and SSM2 over real ISO-TP, a transmission ECU that answers 0x7DF and watches the engine ECU's broadcasts (it sets P1718 when they thin out), fault injection including a marginal link on which a normal-mode master error-flags - destroys - those broadcasts |
 | `sim/sim_platform.cpp` | FreeRTOS queues and semaphores (flags mutex misuse), in-memory LittleFS (short writes, rename quirks), ESP-NOW decoded as a display would |
 | `tests/scenarios.cpp` | The scenarios and their checks |
+| `portal_tests.js` | The portal's teach-by-doing analysis, run in Node (`portal_teach`) |
 
 What it cannot show: preemption in the middle of code that never blocks,
 real electrical bus behaviour, and radio timing. Those need the car.

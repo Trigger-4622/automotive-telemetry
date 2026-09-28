@@ -167,6 +167,19 @@ double elapsedS();
 struct Truth { double rpm, speed, throttle, coolant, gear; bool brake, lights; };
 Truth truth();
 
+/**
+ * A body/transmission frame, 0x3D1 at 20 Hz, sent only while @ref enabled
+ * (the scenarios that need it switch it on; every other one sees the bus it
+ * always had). Byte 0 bits 4-6: the lever as P 0, R 1, N 2, D 4 (any other
+ * letter 7). Byte 1: doors FL FR RL RR in bits 0-3, trunk bit 4, hood bit 5.
+ * Byte 2 bit 0: the left turn lamp, the flasher's own output - lit 350 ms,
+ * dark 350 ms while @ref turnLeft is on. Byte 7: a rolling counter.
+ */
+struct Body { bool enabled = false; char lever = 'P'; bool turnLeft = false; uint8_t doors = 0; };
+extern Body body;
+/** The left turn lamp as the car sends it now (for counting its flashes). */
+bool turnLampLit();
+
 /** Start the bus/car task. Call from the main task before setup(). */
 void start();
 

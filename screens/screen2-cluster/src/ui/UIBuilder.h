@@ -531,6 +531,9 @@ private:
 
     /** @return The reverse-gear switch is on the bus and set. */
     bool reverseEngaged();
+    /** @return The gear lever's letter ('P' 'R' 'N' 'D' 'M'…) while the bus
+     *          has a fresh one; 0 otherwise. */
+    int gearLever();
 
     /**
      * @brief Write a binding's value as text (numbers, or a gear letter).

@@ -112,9 +112,29 @@ def run_one(name, env, verbose, config=None):
     return name, code, out, time.time() - t
 
 
+PORTAL_TESTS = os.path.join(HERE, "portal_tests.js")
+
+
+def run_portal():
+    """The portal page's teach-by-doing analysis, in Node (portal_tests.js):
+    reported like a scenario, as "portal_teach". Node.js is part of the test
+    setup, like g++ - a missing one fails the run rather than skipping it."""
+    t = time.time()
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        return "portal_teach", 1, "node not found - the portal's teach tests need Node.js on the PATH", 0.0
+    r = subprocess.run([node, PORTAL_TESTS], capture_output=True, text=True, timeout=300)
+    return "portal_teach", r.returncode, (r.stdout or "") + (r.stderr or ""), time.time() - t
+
+
 def main():
     args = [a for a in sys.argv[1:] if a != "-v"]
     verbose = "-v" in sys.argv
+    if args == ["portal_teach"]:                 # just the page's tests: no build needed
+        name, code, out, dt = run_portal()
+        print(f"\n=== {name} ({dt:.1f} s) ===\n{out.rstrip()}")
+        print("\n" + ("ALL SCENARIOS PASSED" if code == 0 else "FAILED: " + name))
+        sys.exit(1 if code else 0)
     env = build()
     # device_config replays a settings file read from the car's master (no
     # passwords in it) - every one in fixtures/, unless DEVICE_CONFIG=path
@@ -124,7 +144,9 @@ def main():
     mine = os.environ.get("DEVICE_CONFIG")
     env.setdefault("DEVICE_CONFIG", os.path.join(HERE, "fixtures", "car_config_2026-09-25.json"))
     runs = []
-    for n in args or scenarios(env):
+    portal = not args or "portal_teach" in args
+    args = [a for a in args if a != "portal_teach"]
+    for n in args or scenarios(env):               # (portal_teach alone was handled above)
         if n == "device_config" and not mine and fixtures:
             runs += [(n, f) for f in fixtures]
         else:
@@ -137,6 +159,13 @@ def main():
                 print(out.rstrip())
             if code != 0:
                 failed.append(name)
+    if portal:
+        name, code, out, dt = run_portal()
+        print(f"\n=== {name} ({dt:.1f} s) ===")
+        if out:
+            print(out.rstrip())
+        if code != 0:
+            failed.append(name)
     print("\n" + ("ALL SCENARIOS PASSED" if not failed else "FAILED: " + ", ".join(failed)))
     sys.exit(1 if failed else 0)
 

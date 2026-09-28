@@ -15,6 +15,7 @@ python scripts/test_all.py                    # everything: sync checks + the th
 python scripts/test_all.py sync master        # or any of: sync master screen1 screen2
 python scripts/check_sync.py                  # just the copies-and-generated-files rules below
 python master/test_host/run.py [scenario] [-v]                 # master in a simulated car (device_config: every fixture)
+python master/test_host/run.py portal_teach                    # the portal's teach-by-doing analysis, in Node
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
@@ -162,6 +163,16 @@ with diag mode 2 = OBD-II only - the file the P1718 scenarios drive with - and
 0x4B1, lights 0x351, seatbelt 0x432, steering 0x331, reverse 0x451, neutral
 0x252. Not yet taught: door, turn signals, high beam, cruise; oil pressure has
 no known source.
+
+Teach by doing (portal Bus tab; its analysis is the `teach-core` JS in
+`portal_page.html`, tested by `master/test_host/portal_tests.js`) finds a
+flashing turn signal from the census's per-bit flip counters (`/api/bus?e=1`,
+`masterCensusEdges`), and the gear lever with its Positions mode: one field
+saved with a value table (`"map":[[raw,value]]` on a signal, `RtSignal::nMap`;
+the lever publishes its letter's character code, `METRIC_ID_GEAR_LEVER`), or
+one bit per position (`METRIC_ID_PARK`/`REVERSE`/`NEUTRAL`/`DRIVE`), which
+`masterUpdateDerived()` combines into the lever; single doors likewise make
+`DOOR_OPEN`. A taught field always outranks the derived value.
 
 ## Open items
 

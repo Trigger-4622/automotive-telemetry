@@ -880,6 +880,37 @@ SCENARIO(gear_display) {
     CHECK(text() == "--", "no gear shown as '%s'", text().c_str());
 }
 
+/* The gear lever's letter; in the manual gate the gear itself; the reverse
+   switch over both; and the gear again once the lever goes quiet. */
+SCENARIO(gear_lever) {
+    engineOn();
+    car.set(METRIC_ID_GEAR_LEVER, 'P');
+    boot();
+    gotoType("dash");
+    GaugeBinding *g = nullptr;
+    for (auto &b : UI._screens[UI._active].bindings)
+        if (b.fmt == ValueFmt::Gear) g = &b;
+    CHECK(g != nullptr, "dash has no gear binding");
+    if (!g) return;
+    auto text = [&] { return std::string(lv_label_get_text(g->valueLabel)); };
+    run(300);
+    CHECK(text() == "P", "lever in P shown as '%s'", text().c_str());
+    for (char c : {'R', 'N', 'D'}) {
+        car.set(METRIC_ID_GEAR_LEVER, c); run(300);
+        CHECK(text() == std::string(1, c), "lever in %c shown as '%s'", c, text().c_str());
+    }
+    car.set(METRIC_ID_GEAR, 3); run(300);
+    CHECK(text() == "D", "in D the lever, not the gear: '%s'", text().c_str());
+    car.set(METRIC_ID_GEAR_LEVER, 'M'); run(300);
+    CHECK(text() == "3", "in the manual gate the gear: '%s'", text().c_str());
+    car.drop(METRIC_ID_GEAR); run(2500);
+    CHECK(text() == "M", "manual gate with no gear: '%s'", text().c_str());
+    car.set(METRIC_ID_GEAR_LEVER, 'D'); car.set(METRIC_ID_REVERSE, 1); run(300);
+    CHECK(text() == "R", "the reverse switch wins: '%s'", text().c_str());
+    car.set(METRIC_ID_REVERSE, 0); car.drop(METRIC_ID_GEAR_LEVER); car.set(METRIC_ID_GEAR, 2); run(2500);
+    CHECK(text() == "2", "the gear again once the lever is gone: '%s'", text().c_str());
+}
+
 /* One sample per metric per tick, however many screens bind it. */
 SCENARIO(sample_once_per_tick) {
     engineOn();

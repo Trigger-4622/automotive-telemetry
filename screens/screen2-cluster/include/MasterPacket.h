@@ -117,6 +117,12 @@
 #define METRIC_ID_LAT_ACCEL       0x100C  /**< Lateral acceleration     [g]   */
 #define METRIC_ID_LON_ACCEL       0x100D  /**< Longitudinal accel.      [g]   */
 #define METRIC_ID_YAW_RATE        0x100E  /**< Yaw rate                 [°/s] */
+/** Gear lever position, sent as its letter's character code - 'P' 80,
+ *  'R' 82, 'N' 78, 'D' 68, 'M' 77, '3' 51 - so any lever (P R N D, a manual
+ *  gate, 3 2 1) needs no table on the screens: they print the character. */
+#define METRIC_ID_GEAR_LEVER      0x100F  /**< Gear lever (letter code) [-]   */
+#define METRIC_ID_CRUISE_SET      0x1010  /**< Cruise set speed         [km/h]*/
+#define METRIC_ID_ATF_TEMP        0x1011  /**< Transmission fluid temp  [°C]  */
 
 /* ---- Body & chassis state from the bus (0x12xx) — 0 or 1 ---------------
  * Found by the portal's "teach by doing" mode: nothing requests these, the
@@ -130,6 +136,21 @@
 #define METRIC_ID_SEATBELT        0x1206  /**< Driver seatbelt unfastened     */
 #define METRIC_ID_CRUISE_ON       0x1207  /**< Cruise control active          */
 #define METRIC_ID_REVERSE         0x1208  /**< Reverse selected               */
+#define METRIC_ID_PARK            0x1209  /**< Lever in P                     */
+#define METRIC_ID_NEUTRAL         0x120A  /**< Lever in N                     */
+#define METRIC_ID_DRIVE           0x120B  /**< Lever in D                     */
+#define METRIC_ID_HAZARD          0x120C  /**< Hazard lights switched on      */
+#define METRIC_ID_CRUISE_MAIN     0x120D  /**< Cruise main switch on          */
+#define METRIC_ID_FOG_FRONT       0x120E  /**< Front fog lights on            */
+#define METRIC_ID_FOG_REAR        0x120F  /**< Rear fog light on              */
+#define METRIC_ID_DOOR_FL         0x1210  /**< Front left door open           */
+#define METRIC_ID_DOOR_FR         0x1211  /**< Front right door open          */
+#define METRIC_ID_DOOR_RL         0x1212  /**< Rear left door open            */
+#define METRIC_ID_DOOR_RR         0x1213  /**< Rear right door open           */
+#define METRIC_ID_TRUNK           0x1214  /**< Trunk open                     */
+#define METRIC_ID_HOOD            0x1215  /**< Hood open                      */
+#define METRIC_ID_VDC_OFF         0x1216  /**< VDC switched off               */
+#define METRIC_ID_SEATBELT_PASS   0x1217  /**< Passenger seatbelt unfastened  */
 
 /* ---- Custom channels (0x30xx) -------------------------------------------
  * For anything found on the bus that has no standard ID. Name it on the
