@@ -461,8 +461,15 @@ static void bodyFrame(uint64_t now) {
     uint8_t lever = 7;
     switch (body.lever) { case 'P': lever = 0; break; case 'R': lever = 1; break;
                           case 'N': lever = 2; break; case 'D': lever = 4; break; default: break; }
+    // The same lever as scattered bits too: P bit 24, D bit 30, N bit 39 held
+    // low only in N, R bit 42 - and bit 27, which flips every 1.5 s by itself.
+    const char lv = body.lever;
+    const uint8_t b3 = (uint8_t)((lv == 'P' ? 0x01 : 0) | (lv == 'D' ? 0x40 : 0) |
+                                 (((int)(elapsedS() / 1.5)) & 1 ? 0x08 : 0));
+    const uint8_t b4 = lv == 'N' ? 0x00 : 0x80;
+    const uint8_t b5 = lv == 'R' ? 0x04 : 0x00;
     const twai_message_t m = frame(0x3D1, {(uint8_t)(lever << 4), body.doors,
-                                           (uint8_t)(turnLampLit() ? 1 : 0), 0, 0, 0, 0, cnt++});
+                                           (uint8_t)(turnLampLit() ? 1 : 0), b3, b4, b5, 0, cnt++});
     if (tcmSee(m)) deliver(m);
 }
 

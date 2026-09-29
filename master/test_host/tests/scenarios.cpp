@@ -2000,6 +2000,61 @@ static void scSignalTable() {
     commonChecks();
 }
 
+/** A bit-combination signal on the body frame, as the portal saves one. */
+static std::string bodySigBits(uint16_t metric, const char *bits, const char *map) {
+    return std::string(R"({"can_id":977,"ext":false,"start":0,"len":1,"be":false,"signed":false,)"
+                       R"("scale":1,"offset":0,"metric":)") + std::to_string(metric) +
+           R"(,"mode":1,"ref":0,"learned":false,"name":"t","bits":)" + bits + R"(,"map":)" + map + "}";
+}
+
+/**
+ * The gear lever as a combination of bits scattered over three bytes (P bit
+ * 24, D bit 30, N bit 39 held low only in N, R bit 42), with a bit beside
+ * them (27) that flips every 1.5 s on its own: every position reads from
+ * exactly its bits, whatever the neighbour does. Bit lists that cannot be
+ * decoded as saved drop their signal.
+ */
+static void scSignalBits() {
+    body.enabled = true;
+    // Code bit i = bits[i]: P 24+39 = 0b0011, R 39+42 = 0b0110, N none, D 39+30 = 0b1010.
+    simfs::files["/config.json"] = sigFile({
+        bodySigBits(METRIC_ID_GEAR_LEVER, "[24,39,42,30]", "[[3,80],[6,82],[0,78],[10,68]]"),
+        bodySigBits(METRIC_ID_CUSTOM_1, "[5,5]", "[[0,1]]"),      // a bit twice
+        bodySigBits(METRIC_ID_CUSTOM_2, "[64]", "[[0,1]]"),       // no such bit
+        bodySigBits(METRIC_ID_CUSTOM_3, "[]", "[[0,1]]")});       // no bits
+    boot();
+    Cfg.lock();
+    const size_t n = Cfg.signals.size();
+    const RtSignal lev = n ? Cfg.signals[0] : RtSignal{};
+    Cfg.unlock();
+    check(n == 1, "bit lists that cannot be decoded as saved drop their signal", fmt("%zu kept", n));
+    check(lev.nBits == 4 && lev.bitList[0] == 24 && lev.bitList[3] == 30 && lev.nMap == 4,
+          "the combination and its table are read", fmt("%u bits, %u entries", lev.nBits, lev.nMap));
+    const char *seq = "PRNDNRP";
+    double v = 0;
+    bool ok = false;
+    for (int i = 0; seq[i]; i++) {                      // 7 x 1.5 s: the neighbour flips throughout
+        body.lever = seq[i];
+        runUntil(2.0 + 1.5 * i);
+        v = -1;
+        ok = shownNow(METRIC_ID_GEAR_LEVER, v);
+        check(ok && v == seq[i], fmt("lever in %c reads '%c'", seq[i], seq[i]).c_str(), fmt("%.0f", v));
+    }
+    body.lever = 'M';                                   // only N's bit set: a code not in the table
+    runUntil(16);
+    ok = shownNow(METRIC_ID_GEAR_LEVER, v);
+    check(!ok, "a position not taught publishes nothing");
+
+    JsonDocument doc;
+    Cfg.toJson(doc);
+    std::string bits, map;
+    serializeJson(doc["signals"][0]["bits"], bits);
+    serializeJson(doc["signals"][0]["map"], map);
+    check(bits == "[24,39,42,30]" && map == "[[3,80],[6,82],[0,78],[10,68]]", "saved as it was read",
+          bits + " " + map);
+    commonChecks();
+}
+
 /**
  * A lever whose positions are separate bits, taught one by one as Reverse,
  * Lever in N and Lever in D: the master puts them together as the gear
@@ -2117,6 +2172,7 @@ static const Scenario SCENARIOS[] = {
     {"tx_hold", scTxHold, 0}, {"tx_hold_off", scTxHoldOff, 0},
     {"teach_flips", scTeachFlips, 0}, {"signal_table", scSignalTable, 0},
     {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
+    {"signal_bits", scSignalBits, 0},
 };
 
 static const Scenario *s_sc = nullptr;

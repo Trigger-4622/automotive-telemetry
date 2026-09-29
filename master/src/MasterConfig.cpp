@@ -579,6 +579,10 @@ void MasterConfig::toJson(JsonDocument &doc) const {
         if (s.vtol > 0)    o["vtol"] = s.vtol;
         if (s.vspread > 0) o["vsp"]  = s.vspread;
         o["name"]   = s.name;
+        if (s.nBits) {                   // only bit combinations carry the key
+            JsonArray bl = o["bits"].to<JsonArray>();
+            for (uint8_t k = 0; k < s.nBits; k++) bl.add(s.bitList[k]);
+        }
         if (s.nMap) {                    // only table signals carry the key
             JsonArray m = o["map"].to<JsonArray>();
             for (uint8_t k = 0; k < s.nMap; k++) {
@@ -785,17 +789,34 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
             s.bitLength = (uint8_t)constrain(e["len"] | 8, 1, 32);
             if (!s.bigEndian && s.startBit + s.bitLength > 64)
                 s.bitLength = (uint8_t)(64 - s.startBit);
+            // A bit combination: payload bit numbers, bit i of the value first.
+            // Its table's codes depend on the exact list, so a list that cannot
+            // be decoded as saved - a bad or repeated bit, too many - drops the
+            // whole signal rather than decoding the wrong bits.
+            s.nBits = 0;
+            if (e["bits"].is<JsonArrayConst>()) {
+                bool bad = e["bits"].size() == 0 || e["bits"].size() > MAX_SIG_BITS;
+                for (JsonVariantConst bv : e["bits"].as<JsonArrayConst>()) {
+                    if (bad) break;
+                    const long b = bv.is<long>() ? bv.as<long>() : -1;
+                    bad = b < 0 || b > 63;
+                    for (uint8_t k = 0; k < s.nBits && !bad; k++) bad = s.bitList[k] == b;
+                    if (!bad) s.bitList[s.nBits++] = (uint8_t)b;
+                }
+                if (bad) continue;
+            }
             // A value table: pairs of [raw, value], for fields of 16 bits at
             // most. Malformed or duplicate pairs are dropped, not guessed at.
             s.nMap = 0;
-            if (s.bitLength <= 16 && e["map"].is<JsonArrayConst>())
+            const uint8_t rawBits = s.nBits ? s.nBits : s.bitLength;
+            if (rawBits <= 16 && e["map"].is<JsonArrayConst>())
                 for (JsonVariantConst pv : e["map"].as<JsonArrayConst>()) {
                     if (s.nMap >= MAX_SIG_MAP) break;
                     if (!pv.is<JsonArrayConst>()) continue;
                     JsonArrayConst pr = pv.as<JsonArrayConst>();
                     if (pr.size() < 2 || !pr[0].is<long>() || !pr[1].is<long>()) continue;
                     const long raw = pr[0].as<long>(), val = pr[1].as<long>();
-                    if (raw < 0 || raw >= (1L << s.bitLength) || val < -32768 || val > 32767) continue;
+                    if (raw < 0 || raw >= (1L << rawBits) || val < -32768 || val > 32767) continue;
                     bool dup = false;
                     for (uint8_t k = 0; k < s.nMap; k++) dup |= s.mapRaw[k] == raw;
                     if (dup) continue;

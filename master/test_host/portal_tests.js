@@ -166,19 +166,37 @@ console.log('--- gear lever positions in one field');
     const S = session(posSteps(PRND), leverFrame([0, 1, 2, 4]), { skipMs: 1500 });
     const r = teachFind('pos', S, PRND.map((t, i) => 'p' + i), PRND);
     const f = r[0];
-    check(f && f.id === 0x252 && f.codes, 'the field is found first', JSON.stringify(r[0]));
-    check(f && f.s === 52 && f.l === 3, 'bits 52-54: every bit that moved, and no more', f && `start ${f.s} len ${f.l}`);
+    check(f && f.id === 0x252 && f.codes, 'the combination is found first', JSON.stringify(r[0]));
+    check(f && JSON.stringify(f.bits) === '[52,53,54]', 'bits 52-54: every bit that moved, and no more', f && JSON.stringify(f.bits));
     check(f && JSON.stringify(f.codes) === '[0,1,2,4]', 'with each position\'s code', f && JSON.stringify(f.codes));
-    const map = f ? f.codes.map((c, j) => [c, posValue(0x100F, PRND[j], j)]) : [];
-    check(JSON.stringify(map) === '[[0,80],[1,82],[2,78],[4,68]]', 'the table it saves: raw code to the letter\'s code', JSON.stringify(map));
+    const map = f ? f.codes.map((c, g) => [c, posValue(0x100F, f.names[g], g)]) : [];
+    check(JSON.stringify(map) === '[[0,80],[1,82],[2,78],[4,68]]', 'the table it saves: code to the letter\'s code', JSON.stringify(map));
     check(map.map(p => posLabel(0x100F, p[1])).join('') === 'PRND', 'which reads back as P R N D');
-    check(!r.some(x => x.id === 0x351), 'the body frame\'s counter is not a position');
+    check(r.length === 1, 'and it is the only answer: nothing per position, nothing from the body frame', `${r.length} results`);
 }
 
-console.log('--- gear lever positions spread over separate bits');
+console.log('--- all in one byte, scattered, beside bits that do other things');
+{
+    // Byte 6: P bit 48, R bit 50, N bit 53, D bit 55. Bit 49 is always set,
+    // bit 51 flickers (2 Hz) - neither is part of the lever.
+    const S = session(posSteps(PRND), (t, n, step) => {
+        const j = +step.slice(1);
+        const b = [0, 0, 0, 0, 0, 0, 0x02, n & 0xFF];
+        setBit(b, [48, 50, 53, 55][j], 1);
+        setBit(b, 51, (t % 500) < 250);
+        return { 0x252: b };
+    }, { skipMs: 1500 });
+    const r = teachFind('pos', S, PRND.map((t, i) => 'p' + i), PRND);
+    const f = r[0];
+    check(f && JSON.stringify(f.bits) === '[48,50,53,55]', 'the combination is those four bits, not the byte',
+          f && JSON.stringify(f.bits));
+    check(f && JSON.stringify(f.codes) === '[1,2,4,8]', 'one bit each', f && JSON.stringify(f.codes));
+}
+
+console.log('--- the positions spread over several bytes: still one value');
 {
     // P on bit 8, R on bit 54, N as bit 15 held LOW only in N, D on bit 33.
-    const S = session(posSteps(PRND), (t, n, step) => {
+    const spread = (t, n, step) => {
         const j = +step.slice(1);
         const b = [0, 0x80, 0, 0, 0, 0, 0, n & 0xFF];
         setBit(b, 8, j === 0);
@@ -186,14 +204,57 @@ console.log('--- gear lever positions spread over separate bits');
         setBit(b, 15, j !== 2);
         setBit(b, 33, j === 3);
         return { 0x252: b };
+    };
+    const r = teachFind('pos', session(posSteps(PRND), spread, { skipMs: 1500 }), PRND.map((t, i) => 'p' + i), PRND);
+    check(r.length === 1 && r[0].codes, 'one combination, not one switch per position', `${r.length} results`);
+    const f = r[0];
+    check(f && JSON.stringify(f.bits) === '[8,15,33,54]', 'bits 8, 15, 33 and 54', f && JSON.stringify(f.bits));
+    // code bit i = bits[i]: P 8+15 = 0b0011, R 15+54 = 0b1010, N none, D 15+33 = 0b0110
+    check(f && JSON.stringify(f.codes) === '[3,10,0,6]', 'each position its own pattern', f && JSON.stringify(f.codes));
+}
+
+console.log('--- back in P at the end: a bit that only happened to change is dropped');
+{
+    // Bit 60 flips once, 12 s in (a slow timer): between the first positions it
+    // looks like part of the lever. The second visit to P reads it the other
+    // way, so it is not.
+    const PRNDP = ['P', 'R', 'N', 'D', 'P'];
+    const S = session(posSteps(PRNDP), (t, n, step) => {
+        const f = leverFrame([0, 1, 2, 4, 0])(t, n, step);
+        setBit(f[0x252], 60, t > 12000);
+        return f;
+    }, { skipMs: 1500 });
+    const r = teachFind('pos', S, PRNDP.map((t, i) => 'p' + i), PRNDP);
+    const f = r[0];
+    check(f && JSON.stringify(f.bits) === '[52,53,54]', 'the timer bit is left out', f && JSON.stringify(f.bits));
+    check(f && JSON.stringify(f.names) === '["P","R","N","D"]' && JSON.stringify(f.codes) === '[0,1,2,4]',
+          'four positions, P once in the table', f && JSON.stringify([f.names, f.codes]));
+    // Without the second P it would have been taken in:
+    const S4 = session(posSteps(PRND), (t, n, step) => {
+        const f2 = leverFrame([0, 1, 2, 4])(t, n, step);
+        setBit(f2[0x252], 60, t > 12000);
+        return f2;
+    }, { skipMs: 1500 });
+    const r4 = teachFind('pos', S4, PRND.map((t, i) => 'p' + i), PRND);
+    check(r4[0] && r4[0].bits.includes(60), '(one pass alone cannot tell)', r4[0] && JSON.stringify(r4[0].bits));
+}
+
+console.log('--- positions in different frames: one switch per position');
+{
+    // Park only in 0x252 (bit 8), reverse only in 0x3D1 (bit 3): no one frame
+    // tells every position apart.
+    const S = session(posSteps(PRND), (t, n, step) => {
+        const j = +step.slice(1);
+        const a = [0, 0, 0, 0, 0, 0, 0, n & 0xFF], c = [0, 0, 0, 0, 0, 0, 0, n & 0xFF];
+        setBit(a, 8, j === 0);
+        setBit(c, 3, j === 1);
+        return { 0x252: a, 0x3D1: c };
     }, { skipMs: 1500 });
     const r = teachFind('pos', S, PRND.map((t, i) => 'p' + i), PRND);
-    check(!r.some(x => x.codes), 'no single field: the bits are in different bytes');
     const as = m => r.find(x => x.metric === m);
-    check(as(0x1209) && as(0x1209).s === 8 && !as(0x1209).inv, 'P: bit 8, as Lever in P');
-    check(as(0x1208) && as(0x1208).s === 54 && !as(0x1208).inv, 'R: bit 54, as Reverse');
-    check(as(0x120A) && as(0x120A).s === 15 && as(0x120A).inv, 'N: bit 15, inverted, as Lever in N');
-    check(as(0x120B) && as(0x120B).s === 33, 'D: bit 33, as Lever in D');
+    check(!r.some(x => x.codes), 'no combination');
+    check(as(0x1209) && as(0x1209).id === 0x252 && as(0x1209).s === 8, 'P: 0x252 bit 8, as Lever in P');
+    check(as(0x1208) && as(0x1208).id === 0x3D1 && as(0x1208).s === 3, 'R: 0x3D1 bit 3, as Reverse');
 }
 
 console.log('--- position values');

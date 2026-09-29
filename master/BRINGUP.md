@@ -105,15 +105,19 @@ same quantity, and set it to Auto; the verifier does the rest.
   flashes only while the lever is on is found as the flasher (the portal
   says how many times it flashed); the screens follow the car's own flash.
 - **Positions** — the gear lever (pick *Gear lever*), SI-Drive, anything
-  with a handful of set positions. Foot on the brake, then move it through
-  the positions in the order listed (P R N D by default; add M, or 3 2 1,
-  if the lever has them) and hold each until the next is asked for. A
-  field that reads differently in every position is saved with a table of
-  what each code means. A car that reports each position as a bit of its
-  own instead (reverse here, park there) gets one on/off value per
-  position: *Lever in P*, *Reverse*, *Lever in N*, *Lever in D* - the master
-  puts those together as the gear lever, and the screens' gear shows
-  P R N D (or the gear itself in the manual gate).
+  with a handful of set positions. Foot on the brake the whole time, then
+  move it through the positions in the order listed (P R N D P by default -
+  ending back in P checks every bit twice; add M, or 3 2 1, if the lever has
+  them) and hold each until the next is asked for. The lever is learnt as
+  one value from the combination of every bit that changes with it - bits
+  side by side or scattered through a byte, in one byte or several - and
+  saved with a table of what each pattern means. Bits beside them that do
+  something else are left out, so they can change later without upsetting
+  the lever. Only when no single frame tells every position apart (reverse
+  from one module, park from another) does it offer one on/off value per
+  position instead: *Lever in P*, *Reverse*, *Lever in N*, *Lever in D* - the
+  master puts those together as the gear lever. Either way the screens'
+  gear shows P R N D (or the gear itself in the manual gate).
 - **A moving value** — steering angle, wheel speeds, brake pressure.
 
 Doors taught one at a time (*Door FL* … *Trunk open*, *Hood open*) light

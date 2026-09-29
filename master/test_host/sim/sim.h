@@ -173,7 +173,9 @@ Truth truth();
  * always had). Byte 0 bits 4-6: the lever as P 0, R 1, N 2, D 4 (any other
  * letter 7). Byte 1: doors FL FR RL RR in bits 0-3, trunk bit 4, hood bit 5.
  * Byte 2 bit 0: the left turn lamp, the flasher's own output - lit 350 ms,
- * dark 350 ms while @ref turnLeft is on. Byte 7: a rolling counter.
+ * dark 350 ms while @ref turnLeft is on. The lever again, as scattered bits:
+ * P bit 24, D bit 30, N bit 39 (held LOW only in N), R bit 42; bit 27 beside
+ * them flips every 1.5 s on its own. Byte 7: a rolling counter.
  */
 struct Body { bool enabled = false; char lever = 'P'; bool turnLeft = false; uint8_t doors = 0; };
 extern Body body;

@@ -822,6 +822,14 @@ static void censusPrint() {
  * @return The unscaled, unsigned bit field.
  */
 static uint64_t extractRaw(const uint8_t *d, uint8_t dlc, const RtSignal &s) {
+    if (s.nBits) {                       // a bit combination: gather its bits
+        uint64_t v = 0;
+        for (uint8_t i = 0; i < s.nBits; i++) {
+            const uint8_t b = s.bitList[i];
+            if ((b >> 3) < dlc && ((d[b >> 3] >> (b & 7)) & 1)) v |= 1ULL << i;
+        }
+        return v;
+    }
     uint64_t word = 0;
     if (!s.bigEndian) {
         for (int i = 7; i >= 0; i--)

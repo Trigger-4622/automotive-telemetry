@@ -167,12 +167,17 @@ no known source.
 Teach by doing (portal Bus tab; its analysis is the `teach-core` JS in
 `portal_page.html`, tested by `master/test_host/portal_tests.js`) finds a
 flashing turn signal from the census's per-bit flip counters (`/api/bus?e=1`,
-`masterCensusEdges`), and the gear lever with its Positions mode: one field
-saved with a value table (`"map":[[raw,value]]` on a signal, `RtSignal::nMap`;
-the lever publishes its letter's character code, `METRIC_ID_GEAR_LEVER`), or
-one bit per position (`METRIC_ID_PARK`/`REVERSE`/`NEUTRAL`/`DRIVE`), which
-`masterUpdateDerived()` combines into the lever; single doors likewise make
-`DOOR_OPEN`. A taught field always outranks the derived value.
+`masterCensusEdges`), and the gear lever with its Positions mode: the
+combination of every bit that moves with the lever, anywhere in one frame
+(`"bits":[..]` on a signal, `RtSignal::bitList` - bit i of the code is the
+i-th listed bit), saved with a value table (`"map":[[code,value]]`,
+`RtSignal::nMap`; the lever publishes its letter's character code,
+`METRIC_ID_GEAR_LEVER`). A position visited twice ("P R N D P") must read the
+same both times, which drops bits that only happened to change. Only when no
+frame tells every position apart does it fall back to one bit per position
+(`METRIC_ID_PARK`/`REVERSE`/`NEUTRAL`/`DRIVE`), which `masterUpdateDerived()`
+combines into the lever; single doors likewise make `DOOR_OPEN`. A taught
+field always outranks the derived value.
 
 ## Open items
 
