@@ -102,10 +102,15 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   never goes error-passive and drives the sender bus-off instead (it made the
   car's MIL worse on 2026-09-26). ESP-IDF's fix
   (`CONFIG_TWAI_ERRATA_FIX_LISTEN_ONLY_DOM`) is off in the Arduino core, so
-  `listenOnlyErratumFix()` in main.cpp sets TEC and REC to 128 after
-  `twai_start()` (REC alone drifted back to 0 on the car; TEC cannot move in
-  listen-only) and `setupTwai()` takes the TX pad from the controller while it
-  listens. Every listen-only install must keep both.
+  `listenOnlyErratumFix()` in main.cpp sets TEC to `TEC_LISTEN` (200) and REC
+  to 128 after `twai_start()`, and `setupTwai()` takes the TX pad from the
+  controller while it listens. Every listen-only install must keep both. REC
+  alone drifted back to 0 on the car, and the S3 read a TEC of 128 back as
+  127 (2026-09-27) - error-active again, and then every misread became rounds
+  of its own unheard error flags, each counted (7.8 errors per misread in
+  `lom_tec_hold` without the fix). So TEC is written well clear of 128 and
+  `busGuardTask` pins it again below `TEC_LISTEN_LOW`; the sim models the
+  drop (`faults.tecExitDrop`, on by default).
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only
@@ -167,12 +172,17 @@ no known source.
 Teach by doing (portal Bus tab; its analysis is the `teach-core` JS in
 `portal_page.html`, tested by `master/test_host/portal_tests.js`) finds a
 flashing turn signal from the census's per-bit flip counters (`/api/bus?e=1`,
-`masterCensusEdges`), and the gear lever with its Positions mode: one field
-saved with a value table (`"map":[[raw,value]]` on a signal, `RtSignal::nMap`;
-the lever publishes its letter's character code, `METRIC_ID_GEAR_LEVER`), or
-one bit per position (`METRIC_ID_PARK`/`REVERSE`/`NEUTRAL`/`DRIVE`), which
-`masterUpdateDerived()` combines into the lever; single doors likewise make
-`DOOR_OPEN`. A taught field always outranks the derived value.
+`masterCensusEdges`), and the gear lever with its Positions mode: the
+combination of every bit that moves with the lever, anywhere in one frame
+(`"bits":[..]` on a signal, `RtSignal::bitList` - bit i of the code is the
+i-th listed bit), saved with a value table (`"map":[[code,value]]`,
+`RtSignal::nMap`; the lever publishes its letter's character code,
+`METRIC_ID_GEAR_LEVER`). A position visited twice ("P R N D P") must read the
+same both times, which drops bits that only happened to change. Only when no
+frame tells every position apart does it fall back to one bit per position
+(`METRIC_ID_PARK`/`REVERSE`/`NEUTRAL`/`DRIVE`), which `masterUpdateDerived()`
+combines into the lever; single doors likewise make `DOOR_OPEN`. A taught
+field always outranks the derived value.
 
 ## Open items
 

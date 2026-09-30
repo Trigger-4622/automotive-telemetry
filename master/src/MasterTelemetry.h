@@ -120,6 +120,8 @@ struct MasterStats {
      *  @{ */
     uint32_t errWhileTx;   /**< Bus errors in frames we were sending.      */
     uint32_t errIdle;      /**< Bus errors while we were not transmitting.  */
+    uint32_t lomTecRead;   /**< TEC read back after the listen-only pin.    */
+    uint32_t lomRepins;    /**< Times it was pinned again while listening.  */
     uint8_t  guardTrips;   /**< Times requests were paused this session.    */
     uint32_t guardPauseMs; /**< Pause left, ms (0 = requests allowed).      */
     bool     guardSilent;  /**< A guard forced the controller to listen-only.*/

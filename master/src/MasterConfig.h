@@ -62,6 +62,9 @@ static constexpr size_t MAX_RT_SIGNALS = 96;
  *  with a manual gate and 3-2-1 positions (P R N D M 3 2 1). */
 static constexpr uint8_t MAX_SIG_MAP = 8;
 
+/** @brief Most bits in one bit combination (see RtSignal::bitList). */
+static constexpr uint8_t MAX_SIG_BITS = 16;
+
 /**
  * @brief One runtime-editable CAN signal definition.
  *
@@ -95,6 +98,18 @@ struct RtSignal {
     uint8_t  nMap      = 0;
     uint16_t mapRaw[MAX_SIG_MAP] = {};
     int16_t  mapVal[MAX_SIG_MAP] = {};
+    /** @} */
+    /**
+     * @name Bit combination
+     * For a value spread over bits that need not sit side by side - a gear
+     * lever whose positions set bits here and there, in one byte or several:
+     * payload bit bitList[i] (numbered as startBit) is bit i of the raw value,
+     * and bits in between are ignored, so they can do something else. nBits
+     * 0 = the start/length field as usual. Saved as "bits":[..]; startBit and
+     * bitLength then only describe it (first bit, how many).
+     * @{ */
+    uint8_t  nBits     = 0;
+    uint8_t  bitList[MAX_SIG_BITS] = {};
     /** @} */
 
     /** @return true when the signal publishes. */

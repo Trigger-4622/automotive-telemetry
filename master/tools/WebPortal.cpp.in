@@ -173,6 +173,8 @@ void WebPortal::setupRoutes() {
         b["missed"]  = st.rxMissed + st.rxOverrun;
         b["err_tx"]  = st.errWhileTx;
         b["err_idle"] = st.errIdle;
+        b["lom_tec"] = st.lomTecRead;
+        b["lom_rp"]  = st.lomRepins;
         {
             // What the controller says the errors are: code, mode, count.
             ErrKindView ek[6];

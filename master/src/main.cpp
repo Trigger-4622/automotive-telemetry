@@ -822,6 +822,14 @@ static void censusPrint() {
  * @return The unscaled, unsigned bit field.
  */
 static uint64_t extractRaw(const uint8_t *d, uint8_t dlc, const RtSignal &s) {
+    if (s.nBits) {                       // a bit combination: gather its bits
+        uint64_t v = 0;
+        for (uint8_t i = 0; i < s.nBits; i++) {
+            const uint8_t b = s.bitList[i];
+            if ((b >> 3) < dlc && ((d[b >> 3] >> (b & 7)) & 1)) v |= 1ULL << i;
+        }
+        return v;
+    }
     uint64_t word = 0;
     if (!s.bigEndian) {
         for (int i = 7; i >= 0; i--)
@@ -1592,6 +1600,17 @@ static void txRecessiveForSleep() {
  *  @{ */
 static constexpr uint32_t TEC_PASSIVE     = 220;
 static constexpr uint32_t TEC_PASSIVE_LOW = 170;
+/**
+ * TEC in listen-only (listenOnlyErratumFix), well clear of 128: on the car
+ * the S3 read 128 back as 127 straight after leaving reset mode, which left
+ * the controller error-active - counting rounds of its own unheard error
+ * flags. Pinned again below TEC_LISTEN_LOW, should it wind down.
+ */
+static constexpr uint32_t TEC_LISTEN     = 200;
+static constexpr uint32_t TEC_LISTEN_LOW = 160;
+/** TEC as read back after the last listen-only pin, and how often it had to
+ *  be pinned again while listening. */
+static volatile uint32_t s_lomTecRead = 0, s_lomRepins = 0;
 /** TEC writes of ours - the passive-mode top-ups, the start in normal mode,
  *  the listen-only fix - so busGuardTask never takes the jump for an error in
  *  our own frame. */
@@ -1662,15 +1681,19 @@ static void listenOnlyErratumFix() {
      * an error-active controller whose error flags the detached TX pad keeps
      * off the bus reads its own flag back recessive, calls that a bit error,
      * flags again, and counts every round: the million errors a drive. TEC
-     * moves only when the controller transmits, which it never does in
-     * listen-only, so TEC 128 keeps it error-passive for good.
+     * should only move when the controller transmits, which it never does in
+     * listen-only - but the S3 on the car read 128 back as 127 at once, so
+     * it is written as TEC_LISTEN, and busGuardTask pins it again should it
+     * ever wind down below TEC_LISTEN_LOW.
      */
+    masterBusBlind();                // a frame arriving now is lost to us
     s_tecWrites = s_tecWrites + 1;
     twai_ll_enter_reset_mode(&TWAI);
-    twai_ll_set_tec(&TWAI, 128);
+    twai_ll_set_tec(&TWAI, TEC_LISTEN);
     twai_ll_set_rec(&TWAI, 128);
     twai_ll_exit_reset_mode(&TWAI);
     const uint32_t tec = twai_ll_get_tec(&TWAI);
+    s_lomTecRead = tec;
     if (tec < 128) log_e("listen-only erratum fix did not take (TEC %u)", (unsigned)tec);
 }
 
@@ -2021,6 +2044,8 @@ static void housekeepingTask(void *) {
 static void busGuardTask(void *) {
     uint32_t lastErrCount = 0, lastTec = 0, winStart = 0, winErrs = 0, lastSwitch = 0, lastTecWrites = 0;
     uint32_t lastDropped = 0;                 /**< Queue-full + FIFO-overrun drops.   */
+    uint32_t lastRepin = 0;                   /**< Last listen-only pin (ms).         */
+    bool     repinLogged = false;
     uint32_t rxWinStart = 0, rxWinErrs = 0;   /**< Receive-side errors, per window. */
     bool     wasPassive = false, wasSettling = false;
     bool     ctrlRunning = false;             /**< Last status read said RUNNING. */
@@ -2093,6 +2118,20 @@ static void busGuardTask(void *) {
                 stSilent = s_twaiSilentNow;
                 tecWrites = s_tecWrites;
                 ecc = (uint8_t)(TWAI.error_code_capture_reg.val & 0xFF);
+                // Listen-only must stay error-passive (listenOnlyErratumFix):
+                // should TEC wind down after all, it is pinned again long
+                // before it reaches 128.
+                if (stSilent && st.state == TWAI_STATE_RUNNING && !s_twaiReinstall &&
+                    st.tx_error_counter < TEC_LISTEN_LOW && millis() - lastRepin >= 50) {
+                    lastRepin = millis();
+                    if (!repinLogged) {
+                        repinLogged = true;
+                        log_w("listen-only: TEC wound down to %u (REC %u) - pinned again",
+                              (unsigned)st.tx_error_counter, (unsigned)st.rx_error_counter);
+                    }
+                    listenOnlyErratumFix();
+                    s_lomRepins = s_lomRepins + 1;
+                }
                 if (!s_twaiReinstall &&
                     (st.state == TWAI_STATE_BUS_OFF || st.state == TWAI_STATE_STOPPED)) {
                     if (st.state == TWAI_STATE_BUS_OFF) {
@@ -2437,6 +2476,8 @@ void masterGetStats(MasterStats &out) {
     out.settleMs   = settleLeft();
     out.errWhileTx = s_errWhileTx;
     out.errIdle    = s_errIdle;
+    out.lomTecRead = s_lomTecRead;
+    out.lomRepins  = s_lomRepins;
     out.guardTrips = s_guardTrips;
     out.guardSilent = s_guardSilent || s_rxGuardSilent;
     out.rxGuardSilent = s_rxGuardSilent;
@@ -2881,6 +2922,12 @@ void loop() {
             // Where they come from: frames missed per mode, and the radio.
             MasterStats ls;
             masterGetStats(ls);
+            Serial.printf("[ctrl ] TEC %u REC %u | errors: %u during our frames, %u otherwise | "
+                          "tx failed %u, arbitration lost %u | listen-only pin: TEC %u, "
+                          "pinned again %u\n",
+                          (unsigned)ls.tec, (unsigned)ls.rec, (unsigned)ls.errWhileTx,
+                          (unsigned)ls.errIdle, (unsigned)ls.txFailed, (unsigned)ls.arbLost,
+                          (unsigned)ls.lomTecRead, (unsigned)ls.lomRepins);
             if (ls.expected[0] || ls.expected[1] || ls.errRadioChecked)
                 Serial.printf("[link ] missed %u of %u normal, %u of %u listen-only | "
                               "errors near the radio %u of %u (radio busy %u.%u%%)\n",

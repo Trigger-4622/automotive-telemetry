@@ -66,7 +66,7 @@ button:disabled{opacity:.5}
 .muted{color:var(--muted)}.ok{color:var(--ok)}.warn{color:var(--warn)}.crit{color:var(--crit)}.acc{color:var(--acc)}
 .bar{height:6px;border-radius:3px;background:#ffffff12;overflow:hidden;min-width:80px}
 .bar i{display:block;height:100%;background:var(--acc);border-radius:3px}
-.hx{font:12px ui-monospace,Consolas,monospace}.hx span{padding:0 2px;color:#4a5967}
+.hx,.mono{font:12px ui-monospace,Consolas,monospace}.hx span{padding:0 2px;color:#4a5967}
 .hx span.l{color:var(--text)}.hx span.h{color:var(--acc);background:#00e5ff22;border-radius:3px}
 details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px}
 #save{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:10px 16px;
@@ -131,7 +131,8 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <p class="say" style="margin:0 0 10px">Turn signals, doors, handbrake, steering, wheel speeds, the gear lever… Pick what you are about to
    operate, press Start and follow the steps. The master finds the bits or bytes that followed you. A flashing turn signal is
    fine: leave it flashing through the ON step. For the gear lever, pick <b>Gear lever</b>, foot on the brake, and move it
-   through the positions as asked.</p>
+   through the positions as asked: it ends back in P, so every bit is checked twice. The master learns the lever as one value
+   from whichever bits change with it, in one byte or several.</p>
   <div class="row"><select id="tM" style="flex:1;min-width:180px"></select>
    <select id="tK"><option value="bit">On / off</option><option value="val">A moving value</option><option value="pos">Positions</option></select>
    <button class="b p" id="tBtn" onclick="teachStart()">Start</button></div>
@@ -426,8 +427,10 @@ function hint(id){
  return'hold it at a few different levels for a couple of seconds each'}
 function field(x){
  if(!x.id)return'<span class="muted">—</span>';
+ const tbl=x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
+ if(x.bits&&x.bits.length)return`${hex(x.id,3)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
  if(x.l===1)return`${hex(x.id,3)} <span class="muted">bit ${x.s}</span>`;
- const k=x.s>>3,tbl=x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
+ const k=x.s>>3;
  if(x.l<8&&!x.be)return`${hex(x.id,3)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
  return`${hex(x.id,3)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
 async function learnAct(a,m){await post(`/api/learn/${a}?m=${m}`,a==='accept'?`Listening for ${nm(m)}`:`Requesting ${nm(m)} again`,()=>load(true))}
@@ -550,7 +553,8 @@ function renderBusTiles(){
  bar.style.background=RATES.load>70?'var(--crit)':RATES.load>50?'var(--warn)':'var(--ok)';
  $('#bTx').textContent=RATES.tx.toFixed(0);
  $('#bErr').textContent=d.bus.err;$('#bErr').className='v '+(RATES.errs>0?'crit':d.bus.err?'warn':'ok');
- $('#bErrS').textContent=`error counters ${d.bus.tec} / ${d.bus.rec}`+(C.tx_passive&&!d.silent&&d.bus.tec>=128?' (high on purpose: errors let pass)':'');
+ $('#bErrS').textContent=`error counters ${d.bus.tec} / ${d.bus.rec}`+(C.tx_passive&&!d.silent&&d.bus.tec>=128?' (high on purpose: errors let pass)':'')+
+  (d.bus.lom_rp?` · listen-only kept error-passive ${d.bus.lom_rp}×`:'');
  $('#bFps').textContent=(RATES.fps||0).toFixed(0)+'/s';$('#bIds').textContent=d.bus.ids+' different IDs';
  let s;
  if(!d.bus.alive)s='No traffic.';
@@ -590,7 +594,7 @@ async function mapAdd(){
 /* The analysis is pure - payloads in, candidates out, no page state - so
    test_host/portal_tests.js runs it in Node. */
 const POS_BOOL={P:0x1209,R:0x1208,N:0x120A,D:0x120B};   // a lever position with a bit of its own
-const TEACH_POS={0x100F:'P R N D',0x2039:'I S S#',0x1005:'N 1 2 3 4 5 R'};
+const TEACH_POS={0x100F:'P R N D P',0x2039:'I S S# I',0x1005:'N 1 2 3 4 5 R N'};
 /** What a position publishes: the gear lever sends its letter's code, SI-Drive
     the ECU's own numbers, the gear 0 for N and -1 for R. */
 function posValue(m,tok,i){
@@ -661,38 +665,55 @@ function teachValues(id,A,B,dlc){
    if(pick&&(!best||pick.score>best.score))best=pick}
   if(best)res.push(best)}
  return res}
-/** Positions: P[j] are the payloads while the lever sat in position j (named
-    toks[j]). A position field holds still in every position and reads
-    differently in each. */
+/** Positions: P[j] are the payloads while the lever sat in position j, named
+    toks[j]. A name may come back ("P R N D P"): every visit to it must read
+    the same. The lever is learnt as a combination - every bit that holds still
+    in each position and reads differently between them, wherever it sits: side
+    by side in one byte, scattered through it, or across bytes. */
 function teachPositions(id,P,toks,dlc){
  const res=[],np=P.length;
  if(np<2||P.some(a=>a.length<3))return res;
+ // The positions, once each, in the order first visited; and each visit's.
+ const names=[],grp=[];
+ for(let j=0;j<np;j++){const t=String(toks[j]||j).toUpperCase();let g=names.indexOf(t);if(g<0){g=names.length;names.push(t)}grp.push(g)}
+ if(names.length<2)return res;
  const maj=[],stead=[];
  for(let bit=0;bit<dlc*8;bit++){
   const m=[],st=[];
   for(const a of P){const f=a.filter(b=>bitOf(b,bit)).length/a.length;m.push(f>=0.5?1:0);st.push(Math.max(f,1-f))}
   maj.push(m);stead.push(Math.min(...st))}
- const moving=[];
- for(let bit=0;bit<dlc*8;bit++)if(stead[bit]>=0.85&&maj[bit].some(x=>x!==maj[bit][0]))moving.push(bit);
+ // A lever bit holds still in every visit, reads the same whenever the lever
+ // is back in a position, and differs between some positions. A bit that
+ // only happened to change between two visits (a slow timer) fails the
+ // second test when a position is visited twice.
+ const byGroup=bit=>{const v=new Array(names.length).fill(-1);
+  for(let j=0;j<np;j++){if(v[grp[j]]>=0&&v[grp[j]]!==maj[bit][j])return null;v[grp[j]]=maj[bit][j]}return v};
+ const moving=[],gv={};
+ for(let bit=0;bit<dlc*8;bit++){
+  if(stead[bit]<0.85)continue;
+  const v=byGroup(bit);if(!v||v.every(x=>x===v[0]))continue;
+  moving.push(bit);gv[bit]=v}
  if(!moving.length)return res;
- // One field: every bit that moved, within one byte - lowest to highest, so
- // a code that happens to differ in fewer bits for these positions still
- // decodes a position taught later (M, 3) that uses the rest.
- if(new Set(moving.map(b=>b>>3)).size===1){
-  const lo=Math.min(...moving),len=Math.max(...moving)-lo+1;
-  const val=b=>(b[lo>>3]>>(lo&7))&((1<<len)-1),codes=[],hold=[];
-  for(const a of P){
-   const cnt=new Map();a.forEach(b=>{const x=val(b);cnt.set(x,(cnt.get(x)||0)+1)});
-   let best=0,n=0;cnt.forEach((c,x)=>{if(c>n){n=c;best=x}});codes.push(best);hold.push(n/a.length)}
-  if(new Set(codes).size===np&&Math.min(...hold)>=0.8)
-   res.push({id,s:lo,l:len,be:false,score:1+Math.min(...hold),codes})}
- // A position with a bit of its own - a reverse switch in one byte, park in
- // another: that position alone, as an on/off value.
- for(let j=0;j<np;j++){
-  const bm=POS_BOOL[(toks[j]||'').toUpperCase()];if(!bm)continue;
+ // The combination: bit i of the code is moving[i]. Bits beside them that did
+ // nothing here are left out, so they are free to change later.
+ if(moving.length<=16){
+  const codeOf=b=>moving.reduce((c,bit,i)=>c|(bitOf(b,bit)<<i),0);
+  const codes=new Array(names.length).fill(null),hold=[];
+  for(let j=0;j<np;j++){
+   const cnt=new Map();P[j].forEach(b=>{const x=codeOf(b);cnt.set(x,(cnt.get(x)||0)+1)});
+   let best=0,n=0;cnt.forEach((c,x)=>{if(c>n){n=c;best=x}});
+   if(codes[grp[j]]===null)codes[grp[j]]=best;else if(codes[grp[j]]!==best){codes.fill(null);break}
+   hold.push(n/P[j].length)}
+  if(codes.every(c=>c!==null)&&new Set(codes).size===names.length&&Math.min(...hold)>=0.8)
+   res.push({id,s:moving[0],l:moving.length,be:false,bits:moving.slice(),names:names.slice(),codes,
+    score:1+Math.min(...hold)-0.01*moving.length})}
+ // A position with a bit of its own, when no one frame tells every position
+ // apart (reverse from one module, park from another): that position alone.
+ for(let g=0;g<names.length;g++){
+  const bm=POS_BOOL[names[g]];if(!bm)continue;
   for(const bit of moving){
-   const m=maj[bit];
-   if(m.every((x,k)=>k===j||x!==m[j]))res.push({id,s:bit,l:1,be:false,score:stead[bit],inv:m[j]===0,pos:j,metric:bm})}}
+   const v=gv[bit];
+   if(v.every((x,k)=>k===g||x!==v[g]))res.push({id,s:bit,l:1,be:false,score:stead[bit],inv:v[g]===0,pos:g,names:names.slice(),metric:bm})}}
  return res}
 /** Every candidate, best first, one per stretch of bytes. @p S maps each step
     to its polls; a poll maps an identifier to {b: payload, e: flip counters}. */
@@ -711,9 +732,12 @@ function teachFind(kind,S,steps,toks){
   const dlc=Math.max(...A.map(x=>x.b.length),...B.map(x=>x.b.length)),pl=a=>a.map(x=>x.b),ed=a=>a.map(x=>x.e);
   if(kind==='bit')res.push(...teachBits(id,pl(A),pl(B),pl(Cc),ed(A),ed(B),ed(Cc),dlc));
   else res.push(...teachValues(id,pl(A),pl(B),dlc))}
+ // A combination that tells every position apart, in any frame, is the
+ // answer: one value per position is only for when there is none.
+ if(kind==='pos'&&res.some(r=>r.codes)){const c=res.filter(r=>r.codes);res.length=0;res.push(...c)}
  res.sort((a,b)=>b.score-a.score);
  // One answer per stretch of bytes: drop anything overlapping a better hit.
- const bytesOf=r=>{const k=r.s>>3;return r.l===1?[k]:r.s%8+r.l<=8?[k]:[k,k+1]};
+ const bytesOf=r=>{if(r.bits)return[...new Set(r.bits.map(b=>b>>3))];const k=r.s>>3;return r.l===1?[k]:r.s%8+r.l<=8?[k]:[k,k+1]};
  const out=[];
  for(const r of res){
   if(r.l!==1&&out.some(t=>t.id===r.id&&t.l!==1&&bytesOf(t).some(b=>bytesOf(r).includes(b))))continue;
@@ -753,20 +777,21 @@ function teachAnalyze(steps){
  const {S,kind,m}=TEACH;
  TRES=teachFind(kind,S,steps,TTOK);
  if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}
- const say=r=>r.codes?`${r.codes.map((c,j)=>`${esc(TTOK[j])}=${c}`).join(' ')}`:
-  r.pos!==undefined?`on only in ${esc(TTOK[r.pos])}${r.inv?' (inverted)':''} - as ${esc(nm(r.metric))}`:
+ const pat=(c,n)=>Array.from({length:n},(_,i)=>(c>>i)&1).join('');
+ const say=r=>r.codes?r.names.map((t,g)=>`${esc(t)} <span class="mono">${pat(r.codes[g],r.bits.length)}</span>`).join(' • '):
+  r.pos!==undefined?`on only in ${esc(r.names[r.pos])}${r.inv?' (inverted)':''} - as ${esc(nm(r.metric))}`:
   r.l===1?(r.blink?`flashed ${r.blink} time${r.blink>1?'s':''}${r.inv?' (inverted)':''}`:`followed ${(Math.min(1,r.score)*100).toFixed(0)}%${r.inv?' (inverted)':''}`):
   `raw ${r.mn} … ${r.mx} while moving`;
  $('#tRes').innerHTML='<p class="say" style="margin-top:8px">These followed you, best first:</p>'+TRES.map((r,i)=>
-  `<div class="lr"><div class="lt"><span>${field({id:r.id,s:r.s,l:r.l,be:r.be})}${r.sg?' <span class="muted">signed</span>':''}</span>
+  `<div class="lr"><div class="lt"><span>${field({id:r.id,s:r.s,l:r.l,be:r.be,bits:r.bits})}${r.sg?' <span class="muted">signed</span>':''}</span>
    <button class="b s p" onclick="teachUse(${i})">${r.l===1||r.codes?'Use':'Use…'}</button></div>
    <div class="ls"><span>${say(r)}</span></div></div>`).join('')}
 async function teachUse(i){
  const r=TRES[i],m=+$('#tM').value,bm=r.metric||m;
- if((C.signals||[]).some(g=>g.metric===bm&&g.can_id===r.id&&g.start===r.s&&g.len===r.l)){toast(`${nm(bm)} is already read from there`);return}
+ if((C.signals||[]).some(g=>g.metric===bm&&g.can_id===r.id&&g.start===r.s&&g.len===r.l&&String(g.bits||'')===String(r.bits||''))){toast(`${nm(bm)} is already read from there`);return}
  if(r.codes){
   await addSignal({name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,
-   metric:m,mode:1,ref:0,learned:false,map:r.codes.map((c,j)=>[c,posValue(m,TTOK[j],j)])});
+   metric:m,mode:1,ref:0,learned:false,bits:r.bits,map:r.codes.map((c,g)=>[c,posValue(m,r.names[g],g)])});
   toast(`${nm(m)} is now read from the bus`);$('#tRes').innerHTML='';return}
  if(r.l===1){
   await addSignal({name:nm(bm).slice(0,15),can_id:r.id,ext:false,start:r.s,len:1,be:false,signed:false,
@@ -787,13 +812,14 @@ function renderSources(){
  $('#sTab').innerHTML=sig.map((s,i)=>{
   const st=s.mode===3?'<span class="ok">Verified</span>':s.mode===1?'<span class="ok">In use</span>':s.mode===2?'<span class="acc">Checking…</span>':s.mode===4?'<span class="crit">Rejected</span>':'<span class="muted">Off</span>';
   const by=s.learned?' <span class="muted">(learned)</span>':'';
-  if(!adv)return`<tr><td>${esc(nm(s.metric))}${by}</td><td>${field({id:s.can_id,s:s.start,l:s.len,be:s.be,map:s.map,m:s.metric})}</td><td>${st}</td><td>${curVal(s.metric)}</td>
+  if(!adv)return`<tr><td>${esc(nm(s.metric))}${by}</td><td>${field({id:s.can_id,s:s.start,l:s.len,be:s.be,map:s.map,m:s.metric,bits:s.bits})}</td><td>${st}</td><td>${curVal(s.metric)}</td>
    <td><button class="x" title="Remove" onclick="C.signals.splice(${i},1);renderSources();setDirty(true)">✕</button></td></tr>`;
   return`<tr><td><select onchange="C.signals[${i}].mode=+this.value">${SMODE.map((t,k)=>`<option value="${k}" ${s.mode===k?'selected':''}>${t}</option>`).join('')}</select></td>
    <td><select onchange="C.signals[${i}].metric=+this.value">${metricOpts(s.metric)}</select></td>
    <td><input value="${hex(s.can_id,3)}" onchange="C.signals[${i}].can_id=parseInt(this.value,16)||0"></td>
-   <td><input type="number" value="${s.start}" onchange="C.signals[${i}].start=+this.value"></td>
-   <td><input type="number" value="${s.len}" onchange="C.signals[${i}].len=+this.value"></td>
+   ${s.bits&&s.bits.length?`<td colspan="2" class="muted">bits ${s.bits.join(' ')}</td>`:
+   `<td><input type="number" value="${s.start}" onchange="C.signals[${i}].start=+this.value"></td>
+   <td><input type="number" value="${s.len}" onchange="C.signals[${i}].len=+this.value"></td>`}
    <td><input type="checkbox" ${s.be?'checked':''} onchange="C.signals[${i}].be=this.checked"></td>
    <td><input type="checkbox" ${s.signed?'checked':''} onchange="C.signals[${i}].signed=this.checked"></td>
    ${s.map&&s.map.length?`<td colspan="2" class="muted">${s.map.map(p=>`${p[0]}→${esc(posLabel(s.metric,p[1]))}`).join(' ')}</td>`:

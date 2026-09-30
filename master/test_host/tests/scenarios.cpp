@@ -1167,7 +1167,8 @@ static void scLomRecDrift() {
     boot();
     runUntil(120);
     MasterStats st; masterGetStats(st);
-    check(controller().tec == 128, "TEC 128 in listen-only, and it stays there", fmt("TEC %u", controller().tec));
+    check(controller().tec >= 128, "TEC error-passive in listen-only, and it stays there",
+          fmt("TEC %u", controller().tec));
     check(controller().rec < 128, "REC drifted down on good frames, as on the car", fmt("REC %u", controller().rec));
     check(tcm().misreads > 50, "the master misread frames", fmt("%u misreads", tcm().misreads));
     check(st.busErrors == tcm().misreads, "one error counted per misread - no rounds of unheard flags",
@@ -1175,6 +1176,41 @@ static void scLomRecDrift() {
     check(tcm().destroyed == 0 && !tcm().p1718, "nothing destroyed, no P1718");
     commonChecks();
 }
+
+/**
+ * The S3 in the car read the listen-only TEC back one lower than written (128
+ * as 127) - error-active once a good frame had wound REC down, and then every
+ * misread became rounds of the controller's own unheard error flags, each
+ * counted. TEC is written well clear of 128 now, and pinned again should it
+ * wind down at all - even on a chip that loses one per frame received.
+ */
+static void lomTecHold(bool drain) {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":4})");
+    faults.lomRecCounts = true;                     // REC winds down on good frames, as on the car
+    faults.tecExitDrop  = 1;                        // TEC 128 read back as 127, as on the car
+    faults.lomTecDrain  = drain;
+    faults.rxCorruptRate = 0.05;
+    boot();
+    uint32_t minTec = 255;
+    for (double t = 1; t <= 120; t += 0.05) {
+        runUntil(t);
+        if (controller().mode == TWAI_MODE_LISTEN_ONLY && controller().state == TWAI_STATE_RUNNING)
+            minTec = std::min(minTec, controller().tec);
+    }
+    MasterStats st; masterGetStats(st);
+    check(minTec >= 128, "error-passive throughout the listen", fmt("lowest TEC %u", minTec));
+    check(tcm().misreads > 50, "the master misread frames", fmt("%u misreads", tcm().misreads));
+    check(st.busErrors <= tcm().misreads, "one error counted per misread - no rounds of unheard flags",
+          fmt("%u errors for %u misreads", st.busErrors, tcm().misreads));
+    check(drain ? st.lomRepins > 0 : st.lomRepins == 0,
+          drain ? "pinned again as it wound down" : "never needed pinning again",
+          fmt("%u times, TEC read back %u", st.lomRepins, st.lomTecRead));
+    check(tcm().destroyed == 0 && !tcm().p1718, "nothing destroyed, no P1718");
+    commonChecks();
+}
+static void scLomTecHold()  { lomTecHold(false); }
+static void scLomTecDrain() { lomTecHold(true); }
 
 /** The default bit timing: the Arduino-CAN profile - 87.5 %, SJW 2, triple sampling. */
 static void scTimingDefault() {
@@ -2000,6 +2036,61 @@ static void scSignalTable() {
     commonChecks();
 }
 
+/** A bit-combination signal on the body frame, as the portal saves one. */
+static std::string bodySigBits(uint16_t metric, const char *bits, const char *map) {
+    return std::string(R"({"can_id":977,"ext":false,"start":0,"len":1,"be":false,"signed":false,)"
+                       R"("scale":1,"offset":0,"metric":)") + std::to_string(metric) +
+           R"(,"mode":1,"ref":0,"learned":false,"name":"t","bits":)" + bits + R"(,"map":)" + map + "}";
+}
+
+/**
+ * The gear lever as a combination of bits scattered over three bytes (P bit
+ * 24, D bit 30, N bit 39 held low only in N, R bit 42), with a bit beside
+ * them (27) that flips every 1.5 s on its own: every position reads from
+ * exactly its bits, whatever the neighbour does. Bit lists that cannot be
+ * decoded as saved drop their signal.
+ */
+static void scSignalBits() {
+    body.enabled = true;
+    // Code bit i = bits[i]: P 24+39 = 0b0011, R 39+42 = 0b0110, N none, D 39+30 = 0b1010.
+    simfs::files["/config.json"] = sigFile({
+        bodySigBits(METRIC_ID_GEAR_LEVER, "[24,39,42,30]", "[[3,80],[6,82],[0,78],[10,68]]"),
+        bodySigBits(METRIC_ID_CUSTOM_1, "[5,5]", "[[0,1]]"),      // a bit twice
+        bodySigBits(METRIC_ID_CUSTOM_2, "[64]", "[[0,1]]"),       // no such bit
+        bodySigBits(METRIC_ID_CUSTOM_3, "[]", "[[0,1]]")});       // no bits
+    boot();
+    Cfg.lock();
+    const size_t n = Cfg.signals.size();
+    const RtSignal lev = n ? Cfg.signals[0] : RtSignal{};
+    Cfg.unlock();
+    check(n == 1, "bit lists that cannot be decoded as saved drop their signal", fmt("%zu kept", n));
+    check(lev.nBits == 4 && lev.bitList[0] == 24 && lev.bitList[3] == 30 && lev.nMap == 4,
+          "the combination and its table are read", fmt("%u bits, %u entries", lev.nBits, lev.nMap));
+    const char *seq = "PRNDNRP";
+    double v = 0;
+    bool ok = false;
+    for (int i = 0; seq[i]; i++) {                      // 7 x 1.5 s: the neighbour flips throughout
+        body.lever = seq[i];
+        runUntil(2.0 + 1.5 * i);
+        v = -1;
+        ok = shownNow(METRIC_ID_GEAR_LEVER, v);
+        check(ok && v == seq[i], fmt("lever in %c reads '%c'", seq[i], seq[i]).c_str(), fmt("%.0f", v));
+    }
+    body.lever = 'M';                                   // only N's bit set: a code not in the table
+    runUntil(16);
+    ok = shownNow(METRIC_ID_GEAR_LEVER, v);
+    check(!ok, "a position not taught publishes nothing");
+
+    JsonDocument doc;
+    Cfg.toJson(doc);
+    std::string bits, map;
+    serializeJson(doc["signals"][0]["bits"], bits);
+    serializeJson(doc["signals"][0]["map"], map);
+    check(bits == "[24,39,42,30]" && map == "[[3,80],[6,82],[0,78],[10,68]]", "saved as it was read",
+          bits + " " + map);
+    commonChecks();
+}
+
 /**
  * A lever whose positions are separate bits, taught one by one as Reverse,
  * Lever in N and Lever in D: the master puts them together as the gear
@@ -2103,6 +2194,7 @@ static const Scenario SCENARIOS[] = {
     {"lom_erratum_silent", scLomErratumSilent, 0}, {"lom_erratum_drive", scLomErratumDrive, 0},
     {"normal_confinement", scNormalConfinement, 0},
     {"lom_rec_drift", scLomRecDrift, 0}, {"passive_marginal", scPassiveMarginal, 0},
+    {"lom_tec_hold", scLomTecHold, 0}, {"lom_tec_drain", scLomTecDrain, 0},
     {"passive_off", scPassiveOff, 0}, {"passive_busoff", scPassiveBusOff, 0},
     {"error_frames_never", scErrorFramesNever, 0}, {"bus_defaults", scBusDefaults, 0},
     {"link_misses", scLinkMisses, 0}, {"link_radio", scLinkRadio, 0},
@@ -2117,6 +2209,7 @@ static const Scenario SCENARIOS[] = {
     {"tx_hold", scTxHold, 0}, {"tx_hold_off", scTxHoldOff, 0},
     {"teach_flips", scTeachFlips, 0}, {"signal_table", scSignalTable, 0},
     {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
+    {"signal_bits", scSignalBits, 0},
 };
 
 static const Scenario *s_sc = nullptr;
