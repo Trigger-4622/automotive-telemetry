@@ -110,7 +110,14 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   of its own unheard error flags, each counted (7.8 errors per misread in
   `lom_tec_hold` without the fix). So TEC is written well clear of 128 and
   `busGuardTask` pins it again below `TEC_LISTEN_LOW`; the sim models the
-  drop (`faults.tecExitDrop`, on by default).
+  drop (`faults.tecExitDrop`, on by default). **That does not hold on the
+  car's S3 either** (bench boot 2026-09-30, no bus traffic): TEC 200 read
+  back as 200, then TEC and REC were 0 within milliseconds and the pin was
+  applied 75 times in 4 s. This chip keeps no counters in listen-only, so a
+  listening controller is error-active whatever is written - only the
+  detached TX pad keeps it off the bus. Proposed, waiting for the owner's
+  go-ahead: silent periods in NORMAL mode with the TX pad detached and TEC
+  220, where the counters do hold (no MIL with `tx_passive` on the car).
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only
@@ -200,6 +207,14 @@ field always outranks the derived value.
   flashed). The simulator has a TCM that sets P1718 and an ECM that goes
   bus-off. The switch to listen-only is never throttled; only the switch back
   to normal is.
+- Master flashed 2026-09-30 with main 0e3d754 (gear lever teaching, #4 and
+  #5, and the listen-only TEC pin). The evidence log of the drive before it,
+  with `tx_passive` on, had 47 bus-offs in 155 s while polling: the master's
+  own frames fail (TEC 220 is bus-off after five transmit errors), with no
+  MIL. Suspect the master's transmit path - the transceiver board's own 120
+  ohm terminator (CANH-CANL ~40 ohm instead of ~60), its RS pin, its ground
+  to OBD pin 5, the supply - and confirm with the portal's "What the errors
+  are" before changing firmware for it.
 - Screens: warning lamps, dash screen and the cluster redesign are built and
   tested in the harness but not yet flashed or seen on hardware.
 - Cluster: whether the Arduino_GFX driver cured the panel speckle is
