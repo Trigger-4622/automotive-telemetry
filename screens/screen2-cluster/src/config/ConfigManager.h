@@ -295,6 +295,8 @@ private:
      * @return true when the layout changed and should be saved.
      */
     bool migrateLayout();
+    /** @brief Version 1 to 2: the dash screen and the warnings block. */
+    void migrateToV2();
 
     /** @brief Register every HTTP route of the Gauge Studio API. */
     void setupRoutes();
