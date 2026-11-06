@@ -27,6 +27,13 @@ struct EcuConfig {
     uint32_t replyLatencyUs  = 4000;   ///< ECU reply delay.
     int      dropReplyEveryN = 0;      ///< Drop every Nth OBD reply (0 = never).
     int      ssmCutEveryN    = 0;      ///< Stop every Nth multi-frame SSM reply half-way.
+    /** Trouble codes each computer holds (raw, 0x1718 = P1718), on top of
+     *  what the TCM model latches: P1718 in the TCM, P0700 in the ECM. */
+    std::vector<uint16_t> ecmStored, ecmPending, tcmStored, tcmPending;
+    bool     tcmPhysical     = true;   ///< TCM answers 0x7E1 (else only 0x7DF).
+    bool     permanentCodes  = false;  ///< Service 0A supported (a 2009 car: no).
+    bool     clearNeedsEngineOff = false;  ///< Service 04 refused (0x22) while it runs.
+    double   odometerKm      = 123456; ///< What SSM2 address 0x10E reads.
 };
 
 /* ── bus faults ─────────────────────────────────────────────────────────── */
@@ -186,6 +193,13 @@ extern int  txInReset;
 extern int  reinstalls;                        ///< Driver installs since boot.
 extern int  bugUninstallWhileWaiting;          ///< Uninstall with a task blocked inside.
 
+/** Requests to the ISO-TP nodes: key (request ID << 8) | service. */
+extern std::map<uint32_t, int> isoRequests;
+extern int codesCleared;                       ///< Service 04 accepted.
+/** Speed of the car in km/h at time t (seconds since start), replacing the
+ *  built-in drive; nullptr = the built-in drive. */
+extern double (*speedOverride)(double t);
+
 /** Seconds since the simulation began (the clock may not start at 0). */
 double elapsedS();
 
@@ -205,6 +219,16 @@ Truth truth();
  */
 struct Body { bool enabled = false; char lever = 'P'; bool turnLeft = false; uint8_t doors = 0; };
 extern Body body;
+/**
+ * The stability control unit's frame, 0x0D4 at 50 Hz, sent only while
+ * @ref enabled: yaw rate (bytes 0-1, int16 LE, 0.01 deg/s), lateral G (2-3,
+ * int16 LE, 0.001 g) and longitudinal G (4-5, int16 LE, 0.001 g) - the car's
+ * own, consistent with its speed: longitudinal from the speed's rate of
+ * change, lateral = speed x yaw. ISO 8855 signs: left and speeding up positive.
+ */
+struct Vdc { bool enabled = false; double yawDegS = 0; };
+extern Vdc vdc;
+
 /** The left turn lamp as the car sends it now (for counting its flashes). */
 bool turnLampLit();
 

@@ -27,7 +27,7 @@ def group(i, name, unit):
     if i & 0xFF00 == 0x3000: return "Custom"
     if i & 0xFF00 == 0x1200: return "Status & switches"
     if 0x1008 <= i <= 0x100E: return "Driving"
-    if i in (0x0101, 0x0301, 0x0103, 0x0151, 0x110A, 0x2033, 0x2039) or i & 0xFF00 == 0x2100:
+    if i in (0x0101, 0x0301, 0x0103, 0x0151, 0x110A, 0x2033, 0x2039) or i & 0xFF00 in (0x2100, 0x0400):
         return "Status & switches"
     if unit == "°C": return "Temperatures"
     if i & 0xFF00 == 0x1100 or re.search(r"Batt|Alternator|12V|EPS|pump A", name): return "Electrical"
@@ -48,7 +48,7 @@ for i, full in NAMES.items():
     if i == 0x010C: unit = "rpm"
     if i == 0x1002: unit = "AFR"
     dec = DEC.get(unit, 2)
-    if i in (0x1005, 0x100F, 0x0301, 0x0101, 0x0103) or i & 0xFF00 in (0x2100, 0x1200): dec = 0
+    if i in (0x1005, 0x100F, 0x0301, 0x0101, 0x0103) or i & 0xFF00 in (0x2100, 0x1200, 0x0400): dec = 0
     meta[i] = [name, unit, group(i, name, unit), dec]
 
 js = "{" + ",".join(f"{i}:{json.dumps(v, ensure_ascii=False)}" for i, v in sorted(meta.items())) + "}"

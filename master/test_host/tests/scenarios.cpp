@@ -6,13 +6,18 @@
  */
 #include <ArduinoJson.h>
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
 
 #include "Arduino.h"
 #include "LittleFS.h"
+#include "DiagCodes.h"
+#include "DriveLog.h"
+#include "DtcText.h"
 #include "Learner.h"
 #include "MasterConfig.h"
 #include "MasterPacket.h"
@@ -105,7 +110,19 @@ static bool isObd(const twai_message_t &m, int pid = -1) {
            (pid < 0 || m.data[2] == pid);
 }
 static bool isObdReq(const twai_message_t &m) { return isObd(m); }   // any PID, for txCount
-static bool isSsm(const twai_message_t &m) { return m.identifier == 0x7E0 && !isObd(m); }
+/** A request of the OBD-II services carried by ISO-TP - trouble codes (03 07
+ *  0A), clear (04), vehicle information (09) - to the ECM, the TCM or all. */
+static bool isObdIso(const twai_message_t &m) {
+    if (m.identifier != 0x7E0 && m.identifier != 0x7E1 && m.identifier != 0x7DF) return false;
+    if ((m.data[0] & 0xF0) != 0x00) return false;
+    const uint8_t s = m.data[1];
+    return s == 0x03 || s == 0x04 || s == 0x07 || s == 0x0A || s == 0x09;
+}
+/** An SSM2 request frame (single, first or consecutive; not our flow control,
+ *  which answers whichever service the ECU is replying to). */
+static bool isSsm(const twai_message_t &m) {
+    return m.identifier == 0x7E0 && !isObd(m) && !isObdIso(m) && (m.data[0] & 0xF0) != 0x30;
+}
 static bool anyFrame(const twai_message_t &) { return true; }
 
 static const sim::Shown *shown(uint16_t id) {
@@ -721,7 +738,7 @@ static void scSleepHeld() {
     check(sleepEntered, "but sleeps within the 5-minute cap", fmt("at %.0f s", tNow()));
 }
 
-static bool isRequest(const twai_message_t &m) { return isObd(m) || isSsm(m); }
+static bool isRequest(const twai_message_t &m) { return isObd(m) || isSsm(m) || isObdIso(m); }
 static bool logHas(const char *text) {
     for (const auto &l : logLines) if (l.find(text) != std::string::npos) return true;
     return false;
@@ -2054,6 +2071,357 @@ static void scBusOffCycles() {
           fmt("%d", sim::activeFlagStarts));
 }
 
+/* ═══════════ trouble codes, service reminder, G-meter, drive log ═══════════ */
+
+/** What a display shows in code slot @p slot: "P1718 stored transmission". */
+static std::string shownCode(int slot) {
+    const sim::Shown *s = shown(METRIC_ID_DTC_1 + slot);
+    if (!s || (simrtos::nowUs() - s->tUs) > 1500000) return "-";
+    uint16_t raw; uint8_t kind, mod;
+    dtcUnpack(s->value, raw, kind, mod);
+    char c[6];
+    dtcCode(raw, c);
+    return fmt("%s %s %s", c, DTC_KIND_NAME[kind], DTC_MODULE_NAME[mod]);
+}
+static int isoReq(uint32_t id, uint8_t svc) {
+    const auto it = sim::isoRequests.find(id << 8 | svc);
+    return it == sim::isoRequests.end() ? 0 : it->second;
+}
+/** Ignition off: every module at once, nobody left to acknowledge a frame. */
+static void carOff() {
+    faults.silenceBus = true;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;
+    faults.nobodyAcks = true;
+}
+static void carOn() {
+    faults.silenceBus = false;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = true;
+    faults.nobodyAcks = false;
+}
+/** A stored settings file with these keys, as saved on an earlier drive. */
+static void storedConfig(const char *keys) {
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,)", (int)MasterConfig::CFG_VERSION) + (keys + 1);
+}
+static double shownValue(uint16_t id) {
+    const sim::Shown *s = shown(id);
+    return s && simrtos::nowUs() - s->tUs < 1500000 ? s->value : NAN;
+}
+
+/** Codes in both computers: read a few seconds after the car comes on, each
+ *  shown once with its name, read again every minute, never with the car off. */
+static void scDtcRead() {
+    ecu.ecmStored  = {0x0700};
+    ecu.ecmPending = {0x0171, 0x0700};          // a confirmed code is often pending too
+    ecu.tcmStored  = {0x1718};
+    boot();
+    runUntil(6);
+    check(txCount(isObdIso, 0) == 0, "nothing asked in the first seconds (probe and SSM2 first)");
+    runUntil(20);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.haveRead && cs.reads == 1, "read once the car has been on a few seconds", fmt("%u reads", cs.reads));
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 3, "three codes for the displays, P0700 once",
+          fmt("%.0f", shownValue(METRIC_ID_DTC_TOTAL)));
+    check(shownCode(0) == "P0700 stored engine", "first: the engine's stored code", shownCode(0));
+    check(shownCode(1) == "P1718 stored transmission", "then the transmission's", shownCode(1));
+    check(shownCode(2) == "P0171 pending engine", "then the pending one", shownCode(2));
+    check(shownCode(3) == "-", "no fourth slot");
+    check(!std::strcmp(dtcText(0x1718), "AT CAN communication circuit") &&
+          !std::strcmp(dtcText(0x0700), "Transmission asks for the lamp"), "named", dtcText(0x1718));
+    check(cs.list[0][2] == LIST_REFUSED && cs.list[1][2] == LIST_REFUSED,
+          "permanent codes: refused by both (a 2009 car keeps none)");
+    check(isoReq(0x7E0, 0x03) == 1 && isoReq(0x7E1, 0x03) == 1 && isoReq(0x7DF, 0x03) == 0,
+          "each computer asked on its own address, never through 0x7DF");
+    check(!std::strcmp(cs.vin, "JF1BL5KS59G000123") && !std::strcmp(cs.calId[0], "A2WC522N") &&
+          !std::strcmp(cs.cvn[0], "1A2B3C4D"), "VIN, calibration ID and CVN read",
+          fmt("%s %s %s", cs.vin, cs.calId[0], cs.cvn[0]));
+    runUntil(25);
+    JsonDocument d;
+    deserializeJson(d, simfs::files["/config.json"]);
+    check(!std::strcmp(d["ecu_cal_id"] | "", "A2WC522N") && !std::strcmp(d["vin"] | "", "JF1BL5KS59G000123"),
+          "calibration ID and VIN saved, for the portal with the car off");
+
+    runUntil(75);
+    codesGetStatus(cs);
+    check(cs.reads == 2, "read again a minute later", fmt("%u reads", cs.reads));
+    check(isoReq(0x7E0, 0x09) == 3, "the identity read once (VIN, calibration, CVN)",
+          fmt("%d", isoReq(0x7E0, 0x09)));
+    ecu.tcmPending.push_back(0x0705);
+    runUntil(135);
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 4 && shownCode(3) == "P0705 pending transmission",
+          "a new code shows at the next read", shownCode(3));
+
+    const double off = tNow();
+    carOff();
+    runUntil(off + 30);
+    check(txCount(anyFrame, off + 0.3) == 0, "nothing asked once the car is off");
+    check(std::isnan(shownValue(METRIC_ID_DTC_TOTAL)), "the displays let the codes go with the car");
+    char why[64];
+    check(!codesRequestClear(why, sizeof why), "no clear with the car off", why);
+    commonChecks();
+}
+
+/** Clear: refused while moving; at a standstill both computers clear and the
+ *  list is read again; an engine that must be off says so. */
+static void scDtcClear() {
+    ecu.ecmStored = {0x0700};
+    ecu.tcmStored = {0x1718};
+    sim::speedOverride = [](double t) { return t < 30 ? 50.0 : 0.0; };
+    boot();
+    runUntil(20);
+    char why[64] = "";
+    check(!codesRequestClear(why, sizeof why) && !std::strcmp(why, "stop the car first"),
+          "refused while moving", why);
+    check(isoReq(0x7E0, 0x04) == 0, "and nothing sent");
+    runUntil(35);
+    check(codesRequestClear(why, sizeof why), "accepted at a standstill", why);
+    runUntil(40);
+    CodesStatus cs; codesGetStatus(cs);
+    check(isoReq(0x7E0, 0x04) == 1 && isoReq(0x7E1, 0x04) == 1 && sim::codesCleared == 2,
+          "service 04 to each computer, once", cs.note);
+    check(std::strstr(cs.clearNote, "engine cleared") && std::strstr(cs.clearNote, "transmission cleared"),
+          "the portal says what each did", cs.clearNote);
+    check(cs.n == 0 && shownValue(METRIC_ID_DTC_TOTAL) == 0, "read again: nothing left",
+          fmt("%u codes", cs.n));
+
+    ecu.clearNeedsEngineOff = true;
+    ecu.ecmStored = {0x0420};
+    check(codesRequestClear(why, sizeof why), "asked again with the engine running");
+    runUntil(45);
+    codesGetStatus(cs);
+    check(std::strstr(cs.clearNote, "engine refused - switch the engine off") != nullptr,
+          "an engine that must be off: said in plain words", cs.clearNote);
+    check(cs.n == 1 && shownCode(0) == "P0420 stored engine", "and the code is still listed", shownCode(0));
+    commonChecks();
+}
+
+/** A transmission computer that answers only 0x7DF: asked there once its own
+ *  address stays silent, its reply picked out by ID, flow control to 0x7E1. */
+static void scDtcTcmFunctional() {
+    ecu.tcmPhysical = false;
+    ecu.tcmStored = {0x1718, 0x0705, 0x0710, 0x0715};   // a reply of several frames
+    boot();
+    runUntil(20);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.tcmFunctional, "fell back to 0x7DF for the transmission");
+    check(isoReq(0x7E1, 0x03) == 1 && isoReq(0x7DF, 0x03) == 1, "its own address first, then 0x7DF",
+          fmt("%d / %d", isoReq(0x7E1, 0x03), isoReq(0x7DF, 0x03)));
+    check(txCount([](const twai_message_t &m) { return m.identifier == 0x7E1 && (m.data[0] & 0xF0) == 0x30; }, 0) >= 1,
+          "flow control to the transmission's own address");
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 4 && shownCode(0) == "P1718 stored transmission",
+          "its four codes, the engine's answer to 0x7DF ignored", shownCode(0));
+    runUntil(75);
+    check(isoReq(0x7E1, 0x03) == 1 && isoReq(0x7DF, 0x03) == 2, "and straight to 0x7DF from then on");
+    commonChecks();
+}
+
+/** Listen-only: no code is asked for, and a clear is refused. */
+static void scDtcSilent() {
+    ecu.ecmStored = {0x0700};
+    storedConfig(R"({"diag_mode":4})");
+    boot();
+    runUntil(40);
+    check(txCount(anyFrame, 0) == 0, "not one frame sent");
+    char why[64];
+    check(!codesRequestClear(why, sizeof why) && std::strstr(why, "listen only"), "clear refused", why);
+    portalPost(R"({"dtc_poll_s":0,"diag_mode":0})");
+    runUntil(120);
+    check(txCount(isObdIso, 0) == 0, "dtc_poll_s 0: only when asked");
+    codesRequestRead();
+    runUntil(125);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 1 && shownValue(METRIC_ID_DTC_TOTAL) == 1, "asked: read", cs.note);
+    commonChecks();
+}
+
+/** Oil change due by the odometer SSM2 reads (123456 km in the simulator). */
+static void scServiceDue() {
+    storedConfig(R"({"oil_every_km":7500,"oil_at_km":116000})");
+    boot();
+    runUntil(30);
+    std::string info;
+    float odo = 0;
+    check(masterOdometer(odo) && std::fabs(odo - 123456) < 2.5, "odometer from SSM2", fmt("%.0f km", odo));
+    check(freshNear(METRIC_ID_SERVICE_KM, 116000 + 7500 - 123456, 2.5, info), "due in 44 km", info);
+    char why[64] = "";
+    check(masterServiceReset(why, sizeof why), "oil changed now", why);
+    runUntil(40);
+    check(freshNear(METRIC_ID_SERVICE_KM, 7500, 2.5, info), "the next one 7500 km away", info);
+    JsonDocument d;
+    deserializeJson(d, simfs::files["/config.json"]);
+    check((d["oil_at_km"] | -1L) == 123456L, "the reading is saved", fmt("%ld", d["oil_at_km"] | -1L));
+    commonChecks();
+}
+
+/** No last change set: no reminder. No odometer (OBD-II only): "oil changed
+ *  now" says why it cannot. */
+static void scServiceUnset() {
+    storedConfig(R"({"diag_mode":2})");
+    boot();
+    runUntil(40);
+    check(!shown(METRIC_ID_SERVICE_KM), "no reminder until the last change is set");
+    char why[80] = "";
+    check(!masterServiceReset(why, sizeof why) && std::strstr(why, "odometer"), "no odometer: refused", why);
+    commonChecks();
+}
+
+/** 0-100 km/h in 10 s, 10 s at 100, a stop in 5 s. */
+static double accelRun(double t) {
+    if (t < 10) return 0;
+    if (t < 20) return (t - 10) * 10;
+    if (t < 30) return 100;
+    if (t < 35) return 100 - (t - 30) * 20;
+    return 0;
+}
+
+/** G-meter without the stability unit's frame: longitudinal from speed. */
+static void scGDerived() {
+    sim::speedOverride = accelRun;
+    boot();
+    const double g0 = 100 / 3.6 / 10 / 9.80665, gb = -2 * g0;   // 0.283 g, -0.566 g
+    runUntil(15.5);
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL) - g0) < 0.03 && sourceOf(METRIC_ID_LON_ACCEL) == SRC_DERIVED,
+          "speeding up: from the speed", fmt("%.3f g (truth %.3f)", shownValue(METRIC_ID_LON_ACCEL), g0));
+    runUntil(25);
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL)) < 0.03, "steady: 0 g",
+          fmt("%.3f g", shownValue(METRIC_ID_LON_ACCEL)));
+    runUntil(33);
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL) - gb) < 0.05, "braking",
+          fmt("%.3f g (truth %.3f)", shownValue(METRIC_ID_LON_ACCEL), gb));
+    check(!shown(METRIC_ID_LAT_ACCEL), "no lateral G without a yaw rate");
+    commonChecks();
+}
+
+/** The stability unit's frame taught: its yaw rate gives lateral G (speed x
+ *  yaw); its own G fields, once taught, outrank anything derived. */
+static void scGTaught() {
+    sim::speedOverride = accelRun;
+    vdc.enabled = true;
+    vdc.yawDegS = 10;
+    boot();
+    portalPost(R"({"signals":[
+      {"name":"Yaw","can_id":212,"start":0,"len":16,"be":false,"signed":true,"scale":0.01,"offset":0,"metric":4110,"mode":1}]})");
+    runUntil(25);
+    const double lat = 100 / 3.6 * 10 * M_PI / 180 / 9.80665;   // 0.494 g
+    check(std::fabs(shownValue(METRIC_ID_YAW_RATE) - 10) < 0.02, "yaw rate read from the frame",
+          fmt("%.2f", shownValue(METRIC_ID_YAW_RATE)));
+    check(std::fabs(shownValue(METRIC_ID_LAT_ACCEL) - lat) < 0.02 && sourceOf(METRIC_ID_LAT_ACCEL) == SRC_DERIVED,
+          "lateral G = speed x yaw", fmt("%.3f g (truth %.3f)", shownValue(METRIC_ID_LAT_ACCEL), lat));
+    portalPost(R"({"signals":[
+      {"name":"Yaw","can_id":212,"start":0,"len":16,"be":false,"signed":true,"scale":0.01,"offset":0,"metric":4110,"mode":1},
+      {"name":"Lat G","can_id":212,"start":16,"len":16,"be":false,"signed":true,"scale":0.001,"offset":0,"metric":4108,"mode":1},
+      {"name":"Lon G","can_id":212,"start":32,"len":16,"be":false,"signed":true,"scale":0.001,"offset":0,"metric":4109,"mode":1}]})");
+    runUntil(32);
+    check(sourceOf(METRIC_ID_LAT_ACCEL) == SRC_RAW && sourceOf(METRIC_ID_LON_ACCEL) == SRC_RAW,
+          "taught fields outrank the derived values");
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL) + 0.566) < 0.02, "braking G from the frame",
+          fmt("%.3f g", shownValue(METRIC_ID_LON_ACCEL)));
+    commonChecks();
+}
+
+/** A drive log file, parsed. */
+struct LogFile { bool ok = false; uint8_t hz = 0; std::vector<uint16_t> ids; uint32_t startMs = 0;
+                 std::vector<uint32_t> t; std::vector<std::vector<float>> rows; };
+static LogFile readLog(const std::string &path) {
+    LogFile L;
+    if (!simfs::files.count(path)) return L;
+    const std::string &d = simfs::files[path];
+    auto u8 = [&](size_t i) { return (uint8_t)d[i]; };
+    auto u32 = [&](size_t i) { return (uint32_t)(u8(i) | u8(i + 1) << 8 | u8(i + 2) << 16 | (uint32_t)u8(i + 3) << 24); };
+    if (d.size() < 16 || d.compare(0, 4, "TLG1")) return L;
+    L.hz = u8(5);
+    const size_t cols = u8(6);
+    L.startMs = u32(12);
+    size_t p = 16;
+    for (size_t i = 0; i < cols; i++, p += 2) L.ids.push_back((uint16_t)(u8(p) | u8(p + 1) << 8));
+    const size_t row = 4 + 4 * cols;
+    for (; p + row <= d.size(); p += row) {
+        L.t.push_back(u32(p));
+        std::vector<float> r(cols);
+        for (size_t i = 0; i < cols; i++) std::memcpy(&r[i], d.data() + p + 4 + 4 * i, 4);
+        L.rows.push_back(r);
+    }
+    L.ok = (d.size() - 16 - 2 * cols) % row == 0;
+    return L;
+}
+
+/** Recorded at 10 Hz into flash, one file a drive, values matching the car. */
+static void scDriveLog() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_ids":[268,269,4097]})");
+    boot();
+    runUntil(40);
+    DriveLogStatus st; driveLogStatus(st);
+    check(st.recording && !std::strcmp(st.file, "00001.tlg"), "recording into 00001.tlg", st.file);
+    check(st.flushes >= 2, "written to flash as it goes, not only at the end", fmt("%u writes", st.flushes));
+    carOff();
+    runUntil(45);
+    driveLogStatus(st);
+    check(!st.recording, "closed when the car went off", st.file);
+    const LogFile L = readLog("/log/00001.tlg");
+    check(L.ok && L.hz == 10 && L.ids == std::vector<uint16_t>({268, 269, 4097}), "header: 10 Hz, RPM, speed, boost");
+    const double secs = L.t.empty() ? 0 : L.t.back() / 1000.0;
+    check(std::fabs(L.rows.size() - secs * 10) < secs * 0.5 + 2 && secs > 38, "ten rows a second for the whole drive",
+          fmt("%zu rows over %.1f s", L.rows.size(), secs));
+    // Every row after the first seconds has the engine's values in it.
+    size_t good = 0, n = 0;
+    for (size_t i = 0; i < L.rows.size(); i++) {
+        const double at = tOf(((uint64_t)L.startMs + L.t[i]) * 1000);
+        if (at < 12) continue;
+        n++;
+        if (!std::isnan(L.rows[i][0]) && L.rows[i][0] > 600 && L.rows[i][0] < 4200 &&
+            !std::isnan(L.rows[i][1]) && L.rows[i][1] >= 0 && L.rows[i][1] < 120) good++;
+    }
+    check(n > 200 && good == n, "every row has RPM and speed", fmt("%zu of %zu", good, n));
+
+    carOn();
+    runUntil(70);
+    carOff();
+    runUntil(75);
+    LogFileInfo li[8];
+    const size_t nl = driveLogList(li, 8);
+    check(nl == 2 && !std::strcmp(li[1].name, "00002.tlg") && li[1].rows > 150, "the next drive: its own file",
+          nl == 2 ? fmt("%s %u rows %.0f s", li[1].name, li[1].rows, li[1].seconds) : fmt("%zu files", nl));
+    char path[32];
+    check(!driveLogPath("../config.json", path, sizeof path) && !driveLogPath("00009.tlg", path, sizeof path),
+          "only log files can be named");
+    check(driveLogDelete("00001.tlg") && !simfs::files.count("/log/00001.tlg"), "deleted on request");
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/config.json"]) && (d["log_on"] | false), "the settings untouched");
+    commonChecks();
+}
+
+/** The space it may use: the oldest drive goes to make room, and the settings
+ *  always keep 128 KB of the partition. */
+static void scDriveLogFull() {
+    // 24 values: 100-byte rows, 1 KB a second.
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_max_kb":64,
+      "log_ids":[268,269,4097,273,260,261,262,263,264,265,266,267,270,271,272,274,275,276,277,278,279,280,281,282]})");
+    boot();
+    runUntil(40);
+    carOff(); runUntil(45);
+    carOn();  runUntil(85);
+    carOff(); runUntil(90);
+    LogFileInfo li[8];
+    size_t nl = driveLogList(li, 8);
+    uint32_t total = 0;
+    for (size_t i = 0; i < nl; i++) total += li[i].bytes;
+    check(nl == 1 && !std::strcmp(li[0].name, "00002.tlg") && total <= 64 * 1024,
+          "the first drive deleted to make room for the second", fmt("%zu files, %u bytes", nl, total));
+
+    // A partition nearly full of something else: the logger stops, settings saves still work.
+    simfs::totalBytes = simfs::usedBytes() + 140 * 1024;
+    carOn();
+    runUntil(180);
+    DriveLogStatus st; driveLogStatus(st);
+    check(std::strstr(st.note, "log space full") != nullptr, "stops when only the reserve is left", st.note);
+    check(simfs::usedBytes() + 100 * 1024 <= simfs::totalBytes, "the reserve is still free",
+          fmt("%zu KB free", (simfs::totalBytes - simfs::usedBytes()) / 1024));
+    portalPost(R"({"oil_every_km":8000})");
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/config.json"]) && (d["oil_every_km"] | 0) == 8000,
+          "a settings save still fits");
+    commonChecks();
+}
+
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
 /* ───────────── body values: flashing, positions, derived ───────────── */
 
@@ -2337,6 +2705,16 @@ static const Scenario SCENARIOS[] = {
     {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
     {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
     {"busoff_cycles", scBusOffCycles, 0},
+    {"dtc_read", scDtcRead, 0},
+    {"dtc_clear", scDtcClear, 0},
+    {"dtc_tcm_functional", scDtcTcmFunctional, 0},
+    {"dtc_silent", scDtcSilent, 0},
+    {"service_due", scServiceDue, 0},
+    {"service_unset", scServiceUnset, 0},
+    {"g_derived", scGDerived, 0},
+    {"g_taught", scGTaught, 0},
+    {"drive_log", scDriveLog, 0},
+    {"drive_log_full", scDriveLogFull, 0},
 };
 
 static const Scenario *s_sc = nullptr;

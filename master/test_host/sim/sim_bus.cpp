@@ -444,6 +444,8 @@ static void levels(double *rpm, double *spd, double *thr) {
     }
 }
 
+double (*sim::speedOverride)(double) = nullptr;
+
 Truth sim::truth() {
     const double t = elapsedS();
     static double RPM[8], SPD[8], THR[8];
@@ -451,7 +453,7 @@ Truth sim::truth() {
     if (!init) { levels(RPM, SPD, THR); init = true; }
     Truth r;
     r.rpm = t < 8 ? 800 : profile(RPM, 8, 2.5, t);
-    r.speed = t < 8 ? 0 : profile(SPD, 8, 3.0, t);
+    r.speed = speedOverride ? speedOverride(t) : t < 8 ? 0 : profile(SPD, 8, 3.0, t);
     r.throttle = t < 8 ? 0 : profile(THR, 8, 2.2, t);
     r.coolant = 20 + std::min(70.0, t * 0.5);
     r.gear = r.speed < 15 ? 1 : r.speed < 30 ? 2 : r.speed < 50 ? 3 : r.speed < 70 ? 4 : 5;
@@ -493,9 +495,28 @@ static void bodyFrame(uint64_t now) {
     if (tcmSee(m)) deliver(m);
 }
 
+sim::Vdc sim::vdc;
+/** The stability control frame (see Vdc); due every 20 ms while enabled. */
+static void vdcFrame(uint64_t now) {
+    static uint64_t due = 0;
+    if (!vdc.enabled) { due = 0; return; }
+    if (due > now) return;
+    due = due && now - due < 20100 ? due + 20100 : now + 20100;
+    const double t = elapsedS(), v = truth().speed / 3.6;
+    const double dv = (truth().speed - (speedOverride ? speedOverride(t - 0.05)
+                                                      : truth().speed)) / 3.6 / 0.05;
+    const double lon = dv / 9.80665, lat = v * vdc.yawDegS * M_PI / 180.0 / 9.80665;
+    const int16_t y = (int16_t)std::lround(vdc.yawDegS * 100), la = (int16_t)std::lround(lat * 1000),
+                  lo = (int16_t)std::lround(lon * 1000);
+    const twai_message_t m = frame(0x0D4, {(uint8_t)y, (uint8_t)(y >> 8), (uint8_t)la, (uint8_t)(la >> 8),
+                                           (uint8_t)lo, (uint8_t)(lo >> 8), 0, 0});
+    if (tcmSee(m)) deliver(m);
+}
+
 /** @return When the next broadcast is due. */
 static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
     bodyFrame(now);
+    vdcFrame(now);
     const Truth v = truth();
     struct Def { uint32_t id; uint32_t periodUs; };
     static const Def DEFS[] = {{0x002, 10000}, {0x231, 10000}, {0x232, 20000}, {0x252, 20000},
@@ -555,6 +576,7 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
     uint64_t soonest = UINT64_MAX;
     for (const Def &d : DEFS) soonest = std::min(soonest, next[d.id]);
     if (body.enabled) soonest = std::min<uint64_t>(soonest, now + 50250);
+    if (vdc.enabled) soonest = std::min<uint64_t>(soonest, now + 20100);
     // Stress: many more identifiers than the census holds, each at 20 Hz,
     // spread over time as a real bus would carry them (not in one burst).
     static uint64_t extraLast = 0;
@@ -674,12 +696,24 @@ static void obdRequest(uint32_t id, uint8_t pid) {
 
 /* ═══════════════════════════ SSM2 responder ══════════════════════════════ */
 
-static struct IsoRx { std::vector<uint8_t> buf; size_t total = 0; uint8_t sn = 0; bool active = false; } s_isoRx;
-static struct IsoTx { std::vector<uint8_t> msg; size_t off = 0; uint8_t sn = 1; bool waitingFc = false; } s_isoTx;
+/* One ISO 15765-2 node per computer: the engine ECU (0x7E0 -> 0x7E8, SSM2 and
+ * the OBD-II services that need more than a single frame) and the TCM (0x7E1
+ * -> 0x7E9). Each assembles a request, answers it, and sends a long answer
+ * as a first frame whose consecutive frames follow the master's flow control. */
+struct IsoNode {
+    const char *name;
+    uint32_t reqId, rspId;
+    struct { std::vector<uint8_t> buf; size_t total = 0; uint8_t sn = 0; bool active = false; } rx;
+    struct { std::vector<uint8_t> msg; size_t off = 0; uint8_t sn = 1; bool waitingFc = false; } tx;
+};
+static IsoNode s_ecmNode{"ECM", 0x7E0, 0x7E8}, s_tcmNode{"TCM", 0x7E1, 0x7E9};
+std::map<uint32_t, int> sim::isoRequests;
+int sim::codesCleared = 0;
 
 static uint8_t ssmByte(uint32_t a) {
     const Truth v = truth();
     const uint16_t rpm4 = (uint16_t)(v.rpm * 4);
+    const uint16_t odo2 = (uint16_t)(ecu.odometerKm / 2);
     switch (a) {
         case 0x07: return (uint8_t)std::lround((v.throttle * 0.8 + 15) * 2.55);
         case 0x08: return (uint8_t)(v.coolant + 40);
@@ -699,6 +733,8 @@ static uint8_t ssmByte(uint32_t a) {
         case 0x29: return (uint8_t)std::lround(v.throttle * 2.55);
         case 0x46: return 128;                                // lambda 1.0
         case 0x4A: return (uint8_t)(v.gear - 1);
+        case 0x10E: return odo2 >> 8;                        // odometer, 2 km a count
+        case 0x10F: return odo2 & 0xFF;
         case 0x113: return 95 + 40;
         case 0x64: return v.lights ? 0x08 : 0;                // bit 4 = lights
         case 0x121: return v.brake ? 0x48 : 0;                // brake + stop light
@@ -706,20 +742,20 @@ static uint8_t ssmByte(uint32_t a) {
     }
 }
 
-static void ecuSend(const std::vector<uint8_t> &msg, uint64_t at) {
+static void nodeSend(IsoNode &n, const std::vector<uint8_t> &msg, uint64_t at) {
     if (msg.size() <= 7) {
-        twai_message_t m = frame(0x7E8, {});
+        twai_message_t m = frame(n.rspId, {});
         m.data[0] = (uint8_t)msg.size();
         std::memcpy(&m.data[1], msg.data(), msg.size());
         schedule(at, m);
         return;
     }
-    twai_message_t m = frame(0x7E8, {});
+    twai_message_t m = frame(n.rspId, {});
     m.data[0] = (uint8_t)(0x10 | ((msg.size() >> 8) & 0x0F));
     m.data[1] = (uint8_t)(msg.size() & 0xFF);
     std::memcpy(&m.data[2], msg.data(), 6);
     schedule(at, m);
-    s_isoTx = {msg, 6, 1, true};                          // CFs follow our flow control
+    n.tx.msg = msg; n.tx.off = 6; n.tx.sn = 1; n.tx.waitingFc = true;   // CFs follow our flow control
 }
 
 static void ssmHandle(const std::vector<uint8_t> &req) {
@@ -728,7 +764,7 @@ static void ssmHandle(const std::vector<uint8_t> &req) {
     if (req[0] == 0xAA) {
         std::vector<uint8_t> r = {0xEA, 0xA1, 0x10, 0x09, 0x5B, 0x44, 0x3C, 0x41, 0x07};
         for (int i = 0; i < 96; i++) r.push_back(0xFF);   // every parameter supported
-        ecuSend(r, at);
+        nodeSend(s_ecmNode, r, at);
         return;
     }
     if (req[0] == 0xA8 && req.size() >= 5 && (req.size() - 2) % 3 == 0) {
@@ -742,33 +778,102 @@ static void ssmHandle(const std::vector<uint8_t> &req) {
         }
         if (bad || (ecu.ssmMaxAddrs && (int)n > ecu.ssmMaxAddrs)) {
             if (bad) ssmReadsWithBad++;
-            ecuSend({0x7F, 0xA8, 0x31}, at);
+            nodeSend(s_ecmNode, {0x7F, 0xA8, 0x31}, at);
             return;
         }
-        ecuSend(r, at);
+        nodeSend(s_ecmNode, r, at);
         return;
     }
-    ecuSend({0x7F, req[0], 0x11}, at);                    // service not supported
+    nodeSend(s_ecmNode, {0x7F, req[0], 0x11}, at);       // service not supported
 }
 
-/** A frame the master sent to 0x7E0 that is not an OBD-II request. */
-static void ssmFrame(const twai_message_t &m) {
+/** The codes a computer holds now: its own list, and what the TCM model
+ *  latched (P1718 in the TCM, P0700 in the ECM). */
+static std::vector<uint16_t> codesOf(bool tcm, uint8_t svc) {
+    std::vector<uint16_t> c;
+    if (svc == 0x03) {
+        c = tcm ? ecu.tcmStored : ecu.ecmStored;
+        if (tcm && T.p1718)  c.push_back(0x1718);
+        if (!tcm && T.p0700) c.push_back(0x0700);
+    } else if (svc == 0x07) {
+        c = tcm ? ecu.tcmPending : ecu.ecmPending;
+    }
+    return c;
+}
+
+/** The OBD-II services carried by ISO-TP: codes, clear, vehicle information. */
+static void obdIsoHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functional) {
+    const bool tcm = &n == &s_tcmNode;
+    const uint8_t svc = req[0];
+    const uint64_t at = simrtos::nowUs() + (tcm ? 1500 : ecu.replyLatencyUs);
+    auto refuse = [&](uint8_t code) { if (!functional) nodeSend(n, {0x7F, svc, code}, at); };
+    if (svc == 0x03 || svc == 0x07 || svc == 0x0A) {
+        if (svc == 0x0A && !ecu.permanentCodes) { refuse(0x11); return; }
+        const std::vector<uint16_t> c = codesOf(tcm, svc);
+        std::vector<uint8_t> r = {(uint8_t)(svc + 0x40), (uint8_t)c.size()};
+        for (uint16_t x : c) { r.push_back(x >> 8); r.push_back(x & 0xFF); }
+        nodeSend(n, r, at);
+        return;
+    }
+    if (svc == 0x04) {
+        if (ecu.clearNeedsEngineOff && truth().rpm > 0) { refuse(0x22); return; }
+        if (tcm) { ecu.tcmStored.clear(); ecu.tcmPending.clear(); T.p1718 = false; }
+        else     { ecu.ecmStored.clear(); ecu.ecmPending.clear(); T.p0700 = false; }
+        sim::codesCleared++;
+        nodeSend(n, {0x44}, at);
+        return;
+    }
+    if (svc == 0x09 && req.size() >= 2 && !tcm) {
+        std::vector<uint8_t> r = {0x49, req[1]};
+        if (req[1] == 0x02) {
+            r.push_back(1);
+            for (char ch : std::string("JF1BL5KS59G000123")) r.push_back((uint8_t)ch);
+        } else if (req[1] == 0x04) {
+            r.push_back(1);
+            const std::string cal = "A2WC522N";
+            for (int i = 0; i < 16; i++) r.push_back(i < (int)cal.size() ? (uint8_t)cal[i] : 0);
+        } else if (req[1] == 0x06) {
+            r.push_back(1);
+            for (uint8_t b : {0x1A, 0x2B, 0x3C, 0x4D}) r.push_back(b);
+        } else { refuse(0x12); return; }
+        nodeSend(n, r, at);
+        return;
+    }
+    refuse(0x11);                                       // service not supported
+}
+
+/** Does this node answer @p svc? */
+static void nodeHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functional) {
+    if (req.empty()) return;
+    const bool tcm = &n == &s_tcmNode;
+    if (!tcm && (req[0] == 0xAA || req[0] == 0xA8)) {
+        if (!functional && ecu.ssmEnabled) ssmHandle(req);
+        return;
+    }
+    if (tcm  && (!ecu.tcmEnabled || (!functional && !ecu.tcmPhysical))) return;
+    if (!tcm && (!ecu.obdEnabled || (!functional && !ecu.obdPhysical))) return;
+    obdIsoHandle(n, req, functional);
+}
+
+/** A frame the master sent to this node (or to everyone, @p functional). */
+static void nodeFrame(IsoNode &n, const twai_message_t &m, bool functional) {
     const uint64_t now = simrtos::nowUs();
     const uint8_t pci = m.data[0] & 0xF0;
-    if (pci == 0x30) {                                    // our flow control for the ECU's reply
-        if (!s_isoTx.waitingFc) { simLog('E', "SIM-BUG: flow control with no reply in progress"); return; }
-        if ((m.data[0] & 0x0F) == 2) { s_isoTx.waitingFc = false; return; }   // overflow: abort
-        s_isoTx.waitingFc = false;
+    if (pci == 0x30) {                                    // our flow control for its reply
+        if (functional) return;
+        if (!n.tx.waitingFc) { simLog('E', "SIM-BUG: flow control to the %s with no reply in progress", n.name); return; }
+        if ((m.data[0] & 0x0F) == 2) { n.tx.waitingFc = false; return; }   // overflow: abort
+        n.tx.waitingFc = false;
         uint64_t t = now + 500;
         static int replies = 0;
-        size_t end = s_isoTx.msg.size();
-        if (ecu.ssmCutEveryN && ++replies % ecu.ssmCutEveryN == 0) end = 6 + 7;   // one CF, then silence
-        while (s_isoTx.off < end) {
-            twai_message_t cf = frame(0x7E8, {});
-            cf.data[0] = (uint8_t)(0x20 | (s_isoTx.sn++ & 0x0F));
-            const size_t k = std::min((size_t)7, s_isoTx.msg.size() - s_isoTx.off);
-            std::memcpy(&cf.data[1], &s_isoTx.msg[s_isoTx.off], k);
-            s_isoTx.off += k;
+        size_t end = n.tx.msg.size();
+        if (&n == &s_ecmNode && ecu.ssmCutEveryN && ++replies % ecu.ssmCutEveryN == 0) end = 6 + 7;
+        while (n.tx.off < end) {
+            twai_message_t cf = frame(n.rspId, {});
+            cf.data[0] = (uint8_t)(0x20 | (n.tx.sn++ & 0x0F));
+            const size_t k = std::min((size_t)7, n.tx.msg.size() - n.tx.off);
+            std::memcpy(&cf.data[1], &n.tx.msg[n.tx.off], k);
+            n.tx.off += k;
             schedule(t, cf);
             t += 600;
         }
@@ -776,31 +881,32 @@ static void ssmFrame(const twai_message_t &m) {
     }
     if (pci == 0x00) {
         const uint8_t len = m.data[0] & 0x0F;
-        if (len >= 1 && len <= 7) ssmHandle(std::vector<uint8_t>(m.data + 1, m.data + 1 + len));
+        if (len >= 1 && len <= 7) nodeHandle(n, std::vector<uint8_t>(m.data + 1, m.data + 1 + len), functional);
         return;
     }
+    if (functional) { simLog('E', "SIM-BUG: a multi-frame request to 0x7DF"); return; }
     if (pci == 0x10) {
-        s_isoRx.total = (size_t)(m.data[0] & 0x0F) << 8 | m.data[1];
-        s_isoRx.buf.assign(m.data + 2, m.data + 8);
-        s_isoRx.sn = 1;
-        s_isoRx.active = true;
-        schedule(now + 1000, frame(0x7E8, {0x30, 0x00, ecu.ssmStmin, 0, 0, 0, 0, 0}));
+        n.rx.total = (size_t)(m.data[0] & 0x0F) << 8 | m.data[1];
+        n.rx.buf.assign(m.data + 2, m.data + 8);
+        n.rx.sn = 1;
+        n.rx.active = true;
+        schedule(now + 1000, frame(n.rspId, {0x30, 0x00, ecu.ssmStmin, 0, 0, 0, 0, 0}));
         return;
     }
     if (pci == 0x20) {
-        if (!s_isoRx.active) { simLog('E', "SIM-BUG: consecutive frame with no first frame"); return; }
-        if ((m.data[0] & 0x0F) != (s_isoRx.sn & 0x0F)) {
+        if (!n.rx.active) { simLog('E', "SIM-BUG: consecutive frame to the %s with no first frame", n.name); return; }
+        if ((m.data[0] & 0x0F) != (n.rx.sn & 0x0F)) {
             simLog('E', "SIM-BUG: consecutive frame out of order (got %u, want %u)",
-                   m.data[0] & 0x0F, s_isoRx.sn & 0x0F);
-            s_isoRx.active = false;
+                   m.data[0] & 0x0F, n.rx.sn & 0x0F);
+            n.rx.active = false;
             return;
         }
-        s_isoRx.sn++;
-        const size_t k = std::min((size_t)7, s_isoRx.total - s_isoRx.buf.size());
-        s_isoRx.buf.insert(s_isoRx.buf.end(), m.data + 1, m.data + 1 + k);
-        if (s_isoRx.buf.size() >= s_isoRx.total) {
-            s_isoRx.active = false;
-            ssmHandle(s_isoRx.buf);
+        n.rx.sn++;
+        const size_t k = std::min((size_t)7, n.rx.total - n.rx.buf.size());
+        n.rx.buf.insert(n.rx.buf.end(), m.data + 1, m.data + 1 + k);
+        if (n.rx.buf.size() >= n.rx.total) {
+            n.rx.active = false;
+            nodeHandle(n, n.rx.buf, false);
         }
     }
 }
@@ -853,9 +959,15 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
         C.tec--;
     }
     flagCheck();
-    if (m->identifier == 0x7DF || m->identifier == 0x7E0) {
-        if (m->data[0] == 0x02 && m->data[1] == 0x01) obdRequest(m->identifier, m->data[2]);
-        else if (m->identifier == 0x7E0 && ecu.ssmEnabled) ssmFrame(*m);
+    if (m->identifier == 0x7DF || m->identifier == 0x7E0 || m->identifier == 0x7E1) {
+        // What was asked of whom (single-frame OBD-II services but 01).
+        if ((m->data[0] & 0xF0) == 0 && m->data[1] != 0x01 && m->data[1] < 0x10)
+            sim::isoRequests[(m->identifier << 8) | m->data[1]]++;
+        if (m->identifier != 0x7E1 && m->data[0] == 0x02 && m->data[1] == 0x01)
+            obdRequest(m->identifier, m->data[2]);
+        else if (m->identifier == 0x7E0) nodeFrame(s_ecmNode, *m, false);
+        else if (m->identifier == 0x7E1) nodeFrame(s_tcmNode, *m, false);
+        else { nodeFrame(s_ecmNode, *m, true); nodeFrame(s_tcmNode, *m, true); }
     }
     return ESP_OK;
 }

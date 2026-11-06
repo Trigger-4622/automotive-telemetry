@@ -112,7 +112,7 @@ static uint8_t s_swRefused = 0;           /**< Bit per distinct switch byte. */
 
 /* ───────────────────────────────── state ─────────────────────────────────── */
 
-static QueueHandle_t s_rxQ = nullptr;     /**< 0x7E8 frames during an exchange. */
+static QueueHandle_t s_rxQ = nullptr;     /**< Reply frames during an exchange. */
 static volatile bool s_inExchange = false;
 static volatile bool s_active     = false;
 static volatile bool s_reinit     = false;
@@ -166,6 +166,32 @@ void     ssm2Reinit()    { s_reinit = true; }
 static void setErr(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     vsnprintf(s_lastErr, sizeof(s_lastErr), fmt, ap);
+    va_end(ap);
+}
+
+/**
+ * Who the exchange in progress talks to: request, reply and flow-control
+ * IDs, how long a reply may take, and where its failure is written. SSM2
+ * talks to the engine ECU (0x7E0 / 0x7E8) and writes to its own status;
+ * isoExchange() lends the transport to the trouble-code reader for the
+ * engine or the transmission computer. Only changed under diagBusLock().
+ */
+struct IsoLink {
+    uint32_t txId, rxId, fcId;
+    uint32_t timeoutMs;
+    char    *err;
+    size_t   errCap;
+};
+static IsoLink s_ssmLink = { SSM_REQUEST_ID, SSM_RESPONSE_ID, SSM_REQUEST_ID, 1000,
+                             s_lastErr, sizeof(s_lastErr) };
+static IsoLink *volatile s_link = &s_ssmLink;
+/** The reply ID ssm2FeedFrame() takes during an exchange (the RX task reads it). */
+static volatile uint32_t s_rxId = SSM_RESPONSE_ID;
+
+/** @brief Why the exchange in progress failed, for whoever asked. */
+static void linkErr(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(s_link->err, s_link->errCap, fmt, ap);
     va_end(ap);
 }
 
@@ -227,9 +253,9 @@ void ssm2GetStatus(Ssm2Status &out) {
 /* ─────────────────────────────── transport ───────────────────────────────── */
 
 bool ssm2FeedFrame(const twai_message_t &msg) {
-    if (msg.identifier != SSM_RESPONSE_ID || msg.extd) return false;
     // Outside an exchange a 0x7E8 frame is an OBD-II reply, not ours.
-    if (!s_inExchange || !s_rxQ) return false;
+    if (!s_inExchange || !s_rxQ || msg.extd) return false;
+    if (msg.identifier != s_rxId) return false;
     xQueueSend(s_rxQ, &msg, 0);   // never stall the receive task
     return true;
 }
@@ -250,19 +276,23 @@ static const char *guardWhy() {
     return "paused by bus guard";
 }
 
-/** @brief One padded frame to the ECU. Refuses while the bus guard is up. */
-static bool tx8(const uint8_t data[8]) {
-    if (!diagGuardOk()) { setErr("%s", guardWhy()); return false; }
+/** @brief One padded frame to @p id. Refuses while the bus guard is up. */
+static bool tx8To(uint32_t id, const uint8_t data[8]) {
+    if (!diagGuardOk()) { linkErr("%s", guardWhy()); return false; }
     twai_message_t m = {};
-    m.identifier       = SSM_REQUEST_ID;
+    m.identifier       = id;
     m.data_length_code = 8;
     memcpy(m.data, data, 8);
     if (!masterTransmit(m, 50)) {
-        setErr("%s", diagGuardOk() ? "transmit refused" : guardWhy());
+        linkErr("%s", diagGuardOk() ? "transmit refused" : guardWhy());
         return false;
     }
     return true;
 }
+/** @brief A frame of the request, to the computer being asked. */
+static bool tx8(const uint8_t data[8])   { return tx8To(s_link->txId, data); }
+/** @brief Our flow control for its reply, to its own (physical) address. */
+static bool txFc(const uint8_t data[8])  { return tx8To(s_link->fcId, data); }
 
 /**
  * @brief Wait for the ECU's flow control. WAIT frames extend the wait (at
@@ -271,12 +301,12 @@ static bool tx8(const uint8_t data[8]) {
 static bool waitFlowControl(uint8_t &bs, uint8_t &stmin) {
     twai_message_t fc;
     for (uint8_t waits = 0;;) {
-        if (!rxFrame(fc, T_FC_MS)) { setErr("no flow control from ECU"); return false; }
+        if (!rxFrame(fc, T_FC_MS)) { linkErr("no flow control from ECU"); return false; }
         if ((fc.data[0] & 0xF0) != PCI_FC) { s_stray++; continue; }
         const uint8_t fs = fc.data[0] & 0x0F;
         if (fs == 0) { bs = fc.data[1]; stmin = fc.data[2]; return true; }
         if (fs == 1 && ++waits <= 10) continue;
-        setErr("ECU flow control %s", fs == 2 ? "overflow" : "abort");
+        linkErr("ECU flow control %s", fs == 2 ? "overflow" : "abort");
         return false;
     }
 }
@@ -340,11 +370,11 @@ static bool isoSend(const uint8_t *p, size_t len) {
  * @return Bytes in @p out, 0 on timeout or a broken sequence.
  */
 static size_t isoRecv(uint8_t svc, uint8_t *out, size_t max) {
-    uint32_t deadline = millis() + Cfg.ssmTimeoutMs;
+    uint32_t deadline = millis() + s_link->timeoutMs;
     twai_message_t m;
     for (;;) {
         const int32_t left = (int32_t)(deadline - millis());
-        if (left <= 0 || !rxFrame(m, left)) { setErr("no reply from ECU"); return 0; }
+        if (left <= 0 || !rxFrame(m, left)) { linkErr("no reply from ECU"); return 0; }
         const uint8_t pci = m.data[0] & 0xF0;
 
         if (pci == PCI_SF) {
@@ -369,21 +399,21 @@ static size_t isoRecv(uint8_t svc, uint8_t *out, size_t max) {
             // Ours, but longer than it can be. Say so (flow control
             // "overflow") rather than leave the ECU waiting for a go-ahead.
             const uint8_t ovf[8] = { (uint8_t)(PCI_FC | 0x02), 0, 0, 0, 0, 0, 0, 0 };
-            tx8(ovf);
-            setErr("reply of %u bytes, at most %u expected", (unsigned)total, (unsigned)max);
+            txFc(ovf);
+            linkErr("reply of %u bytes, at most %u expected", (unsigned)total, (unsigned)max);
             return 0;
         }
         memcpy(out, &m.data[2], 6);
         size_t got = 6;
 
         uint8_t fc[8] = { (uint8_t)(PCI_FC | 0x00), 0x00, 0x00, 0, 0, 0, 0, 0 };
-        if (!tx8(fc)) return 0;
+        if (!txFc(fc)) return 0;
 
         uint8_t expect = 1;
         while (got < total) {
-            if (!rxFrame(m, T_CF_MS)) { setErr("reply cut short"); return 0; }
+            if (!rxFrame(m, T_CF_MS)) { linkErr("reply cut short"); return 0; }
             if ((m.data[0] & 0xF0) != PCI_CF) { s_stray++; continue; }
-            if ((m.data[0] & 0x0F) != (expect & 0x0F)) { setErr("reply frames out of order"); return 0; }
+            if ((m.data[0] & 0x0F) != (expect & 0x0F)) { linkErr("reply frames out of order"); return 0; }
             expect++;
             const size_t n = min((size_t)7, total - got);
             memcpy(out + got, &m.data[1], n);
@@ -405,6 +435,7 @@ static ExResult exchange(const uint8_t *req, size_t len, uint8_t svc,
     got = 0;
     if (!diagGuardOk()) { setErr("%s", guardWhy()); return EX_BUSY; }
     if (!diagBusLock(250)) return EX_BUSY;
+    s_ssmLink.timeoutMs = Cfg.ssmTimeoutMs;
     s_inExchange = true;
     flushRx();
     if (isoSend(req, len)) got = isoRecv(svc, rsp, max);
@@ -418,6 +449,38 @@ static ExResult exchange(const uint8_t *req, size_t len, uint8_t svc,
         return EX_NRC;
     }
     return got ? EX_OK : EX_FAIL;
+}
+
+IsoResult isoExchange(uint32_t txId, uint32_t rxId, uint32_t fcId,
+                      const uint8_t *req, size_t len, uint8_t *rsp, size_t max, size_t &got,
+                      uint32_t timeoutMs, char *why, size_t whyCap) {
+    got = 0;
+    char none[4];
+    IsoLink L = { txId, rxId, fcId, timeoutMs, why && whyCap ? why : none,
+                  why && whyCap ? whyCap : sizeof(none) };
+    L.err[0] = '\0';
+    if (!s_rxQ || !len) { snprintf(L.err, L.errCap, "not started"); return ISO_BUSY; }
+    // A request to every computer at once must fit one frame: their flow
+    // controls would all answer a first frame together.
+    if (txId == 0x7DF && len > 7) { snprintf(L.err, L.errCap, "too long for 0x7DF"); return ISO_BUSY; }
+    if (!diagGuardOk()) { snprintf(L.err, L.errCap, "%s", guardWhy()); return ISO_BUSY; }
+    if (!diagBusLock(250)) { snprintf(L.err, L.errCap, "the bus is in use"); return ISO_BUSY; }
+    s_link = &L;
+    s_rxId = rxId;                     // before s_inExchange: the RX task reads both
+    s_inExchange = true;
+    flushRx();
+    const bool sent = isoSend(req, len);
+    if (sent) got = isoRecv((uint8_t)(req[0] + 0x40), rsp, max);
+    s_inExchange = false;
+    s_rxId = SSM_RESPONSE_ID;
+    s_link = &s_ssmLink;
+    diagBusUnlock();
+    if (!sent) return ISO_BUSY;
+    if (got >= 3 && rsp[0] == SSM_NEGATIVE) {
+        snprintf(L.err, L.errCap, "refused 0x%02X (code 0x%02X)", rsp[1], rsp[2]);
+        return ISO_NRC;
+    }
+    return got ? ISO_OK : ISO_NO_REPLY;
 }
 
 /* ───────────────────────────────── init ──────────────────────────────────── */

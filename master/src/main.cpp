@@ -46,6 +46,8 @@
 #include "MasterTelemetry.h"
 #include "Learner.h"
 #include "Ssm2.h"
+#include "DiagCodes.h"
+#include "DriveLog.h"
 #include "WebPortal.h"
 
 /**
@@ -385,6 +387,7 @@ static bool heardWithin(uint32_t ms) {
     const uint32_t last = s_lastCanMs;
     return last && millis() - last < ms;
 }
+bool masterHeardWithin(uint32_t ms) { return heardWithin(ms); }
 
 static volatile bool s_obdSettled = false;   /**< One full OBD pass done. */
 bool diagObdSettled() { return s_obdSettled; }
@@ -1594,6 +1597,86 @@ void masterUpdateDerived() {
             }
         if (known) publishMetric(METRIC_ID_DOOR_OPEN, open ? 1.0f : 0.0f, SRC_DERIVED);
     }
+
+    // Oil change due: the interval on from the odometer at the last change.
+    float odo;
+    if (Cfg.oilAtKm >= 0 && masterOdometer(odo))
+        publishMetric(METRIC_ID_SERVICE_KM,
+                      (float)((double)Cfg.oilAtKm + Cfg.oilEveryKm - odo), SRC_DERIVED);
+}
+
+bool masterOdometer(float &km) {
+    float v; uint32_t age; uint8_t src;
+    // SSM2 reads it every 5 s; OBD-II PID A6 on cars that have it.
+    if (metricLookup(METRIC_ID_SSM_ODOMETER, v, age, src) && age < 20000 && v > 0) { km = v; return true; }
+    if (metricLookup(METRIC_ID_ODOMETER, v, age, src) && age < 30000 && v > 0)     { km = v; return true; }
+    return false;
+}
+
+bool masterServiceReset(char *why, size_t cap) {
+    float odo;
+    if (!masterOdometer(odo)) {
+        snprintf(why, cap, "the odometer has not been read - switch the ignition on");
+        return false;
+    }
+    Cfg.lock();
+    Cfg.oilAtKm = (int32_t)lroundf(odo);
+    Cfg.unlock();
+    Cfg.requestSave();
+    log_i("service: oil changed at %ld km, next at %ld km", (long)Cfg.oilAtKm,
+          (long)(Cfg.oilAtKm + (int32_t)Cfg.oilEveryKm));
+    return true;
+}
+
+/**
+ * @brief Longitudinal and lateral G for the G-meter when the car does not
+ *        broadcast them, or they are not taught yet.
+ *
+ * Longitudinal: the slope of the speed over the last second (least squares -
+ * OBD-II speed comes in whole km/h, and a two-point difference of those is
+ * 0.14 g of noise at 5 Hz). Lateral: speed times yaw rate, when a yaw rate is
+ * known. Signs per ISO 8855: speeding up and turning left are positive.
+ * A field taught onto either outranks these (SRC_RAW over SRC_DERIVED).
+ * Called from the broadcast task only: it keeps its samples between calls.
+ */
+static void gDerive() {
+    static constexpr int N = 24;
+    static uint32_t ts[N];
+    static float    vs[N];
+    static int      n = 0, head = 0;
+    static uint32_t lastStamp = 0;
+    float v; uint32_t age; uint8_t src;
+    const uint32_t now = millis();
+    if (!metricLookup(METRIC_ID_SPEED, v, age, src) || age > 1500) { n = 0; return; }
+    const uint32_t stamp = now - age;
+    if (stamp != lastStamp) {
+        lastStamp = stamp;
+        ts[head] = stamp; vs[head] = v;
+        head = (head + 1) % N;
+        if (n < N) n++;
+    }
+    // Least squares over the samples of the last second.
+    double st = 0, sv = 0, stt = 0, stv = 0;
+    int k = 0;
+    uint32_t oldest = now;
+    for (int i = 0; i < n; i++) {
+        const int j = (head - 1 - i + N) % N;
+        if (now - ts[j] > 1000) break;
+        const double t = (double)(int32_t)(ts[j] - now) / 1000.0, x = vs[j];
+        st += t; sv += x; stt += t * t; stv += t * x; k++;
+        oldest = ts[j];
+    }
+    if (k >= 3 && now - oldest >= 300) {
+        const double den = k * stt - st * st;
+        if (den > 1e-9) {
+            const double kmhPerS = (k * stv - st * sv) / den;
+            publishMetric(METRIC_ID_LON_ACCEL, (float)(kmhPerS / 3.6 / 9.80665), SRC_DERIVED);
+        }
+    }
+    float yaw;
+    if (metricLookup(METRIC_ID_YAW_RATE, yaw, age, src) && age < 500 && src != SRC_DERIVED)
+        publishMetric(METRIC_ID_LAT_ACCEL,
+                      (float)(v / 3.6 * yaw * (M_PI / 180.0) / 9.80665), SRC_DERIVED);
 }
 
 static void setupTwai(bool silent);
@@ -2005,6 +2088,7 @@ static void broadcastTask(void *) {
         // this after each reply, but values read from the bus arrive with no
         // reply at all - listening only, boost and AFR would otherwise freeze.
         masterUpdateDerived();
+        gDerive();
 
         const uint32_t now = millis();
         const bool night = s_night;
@@ -2954,6 +3038,8 @@ void setup() {
     xTaskCreatePinnedToCore(busGuardTask,    "busguard",  3072, nullptr,  9, nullptr, 1);
     ssm2Begin();
     learnerBegin();
+    codesBegin();
+    driveLogBegin();
 }
 
 /**

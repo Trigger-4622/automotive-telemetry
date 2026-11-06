@@ -64,6 +64,7 @@ bool diagObdWanted();                 /**< The OBD-II poller should run.   */
 void diagReportSsm(bool answered);    /**< SSM2 init result, from its task.*/
 void diagReportObd(bool answered);    /**< OBD-II probe result.            */
 bool diagBusAlive();                  /**< Frames seen within the last 2 s.*/
+bool masterHeardWithin(uint32_t ms);  /**< A frame within the last @p ms.  */
 /** One diagnostic dialogue on the bus at a time. Both engines transmit to
  *  0x7E0 and listen on 0x7E8; interleaving them corrupts both. */
 bool diagBusLock(uint32_t timeoutMs);
@@ -299,3 +300,11 @@ bool diagObdSettled();
  *        and by the broadcaster before every burst (bus-read inputs).
  */
 void masterUpdateDerived();
+
+/** @brief The odometer [km]: SSM2's, else OBD-II PID A6. @return false if neither is fresh. */
+bool masterOdometer(float &km);
+/**
+ * @brief "Oil changed now": the odometer becomes the last change.
+ * @param[out] why Why not (the odometer not read yet).
+ */
+bool masterServiceReset(char *why, size_t cap);

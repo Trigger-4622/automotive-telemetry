@@ -7,6 +7,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <deque>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -241,8 +242,31 @@ long writeBudget = -1;
 bool renameOverwrites = true;
 bool mountOk = true;
 int  renames = 0, removes = 0;
+size_t totalBytes = 1536 * 1024;
+std::set<std::string> dirs;
+size_t usedBytes() {
+    size_t n = 2 * 4096;                       // superblocks
+    for (const auto &kv : files) n += (kv.second.size() + 4095) / 4096 * 4096 + 4096;
+    return n;
+}
 }
 LittleFSFS LittleFS;
+
+bool LittleFSFS::mkdir(const char *p) { simfs::dirs.insert(p); return true; }
+size_t File::size() const { return _st ? _st->data.size() : 0; }
+const char *File::name() const {
+    if (!_st) return "";
+    const size_t k = _st->path.rfind('/');
+    return _st->path.c_str() + (k == std::string::npos ? 0 : k + 1);
+}
+File File::openNextFile() {
+    File f;
+    if (!_st || !_st->dir || _st->next >= _st->list.size()) return f;
+    f._st = std::make_shared<State>();
+    f._st->path = _st->list[_st->next++];
+    f._st->data = simfs::files[f._st->path];
+    return f;
+}
 
 bool LittleFSFS::begin(bool) { return simfs::mountOk; }
 bool LittleFSFS::exists(const char *p) { return simfs::files.count(p) > 0; }
@@ -257,12 +281,26 @@ bool LittleFSFS::rename(const char *from, const char *to) {
 }
 File LittleFSFS::open(const char *path, const char *mode) {
     File f;
-    const bool w = mode && mode[0] == 'w';
-    if (!w && !simfs::files.count(path)) return f;
+    const bool w = mode && mode[0] == 'w', a = mode && mode[0] == 'a';
+    if (!w && !a && !simfs::files.count(path)) {
+        // A directory: a path made with mkdir, or one files live under.
+        const std::string pre = std::string(path) + "/";
+        std::vector<std::string> list;
+        for (const auto &kv : simfs::files)
+            if (kv.first.compare(0, pre.size(), pre) == 0 && kv.first.find('/', pre.size()) == std::string::npos)
+                list.push_back(kv.first);
+        if (list.empty() && !simfs::dirs.count(path)) return f;
+        f._st = std::make_shared<File::State>();
+        f._st->path = path;
+        f._st->dir = true;
+        f._st->list = list;
+        return f;
+    }
     f._st = std::make_shared<File::State>();
     f._st->path = path;
-    f._st->writing = w;
+    f._st->writing = w || a;
     if (w) simfs::files[path] = "";
+    else if (a) simfs::files[path];            // created if missing, kept if not
     else   f._st->data = simfs::files[path];
     return f;
 }

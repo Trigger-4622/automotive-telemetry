@@ -220,12 +220,23 @@ void MasterConfig::loadDefaults() {
     keepaliveMs = 300; sourceHoldMs = 500; ldrDark = NIGHT_LDR_DARK_ADC; ldrLight = NIGHT_LDR_LIGHT_ADC;
     sleepEnabled = true;
     sleepIdleS   = 90;
-    ecuId[0] = ecuSysId[0] = ecuFlags[0] = '\0';
+    ecuId[0] = ecuSysId[0] = ecuFlags[0] = ecuCalId[0] = vin[0] = '\0';
     ssmRemoved.clear();
+    dtcPollS = 60;
+    oilEveryKm = 7500; oilAtKm = -1;
+    logOn = false; logHz = 10; logMaxKb = 1024;
+    defaultLogIds(logIds);
 
     unlock();
     reseedPids();
     reseedTables();
+}
+
+void MasterConfig::defaultLogIds(std::vector<uint16_t> &ids) {
+    ids = { METRIC_ID_RPM, METRIC_ID_SPEED, METRIC_ID_THROTTLE, METRIC_ID_SSM_ACCEL_ANGLE,
+            METRIC_ID_BOOST, METRIC_ID_SSM_TGT_BOOST, METRIC_ID_SSM_WGDC, METRIC_ID_MAF,
+            METRIC_ID_ENGINE_LOAD, METRIC_ID_TIMING_ADV, METRIC_ID_SSM_KNOCK_CORR,
+            METRIC_ID_SSM_SI_DRIVE, METRIC_ID_GEAR, METRIC_ID_COOLANT_TEMP };
 }
 
 void MasterConfig::reseedPids() {
@@ -526,6 +537,16 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["ecu_id"]       = ecuId;
     doc["ecu_sys_id"]   = ecuSysId;
     doc["ecu_flags"]    = ecuFlags;
+    doc["ecu_cal_id"]   = ecuCalId;
+    doc["vin"]          = vin;
+    doc["dtc_poll_s"]   = dtcPollS;
+    doc["oil_every_km"] = oilEveryKm;
+    doc["oil_at_km"]    = oilAtKm;
+    doc["log_on"]       = logOn;
+    doc["log_hz"]       = logHz;
+    doc["log_max_kb"]   = logMaxKb;
+    JsonArray li = doc["log_ids"].to<JsonArray>();
+    for (uint16_t id : logIds) li.add(id);
     JsonArray rm = doc["ssm_removed"].to<JsonArray>();
     for (uint32_t a : ssmRemoved) rm.add(a);
 
@@ -709,6 +730,25 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
         strlcpy(ecuSysId, v["ecu_sys_id"].as<const char *>(), sizeof(ecuSysId));
     if (v["ecu_flags"].is<const char *>())
         strlcpy(ecuFlags, v["ecu_flags"].as<const char *>(), sizeof(ecuFlags));
+    if (v["ecu_cal_id"].is<const char *>())
+        strlcpy(ecuCalId, v["ecu_cal_id"].as<const char *>(), sizeof(ecuCalId));
+    if (v["vin"].is<const char *>())
+        strlcpy(vin, v["vin"].as<const char *>(), sizeof(vin));
+    dtcPollS   = (uint16_t)jint(v["dtc_poll_s"], dtcPollS, 0, 3600);
+    oilEveryKm = (uint32_t)jint(v["oil_every_km"], (int)oilEveryKm, 500, 100000);
+    oilAtKm    = jint(v["oil_at_km"], oilAtKm, -1, 9999999);
+    logOn      = v["log_on"] | logOn;
+    logHz      = (uint8_t)jint(v["log_hz"], logHz, 1, 20);
+    logMaxKb   = (uint16_t)jint(v["log_max_kb"], logMaxKb, 64, 1200);
+    if (v["log_ids"].is<JsonArrayConst>()) {
+        logIds.clear();
+        for (JsonVariantConst a : v["log_ids"].as<JsonArrayConst>()) {
+            const int id = jkey(a, 0xFFFF);
+            if (id && logIds.size() < 24 &&
+                std::find(logIds.begin(), logIds.end(), (uint16_t)id) == logIds.end())
+                logIds.push_back((uint16_t)id);
+        }
+    }
 
     if (v["ssm_removed"].is<JsonArrayConst>()) {
         ssmRemoved.clear();
