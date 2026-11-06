@@ -153,6 +153,15 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   the radio and learner statistics lock to one shared clock.
 - ESP-NOW broadcasts are change-driven with a 300 ms keep-alive (screens drop
   a value after 1.5 s); frames/s is not a health metric, metrics/s is.
+  Broadcasts are not acknowledged, so a change to an on/off value or a
+  position (0x12xx, 0x21xx, the lever: `isStateMetric`) rides in the next two
+  bursts too - one lost packet used to cost a whole indicator flash
+  (`lamp_radio_loss`: a third of packets lost, 50 of 52 changes on time).
+- The master's portal: Arduino's `WebServer` serves one connection at a time
+  and waits up to 5 s on one that has sent nothing yet - which browsers open
+  ahead of need. `PortalServer` (WebPortal.cpp.in) drops such a connection as
+  soon as another is waiting. The page gives every request a deadline, polls
+  one at a time, and polls nothing else while a teach runs.
 - **The portals are the only way into the settings** (no serial console, and
   the settings survive a reflash), so nothing may keep an AP from starting.
   Master: a Wi-Fi name of 1-32 bytes and a password of at most 63 are enforced
@@ -191,6 +200,24 @@ frame tells every position apart does it fall back to one bit per position
 combines into the lever; single doors likewise make `DOOR_OPEN`. A taught
 field always outranks the derived value.
 
+A teach runs on the clock: the countdown is redrawn whatever the Wi-Fi does,
+and a reading counts only for the step it was both asked for and answered in
+(`teachSlot`); a step with fewer than `TEACH_MIN_READS` (3) readings makes the
+page say the master answered too slowly (two can make a slow counter bit look
+like a switch). The indicators are taught in one run - off, left, off, right,
+off, hazard, off (`teachTurns`): a bit that flashes for one side only is that
+side, one that flashes for both is reported and never offered, the hazard
+switch is the bit held on only in the hazard step, and a stalk bit held for
+one side is the fallback (the screens flash those themselves). The lever's
+own field is preferred - the shortest run of neighbouring moving bits that
+tells every position apart - over the combination of every bit that moved,
+and a combination's code within a quarter of its width of exactly one entry
+reads as that entry (`nearestCode`, `lever_tolerant`); numeric tables still
+need an exact match. Using a taught signal replaces whatever fed that value
+before, once confirmed. The screens flash both arrows while `METRIC_ID_HAZARD`
+is on - following each side's own bit when it flashes, in step by themselves
+when it does not (`lamp_hazard_switch`).
+
 ## Open items
 
 - Master power-on settle wait (`start_delay_s`, 10 s default): flashed
@@ -215,10 +242,23 @@ field always outranks the derived value.
   ohm terminator (CANH-CANL ~40 ohm instead of ~60), its RS pin, its ground
   to OBD pin 5, the supply - and confirm with the portal's "What the errors
   are" before changing firmware for it.
-- Screens: warning lamps, dash screen and the cluster redesign are built and
-  tested in the harness but not yet flashed or seen on hardware.
-- Cluster: whether the Arduino_GFX driver cured the panel speckle is
-  unconfirmed on hardware.
+- Master flashed again 2026-09-30 evening (branch portal-teach-turns-hazard:
+  the portal's time-limited requests and idle-connection fix, the indicators'
+  teach run, the lever field and tolerant lever reading, lamp repeats). The
+  car's lever is saved as 8 bits of 0x253 ([9,28,29,48,49,51,52,54], taught
+  that morning); its own field looks like bits 28-29 (P 3, R 2, N 1, D 0) -
+  re-teach it with the new page, which offers to replace the old one.
+- Round screen flashed 2026-09-30 evening from the same branch (lamps, dash,
+  lever letters, hazard arrows): layout and file area byte-identical after,
+  boot log clean. Its esptool needs `--before usb_reset` (native USB), and a
+  plain upload writes boot_app0 at 0xE000, inside its nvs range - harmless,
+  that sector already holds boot_app0.
+- Cluster flashed 2026-09-30 evening from the same branch (lamps, dash,
+  redesign, lever letters, hazard arrows): file area byte-identical after,
+  colour and touch calibration loaded, boot log clean. Same `usb_reset` and
+  boot_app0-at-0xE000 notes as the round screen. Not yet seen on the car:
+  the lamps, the dash screen, and whether the Arduino_GFX driver cured the
+  panel speckle.
 
 More detail: `master/BRINGUP.md`, `master/MASTER_NODE_BLUEPRINT.md`, each
 screen's README, and each `test_host/README.md`.

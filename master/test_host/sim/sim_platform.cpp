@@ -7,6 +7,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <deque>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -296,9 +297,14 @@ esp_err_t esp_wifi_set_channel(uint8_t, wifi_second_chan_t) { return ESP_OK; }
 
 namespace sim {
 std::map<uint16_t, Shown> displayed;
-uint64_t espPackets = 0, espBadPackets = 0, espSeqGaps = 0;
+uint64_t espPackets = 0, espBadPackets = 0, espSeqGaps = 0, espLost = 0;
+uint16_t watchMetric = 0;
+std::vector<Seen> watchLog;
 bool sleepEntered = false;
 }
+/** Which packets the displays miss: its own generator, so a lossy radio does
+ *  not reshuffle the car's random traffic. */
+static std::mt19937 s_lossRng(4242);
 static bool s_espInit = false;
 static uint32_t s_lastSeq = 0;
 static bool s_haveSeq = false;
@@ -323,6 +329,12 @@ esp_err_t esp_now_send(const uint8_t *, const uint8_t *data, size_t len) {
     s_lastSeq = p->sequence_id;
     s_haveSeq = true;
     sim::espPackets++;
+    // Sent, and never received: the master has no way to know.
+    if (sim::faults.radioLoss > 0 &&
+        std::uniform_real_distribution<double>(0, 1)(s_lossRng) < sim::faults.radioLoss) {
+        sim::espLost++;
+        return ESP_OK;
+    }
     for (uint8_t i = 0; i < p->metric_count; i++) {
         // Copied out first: the fields are packed (unaligned), and binding a
         // reference to one - std::map::operator[] takes the key by reference -
@@ -331,6 +343,8 @@ esp_err_t esp_now_send(const uint8_t *, const uint8_t *data, size_t len) {
         const float value = p->metrics[i].value;
         const uint8_t flags = p->metrics[i].flags;
         sim::displayed[id] = { value, flags, simrtos::nowUs() };
+        if (id == sim::watchMetric && (sim::watchLog.empty() || sim::watchLog.back().value != value))
+            sim::watchLog.push_back({ simrtos::nowUs(), value });
     }
     return ESP_OK;
 }

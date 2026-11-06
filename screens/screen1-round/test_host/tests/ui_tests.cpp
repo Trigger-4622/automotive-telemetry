@@ -693,6 +693,70 @@ SCENARIO(lamp_turn_signals) {
     shot("strip_hazard");
 }
 
+/* The hazard switch alone lights both arrows, flashing in step; with the
+ * car's flasher on the bus they follow that instead; and an indicator on its
+ * own never lights the other side. */
+SCENARIO(lamp_hazard_switch) {
+    engineOn();
+    boot();
+    gotoPlain();
+    auto flashes = [](const char *key, int ms) {
+        int flips = 0; bool prev = lamp(key).lit;
+        for (int i = 0; i < ms / 25; i++) { run(25); flips += lamp(key).lit != prev; prev = lamp(key).lit; }
+        return flips;
+    };
+    // Only the switch is known: nothing about either side.
+    car.set(METRIC_ID_HAZARD, 1);
+    car.send();
+    run(300);
+    CHECK(lamp("turn_left").on && lamp("turn_right").on, "hazard switch on: both arrows on");
+    int mismatch = 0;
+    for (int i = 0; i < 100; i++) { run(25); mismatch += lamp("turn_left").lit != lamp("turn_right").lit; }
+    CHECK(mismatch == 0, "the two arrows out of step %d times", mismatch);
+    const int f = flashes("turn_left", 2500);
+    CHECK(f >= 5 && f <= 9, "hazard arrows made %d changes in 2.5 s", f);
+    shot("strip_hazard_switch");
+    car.set(METRIC_ID_HAZARD, 0);
+    car.send();
+    run(300);
+    CHECK(!lamp("turn_left").lit && !lamp("turn_right").lit, "switch off: both dark");
+
+    // Each side's bit is the lever (steady 0 in the centre) and the switch is
+    // on: they still flash, by themselves, in step.
+    car.set(METRIC_ID_TURN_LEFT, 0);
+    car.set(METRIC_ID_TURN_RIGHT, 0);
+    car.set(METRIC_ID_HAZARD, 1);
+    car.send();
+    run(300);
+    mismatch = 0;
+    for (int i = 0; i < 100; i++) { run(25); mismatch += lamp("turn_left").lit != lamp("turn_right").lit; }
+    CHECK(mismatch == 0 && lamp("turn_left").on, "lever bits at rest, switch on: both flash in step (%d)", mismatch);
+
+    // The car's flasher on the bus, 350 ms on / 350 ms off, both sides: the
+    // arrows follow it, not a rhythm of their own.
+    int agree = 0, total = 0;
+    for (int k = 0; k < 6; k++) {
+        car.set(METRIC_ID_TURN_LEFT, 1); car.set(METRIC_ID_TURN_RIGHT, 1); car.send();
+        for (int i = 0; i < 14; i++) { run(25); agree += lamp("turn_left").lit && lamp("turn_right").lit; total++; }
+        car.set(METRIC_ID_TURN_LEFT, 0); car.set(METRIC_ID_TURN_RIGHT, 0); car.send();
+        for (int i = 0; i < 14; i++) { run(25); agree += !lamp("turn_left").lit && !lamp("turn_right").lit; total++; }
+    }
+    CHECK(agree * 100 / total >= 85, "arrows followed the car's flasher only %d%% of the time", agree * 100 / total);
+
+    // The switch off, the left indicator on: the right arrow stays dark.
+    car.set(METRIC_ID_HAZARD, 0);
+    car.send();
+    run(1500);
+    int rightLit = 0;
+    for (int k = 0; k < 4; k++) {
+        car.set(METRIC_ID_TURN_LEFT, 1); car.send();
+        for (int i = 0; i < 14; i++) { run(25); rightLit += lamp("turn_right").lit; }
+        car.set(METRIC_ID_TURN_LEFT, 0); car.send();
+        for (int i = 0; i < 14; i++) { run(25); rightLit += lamp("turn_right").lit; }
+    }
+    CHECK(rightLit == 0, "left indicator lit the right arrow %d times", rightLit);
+}
+
 /* A lamp whose signal stops arriving goes dark, popup and all. */
 SCENARIO(lamp_stale) {
     engineOn();

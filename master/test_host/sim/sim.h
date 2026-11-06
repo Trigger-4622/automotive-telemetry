@@ -86,6 +86,10 @@ struct BusFaults {
      * writes do it (masterBusBlind).
      */
     uint32_t rxStallEveryMs = 0, rxStallMs = 0;
+    /** The displays miss this share of the master's ESP-NOW packets (a car
+     *  full of 2.4 GHz, a phone on the portal). Broadcasts are not
+     *  acknowledged: the master cannot tell. */
+    double   radioLoss = 0;
 };
 
 extern EcuConfig ecu;
@@ -101,6 +105,12 @@ extern uint64_t ssmReadsWithBad;               ///< SSM reads refused for the ba
 struct Shown { float value; uint8_t flags; uint64_t tUs; };
 extern std::map<uint16_t, Shown> displayed;    ///< Latest value per metric at the displays.
 extern uint64_t espPackets, espBadPackets, espSeqGaps;
+extern uint64_t espLost;                       ///< Packets the displays missed (faults.radioLoss).
+/** Every change of one metric as the displays received it - @ref watchMetric,
+ *  0 for none - with when it arrived: how late a lamp follows the car. */
+struct Seen { uint64_t tUs; float value; };
+extern uint16_t watchMetric;
+extern std::vector<Seen> watchLog;
 
 extern bool sleepEntered;
 extern int  logErrors, logWarnings;

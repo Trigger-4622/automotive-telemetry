@@ -59,6 +59,9 @@ button.d{color:var(--crit)}
 button.x{background:none;border:0;color:var(--muted);cursor:pointer;font-size:16px;padding:0 4px}
 button:disabled{opacity:.5}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+/* A class that sets display outranks the browser's own [hidden] rule: without
+   this, a hidden .row (the positions list) showed for every kind of teaching. */
+[hidden]{display:none!important}
 .f{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:11px 0;border-bottom:1px solid var(--line)}
 .f:last-child{border-bottom:0}
 .f .l b{display:block;font-weight:500}.f .l span{font-size:12px;color:var(--muted)}
@@ -129,12 +132,13 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div id="lkBox"></div></div>
  <div class="card" id="teach"><h2>Teach by doing <small>for what the ECU cannot report</small></h2>
   <p class="say" style="margin:0 0 10px">Turn signals, doors, handbrake, steering, wheel speeds, the gear lever… Pick what you are about to
-   operate, press Start and follow the steps. The master finds the bits or bytes that followed you. A flashing turn signal is
-   fine: leave it flashing through the ON step. For the gear lever, pick <b>Gear lever</b>, foot on the brake, and move it
-   through the positions as asked: it ends back in P, so every bit is checked twice. The master learns the lever as one value
-   from whichever bits change with it, in one byte or several.</p>
+   operate, press Start and follow the steps. The master finds the bits or bytes that followed you. For the indicators, pick
+   <b>Left turn signal</b>, <b>Right turn signal</b> or <b>Hazard lights</b>: one run teaches all three - the left indicator, the right one,
+   then the hazard lights, each left flashing for a few seconds - so the master can tell the two sides apart. For the gear
+   lever, pick <b>Gear lever</b>, foot on the brake, and move it through the positions as asked: it ends back in P, so every
+   bit is checked twice.</p>
   <div class="row"><select id="tM" style="flex:1;min-width:180px"></select>
-   <select id="tK"><option value="bit">On / off</option><option value="val">A moving value</option><option value="pos">Positions</option></select>
+   <select id="tK"></select>
    <button class="b p" id="tBtn" onclick="teachStart()">Start</button></div>
   <div class="row" id="tPRow" hidden style="margin-top:8px"><span class="muted">Positions, in the order you will select them:</span>
    <input id="tP" style="flex:1;min-width:120px" value="P R N D"></div>
@@ -254,7 +258,18 @@ const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.r
 const SRC={1:['SSM2','ssm'],2:['OBD-II','obd'],3:['calc','calc'],4:['bus','raw']};
 let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='dash',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
 function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2400)}
-async function post(u,msg,then){try{const r=await fetch(u,{method:'POST'});if(!r.ok)throw 0;toast(msg);if(then)setTimeout(then,500)}catch(e){toast('Failed')}}
+/* Every request has a deadline. The master answers one connection at a time,
+   and a request the browser never gives up on - a lost Wi-Fi frame, a busy
+   master - froze whatever was waiting for it, the teach countdown included. */
+async function req(u,o,ms){
+ const c=new AbortController(),t=setTimeout(()=>c.abort(),ms||6000);
+ try{const r=await fetch(u,Object.assign({},o,{signal:c.signal}));if(!r.ok)throw new Error('HTTP '+r.status);return await r.json()}
+ finally{clearTimeout(t)}}
+/* One request of each kind at a time: a poll still waiting is not joined by
+   the next one, so a slow moment cannot pile up into a slow minute. */
+const BUSY={};
+async function solo(k,fn){if(BUSY[k])return;BUSY[k]=1;try{await fn()}finally{BUSY[k]=0}}
+async function post(u,msg,then){try{await req(u,{method:'POST'},8000);toast(msg);if(then)setTimeout(then,500)}catch(e){toast('Failed')}}
 function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v)}
 function go(t){TAB=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
  ['dash','bus','src','set','adv','diag'].forEach(x=>$('#t-'+x).hidden=x!==t);
@@ -297,7 +312,9 @@ const inside=sel=>{const a=document.activeElement;return!!(a&&a.closest&&a.close
 /* soft: keep every edit not saved yet and take the master's version of the rest -
    the master changes its own tables (learner, verifier) while the page is open. */
 async function load(soft){
- let n;try{n=await fetch('/api/config').then(r=>r.json())}catch(e){return}
+ let n;try{n=await req('/api/config',null,10000)}catch(e){
+  if(!LOADED)setTimeout(()=>load(),2000);      // nothing on the settings tabs works without it
+  return}
  if(soft&&LOADED){
   // A table row being edited right now keeps its data: its inputs write back
   // by row number, and a refreshed table may have rows in other places.
@@ -334,12 +351,13 @@ async function save(){
  if(!Object.keys(body).length){setDirty(false);toast('Nothing changed');return}
  const reboot=REBOOT_KEYS.some(k=>k in body);
  try{
-  if(body.signals){const now=await fetch('/api/config').then(r=>r.json());
+  if(body.signals){const now=await req('/api/config',null,10000);
    body.signals=mergeSignals(ORIG.signals||[],C.signals||[],now.signals||[])}
   if(body.pids)body.pids=body.pids.map(({name,metrics,...p})=>p);   // read-only extras stay here
-  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok)throw 0;setDirty(false);toast(reboot?'Saved - reboot to apply':'Saved');await load()}
- catch(e){toast('Save failed')}}
+  // Generous: the master writes its flash before it answers.
+  await req('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},15000);
+  setDirty(false);toast(reboot?'Saved - reboot to apply':'Saved');await load()}
+ catch(e){toast('Save failed - try again')}}
 
 /* ───────────── advanced: every setting ───────────── */
 const ADV=[
@@ -501,9 +519,10 @@ function extract(b,st,len,be,sg){
  else{for(let i=0;i<8;i++)w=(w<<8n)|BigInt(b[i]||0);const msb=Math.floor(st/8)*8+(7-st%8),sh=64-msb-len;w=sh>=0?(w>>BigInt(sh)):0n}
  let r=Number(w&((1n<<BigInt(len))-1n));if(sg&&len<53&&r>=2**(len-1))r-=2**len;return r}
 /*</teach-core>*/
-async function pollBus(){
+function pollBus(){return solo('bus',pollBusOnce)}
+async function pollBusOnce(){
  if(TAB!=='bus'||TEACH)return;
- try{BUS=await fetch('/api/bus').then(r=>r.json())}catch(e){return}
+ try{BUS=await req('/api/bus',null,4000)}catch(e){return}
  const now=Date.now(),dt=ZT?(now-ZT)/1000:0;ZT=now;
  $('#bN').textContent=BUS.census.length+' IDs';
  $('#bTab').innerHTML=BUS.census.map(c=>{
@@ -595,6 +614,11 @@ async function mapAdd(){
    test_host/portal_tests.js runs it in Node. */
 const POS_BOOL={P:0x1209,R:0x1208,N:0x120A,D:0x120B};   // a lever position with a bit of its own
 const TEACH_POS={0x100F:'P R N D P',0x2039:'I S S# I',0x1005:'N 1 2 3 4 5 R N'};
+/** The indicators are taught in one run; what it finds for each role. */
+const TURN_ROLE={L:0x1201,R:0x1202,H:0x120C};
+/** Fewer readings than this in a step and the page says the master was too
+    slow: two readings can make a slow counter bit look like a switch. */
+const TEACH_MIN_READS=3;
 /** What a position publishes: the gear lever sends its letter's code, SI-Drive
     the ECU's own numbers, the gear 0 for N and -1 for R. */
 function posValue(m,tok,i){
@@ -609,32 +633,89 @@ function posLabel(m,v){
  if(m===0x1005)return v<0?'R':v===0?'N':String(v);
  return String(v)}
 const bitOf=(b,bit)=>(b[bit>>3]>>(bit&7))&1;
-/** Flips of @p bit across polls: from the master's flip counters (@p E, one
-    64-entry array per poll, wrapping at 256) when it sent them - every flash
-    counted - or else between successive payloads. */
+/** Flips of @p bit across polls, pair by pair: from the master's flip counters
+    (@p E, a 64-entry array per poll, wrapping at 256) where both polls of the
+    pair have them - every flash counted, however far apart the polls - or
+    else from the two payloads. */
 function flipsOf(P,E,bit){
  let n=0;
- if(E&&E.length===P.length&&E.every(e=>e&&e.length===64)){for(let i=1;i<E.length;i++)n+=(E[i][bit]-E[i-1][bit])&255;return n}
- for(let i=1;i<P.length;i++)n+=bitOf(P[i],bit)!==bitOf(P[i-1],bit)?1:0;return n}
+ for(let i=1;i<P.length;i++){
+  const a=E&&E[i-1],b=E&&E[i];
+  n+=a&&b&&a.length===64&&b.length===64?(b[bit]-a[bit])&255:bitOf(P[i],bit)!==bitOf(P[i-1],bit)?1:0}
+ return n}
+/** The step a reading counts for: the one it was both asked for and answered
+    in, after that step's first @p skip ms. @p durs are the steps' lengths,
+    times are ms from the start. -1: none - a reading that straddles a change
+    of step, or comes back after it, belongs to neither. */
+function teachSlot(durs,skip,tReq,tResp){
+ let s=0;
+ for(let i=0;i<durs.length;i++){const e=s+durs[i];if(tReq>=s+skip&&tResp<=e)return i;s=e}
+ return -1}
 /** On/off: A and C are the OFF steps, B the ON one. */
 function teachBits(id,A,B,C,EA,EB,EC,dlc){
- const res=[],p=(arr,bit)=>arr.filter(b=>bitOf(b,bit)).length/arr.length,haveC=C.length>=3;
+ const res=[],p=(arr,bit)=>arr.filter(b=>bitOf(b,bit)).length/arr.length,haveC=C.length>=2;
  for(let bit=0;bit<dlc*8;bit++){
   const pa=p(A,bit),pb=p(B,bit),pc=haveC?p(C,bit):pa;
   // A real switch holds still within each step and flips between them; a
   // counter bit flips inside a step, so it is not steady anywhere.
   const steady=Math.min(...[pa,pb,pc].map(x=>Math.max(x,1-x)));
   const score=Math.min(Math.abs(pb-pa),Math.abs(pb-pc));
-  if(score>=0.7&&steady>=0.85){res.push({id,s:bit,l:1,be:false,score,inv:pb<(pa+pc)/2});continue}
+  if(score>=0.7&&steady>=0.8){res.push({id,s:bit,l:1,be:false,score,inv:pb<(pa+pc)/2});continue}
   // A turn signal flashes, so it is on for only part of the ON step and the
-  // test above never passes. It sits still through both OFF steps and flips
-  // again and again in the ON one.
+  // test above never passes. It rests through both OFF steps - a flash or two
+  // at their start is a hand still on the lever - and flips again and again
+  // in the ON one.
   const rest=pa<0.5?0:1;
-  if(Math.max(pa,1-pa)<0.9||Math.max(pc,1-pc)<0.9||(pc<0.5?0:1)!==rest)continue;
+  if(Math.max(pa,1-pa)<0.8||Math.max(pc,1-pc)<0.8||(pc<0.5?0:1)!==rest)continue;
   const fa=flipsOf(A,EA,bit),fb=flipsOf(B,EB,bit),fc=haveC?flipsOf(C,EC,bit):fa;
-  if(fa>1||fc>1||fb<3)continue;
+  if(fa>2||fc>2||fb<3||fb<=2*Math.max(fa,fc))continue;
   res.push({id,s:bit,l:1,be:false,score:0.7+0.3*Math.min(1,fb/8),inv:rest===1,blink:Math.max(1,Math.round(fb/2))})}
  return res}
+/** The indicators in one run, steps A L B R C H D: off, left, off, right,
+    off, hazard lights, off. A lamp that flashes with the left indicator and
+    not with the right is the left one, and the other way round; one that
+    flashes with both cannot tell the side and is only reported. A bit held on
+    for one of them alone is its lever or switch - the displays flash those
+    themselves. Candidates carry the role they fill (L, R, H or both) and,
+    except for both, the metric; best first within each role, three at most. */
+function teachTurns(S){
+ const OFF=['A','B','C','D'],ON=['L','R','H'],ALL=OFF.concat(ON);
+ const ids=new Set();ALL.forEach(k=>(S[k]||[]).forEach(poll=>poll.forEach((x,id)=>ids.add(id))));
+ const res=[];
+ for(const id of ids){
+  if(id>=0x7DF&&id<=0x7EF)continue;
+  const st={};ALL.forEach(k=>st[k]=(S[k]||[]).map(poll=>poll.get(id)).filter(Boolean));
+  if(ALL.some(k=>st[k].length<2))continue;
+  const dlc=Math.max(...ALL.map(k=>Math.max(...st[k].map(x=>x.b.length))));
+  for(let bit=0;bit<dlc*8;bit++){
+   const f={},p={};
+   for(const k of ALL){const a=st[k];f[k]=flipsOf(a.map(x=>x.b),a.map(x=>x.e),bit);p[k]=a.filter(x=>bitOf(x.b,bit)).length/a.length}
+   const rest=OFF.reduce((s,k)=>s+p[k],0)/OFF.length<0.5?0:1,away=k=>rest?1-p[k]:p[k];
+   // At rest in every OFF step (a flash or two at its start is a hand still
+   // on the lever)...
+   const still=k=>away(k)<=0.25&&f[k]<=2;
+   if(!OFF.every(still))continue;
+   const noise=Math.max(...OFF.map(k=>f[k]));
+   // ...and flashing, or held away from rest, in the ON steps.
+   const fl=ON.filter(k=>f[k]>=3&&f[k]>2*noise),held=ON.filter(k=>away(k)>=0.8&&f[k]<=2);
+   let role=null,how='flash';
+   if(fl.includes('L')&&fl.includes('R'))role='both';
+   else if(fl.includes('L')&&still('R'))role='L';
+   else if(fl.includes('R')&&still('L'))role='R';
+   else if(fl.length===1&&fl[0]==='H'&&still('L')&&still('R'))role='H';
+   else if(!fl.length&&held.length===1&&ON.every(k=>k===held[0]||still(k))){role=held[0];how='held'}
+   if(!role)continue;
+   const n=fl.reduce((s,k)=>s+f[k],0);
+   // The car's own flasher beats a lever bit (the displays then flash with
+   // the car); for the hazard lights, their switch beats a lamp of their own.
+   const score=how==='flash'?1+0.5*Math.min(1,n/(8*fl.length)):(role==='H'?1.6:0.9)+0.1*away(held[0]);
+   const r={id,s:bit,l:1,be:false,inv:rest===1,role,how,blink:how==='flash'?Math.max(1,Math.round(n/2)):0,score};
+   if(TURN_ROLE[role])r.metric=TURN_ROLE[role];
+   res.push(r)}}
+ const order=['L','R','H','both'];
+ res.sort((a,b)=>order.indexOf(a.role)-order.indexOf(b.role)||b.score-a.score);
+ const per={};
+ return res.filter(r=>(per[r.role]=(per[r.role]||0)+1)<=3)}
 /** A moving value: A held still, B moved through its range. */
 function teachValues(id,A,B,dlc){
  const res=[],v=a=>{const mu=a.reduce((x,y)=>x+y,0)/a.length;return a.reduce((x,y)=>x+(y-mu)**2,0)/a.length};
@@ -667,12 +748,13 @@ function teachValues(id,A,B,dlc){
  return res}
 /** Positions: P[j] are the payloads while the lever sat in position j, named
     toks[j]. A name may come back ("P R N D P"): every visit to it must read
-    the same. The lever is learnt as a combination - every bit that holds still
-    in each position and reads differently between them, wherever it sits: side
-    by side in one byte, scattered through it, or across bytes. */
+    the same. The lever is learnt from the bits that hold still in each
+    position and read differently between them: its own field where it has
+    one, or else the combination of all of them, wherever they sit - side by
+    side in one byte, scattered through it, or across bytes. */
 function teachPositions(id,P,toks,dlc){
  const res=[],np=P.length;
- if(np<2||P.some(a=>a.length<3))return res;
+ if(np<2||P.some(a=>a.length<2))return res;
  // The positions, once each, in the order first visited; and each visit's.
  const names=[],grp=[];
  for(let j=0;j<np;j++){const t=String(toks[j]||j).toUpperCase();let g=names.indexOf(t);if(g<0){g=names.length;names.push(t)}grp.push(g)}
@@ -694,19 +776,34 @@ function teachPositions(id,P,toks,dlc){
   const v=byGroup(bit);if(!v||v.every(x=>x===v[0]))continue;
   moving.push(bit);gv[bit]=v}
  if(!moving.length)return res;
- // The combination: bit i of the code is moving[i]. Bits beside them that did
- // nothing here are left out, so they are free to change later.
- if(moving.length<=16){
-  const codeOf=b=>moving.reduce((c,bit,i)=>c|(bitOf(b,bit)<<i),0);
+ // Each position's code read from @p bits (bit i of the code is bits[i]):
+ // null unless every visit reads one code throughout and no two positions
+ // share one.
+ const codesOf=bits=>{
+  const codeOf=b=>bits.reduce((c,bit,i)=>c|(bitOf(b,bit)<<i),0);
   const codes=new Array(names.length).fill(null),hold=[];
   for(let j=0;j<np;j++){
    const cnt=new Map();P[j].forEach(b=>{const x=codeOf(b);cnt.set(x,(cnt.get(x)||0)+1)});
    let best=0,n=0;cnt.forEach((c,x)=>{if(c>n){n=c;best=x}});
-   if(codes[grp[j]]===null)codes[grp[j]]=best;else if(codes[grp[j]]!==best){codes.fill(null);break}
+   if(codes[grp[j]]===null)codes[grp[j]]=best;else if(codes[grp[j]]!==best)return null;
    hold.push(n/P[j].length)}
-  if(codes.every(c=>c!==null)&&new Set(codes).size===names.length&&Math.min(...hold)>=0.8)
-   res.push({id,s:moving[0],l:moving.length,be:false,bits:moving.slice(),names:names.slice(),codes,
-    score:1+Math.min(...hold)-0.01*moving.length})}
+  return new Set(codes).size===names.length&&Math.min(...hold)>=0.8?{codes,hold:Math.min(...hold)}:null};
+ // The lever's own field, where it has one: the shortest run of neighbouring
+ // bits, every one of them moving with the lever, that tells every position
+ // apart by itself. Other bits that changed with it - a park/neutral switch,
+ // a reverse lamp - are left out: while driving they can change on their own
+ // and spoil the reading.
+ let pick=null;
+ for(let a=0;a<moving.length;a++)
+  for(let b=a;b<moving.length&&b-a<16&&moving[b]===moving[a]+(b-a);b++){
+   if(pick&&b-a+1>=pick.bits.length)break;
+   const bits=moving.slice(a,b+1),c=codesOf(bits);
+   if(c)pick=Object.assign({bits},c)}
+ // Otherwise the combination of every bit that moved. Bits beside them that
+ // did nothing here are left out, so they are free to change later.
+ if(!pick&&moving.length<=16){const c=codesOf(moving);if(c)pick=Object.assign({bits:moving.slice()},c)}
+ if(pick)res.push({id,s:pick.bits[0],l:pick.bits.length,be:false,bits:pick.bits,names:names.slice(),codes:pick.codes,
+  score:1+pick.hold-0.01*pick.bits.length});
  // A position with a bit of its own, when no one frame tells every position
  // apart (reverse from one module, park from another): that position alone.
  for(let g=0;g<names.length;g++){
@@ -718,6 +815,7 @@ function teachPositions(id,P,toks,dlc){
 /** Every candidate, best first, one per stretch of bytes. @p S maps each step
     to its polls; a poll maps an identifier to {b: payload, e: flip counters}. */
 function teachFind(kind,S,steps,toks){
+ if(kind==='turn')return teachTurns(S);
  const ids=new Set();(S[steps[0]]||[]).forEach(poll=>poll.forEach((x,id)=>ids.add(id)));
  const res=[];
  for(const id of ids){
@@ -725,10 +823,10 @@ function teachFind(kind,S,steps,toks){
   const ser=ph=>(S[ph]||[]).map(poll=>poll.get(id)).filter(Boolean);
   if(kind==='pos'){
    const P=steps.map(ph=>ser(ph).map(x=>x.b));
-   if(P.some(a=>a.length<3))continue;
+   if(P.some(a=>a.length<2))continue;
    res.push(...teachPositions(id,P,toks||[],Math.max(...P.flat().map(b=>b.length))));continue}
   const A=ser('A'),B=ser('B'),Cc=ser('C');
-  if(A.length<3||B.length<3)continue;
+  if(A.length<2||B.length<2)continue;
   const dlc=Math.max(...A.map(x=>x.b.length),...B.map(x=>x.b.length)),pl=a=>a.map(x=>x.b),ed=a=>a.map(x=>x.e);
   if(kind==='bit')res.push(...teachBits(id,pl(A),pl(B),pl(Cc),ed(A),ed(B),ed(Cc),dlc));
   else res.push(...teachValues(id,pl(A),pl(B),dlc))}
@@ -748,57 +846,120 @@ const isSwitch=id=>(id&0xFF00)===0x1200||(id&0xFF00)===0x2100||id===0x0101;
 const TEACH_FIRST=id=>(id&0xFF00)===0x1200||(id>=0x1005&&id<=0x10FF)||(id&0xFF00)===0x3000||(id&0xFF00)===0x2100;
 let TEACH=null,TRES=[],TTOK=[];
 $('#tM').innerHTML='<optgroup label="Body, chassis and custom">'+metricOpts(0x1201,TEACH_FIRST)+'</optgroup><optgroup label="Everything else">'+metricOpts(0,id=>!TEACH_FIRST(id))+'</optgroup>';
+/** What can be taught for @p m: positions only for a lever or selector, the
+    indicators' run only for the indicators. */
+function teachKinds(m){
+ if(TEACH_POS[m])return[['pos','Positions'],['val','A moving value']];
+ if(m===TURN_ROLE.L||m===TURN_ROLE.R||m===TURN_ROLE.H)return[['turn','Left, right and hazard, in one go'],['bit','On / off']];
+ return isSwitch(m)?[['bit','On / off'],['val','A moving value']]:[['val','A moving value'],['bit','On / off']]}
 function teachKindShown(){$('#tPRow').hidden=$('#tK').value!=='pos'}
-$('#tM').onchange=()=>{const m=+$('#tM').value;
- $('#tK').value=TEACH_POS[m]?'pos':isSwitch(m)?'bit':'val';
- if(TEACH_POS[m])$('#tP').value=TEACH_POS[m];teachKindShown()};
+function teachPick(){const m=+$('#tM').value;
+ $('#tK').innerHTML=teachKinds(m).map(([v,t])=>`<option value="${v}">${t}</option>`).join('');
+ if(TEACH_POS[m])$('#tP').value=TEACH_POS[m];teachKindShown()}
+$('#tM').onchange=teachPick;
 $('#tK').onchange=teachKindShown;
+teachPick();
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const plain=h=>h.replace(/<[^>]+>/g,'');
 async function teachStart(){
+ if(TEACH)return;
  const m=+$('#tM').value,kind=$('#tK').value;
  TTOK=kind==='pos'?$('#tP').value.trim().split(/[\s,]+/).filter(Boolean).slice(0,8):[];
  if(kind==='pos'&&TTOK.length<2){toast('List at least two positions');return}
- const phases=kind==='bit'?[['A','Leave it OFF',4000],['B','Turn it ON now, and hold it (flashing is fine)',4000],['C','Turn it OFF again',4000]]:
+ const off=k=>[k,'<b>Off</b>: indicators and hazard lights off',5000];
+ const steps=kind==='bit'?[['A','Leave it OFF',5000],['B','Turn it ON now, and leave it on (flashing is fine)',6000],['C','Turn it OFF again',5000]]:
+  kind==='turn'?[off('A'),['L','<b>Left</b> indicator on - let it flash',6000],off('B'),['R','<b>Right</b> indicator on - let it flash',6000],
+   off('C'),['H','<b>Hazard lights</b> on',6000],off('D')]:
   kind==='pos'?TTOK.map((t,i)=>['p'+i,`Put it in <b>${esc(t)}</b> and hold it there`,5000]):
   [['A','Hold it still',3000],['B','Move it slowly through its whole range, back and forth',9000]];
- // Moving a lever takes a moment: its first second and a half is not sampled.
- const skip=kind==='pos'?1500:800;
- TEACH={m,kind,S:{}};phases.forEach(([k])=>TEACH.S[k]=[]);$('#tBtn').disabled=true;$('#tRes').innerHTML='';
- for(const [k,txt,dur] of phases){
-  const t0=Date.now();
-  while(Date.now()-t0<dur){
-   $('#tStep').innerHTML=`<div class="step">${txt}</div><span class="muted">${Math.ceil((dur-(Date.now()-t0))/1000)} s</span>`;
-   try{const b=await fetch('/api/bus?e=1').then(r=>r.json());
-    if(Date.now()-t0>skip)TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])))}catch(e){}
-   await sleep(60)}}
- $('#tStep').innerHTML='<div class="step">Done</div>';
- teachAnalyze(phases.map(p=>p[0]));TEACH=null;$('#tBtn').disabled=false}
+ // A hand takes a moment to do what a step asks: the start of each is not read.
+ const skip=kind==='val'?800:1500;
+ const durs=steps.map(s=>s[2]),total=durs.reduce((a,b)=>a+b,0);
+ TEACH={m,kind,S:{}};steps.forEach(([k])=>TEACH.S[k]=[]);
+ $('#tBtn').disabled=true;$('#tRes').innerHTML='';
+ // The steps run on the clock, not on the master's answers: the countdown is
+ // redrawn five times a second whatever the Wi-Fi does, and a reading counts
+ // only for the step it was asked for and answered in (teachSlot) - one that
+ // comes back late is dropped, not filed under the step after.
+ const t0=performance.now(),at=()=>performance.now()-t0;
+ const draw=()=>{const t=at();let s=0,i=0;while(i<durs.length&&t>=s+durs[i])s+=durs[i++];if(i>=durs.length)return;
+  const next=steps[i+1]?` · then: ${plain(steps[i+1][1])}`:'';
+  $('#tStep').innerHTML=`<div class="step">${steps[i][1]}</div><span class="muted">${Math.ceil((s+durs[i]-t)/1000)} s · step ${i+1} of ${steps.length}${esc(next)}</span>`};
+ draw();const tick=setInterval(draw,200);
+ let asked=0,late=0;
+ try{
+  while(at()<total){
+   const tq=at();let b=null;asked++;
+   try{b=await req('/api/bus?e=1',null,1500)}catch(e){}
+   const i=b?teachSlot(durs,skip,tq,at()):-1;
+   if(i>=0)TEACH.S[steps[i][0]].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
+   else if(!b||at()-tq>1000)late++;
+   const wait=150-(at()-tq);if(wait>0)await sleep(wait)}
+  $('#tStep').innerHTML='<div class="step">Done</div>';
+  teachAnalyze(steps.map(p=>p[0]));
+  const thin=steps.map(([k,t],i)=>TEACH.S[k].length<TEACH_MIN_READS?`step ${i+1} (${plain(t)})`:'').filter(Boolean);
+  if(thin.length)$('#tRes').insertAdjacentHTML('afterbegin',`<p class="say warn" style="margin-top:8px">The master answered slowly: too few readings in ${esc(thin.join(', '))} - ${late} of ${asked} came back late or not at all. `+
+   `${TRES.length?'What was found may be wrong or incomplete. ':''}Stay close to the master, close other pages open on it, and try again.</p>`)}
+ finally{clearInterval(tick);TEACH=null;$('#tBtn').disabled=false}}
+const ROLE_NAME={L:'Left turn signal',R:'Right turn signal',H:'Hazard lights',both:'Either indicator'};
+const ROLE_SAY={L:' with the left indicator only',R:' with the right indicator only',H:' with the hazard lights only',
+ both:' with either indicator: it cannot tell the side, so it is not used'};
 function teachAnalyze(steps){
- const {S,kind,m}=TEACH;
+ const {S,kind}=TEACH;
  TRES=teachFind(kind,S,steps,TTOK);
- if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}
+ if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':
+  kind==='turn'?'Let each one flash through its whole step and switch it off as soon as the next step asks, or they may not be broadcast.':
+  'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}
  const pat=(c,n)=>Array.from({length:n},(_,i)=>(c>>i)&1).join('');
- const say=r=>r.codes?r.names.map((t,g)=>`${esc(t)} <span class="mono">${pat(r.codes[g],r.bits.length)}</span>`).join(' • '):
+ const say=r=>r.role?(r.how==='flash'?`flashed ${r.blink} time${r.blink>1?'s':''}`:'held on')+ROLE_SAY[r.role]+(r.inv?' (inverted)':''):
+  r.codes?r.names.map((t,g)=>`${esc(t)} <span class="mono">${pat(r.codes[g],r.bits.length)}</span>`).join(' • '):
   r.pos!==undefined?`on only in ${esc(r.names[r.pos])}${r.inv?' (inverted)':''} - as ${esc(nm(r.metric))}`:
   r.l===1?(r.blink?`flashed ${r.blink} time${r.blink>1?'s':''}${r.inv?' (inverted)':''}`:`followed ${(Math.min(1,r.score)*100).toFixed(0)}%${r.inv?' (inverted)':''}`):
   `raw ${r.mn} … ${r.mx} while moving`;
- $('#tRes').innerHTML='<p class="say" style="margin-top:8px">These followed you, best first:</p>'+TRES.map((r,i)=>
-  `<div class="lr"><div class="lt"><span>${field({id:r.id,s:r.s,l:r.l,be:r.be,bits:r.bits})}${r.sg?' <span class="muted">signed</span>':''}</span>
-   <button class="b s p" onclick="teachUse(${i})">${r.l===1||r.codes?'Use':'Use…'}</button></div>
+ let head='<p class="say" style="margin-top:8px">These followed you, best first:</p>';
+ if(kind==='turn'){
+  const got=['L','R','H'].filter(k=>TRES.some(r=>r.role===k)),miss=['L','R','H'].filter(k=>!got.includes(k));
+  head=`<p class="say" style="margin-top:8px">${got.length?'Found '+got.map(k=>'<b>'+ROLE_NAME[k]+'</b>').join(', ')+'. ':''}`+
+   `${miss.length?'Nothing only for '+miss.map(k=>ROLE_NAME[k].toLowerCase()).join(' or ')+'. ':''}The first under each is the best.</p>`+
+   (got.length>1?'<div class="row" style="margin:0 0 6px"><button class="b p" onclick="teachUseAll()">Use the first of each</button></div>':'')}
+ $('#tRes').innerHTML=head+TRES.map((r,i)=>
+  `<div class="lr"><div class="lt"><span>${r.role?`<b>${ROLE_NAME[r.role]}</b> · `:''}${field({id:r.id,s:r.s,l:r.l,be:r.be,bits:r.bits})}${r.sg?' <span class="muted">signed</span>':''}</span>
+   ${r.role==='both'?'':`<button class="b s p" onclick="teachUse(${i})">${r.l===1||r.codes?'Use':'Use…'}</button>`}</div>
    <div class="ls"><span>${say(r)}</span></div></div>`).join('')}
+/** The raw signals feeding @p metric now: taught, mapped by hand or learned. */
+const feeding=metric=>(C.signals||[]).filter(g=>g.metric===metric&&(g.mode===1||g.mode===3));
+const sameSig=(g,x)=>g.can_id===x.can_id&&g.start===x.start&&g.len===x.len&&String(g.bits||'')===String(x.bits||'');
+const where=g=>hex(g.can_id,3)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):g.len===1?' bit '+g.start:` bits ${g.start}-${g.start+g.len-1}`);
+function teachSig(r,m){
+ const s={name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
+ if(r.codes){s.bits=r.bits;s.map=r.codes.map((c,g)=>[c,posValue(m,r.names[g],g)])}
+ else if(r.inv){s.scale=-1;s.offset=1}
+ return s}
+/** Put taught signals in, each replacing whatever fed its value before - once
+    asked. Two sources for one value would fight over it: an old lever table
+    beside a new one, or both indicators on the bit that flashes for either. */
+async function teachAdd(list){
+ if(!LOADED){toast('Not loaded yet');return false}
+ const add=[],old=[],say=[];
+ for(const s of list){
+  const o=feeding(s.metric);
+  if(o.some(g=>sameSig(g,s))){toast(`${nm(s.metric)} is already read from there`);continue}
+  add.push(s);if(o.length){old.push(...o);say.push(`${nm(s.metric)}: ${o.map(where).join(' and ')}`)}}
+ if(!add.length)return false;
+ if(say.length&&!confirm(`Read from the bus already:\n\n${say.join('\n')}\n\nReplace ${say.length>1?'these':'it'} with what you just taught?`))return false;
+ C.signals=(C.signals||[]).filter(g=>!old.includes(g)).concat(add);
+ setDirty(true);await save();return true}
 async function teachUse(i){
- const r=TRES[i],m=+$('#tM').value,bm=r.metric||m;
- if((C.signals||[]).some(g=>g.metric===bm&&g.can_id===r.id&&g.start===r.s&&g.len===r.l&&String(g.bits||'')===String(r.bits||''))){toast(`${nm(bm)} is already read from there`);return}
- if(r.codes){
-  await addSignal({name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,
-   metric:m,mode:1,ref:0,learned:false,bits:r.bits,map:r.codes.map((c,g)=>[c,posValue(m,r.names[g],g)])});
-  toast(`${nm(m)} is now read from the bus`);$('#tRes').innerHTML='';return}
- if(r.l===1){
-  await addSignal({name:nm(bm).slice(0,15),can_id:r.id,ext:false,start:r.s,len:1,be:false,signed:false,
-   scale:r.inv?-1:1,offset:r.inv?1:0,metric:bm,mode:1,ref:0,learned:false});
-  toast(`${nm(bm)} is now read from the bus`);if(r.metric===undefined)$('#tRes').innerHTML='';return}
- BUS=BUS||{census:[]};mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
- toast('Set the scale so the value reads right, then Use this value')}
+ const r=TRES[i],m=r.metric||+$('#tM').value;
+ if(!r.codes&&r.l!==1){BUS=BUS||{census:[]};mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
+  toast('Set the scale so the value reads right, then Use this value');return}
+ if(!await teachAdd([teachSig(r,m)]))return;
+ toast(`${nm(m)} is now read from the bus`);
+ if(r.metric===undefined)$('#tRes').innerHTML=''}   // several of these can be used, one by one
+async function teachUseAll(){
+ const pick=['L','R','H'].map(k=>TRES.find(r=>r.role===k)).filter(Boolean);
+ if(!await teachAdd(pick.map(r=>teachSig(r,r.metric))))return;
+ toast(pick.map(r=>nm(r.metric)).join(', ')+': now read from the bus');$('#tRes').innerHTML=''}
 
 /* ───────────── sources ───────────── */
 const SMODE=['Off','On','Checking','Verified','Rejected'];
@@ -878,9 +1039,10 @@ function evDetail(e){
  if(e.t===4)return`REC ${e.a}, ${e.b} receive errors in the window → listen-only`;
  if(e.t===5)return`TEC ${e.a}${e.b?' → listen-only (bus guard off)':''}`;
  return''}
-async function pollEvlog(){
- if(TAB!=='diag')return;
- let d;try{d=await fetch('/api/evlog').then(r=>r.json())}catch(e){return}
+function pollEvlog(){return solo('ev',pollEvlogOnce)}
+async function pollEvlogOnce(){
+ if(TAB!=='diag'||TEACH)return;
+ let d;try{d=await req('/api/evlog',null,5000)}catch(e){return}
  const ev=d.events||[],rows=ev.slice().reverse();
  $('#evN').textContent=ev.length+' events';
  $('#evTab').innerHTML=rows.map(e=>`<tr><td class="muted">${(e.ms/1000).toFixed(0)} s</td><td><b>${EVN[e.t]||e.t}</b></td><td>${evDetail(e)}</td><td class="muted">${ACTS(e.act)}</td></tr>`).join('')||
@@ -894,9 +1056,13 @@ async function pollEvlog(){
  if(!s)s=`<span class="ok">${boots.length} boot${boots.length===1?'':'s'}, no brown-out, no guard trip, no bus-off</span> — if the lamp still came on, the master was not the one disturbing the bus.`;
  $('#evSay').innerHTML=s}
 
-/* ───────────── polling ───────────── */
-async function poll(){
- let d;try{d=await fetch('/api/live').then(r=>r.json())}catch(e){
+/* ───────────── polling ─────────────
+   While a teach runs, nothing else is asked: its readings have the master to
+   themselves, and are not held up behind a full status document. */
+function poll(){return solo('live',pollOnce)}
+async function pollOnce(){
+ if(TEACH)return;
+ let d;try{d=await req('/api/live',null,4000)}catch(e){
   const c=$('#conn');c.className='pill crit';c.lastChild.textContent='offline';return}
  const now=Date.now();
  // The master restarted (its counters went back): no rate from across that.
@@ -908,7 +1074,7 @@ async function poll(){
  L=d;
  // Pick up what the learner and verifier did to the signal table.
  const lsig=(d.learn||[]).filter(x=>x.st>=3).map(x=>x.m+':'+x.st).join();
- if(LOADED&&(lsig!==LSIG||now-LLOAD>30000)){LSIG=lsig;LLOAD=now;load(true)}
+ if(LOADED&&(lsig!==LSIG||now-LLOAD>30000)){LSIG=lsig;LLOAD=now;solo('cfg',()=>load(true))}
  const c=$('#conn');
  if(!d.bus.alive){c.className='pill warn';c.lastChild.textContent='no CAN'}
  else if(d.silent){c.className='pill ok';c.lastChild.textContent='listening only'}

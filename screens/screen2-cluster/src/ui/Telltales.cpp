@@ -330,7 +330,7 @@ void Telltales::reset(Lamp &l) {
     l.on = l.lit = false;
     l.value = l.extra = NAN;
     l.cond = l.pending = false;
-    l.rawPrev = false;
+    l.rawPrev = l.ownPrev = false;
     l.speedGate = false;
     l.spent = l.snoozed = false;
     l.showing = false;
@@ -362,6 +362,11 @@ void Telltales::update(TelemetryStore &store, uint32_t now) {
     }
     _engineSettled = _engineRunning && now - _engineSince >= ENGINE_SETTLE_MS;
 
+    // The hazard switch, where the bus reports one: both indicators flash
+    // while it is on (see the indicator branch below).
+    const float hz = usableRaw(store, METRIC_ID_HAZARD);
+    const bool hazard = !isnan(hz) && hz >= 0.5f;
+
     for (size_t i = 0; i < _n; i++) {
         Lamp &l = _lamps[i];
         if (!_enabled || !l.enabled || !l.metric) { reset(l); continue; }
@@ -388,6 +393,13 @@ void Telltales::update(TelemetryStore &store, uint32_t now) {
         const bool wasOn = l.on;
 
         if (l.turn) {
+            // With the hazard lights on, an indicator whose own bit is the
+            // car's flasher (it changed within the last flash) keeps following
+            // it, in the car's rhythm; one whose bit reads steady off - the
+            // lever's - or that has no source at all is lit steady here and so
+            // flashes by itself below, both of them in step.
+            if (c != l.ownPrev) { l.ownPrev = c; l.ownEdgeMs = now; }
+            if (hazard && !c && now - l.ownEdgeMs >= TURN_STEADY_MS + TURN_HALF_MS) c = true;
             // Indicators ignore the debounce: the flasher IS the signal.
             if (c != l.rawPrev) { l.rawPrev = c; l.edgeMs = now; }
             if (c) l.lastTrueMs = now;

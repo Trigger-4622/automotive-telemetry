@@ -17,7 +17,8 @@
  *     whenever the condition holds, but it only pops up and flashes above a
  *     speed;
  *   - indicators follow the bus when it reports the flasher, and flash by
- *     themselves when it only reports the lever.
+ *     themselves when it only reports the lever; while the hazard switch is
+ *     on, both flash.
  *
  * Every lamp, and every behaviour of every lamp, can be switched off from the
  * layout's `"warnings"` block — see @ref Telltales::configure. A lamp whose
@@ -115,6 +116,8 @@ struct Lamp {
     uint32_t  onSince;        /**< When the lamp came on (flash phase origin).*/
     bool      rawPrev;        /**< Indicator: previous bus state.             */
     uint32_t  edgeMs;         /**< Indicator: last change of the bus state.   */
+    bool      ownPrev;        /**< Indicator: its own metric's last state.    */
+    uint32_t  ownEdgeMs;      /**< Indicator: when that last changed.         */
     bool      speedGate;      /**< Moving fast enough to pop up (hysteresis). */
     bool      spent;          /**< Once: already shown for this lighting.     */
     bool      snoozed;        /**< Repeat: tapped, quiet until snoozeUntil.   */
