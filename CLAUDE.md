@@ -64,11 +64,14 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 
 ## Things that must stay in sync (`scripts/check_sync.py` enforces them)
 
-- `include/MasterPacket.h` byte-identical in master and both screens. Metric
-  store sizes move together on all three nodes.
+- `include/MasterPacket.h` and `include/DtcText.h` (trouble-code names)
+  byte-identical in master and both screens. Metric store sizes move together
+  on all three nodes. DtcText.h's table is `static`: one source file per
+  project includes it (DiagCodes.cpp, Telltales.cpp).
 - Shared by the two screens, change both: `include/Palette.h`,
-  `include/TelltaleIcons.h`, `src/ui/Telltales.*`, `tools/embed_studio.py`,
-  `tools/make_icons.py`, `tools/telltale_icons.json` and all of `test_host/`.
+  `include/TelltaleIcons.h`, `src/ui/Telltales.*`, `src/ui/PerfTimer.*`,
+  `src/ui/DriveViews.*`, `tools/embed_studio.py`, `tools/make_icons.py`,
+  `tools/telltale_icons.json` and all of `test_host/`.
 - Generated, never edit by hand: `master/src/WebPortal.cpp` (from
   `master/tools/portal_page.html` + `WebPortal.cpp.in` via build_portal.py),
   the studio metric catalogue in `screens/*/data/www/index.html` (from
@@ -203,6 +206,36 @@ frame tells every position apart does it fall back to one bit per position
 combines into the lever; single doors likewise make `DOOR_OPEN`. A taught
 field always outranks the derived value.
 
+## Codes, oil change, G-meter, drive log, timers
+
+- **Trouble codes** (`master/src/DiagCodes.*`): services 03/07/0A from the
+  ECM (0x7E0) and TCM (0x7E1, through 0x7DF with flow control to 0x7E1 if it
+  never answers its own address), read 8 s after the bus comes up, every
+  `dtc_poll_s` (60; 0 = only when asked) and when the MIL or PID 01's count
+  changes; never with the bus quiet, listen-only or the guard up (they go
+  through `isoExchange()` in Ssm2.cpp - the SSM2 ISO-TP transport, lent out
+  under the same lock). Published as `DTC_TOTAL` and `DTC_1..8` (packed:
+  raw | kind << 16 | module << 18). Clear (service 04) only from the portal,
+  refused while moving. Service 09 gives VIN, calibration ID and CVN
+  (remembered in `vin`/`ecu_cal_id`). The screens' check-engine card names the
+  codes one at a time; a card-only `codes` lamp covers them with the MIL off.
+- **Oil change**: `oil_every_km`, `oil_at_km` (-1 = off); `SERVICE_KM` from the
+  SSM2 odometer (address 0x10E); portal "Oil changed now"; a `service` lamp
+  (spanner, amber under 500 km).
+- **G-meter**: `LAT_ACCEL`/`LON_ACCEL`/`YAW_RATE`, taught from the stability
+  unit's frame with the Bus tab's "A corner or a hard stop" (`motionRef`,
+  `teachMotion` in teach-core: correlation with the speed's slope, or with
+  speed x yaw / the steering, and a fitted scale). Until then the master
+  derives longitudinal G from the speed's slope and lateral G from speed x yaw
+  (`gDerive`, SRC_DERIVED: a taught field outranks it). ISO 8855 signs.
+- **Drive log** (`master/src/DriveLog.*`): `log_on`, `log_hz`, `log_ids`,
+  `log_max_kb`; `/log/NNNNN.tlg` on the settings partition, oldest deleted
+  first, 128 KB always left for settings saves, 4 KB writes announced with
+  `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
+- **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
+  display from the master's speed, on the master's clock (`TelemetryStore::
+  stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once.
+
 ## Open items
 
 - Master power-on settle wait (`start_delay_s`, 10 s default): flashed
@@ -229,6 +262,11 @@ field always outranks the derived value.
   are" before changing firmware for it.
 - Screens: warning lamps, dash screen and the cluster redesign are built and
   tested in the harness but not yet flashed or seen on hardware.
+- Codes, oil change, G-meter, drive log and timers (above): harness only. On
+  the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
+  service 03 at all; that the SSM2 odometer matches the cluster; which frame
+  carries the VDC unit's G and yaw (teach it); and how many CAN frames each
+  4 KB log write costs (Bus tab misses while logging).
 - Cluster: whether the Arduino_GFX driver cured the panel speckle is
   unconfirmed on hardware.
 
