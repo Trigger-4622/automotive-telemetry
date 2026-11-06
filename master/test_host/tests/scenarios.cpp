@@ -1930,6 +1930,130 @@ static void scTxHoldOff() {
     check(sleepEntered && gpioHoldEnabled == 0, "tx_hold off: no latch across sleep (adjustable)");
 }
 
+/* ─────────────── off means off; on means sending properly ─────────────── */
+
+static uint32_t txQueued() {
+    twai_status_info_t st = {};
+    return twai_get_status_info(&st) == ESP_OK ? st.msgs_to_tx : 0;
+}
+
+/**
+ * The car switched off under a request. Every module goes quiet at once, so
+ * nobody acknowledges the master's frame - and a CAN controller retransmits an
+ * unacknowledged frame back to back for as long as it stays on the bus (an
+ * error-passive sender's acknowledgement errors do not count towards bus-off).
+ * Before, that lasted until the bus had been quiet for 2 s and the settle wait
+ * switched the controller to listen-only - and for ever with start_delay_s 0:
+ * a frame on the wires of a car that is off, the kind of traffic that wakes
+ * sleeping modules. Now nothing is sent once nothing has been heard for 250
+ * ms, and a frame nobody acknowledges is aborted.
+ */
+static void carOffUnderRequest(bool settle) {
+    loadCarConfig();                                 // the car's file: OBD-II only, obd_gap 10
+    if (!settle) portalPostBeforeBoot(R"({"start_delay_s":0})");
+    boot();
+    runUntil(40);
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 30, 40) > 50, "polling the running car");
+    const double off = tNow();
+    faults.silenceBus = true;                        // ignition off: every module at once
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;
+    faults.nobodyAcks = true;
+    runUntil(off + 5);
+    check(sim::deadBusTxUs < 300000, "a frame nobody acknowledges is not kept on the dead bus",
+          fmt("%.2f s of retransmissions", sim::deadBusTxUs / 1e6));
+    check(txCount(anyFrame, off + 0.3, off + 5) == 0, "nothing new sent once the car is quiet",
+          fmt("%llu frames", (unsigned long long)txCount(anyFrame, off + 0.3, off + 5)));
+    check(txQueued() == 0, "nothing left waiting in the controller", fmt("%u", txQueued()));
+    // Back on: the requests resume and are answered.
+    faults.nobodyAcks = false;
+    faults.silenceBus = false;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = true;
+    runUntil(off + 30);
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "values flow once the car is back on", info);
+    check(simBugs() == 0 && sim::txInReset == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+static void scCarOffTx()         { carOffUnderRequest(true); }
+static void scCarOffTxNoSettle() { carOffUnderRequest(false); }
+
+/**
+ * Ignition off while something else keeps the bus alive: the engine ECU no
+ * longer answers, but frames still flow. Every PID used to be asked down to
+ * once in 10 s each - with the car's 60-odd PIDs, six requests a second
+ * for as long as the bus stayed up, traffic that can keep the body modules
+ * from ever going to sleep. Once nothing has answered for a run of requests,
+ * the poller goes back to the probe (PID 0x00, every 10 s); one answer
+ * there and the full poll resumes.
+ */
+static void scEcuGoneQuiet() {
+    loadCarConfig();
+    boot();
+    runUntil(40);
+    const uint64_t before = txCount(isObdReq, 30, 40);
+    check(before > 50, "polling the running car", fmt("%llu requests in 10 s", (unsigned long long)before));
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;   // engine ECU off, bus still up
+    runUntil(160);
+    const double rate = txCount(anyFrame, 100, 160) / 60.0;
+    check(rate <= 0.2, "a switched-off ECU is probed, not polled", fmt("%.2f frames/s", rate));
+    check(txCount(isObdReq, 100, 160) > 0, "...but still probed", fmt("%llu", (unsigned long long)txCount(isObdReq, 100, 160)));
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = true;
+    runUntil(185);
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "the full poll is back once it answers", info);
+    check(txCount(isObdReq, 175, 185) > 50, "at the full rate", fmt("%llu in 10 s", (unsigned long long)txCount(isObdReq, 175, 185)));
+    check(simBugs() == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+
+/**
+ * A restart from the portal (Reboot, Factory reset, Safe bus settings, the
+ * BOOT rescue). The chip resets, and until the new firmware's first line runs
+ * the TX pin is an unconfigured pad: with the transceiver's input floating it
+ * can read low - dominant - and jam the car's bus, typically with the car on,
+ * since that is when the portal is used. masterBeforeRestart() now takes the
+ * controller off the bus and latches the pad recessive across the reset;
+ * setup() releases the latch once it drives the pin itself.
+ */
+static void scRestartOffBus() {
+    loadCarConfig();
+    boot();
+    sim::restartReturns = true;
+    runUntil(30);
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 20, 30) > 0, "polling before the restart");
+    masterBeforeRestart();                            // what every restart path calls first
+    const double t = tNow();
+    check(!sim::txPadOnController() && txDrivenHigh, "TX pad off the controller, driven recessive");
+    check(gpioHoldEnabled > 0, "...and latched there across the reset");
+    runUntil(t + 0.5);                                // the portal's 300 ms before ESP.restart()
+    check(txCount(anyFrame, t, t + 0.5) == 0, "nothing sent before the reset",
+          fmt("%llu", (unsigned long long)txCount(anyFrame, t, t + 0.5)));
+    check(sim::bugUninstallWhileWaiting == 0 && simBugs() == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+
+/**
+ * The car's settings when it logged 47 bus-offs in 155 s: errors let pass,
+ * bus guard and receive-error guard both off. Every bus-off is recovered and
+ * the controller restarted - with TEC 220, so five more errors put it off
+ * again. However often that happens, a frame goes out only from a running
+ * controller in normal mode with its pad attached: never into reset mode (a
+ * TEC write), never with the pad routed away.
+ */
+static void scBusOffCycles() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"diag_mode":3,"guard":false,"rx_guard":false})";
+    boot();
+    runUntil(20);
+    faults.errorPerOwnFrame = 0.25;                  // a failing transmit path
+    runUntil(140);
+    uint16_t tec = 0;
+    const int offs = evCount(EVT_BUS_OFF, &tec);
+    check(offs >= 10, "repeated bus-offs, recovered each time", fmt("%d", offs));
+    check(txCount(anyFrame, 130, 140) > 20, "still transmitting after the last of them",
+          fmt("%llu", (unsigned long long)txCount(anyFrame, 130, 140)));
+    check(sim::txInReset == 0 && simBugs() == 0, "never a frame into reset mode or a detached pad",
+          fmt("%d in reset, %d bugs", sim::txInReset, simBugs()));
+    check(sim::activeFlagStarts == 0, "never on the bus able to send an active error flag",
+          fmt("%d", sim::activeFlagStarts));
+}
+
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
 /* ───────────── body values: flashing, positions, derived ───────────── */
 
@@ -2210,6 +2334,9 @@ static const Scenario SCENARIOS[] = {
     {"teach_flips", scTeachFlips, 0}, {"signal_table", scSignalTable, 0},
     {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
     {"signal_bits", scSignalBits, 0},
+    {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
+    {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
+    {"busoff_cycles", scBusOffCycles, 0},
 };
 
 static const Scenario *s_sc = nullptr;

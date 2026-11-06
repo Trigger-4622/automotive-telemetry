@@ -245,7 +245,9 @@ static bool rxFrame(twai_message_t &m, uint32_t timeoutMs) {
 
 /** @brief Why diagGuardOk() said no, for the portal. */
 static const char *guardWhy() {
-    return diagSettleLeftMs() ? "waiting for the bus to settle" : "paused by bus guard";
+    if (diagSettleLeftMs()) return "waiting for the bus to settle";
+    if (!diagBusAlive())    return "the bus is quiet";
+    return "paused by bus guard";
 }
 
 /** @brief One padded frame to the ECU. Refuses while the bus guard is up. */
@@ -255,8 +257,10 @@ static bool tx8(const uint8_t data[8]) {
     m.identifier       = SSM_REQUEST_ID;
     m.data_length_code = 8;
     memcpy(m.data, data, 8);
-    if (twai_transmit(&m, pdMS_TO_TICKS(50)) != ESP_OK) { setErr("transmit refused"); return false; }
-    masterCountTx();
+    if (!masterTransmit(m, 50)) {
+        setErr("%s", diagGuardOk() ? "transmit refused" : guardWhy());
+        return false;
+    }
     return true;
 }
 

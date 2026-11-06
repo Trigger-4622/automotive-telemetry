@@ -26,6 +26,8 @@ BusFaults faults;
 std::vector<TxRecord> transmitted;
 uint64_t obdRequests = 0, ssmRequests = 0, ssmReadsWithBad = 0;
 int reinstalls = 0, bugUninstallWhileWaiting = 0;
+uint64_t deadBusTxUs = 0;
+int txInReset = 0;
 int resetReason = 1;   // ESP_RST_POWERON
 }
 using namespace sim;
@@ -51,6 +53,14 @@ static struct Ctrl {
     bool txAttached = false;   ///< The controller's TX signal drives the pad.
     uint64_t rxHoldUntil = 0;  ///< Frames stay queued until then (a stall).
     bool inReset = false;      ///< Reset mode: off the bus, error counters writable.
+    /** A frame in the transmit buffer not yet acknowledged (faults.nobodyAcks),
+     *  and the driver's queue behind it - msgs_to_tx counts both. */
+    bool txPending = false;
+    twai_message_t txFrame = {};
+    uint64_t txLastUs = 0;     ///< Retransmission time counted up to here.
+    bool txAbort = false;      ///< Abort command: no retransmission after this attempt.
+    std::deque<twai_message_t> txq;
+    uint32_t txFailed = 0;
 } C;
 
 static void flagCheck();
@@ -168,6 +178,10 @@ esp_err_t twai_stop() {
     C.state = TWAI_STATE_STOPPED;
     C.inReset = true;
     C.rx.clear();
+    // twai_stop(): reset mode aborts the frame in the buffer, and the driver
+    // empties its transmit queue and count.
+    C.txPending = C.txAbort = false;
+    C.txq.clear();
     flagCheck();
     return ESP_OK;
 }
@@ -184,6 +198,8 @@ esp_err_t twai_get_status_info(twai_status_info_t *s) {
     *s = {};
     s->state = C.state;
     s->msgs_to_rx = (uint32_t)C.rx.size();
+    s->msgs_to_tx = (C.txPending ? 1u : 0u) + (uint32_t)C.txq.size();
+    s->tx_failed_count = C.txFailed;
     s->tx_error_counter = C.tec;
     s->rx_error_counter = C.rec;
     s->rx_missed_count = C.rxMissed;
@@ -799,6 +815,28 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
         return ESP_FAIL;
     }
     if (C.state != TWAI_STATE_RUNNING) return ESP_ERR_INVALID_STATE;
+    if (C.inReset) {
+        // The driver still says RUNNING (a TEC write of ours put the controller
+        // in reset mode): in reset mode the transmit-buffer addresses are the
+        // acceptance filter, so the frame overwrites the filter, the transmit
+        // command is ignored, and the driver waits for a completion that never
+        // comes - every later transmit queues behind it.
+        sim::txInReset++;
+        simLog('E', "SIM-BUG: transmit while the controller is in reset mode");
+        return ESP_FAIL;
+    }
+    if (C.txPending) {                                   // the buffer is taken: queue it
+        if (C.txq.size() >= 16) return ESP_ERR_TIMEOUT;
+        C.txq.push_back(*m);
+        return ESP_OK;
+    }
+    if (faults.nobodyAcks) {                             // nobody to acknowledge it
+        transmitted.push_back({simrtos::nowUs(), *m});
+        C.txPending = true;
+        C.txFrame = *m;
+        C.txLastUs = simrtos::nowUs();
+        return ESP_OK;
+    }
     transmitted.push_back({simrtos::nowUs(), *m});
     if (faults.errorPerOwnFrame > 0 && urand() < faults.errorPerOwnFrame) {
         C.busErrors++;
@@ -822,6 +860,46 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
     return ESP_OK;
 }
 
+esp_err_t twai_clear_transmit_queue() {
+    if (!C.installed) return ESP_ERR_INVALID_STATE;
+    C.txq.clear();                    // the frame in the buffer stays
+    return ESP_OK;
+}
+
+/**
+ * A frame in the transmit buffer with nobody to acknowledge it: retransmitted
+ * back to back for as long as the controller is on the bus. Each attempt
+ * (about 130 bit times with its error frame) is an acknowledgement error,
+ * which raises TEC by 8 only while error-active. Once someone acknowledges
+ * it, or the abort command lets the attempt end, the buffer frees and the
+ * driver loads the next queued frame.
+ */
+static void txService(uint64_t now) {
+    if (!C.installed || !C.txPending) return;
+    const uint64_t dt = now - C.txLastUs;
+    C.txLastUs = now;
+    if (C.state != TWAI_STATE_RUNNING || C.inReset || !C.txAttached) return;
+    if (faults.nobodyAcks && !C.txAbort) {
+        sim::deadBusTxUs += dt;
+        const uint32_t attempts = std::max<uint32_t>(1, (uint32_t)(dt / 260));
+        C.busErrors += attempts;
+        eccLatch(3, 0, 0x19);                              // other error, sending, ACK slot
+        for (uint32_t i = 0; i < attempts && C.tec < 128; i++) C.tec += 8;
+        raiseAlert(TWAI_ALERT_BUS_ERROR);
+        if (C.tec >= 128) raiseAlert(TWAI_ALERT_ERR_PASS);
+        flagCheck();
+        return;
+    }
+    if (C.txAbort) { sim::deadBusTxUs += std::min<uint64_t>(dt, 260); C.txFailed++; }
+    C.txPending = C.txAbort = false;
+    if (!C.txq.empty()) {
+        C.txFrame = C.txq.front();
+        C.txq.pop_front();
+        C.txPending = true;
+        transmitted.push_back({now, C.txFrame});
+    }
+}
+
 /* ═════════════════════════════ the bus task ═════════════════════════════ */
 
 static void busTask(void *) {
@@ -835,6 +913,7 @@ static void busTask(void *) {
             deliver(m);
         }
         radioCallbacks(now);
+        txService(now);
         if (faults.rxStallEveryMs && faults.rxStallMs) {
             static uint64_t nextStall = 0;
             if (!nextStall) nextStall = now + faults.rxStallEveryMs * 1000ull;
@@ -869,7 +948,7 @@ static void busTask(void *) {
             raiseAlert(TWAI_ALERT_BUS_RECOVERED);
             flagCheck();
         }
-        uint64_t wake = std::min(now + 5000, nextCar);
+        uint64_t wake = std::min(now + (C.txPending ? 1000 : 5000), nextCar);
         if (!s_pending.empty()) wake = std::min(wake, s_pending.begin()->first);
         if (!s_airDone.empty()) wake = std::min(wake, s_airDone.front().first);
         simrtos::sleepUs(std::max<uint64_t>(wake, now + 100) - now);
@@ -884,7 +963,14 @@ void sim::start() {
 /* ── register-level access (hal/twai_ll.h), as the master's erratum fix uses ── */
 twai_dev_t TWAI;
 static bool s_tecWrittenInReset = false;
-void twai_ll_enter_reset_mode(twai_dev_t *) { C.inReset = true; }
+void twai_ll_enter_reset_mode(twai_dev_t *) {
+    // On the chip reset mode aborts a transmission without the interrupt the
+    // driver waits for: its transmit state would be stuck from then on.
+    if (C.txPending && C.state == TWAI_STATE_RUNNING)
+        simLog('E', "SIM-BUG: reset mode entered with a frame of ours in the transmit buffer");
+    C.inReset = true;
+}
+void twai_ll_set_cmd_abort_tx(twai_dev_t *) { if (C.txPending) C.txAbort = true; }
 void twai_ll_exit_reset_mode(twai_dev_t *)  {
     C.inReset = false;
     // The S3 on the car: a TEC written in reset mode reads back one lower

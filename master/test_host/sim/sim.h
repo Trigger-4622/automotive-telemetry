@@ -80,6 +80,16 @@ struct BusFaults {
     /** The next this many twai_driver_install() calls fail (ESP_ERR_NO_MEM). */
     int      installFailures = 0;
     /**
+     * Nobody acknowledges the master's frames: every other module is asleep or
+     * unpowered, as when the car is switched off under a request. A frame it
+     * sends then stays in its transmit buffer and is retransmitted back to
+     * back, each attempt an acknowledgement error (TEC +8 while error-active;
+     * an error-passive sender's acknowledgement errors do not count, ISO
+     * 11898-1, so it never goes bus-off) - until it is aborted, the controller
+     * is stopped, or someone wakes up and acknowledges it.
+     */
+    bool     nobodyAcks = false;
+    /**
      * A flash write holding the CAN interrupt off: every rxStallEveryMs the
      * received frames stay in the controller for rxStallMs, then come out in
      * one burst. The stall is announced to the master the way its own flash
@@ -166,6 +176,13 @@ bool txPadOnController();
 
 struct CtrlView { bool installed; twai_mode_t mode; twai_state_t state; uint32_t tec, rec; };
 CtrlView controller();
+/** Time a frame of the master's spent being retransmitted onto a bus nobody
+ *  acknowledges (faults.nobodyAcks), in microseconds. */
+extern uint64_t deadBusTxUs;
+/** Transmissions handed to a controller in reset mode: on the chip the frame
+ *  lands in the acceptance-filter registers and is never sent, and the driver
+ *  waits for its completion for ever. */
+extern int  txInReset;
 extern int  reinstalls;                        ///< Driver installs since boot.
 extern int  bugUninstallWhileWaiting;          ///< Uninstall with a task blocked inside.
 

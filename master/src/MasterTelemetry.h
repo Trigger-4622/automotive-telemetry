@@ -11,6 +11,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "driver/twai.h"
 
 /**
  * @brief Where a value came from, in ascending order of preference.
@@ -251,6 +252,16 @@ bool masterPidSupported(uint8_t pid);
 
 /** @brief Count one frame this node put on the bus. */
 void masterCountTx();
+
+/**
+ * @brief Hand one frame to the controller - the only way the master
+ *        transmits. Refused (false) unless the controller is running in normal
+ *        mode with its TX pad attached and diagGuardOk() holds; checked and
+ *        handed over under the lock every controller change takes, so no start,
+ *        stop, reinstall or TEC write can come in between.
+ * @param waitMs How long to wait for the lock and for room in the queue.
+ */
+bool masterTransmit(const twai_message_t &msg, uint32_t waitMs);
 
 /** @brief Census snapshot in arrival order (no sorting), for the learner. */
 size_t masterCensusRaw(CensusView *out, size_t max);

@@ -95,7 +95,19 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   (`TouchCal`), not a coordinate mapping.
 - Master bus rules: only the TWAI RX task may reinstall or uninstall the
   driver; everything that transmits goes through `diagGuardOk()` /
-  `diagBusLock()`; in normal mode the controller also ACKs and error-flags.
+  `diagBusLock()` and hands its frame over with `masterTransmit()` (under
+  `s_twaiReg`: only to a controller running in normal mode with its pad
+  attached, never into reset mode or a reinstall); in normal mode the
+  controller also ACKs and error-flags.
+- **Off means off** (`car_off_tx*`, `ecu_gone_quiet`, `restart_off_bus`):
+  nothing is sent once nothing has been heard for 250 ms (`TX_LIVE_MS`), and
+  `busGuardTask` aborts a frame of ours left unacknowledged on a quiet bus - a
+  controller retransmits one back to back for ever (an error-passive sender's
+  ACK errors never make it bus-off). Ten requests in a row unanswered and the
+  OBD-II poller drops back to the PID 0x00 probe (every 10 s) instead of
+  asking every PID while the ECU is off. `masterBeforeRestart()` takes the
+  controller off the bus and latches the TX pad recessive (RTC hold) across
+  every portal restart; `txRecessiveBoot()` drives the pin before releasing it.
 - **Listen-only is NOT silent on this chip by itself.** Espressif erratum
   (ESP32/S2/S3/C3): a listen-only TWAI controller still sends ACTIVE error
   flags, and listen-only freezes its error counters, so one started with REC 0
