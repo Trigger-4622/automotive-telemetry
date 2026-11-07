@@ -163,7 +163,8 @@ static int simBugs() {
     for (const auto &l : sim::logLines) if (l.find("SIM-BUG") != std::string::npos) n++;
     return n;
 }
-static void commonChecks() {
+/** @param allowedErr An error line containing this is expected (the scenario's own subject). */
+static void commonChecks(const char *allowedErr = nullptr) {
     MasterStats st; masterGetStats(st);
     check(simBugs() == 0, "no misuse of RTOS/driver detected by the simulator", fmt("%d", simBugs()));
     check(sim::bugUninstallWhileWaiting == 0, "driver never uninstalled under a waiting task");
@@ -172,7 +173,9 @@ static void commonChecks() {
     check(sim::espSeqGaps == 0, "ESP-NOW sequence has no gaps", fmt("%llu", (unsigned long long)sim::espSeqGaps));
     check(sim::espPackets > 0, "the displays received packets", fmt("%llu", (unsigned long long)sim::espPackets));
     std::vector<std::string> errs;
-    for (const auto &l : sim::logLines) if (l.find("] E ") != std::string::npos) errs.push_back(l);
+    for (const auto &l : sim::logLines)
+        if (l.find("] E ") != std::string::npos && (!allowedErr || l.find(allowedErr) == std::string::npos))
+            errs.push_back(l);
     check(errs.empty(), "no error lines in the firmware log", errs.empty() ? "" : errs[0]);
     // A fit better than perfect means the regression lost its precision.
     double worst = 0;
@@ -1253,6 +1256,66 @@ static void lomTecHold(bool drain) {
 static void scLomTecHold()  { lomTecHold(false); }
 static void scLomTecDrain() { lomTecHold(true); }
 
+/**
+ * ESP-IDF v4.4.7's twai_get_status_info() reports TEC = REC = 0 for any driver
+ * installed listen-only, whatever the controller holds ("frozen ... thus are
+ * meaningless"). Read through it, the counters "fell to 0 within
+ * milliseconds" on the bench (2026-09-30), the guard pinned them again every
+ * 50 ms - 75 times in 4 s - and each pin was a moment in reset mode, deaf to
+ * the bus. Read from the controller's own registers they hold, as Espressif
+ * says listen-only keeps them: nothing to pin, no deaf moments, and the portal
+ * shows the counters the controller really has.
+ */
+static void scLomCountersReal() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":4})");
+    boot();
+    runUntil(5);
+    const uint64_t resets0 = sim::resetModeEntries;
+    runUntil(65);
+    MasterStats st; masterGetStats(st);
+    check(st.lomRepins == 0, "listen-only counters never pinned again", fmt("%u times", st.lomRepins));
+    check(sim::resetModeEntries == resets0, "never deaf for a pin while listening",
+          fmt("%llu reset-mode entries in 60 s", (unsigned long long)(sim::resetModeEntries - resets0)));
+    // (199 with faults.tecExitDrop, on by default: one lower once out of reset mode.)
+    check(st.tec >= 199 && st.rec == 128, "the portal shows the controller's counters, not the driver's zeros",
+          fmt("TEC %u, REC %u", st.tec, st.rec));
+    check(st.tec == controller().tec && st.rec == controller().rec, "the ones the controller holds",
+          fmt("controller TEC %u, REC %u", controller().tec, controller().rec));
+    commonChecks();
+}
+
+/**
+ * Frames the data bytes of which are not all there. A DLC of 9-15 is legal on
+ * the wire (8 bytes follow) and the driver hands it over as it came, with
+ * data[8]; a remote frame keeps its DLC with no data at all (the driver
+ * zeroes the bytes). Neither may be read past data[8], nor decoded as values.
+ */
+static void scRxOddFrames() {
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"start_delay_s":0,"diag_mode":4,"signals":[{"can_id":1911,
+      "ext":false,"start":0,"len":8,"be":false,"signed":false,"scale":1,"offset":0,"metric":4097,"mode":1,"ref":0,
+      "learned":false,"name":"t"}]})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(3);
+    twai_message_t rtr = {};
+    rtr.identifier = 0x777;                         // the taught signal's frame, as a remote request
+    rtr.rtr = 1;
+    rtr.data_length_code = 8;
+    sim::injectFrame(rtr);
+    twai_message_t big = {};
+    big.identifier = 0x7E8;                         // an OBD-II reply, DLC 15, length nibble 15
+    big.dlc_non_comp = 1;
+    big.data_length_code = 15;
+    const uint8_t b[8] = {0x0F, 0x41, 0xA6, 1, 2, 3, 4, 5};
+    memcpy(big.data, b, 8);
+    sim::injectFrame(big);
+    runUntil(4);
+    check(!shown(4097), "a remote frame is not decoded as the signal's value");
+    MasterStats st; masterGetStats(st);
+    check(st.canRx > 0, "frames counted", fmt("%u", st.canRx));
+    commonChecks();
+}
+
 /** The default bit timing: the Arduino-CAN profile - 87.5 %, SJW 2, triple sampling. */
 static void scTimingDefault() {
     boot();
@@ -1373,6 +1436,27 @@ static void scPassiveOff() {
     check(!Cfg.txPassive, "the setting is off");
     check(sim::activeFlagStarts >= 1, "able to send error frames, as asked (and the simulator sees it)",
           fmt("%d", sim::activeFlagStarts));
+}
+
+/**
+ * Errors let pass: the TX pad goes back to the controller only once TEC really
+ * reads error-passive. A TEC write that does not take - the register keeping
+ * the 0 twai_start() left - is written again; a controller able to flag errors
+ * actively never reaches the bus. Here the write at the switch from the settle
+ * wait to requesting, and the first top-up after it, are both lost.
+ */
+static void scPassiveTecVerified() {
+    s_keepSettle = true;                              // every default: tx_passive on
+    boot();
+    runUntil(9.5);                                    // still listening (settle wait)
+    faults.tecWriteIgnored = 2;
+    runUntil(30);
+    check(controller().mode == TWAI_MODE_NORMAL && controller().tec >= 128, "requesting, error-passive",
+          fmt("TEC %u", controller().tec));
+    check(sim::activeFlagStarts == 0, "never on the bus able to send an error frame",
+          fmt("%d times", sim::activeFlagStarts));
+    check(txCount(isRequest, 12, 30) > 0, "and requesting", fmt("%llu", (unsigned long long)txCount(isRequest, 12, 30)));
+    commonChecks();
 }
 
 /**
@@ -1774,6 +1858,48 @@ static void scBusOffGuardOff() {
     check(unexpectedErrors("bus-off") == 0 && simBugs() == 0, "no other errors");
 }
 
+/**
+ * Bus-off with the receive-error guard's latch (the bus guard off, as on the
+ * car): listen-only is wanted from that moment on. The driver will not
+ * uninstall a controller in the middle of its bus-off recovery, so a mode
+ * switch asked for then fails - and the controller used to come back from
+ * the recovery in NORMAL mode, TX pad attached, until the next try 2 s later.
+ * With errors flagged actively (tx_passive off) that is exactly the traffic
+ * the latch is there to stop. Sampled every half millisecond.
+ */
+static void busOffLatchNoNormal(double at) {
+    loadCarConfig();                                // guard false, rx_guard true
+    portalPostBeforeBoot(R"({"tx_passive":false})");
+    boot();
+    runUntil(at);
+    faults.busOffNow = true;
+    int onBusNormal = 0;
+    double firstBad = -1, silentAt = -1;
+    for (double t = at; t <= at + 6; t += 0.0005) {
+        runUntil(t);
+        MasterStats st; masterGetStats(st);
+        if (!st.rxGuardSilent) continue;            // not latched yet
+        const sim::CtrlView c = controller();
+        if (c.installed && c.state == TWAI_STATE_RUNNING && c.mode == TWAI_MODE_NORMAL &&
+            sim::txPadOnController()) {
+            if (!onBusNormal++) firstBad = t;
+        }
+        if (silentAt < 0 && c.installed && c.state == TWAI_STATE_RUNNING && c.mode == TWAI_MODE_LISTEN_ONLY)
+            silentAt = t;
+    }
+    check(onBusNormal == 0, "never back on the bus in normal mode once listen-only is latched",
+          onBusNormal ? fmt("%d samples, first at %.4f s", onBusNormal, firstBad) : std::string("0"));
+    check(silentAt > 0 && silentAt < at + 0.5, "listen-only as soon as the recovery is over",
+          fmt("at %.4f s", silentAt));
+    check(unexpectedErrors("bus-off") == 0, "no failed reinstall (\"TWAI init failed\")");
+    commonChecks("bus-off");
+}
+/** Long after the last mode switch. */
+static void scBusOffLatchNoNormal() { busOffLatchNoNormal(20); }
+/** Half a second after the settle wait switched to normal - inside the 2 s
+ *  throttle on mode switches, the likeliest moment for a marginal link. */
+static void scBusOffLatchAfterSettle() { busOffLatchNoNormal(10.6); }
+
 static double minObdGapMs(double fromS, double toS) {
     double best = 1e9, last = -1;
     for (const auto &r : sim::transmitted) {
@@ -1957,6 +2083,29 @@ static void scTxHold() {
     check(sleepEntered, "slept");
     check(gpioHoldEnabled > 0 && txDrivenHigh, "TX latched recessive for the whole sleep");
     check(evCount(EVT_SLEEP) == 1, "sleep recorded in the evidence log");
+}
+
+/**
+ * twai_driver_install() routes the TX pad to the controller before it resets
+ * the peripheral, and after a restart (which resets only the CPUs) that is
+ * still the last run's controller, clocked, in whatever state it was left. So
+ * every install - at boot, on each switch to listen-only and back - is made
+ * with the pad latched recessive, and the latch is gone once requesting.
+ */
+static void scInstallPadLatched() {
+    s_keepSettle = true;                              // settle wait: listen-only first, then normal
+    boot();
+    runUntil(15);
+    portalPost(R"({"diag_mode":4})");
+    runUntil(20);
+    portalPost(R"({"diag_mode":0})");
+    runUntil(30);
+    check(sim::reinstalls >= 4, "installed at boot and on every switch", fmt("%d installs", sim::reinstalls));
+    check(sim::installsUnheld == 0, "every one with the TX pad latched", fmt("%d not", sim::installsUnheld));
+    check(controller().mode == TWAI_MODE_NORMAL && gpioHoldEnabled == 0 && sim::txPadOnController(),
+          "and released for requesting");
+    check(txCount(isRequest, 25, 30) > 0, "requests going out", fmt("%llu", (unsigned long long)txCount(isRequest, 25, 30)));
+    commonChecks();
 }
 
 /** ...and the latch is the owner's to turn off. */
@@ -2815,14 +2964,15 @@ static const Scenario SCENARIOS[] = {
     {"normal_confinement", scNormalConfinement, 0},
     {"lom_rec_drift", scLomRecDrift, 0}, {"passive_marginal", scPassiveMarginal, 0},
     {"lom_tec_hold", scLomTecHold, 0}, {"lom_tec_drain", scLomTecDrain, 0},
+    {"lom_counters_real", scLomCountersReal, 0}, {"rx_odd_frames", scRxOddFrames, 0},
     {"passive_off", scPassiveOff, 0}, {"passive_busoff", scPassiveBusOff, 0},
-    {"error_frames_never", scErrorFramesNever, 0}, {"bus_defaults", scBusDefaults, 0},
+    {"error_frames_never", scErrorFramesNever, 0}, {"passive_tec_verified", scPassiveTecVerified, 0}, {"bus_defaults", scBusDefaults, 0},
     {"link_misses", scLinkMisses, 0}, {"link_radio", scLinkRadio, 0},
     {"no_driver_retry", scNoDriverRetry, 0}, {"tec_write_not_ours", scTecWriteNotOurs, 0},
     {"link_bursts", scLinkBursts, 0}, {"timing_default", scTimingDefault, 0},
     {"portal_ap_safe", scPortalApSafe, 0}, {"portal_rescue", scPortalRescue, 0},
     {"timing_idf", scTimingIdf, 0}, {"timing_sp875_legacy", scTimingSp875Legacy, 0},
-    {"error_kinds", scErrorKinds, 0}, {"radio_power", scRadioPower, 0}, {"busoff_guard_off", scBusOffGuardOff, 0},
+    {"error_kinds", scErrorKinds, 0}, {"radio_power", scRadioPower, 0}, {"busoff_guard_off", scBusOffGuardOff, 0}, {"busoff_latch_no_normal", scBusOffLatchNoNormal, 0}, {"install_pad_latched", scInstallPadLatched, 0}, {"busoff_latch_after_settle", scBusOffLatchAfterSettle, 0},
     {"pacing_p2can", scPacingP2can, 0}, {"pacing_p2can_auto", scPacingP2canAuto, 0},
     {"budget", scBudget, 0}, {"no_functional", scNoFunctional, 0},
     {"crank_reset", scCrankReset, 0}, {"evlog", scEvlog, 0},

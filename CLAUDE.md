@@ -126,14 +126,43 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   of its own unheard error flags, each counted (7.8 errors per misread in
   `lom_tec_hold` without the fix). So TEC is written well clear of 128 and
   `busGuardTask` pins it again below `TEC_LISTEN_LOW`; the sim models the
-  drop (`faults.tecExitDrop`, on by default). **That does not hold on the
-  car's S3 either** (bench boot 2026-09-30, no bus traffic): TEC 200 read
-  back as 200, then TEC and REC were 0 within milliseconds and the pin was
-  applied 75 times in 4 s. This chip keeps no counters in listen-only, so a
-  listening controller is error-active whatever is written - only the
-  detached TX pad keeps it off the bus. Proposed, waiting for the owner's
-  go-ahead: silent periods in NORMAL mode with the TX pad detached and TEC
-  220, where the counters do hold (no MIL with `tx_passive` on the car).
+  drop (`faults.tecExitDrop`, on by default). The 2026-09-30 bench boot
+  (TEC 200 read back as 200, then TEC and REC "0 within milliseconds", the
+  pin applied 75 times in 4 s) was NOT the chip: ESP-IDF v4.4.7's
+  `twai_get_status_info()` reports TEC = REC = 0 for any driver installed
+  listen-only, whatever the controller holds ("frozen ... meaningless",
+  twai.c), and the guard, the portal and the serial log all read them through
+  it - so the guard re-pinned every 50 ms, each time a moment in reset mode,
+  deaf to the bus. The counters are read from the registers now
+  (`twaiCounters()`; `lom_counters_real`), and the sim's driver mock reports
+  0 in listen-only as the real one does (that is why the harness never showed
+  it). Espressif documents the counters as frozen in listen-only. On the car,
+  `[ctrl ]`'s "pinned again" should now stay 0 - if it does not, that is real
+  evidence of a chip that loses its counters; the proposal of silent periods
+  in normal mode rested on the old reading and waits on that evidence. Never
+  read TEC/REC through `twai_get_status_info()` for a decision.
+- **TX pad through restarts and installs** (TX/RX sweep, 2026-11-07, against
+  the v4.4.7 driver source and Espressif's errata - the S3 has no TWAI
+  errata of its own beyond the listen-only one). `esp_restart_noos()`
+  resets only the CPUs and start-up keeps peripheral clocks after a CPU
+  reset, so the CAN controller runs on through a restart, attached to the
+  pad, until `setup()`. Every software restart - a panic, abort, stack
+  overflow, interrupt watchdog, and `esp_restart()` - goes through
+  `__wrap_esp_restart_noos` (`-Wl,--wrap=esp_restart_noos`, verified in the
+  ELF: `esp_restart` and `panic_restart` call it, IRAM, register writes and
+  ROM `gpio_matrix_out` only): pad to the GPIO latch, high, RTC-held with
+  `tx_hold`. A brownout is a hardware reset on the S3 and cannot be hooked:
+  only a pull-up on the transceiver's TXD covers it. `setupTwai()` holds the
+  pad through `twai_driver_install()` (which routes it to the controller
+  before resetting the peripheral); `twaiGoLive()` releases it
+  (`install_pad_latched`). `tecWrite()` reads TEC back and retries before the
+  pad is given to a passive controller (`passive_tec_verified`). No mode
+  switch while bus-off/recovering (the driver refuses the uninstall), and a
+  recovered controller that should listen is replaced, not restarted in
+  normal mode (`busoff_latch_after_settle`). Received DLC is clamped to 8 and
+  remote frames are activity only (`rx_odd_frames`). Stack headroom of the
+  CAN tasks: `[ctrl ]` and `/api/live` (`stack`, `stack_task`); busguard has
+  4 KB.
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only

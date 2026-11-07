@@ -110,6 +110,8 @@ struct MasterStats {
     uint32_t busBitsRx;  /**< Estimated bits received since boot.      */
     uint32_t canTx;      /**< Frames this node transmitted.            */
     uint16_t bitrate;    /**< kbit/s, for turning bits into a load %.  */
+    uint32_t stackMinFree;     /**< Least stack any CAN-side task has had left [B]. */
+    const char *stackMinTask;  /**< ...and which task that was.                     */
     uint32_t tec;        /**< Transmit error counter (ours).           */
     uint32_t rec;        /**< Receive error counter.                   */
     uint32_t busErrors;  /**< Bus errors seen by the controller.       */

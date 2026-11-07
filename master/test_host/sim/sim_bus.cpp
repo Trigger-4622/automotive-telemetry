@@ -51,6 +51,7 @@ static struct Ctrl {
     int waitingRx = 0, waitingAlerts = 0;
     uint64_t recoveryDoneAt = 0;
     bool txAttached = false;   ///< The controller's TX signal drives the pad.
+    bool txRouted = false;     ///< The GPIO matrix routes it there (a hold may still latch the pad).
     uint64_t rxHoldUntil = 0;  ///< Frames stay queued until then (a stall).
     bool inReset = false;      ///< Reset mode: off the bus, error counters writable.
     /** A frame in the transmit buffer not yet acknowledged (faults.nobodyAcks),
@@ -94,10 +95,22 @@ static void txGlitch(const char *why) {
     simLog('E', "SIM-BUG: CAN TX driven dominant by a GPIO - %s", why);
 }
 
-void sim::txPadFromGpio() {
-    if (!sim::txDrivenHigh) txGlitch("pad switched to a GPIO output while its latch is low");
-    C.txAttached = false;
+/** What the pad shows: the controller when routed to it, unless the pad hold
+ *  (gpio_hold_en) has latched it - a held pad changes with nothing. */
+static void padUpdate() {
+    C.txAttached = C.txRouted && !sim::txHeld;
     flagCheck();
+}
+void sim::txPadFromGpio() {
+    if (!sim::txHeld && !sim::txDrivenHigh) txGlitch("pad switched to a GPIO output while its latch is low");
+    C.txRouted = false;
+    padUpdate();
+}
+void sim::txHoldChanged(bool held) {
+    if (!held && sim::txHeld && !C.txRouted && !sim::txDrivenHigh)
+        txGlitch("pad hold released onto a GPIO latch that is low");
+    sim::txHeld = held;
+    padUpdate();
 }
 bool sim::txPadOnController() { return C.txAttached; }
 
@@ -131,8 +144,10 @@ esp_err_t twai_driver_install(const twai_general_config_t *g, const twai_timing_
     C.installed = true;
     // twai_configure_gpio(): gpio_config() makes the pad a GPIO output - showing
     // the GPIO latch's level for a moment - then routes the controller onto it.
-    if (!sim::txDrivenHigh) txGlitch("twai_driver_install with the TX GPIO latch low");
-    C.txAttached = true;
+    if (!sim::txHeld) sim::installsUnheld++;
+    if (!sim::txHeld && !sim::txDrivenHigh) txGlitch("twai_driver_install with the TX GPIO latch low");
+    C.txRouted = true;
+    padUpdate();
     C.inReset = true;
     C.mode = g->mode;
     C.alertsEnabled = g->alerts_enabled;
@@ -200,8 +215,13 @@ esp_err_t twai_get_status_info(twai_status_info_t *s) {
     s->msgs_to_rx = (uint32_t)C.rx.size();
     s->msgs_to_tx = (C.txPending ? 1u : 0u) + (uint32_t)C.txq.size();
     s->tx_failed_count = C.txFailed;
-    s->tx_error_counter = C.tec;
-    s->rx_error_counter = C.rec;
+    // As ESP-IDF v4.4.7's driver (twai.c, twai_get_status_info): a driver
+    // installed listen-only reports TEC = REC = 0 whatever the registers
+    // hold - "frozen ... thus are meaningless". Only twai_ll_get_tec/rec read
+    // the controller itself.
+    const bool lom = C.mode == TWAI_MODE_LISTEN_ONLY;
+    s->tx_error_counter = lom ? 0 : C.tec;
+    s->rx_error_counter = lom ? 0 : C.rec;
     s->rx_missed_count = C.rxMissed;
     s->bus_error_count = C.busErrors;
     return ESP_OK;
@@ -253,6 +273,7 @@ static twai_message_t frame(uint32_t id, std::initializer_list<uint8_t> b) {
 }
 
 static void schedule(uint64_t atUs, const twai_message_t &m) { s_pending.emplace(atUs, m); }
+void sim::injectFrame(const twai_message_t &m) { schedule(simrtos::nowUs(), m); }
 
 static void deliver(const twai_message_t &m) {
     if (!C.installed || C.state != TWAI_STATE_RUNNING || C.inReset) return;
@@ -335,6 +356,8 @@ static bool masterFlagsActive() {
 }
 
 int sim::activeFlagStarts = 0;
+uint64_t sim::resetModeEntries = 0;
+int sim::installsUnheld = 0;
 static bool s_couldFlag = false;
 /** Count each time the controller becomes able to flag actively. Called
  *  wherever its state, counters or pad routing change. */
@@ -1081,6 +1104,8 @@ void twai_ll_enter_reset_mode(twai_dev_t *) {
     // driver waits for: its transmit state would be stuck from then on.
     if (C.txPending && C.state == TWAI_STATE_RUNNING)
         simLog('E', "SIM-BUG: reset mode entered with a frame of ours in the transmit buffer");
+    // Each one is a moment the controller is off the bus: deaf to it.
+    if (C.installed && C.state == TWAI_STATE_RUNNING) sim::resetModeEntries++;
     C.inReset = true;
 }
 void twai_ll_set_cmd_abort_tx(twai_dev_t *) { if (C.txPending) C.txAbort = true; }
@@ -1107,14 +1132,15 @@ void esp_rom_gpio_connect_out_signal(uint32_t gpio, uint32_t signal, bool outInv
     if (!C.installed) simLog('E', "SIM-BUG: TX pad given to an uninstalled controller");
     if (C.installed && C.mode == TWAI_MODE_LISTEN_ONLY)
         simLog('E', "SIM-BUG: TX pad given to a listen-only controller (the erratum reaches the bus)");
-    C.txAttached = true;
-    flagCheck();
+    C.txRouted = true;
+    padUpdate();
 }
 bool twai_ll_is_in_reset_mode(twai_dev_t *) { return C.inReset; }
 uint32_t twai_ll_get_rec(twai_dev_t *)      { return C.rec; }
 uint32_t twai_ll_get_tec(twai_dev_t *)      { return C.tec; }
 void twai_ll_set_tec(twai_dev_t *, uint32_t tec) {
     if (!C.inReset) { simLog('E', "SIM-BUG: TEC written outside reset mode (ignored by the hardware)"); return; }
+    if (faults.tecWriteIgnored > 0) { faults.tecWriteIgnored--; return; }
     C.tec = tec;
     s_tecWrittenInReset = true;
 }

@@ -156,6 +156,10 @@ void WebPortal::setupRoutes() {
         JsonDocument doc;
         doc["uptime"] = millis() / 1000;
         doc["heap"]   = ESP.getFreeHeap();
+        // The least stack any CAN-side task has had left: an overflow is a
+        // panic, and a panic restarts the master mid-drive.
+        doc["stack"]      = st.stackMinFree;
+        doc["stack_task"] = st.stackMinTask;
         // The MAC the displays see is the one the broadcast leaves from, and
         // with the portal up that is the AP interface, not the station's.
         doc["mac"]    = Portal.running() ? WiFi.softAPmacAddress() : WiFi.macAddress();

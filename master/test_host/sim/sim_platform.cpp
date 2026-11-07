@@ -27,12 +27,13 @@
 
 /* ═════════════════════════════ FreeRTOS ═════════════════════════════════ */
 
-BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t, void *arg,
+BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t stack, void *arg,
                                    UBaseType_t prio, TaskHandle_t *handle, BaseType_t) {
-    if (handle) *handle = nullptr;
+    if (handle) *handle = (TaskHandle_t)(uintptr_t)stack;   // what uxTaskGetStackHighWaterMark reports from
     simrtos::createTask(fn, name, arg, (int)prio);
     return pdPASS;
 }
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) { return (UBaseType_t)((uintptr_t)task / 2); }
 void vTaskDelay(TickType_t ticks) { simrtos::sleepUs(simTicksUs(ticks)); }
 TickType_t xTaskGetTickCount() { return (TickType_t)(simrtos::nowUs() / 1000); }
 
@@ -199,6 +200,7 @@ int analogRead(uint8_t) { return 2000; }
 
 namespace sim {
 int  gpioHoldEnabled = 0;
+bool txHeld = false;
 bool txDrivenHigh = false;
 bool txConfiguredOut = false;
 int  txGlitches = 0;
@@ -212,8 +214,9 @@ TimingView timing = {};
 
 esp_reset_reason_t esp_reset_reason() { return (esp_reset_reason_t)sim::resetReason; }
 
-esp_err_t gpio_hold_en(gpio_num_t)  { sim::gpioHoldEnabled++; return ESP_OK; }
-esp_err_t gpio_hold_dis(gpio_num_t) { if (sim::gpioHoldEnabled) sim::gpioHoldEnabled--; return ESP_OK; }
+// The pad hold is on or off, not counted: a second gpio_hold_en() changes nothing.
+esp_err_t gpio_hold_en(gpio_num_t)  { sim::gpioHoldEnabled = 1; sim::txHoldChanged(true);  return ESP_OK; }
+esp_err_t gpio_hold_dis(gpio_num_t) { sim::gpioHoldEnabled = 0; sim::txHoldChanged(false); return ESP_OK; }
 void      gpio_deep_sleep_hold_en()  {}
 void      gpio_deep_sleep_hold_dis() {}
 esp_err_t gpio_pullup_en(gpio_num_t) { return ESP_OK; }
