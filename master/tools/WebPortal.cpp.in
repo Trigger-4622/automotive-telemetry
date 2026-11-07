@@ -26,7 +26,33 @@
 
 WebPortal Portal;
 
-static WebServer s_server(80);
+/**
+ * The library's server handles one connection at a time, and one that has
+ * connected but not yet sent its request holds every other one up for up to
+ * HTTP_MAX_DATA_WAIT (5 s). Browsers open such connections ahead of need
+ * (Chrome's preconnect), so the page's requests queued behind an idle socket
+ * and the portal froze for seconds at a time. Here that socket is let go as
+ * soon as another connection is waiting; a browser opens a fresh one when it
+ * has something to ask.
+ */
+class PortalServer : public WebServer {
+public:
+    using WebServer::WebServer;
+    void handleClient() {
+        if (_currentStatus == HC_WAIT_READ && millis() - _statusChange >= IDLE_MS &&
+            !_currentClient.available() && _server.hasClient()) {
+            _currentClient.stop();
+            _currentClient = WiFiClient();
+            _currentStatus = HC_NONE;
+        }
+        WebServer::handleClient();
+    }
+private:
+    /** A request normally follows its connection within milliseconds. */
+    static constexpr uint32_t IDLE_MS = 150;
+};
+
+static PortalServer s_server(80);
 static DNSServer s_dns;
 
 /*

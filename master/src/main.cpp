@@ -89,6 +89,7 @@ struct MasterMetric {
     float    sentValue;     /**< Value in the last broadcast.           */
     uint32_t sentMs;        /**< millis() of the last broadcast.        */
     bool     everSent;      /**< At least one broadcast has carried it. */
+    uint8_t  repeats;       /**< Bursts still to carry its last change. */
 };
 
 /** @brief The metric store, shared between the CAN and broadcast tasks. */
@@ -285,7 +286,7 @@ void publishMetric(uint16_t id, float value, uint8_t source) {
     if (!slot)
         for (auto &m : s_metrics)
             if (!m.used) { slot = &m; slot->used = true; slot->id = id;
-                           slot->everSent = false; slot->source = SRC_NONE; break; }
+                           slot->everSent = false; slot->repeats = 0; slot->source = SRC_NONE; break; }
     if (slot) {
         /*
          * Source priority. A raw broadcast frame at 50 Hz must not be
@@ -889,17 +890,43 @@ static uint64_t extractRaw(const uint8_t *d, uint8_t dlc, const RtSignal &s) {
 }
 
 /**
+ * @brief A bit combination's code that is in none of its table's entries:
+ *        the entry it is plainly nearest to, or NaN.
+ *
+ * A lever taught as a combination takes in every bit that changed with it on
+ * the day, and one of those - a park/neutral switch, a lamp - can change on
+ * its own while driving: one wrong bit and the whole reading was lost. So a
+ * code within a quarter of the combination's width (one bit at least) of one
+ * entry, and nearer to it than to any other, reads as that entry. Equally near
+ * two - between positions - stays unknown. Numeric fields keep exact matches:
+ * code 3 is not "nearly 1" there.
+ */
+static float nearestCode(uint64_t raw, const RtSignal &s) {
+    if (s.nBits < 2) return NAN;
+    const int tol = max(1, s.nBits / 4);
+    int best = 65, second = 65;
+    float val = NAN;
+    for (uint8_t k = 0; k < s.nMap; k++) {
+        const int dist = __builtin_popcountll(raw ^ s.mapRaw[k]);
+        if (dist < best) { second = best; best = dist; val = s.mapVal[k]; }
+        else if (dist < second) second = dist;
+    }
+    return best <= tol && best < second ? val : NAN;
+}
+
+/**
  * @brief Decode one CAN signal to its engineering value.
  * @return `raw * scale + offset`, sign-extended first when `s.isSigned`; for a
  *         signal with a value table, the value its raw reading maps to, or NaN
- *         (publishes nothing) for a raw reading that is not in the table.
+ *         (publishes nothing) for a raw reading that is not in the table
+ *         (a bit combination: nor plainly near one entry, nearestCode()).
  */
 static float decodeSignal(const uint8_t *d, uint8_t dlc, const RtSignal &s) {
     uint64_t raw = extractRaw(d, dlc, s);
     if (s.nMap) {
         for (uint8_t k = 0; k < s.nMap; k++)
             if (raw == s.mapRaw[k]) return s.mapVal[k];
-        return NAN;
+        return nearestCode(raw, s);
     }
     int64_t  val = (int64_t)raw;
     if (s.isSigned && s.bitLength < 64 &&
@@ -2183,13 +2210,25 @@ static void radioObserve(bool alive) {
  * the radio traffic to a fraction and leaves the fast channels their full
  * cadence. A night-flag change forces a full burst, since it rides on every
  * entry's flags.
+ *
+ * Broadcasts are not acknowledged, and a packet the displays miss leaves them
+ * on the old value until the keep-alive. For a needle that is a moment's lag;
+ * for a lamp it is the wrong state, and a flashing indicator (lit 350 ms) loses
+ * the flash. So a change to an on/off value or a position (@ref isStateMetric)
+ * rides in the next STATE_REPEATS bursts too: a loss costs one burst period.
  */
+static constexpr uint8_t STATE_REPEATS = 2;
+static bool isStateMetric(uint16_t id) {
+    return (id & 0xFF00) == 0x1200 || (id & 0xFF00) == 0x2100 || id == METRIC_ID_GEAR_LEVER;
+}
+
 static void broadcastTask(void *) {
     static const uint8_t BCAST[6] = TELEMETRY_BROADCAST_ADDR;
     static uint32_t seq = 0;
     MasterTelemetryPacket pkt;
     MetricEntry fresh[MAX_MASTER_METRICS];
     uint8_t     slotOf[MAX_MASTER_METRICS];
+    bool        changed[MAX_MASTER_METRICS];
     bool lastNight = false;
 
     for (;;) {
@@ -2210,13 +2249,15 @@ static void broadcastTask(void *) {
         for (size_t i = 0; i < MAX_MASTER_METRICS; i++) {
             MasterMetric &m = s_metrics[i];
             if (!m.used || now - m.lastUpdateMs > Cfg.metricTtlMs) continue;
-            const bool due = forceAll || !m.everSent || m.value != m.sentValue ||
+            const bool moved = !m.everSent || m.value != m.sentValue;
+            const bool due = forceAll || moved || m.repeats ||
                              now - m.sentMs >= Cfg.keepaliveMs;
             if (!due) continue;
             fresh[total].metric_id = m.id;
             fresh[total].value     = m.value;
             fresh[total].flags     = 0;      // flags computed outside the lock
-            slotOf[total] = (uint8_t)i;
+            slotOf[total]  = (uint8_t)i;
+            changed[total] = moved;
             total++;
         }
         portEXIT_CRITICAL(&s_metricMux);
@@ -2247,6 +2288,8 @@ static void broadcastTask(void *) {
                     m.sentValue = fresh[off + k].value;
                     m.sentMs    = now;
                     m.everSent  = true;
+                    if (changed[off + k] && isStateMetric(m.id)) m.repeats = STATE_REPEATS;
+                    else if (m.repeats) m.repeats--;
                 }
                 portEXIT_CRITICAL(&s_metricMux);
             }

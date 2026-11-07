@@ -2860,6 +2860,46 @@ static void scSignalBits() {
 }
 
 /**
+ * A lever taught with a bit that is not its own (as on the car on 2026-09-30:
+ * eight bits, some of which only changed with the lever that day). Here it is
+ * the front left door (bit 8), shut while it was taught: with the door open,
+ * an exact match finds no position at all, and the displays keep the old
+ * letter until it goes stale. A code one bit from exactly one position reads
+ * as that position; one equally near several (between positions) stays
+ * unknown.
+ */
+static void scLeverTolerant() {
+    body.enabled = true;
+    // Code bit i = bits[i], door shut: P 3, R 6, N 0, D 10.
+    simfs::files["/config.json"] = sigFile({
+        bodySigBits(METRIC_ID_GEAR_LEVER, "[24,39,42,30,8]", "[[3,80],[6,82],[0,78],[10,68]]")});
+    boot();
+    runUntil(2);
+    body.doors = 0x01;                                   // the door opens and stays open
+    const char *seq = "RNDP";
+    int reads = 0, right = 0, wrong = 0;
+    for (int i = 0; seq[i]; i++) {
+        body.lever = seq[i];
+        const double t0 = tNow();
+        for (double t = t0 + 0.3; t < t0 + 4; t += 0.1) {
+            runUntil(t);
+            double v = -1;
+            reads++;
+            if (!shownNow(METRIC_ID_GEAR_LEVER, v)) continue;
+            if (v == seq[i]) right++; else wrong++;
+        }
+    }
+    check(wrong == 0, "never the wrong letter", fmt("%d wrong", wrong));
+    check(right == reads, "with the door open, every position still reads", fmt("%d of %d", right, reads));
+    body.lever = 'M';                                    // only N's bit set: as near every position as any other
+    runUntil(tNow() + 4);
+    double v = -1;
+    const bool shownM = shownNow(METRIC_ID_GEAR_LEVER, v);
+    check(!shownM, "a code equally near several positions publishes nothing", fmt("%.0f", v));
+    commonChecks();
+}
+
+/**
  * A lever whose positions are separate bits, taught one by one as Reverse,
  * Lever in N and Lever in D: the master puts them together as the gear
  * lever. A field taught onto the lever itself wins over them.
@@ -2941,6 +2981,45 @@ static void scDerivedDoors() {
     commonChecks();
 }
 
+/**
+ * A flashing indicator over a lossy radio: a third of the master's packets
+ * never reach the displays (broadcasts are not acknowledged, so the master
+ * cannot know). A lamp lit for 350 ms whose change is lost waits for the
+ * keep-alive, 300 ms later - the flash is gone, or shown late and short.
+ * Every change of an on/off value is sent again in the next two bursts, so a
+ * lost packet costs 40 ms instead, and the displays keep the car's rhythm.
+ */
+static void scLampRadioLoss() {
+    body.enabled = true;
+    simfs::files["/config.json"] = sigFile({bodySig(METRIC_ID_TURN_LEFT, 16, 1)});
+    faults.radioLoss = 0.33;
+    watchMetric = METRIC_ID_TURN_LEFT;
+    boot();
+    runUntil(3);
+    body.turnLeft = true;
+    const uint64_t on = simrtos::nowUs();
+    runUntil(tNow() + 20);                               // 20 s: 57 flashes
+    const uint64_t off = simrtos::nowUs();
+    body.turnLeft = false;
+    runUntil(tNow() + 2);
+    // Each change as the displays got it should come 350 ms after the one
+    // before, as the car's flasher made them.
+    std::vector<double> gaps;
+    for (size_t i = 1; i < watchLog.size(); i++)
+        if (watchLog[i - 1].tUs >= on + 500000 && watchLog[i].tUs <= off)
+            gaps.push_back((watchLog[i].tUs - watchLog[i - 1].tUs) / 1e3);
+    const size_t good = (size_t)std::count_if(gaps.begin(), gaps.end(),
+                                              [](double g) { return std::fabs(g - 350) <= 100; });
+    check(gaps.size() >= 50, "the displays saw the lamp change about every 350 ms", fmt("%zu changes", gaps.size()));
+    check(good * 100 >= gaps.size() * 95, "each change on time (350 +- 100 ms) though a third of the packets are lost",
+          fmt("%zu of %zu on time; %llu of %llu packets lost", good, gaps.size(),
+              (unsigned long long)espLost, (unsigned long long)espPackets));
+    double v = -1;
+    const bool dark = shownNow(METRIC_ID_TURN_LEFT, v) && v == 0;
+    check(dark, "and dark once it stops", fmt("%.0f", v));
+    commonChecks();
+}
+
 static const Scenario SCENARIOS[] = {
     {"auto", scAuto, 0}, {"silent", scSilent, 0}, {"mode_switch", scModeSwitch, 0},
     {"guard", scGuard, 0}, {"guard_off", scGuardOff, 0}, {"idle_errors", scIdleErrors, 0},
@@ -2979,7 +3058,8 @@ static const Scenario SCENARIOS[] = {
     {"tx_hold", scTxHold, 0}, {"tx_hold_off", scTxHoldOff, 0},
     {"teach_flips", scTeachFlips, 0}, {"signal_table", scSignalTable, 0},
     {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
-    {"signal_bits", scSignalBits, 0},
+    {"signal_bits", scSignalBits, 0}, {"lamp_radio_loss", scLampRadioLoss, 0},
+    {"lever_tolerant", scLeverTolerant, 0},
     {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
     {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
     {"busoff_cycles", scBusOffCycles, 0},

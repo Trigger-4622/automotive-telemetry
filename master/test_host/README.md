@@ -14,9 +14,12 @@ python test_host/run.py portal_teach   # just the portal's teach-by-doing analys
 
 A full run ends with `portal_teach`: `portal_tests.js` runs, in Node.js, the
 portal page's own teach-by-doing analysis (every block of
-`tools/portal_page.html` marked `teach-core`) on made-up traffic - a flashing
-turn signal polled at any rate, a steady switch, a counter, a gear lever in
-one field or spread over separate bits. Node is needed on the PATH, like g++.
+`tools/portal_page.html` marked `teach-core`) on made-up traffic, read the way
+the page reads it - requests answered after a delay, late answers dropped by
+the page's own `teachSlot`, a driver who reacts late: a flashing turn signal
+from a fast or a slow master, the indicators' left/right/hazard run, a steady
+switch, a counter, a gear lever in its own field, scattered or spread over
+separate bits. Node is needed on the PATH, like g++.
 
 Needs `g++` (WinLibs GCC: `winget install BrechtSanders.WinLibs.POSIX.UCRT`) and a
 `pio run` done once (for ArduinoJson in `.pio/libdeps`). Debug a failure with
@@ -31,7 +34,7 @@ another one instead. The P1718 scenarios drive with the first fixture.
 | `mocks/` | Arduino, FreeRTOS, TWAI, LittleFS, Wi-Fi/ESP-NOW headers, same API as ESP-IDF 4.4 |
 | `sim/sim_rtos.cpp` | Deterministic scheduler: one task runs at a time, virtual time jumps to the next wake-up, so a 4-minute drive takes ~2 s and every run is reproducible. It aborts on deadlock, on a task that spins without blocking, and on blocking inside a critical section |
 | `sim/sim_bus.cpp` | TWAI controller (modes, error counters that wind down on good frames, bus-off, alerts, a transmit buffer that keeps retransmitting a frame nobody acknowledges until it is aborted, and a transmit into reset mode flagged as the bug it is on the chip), the car's broadcast frames, an engine ECU speaking OBD-II and SSM2 over real ISO-TP (trouble codes, clear, VIN/calibration ID, an odometer), a transmission ECU on 0x7E1 and 0x7DF that keeps its own codes and watches the engine ECU's broadcasts (it sets P1718 when they thin out, and the ECM P0700), an optional stability unit frame (yaw rate, lateral and longitudinal G), a speed profile a scenario can set, fault injection including a marginal link on which a normal-mode master error-flags - destroys - those broadcasts |
-| `sim/sim_platform.cpp` | FreeRTOS queues and semaphores (flags mutex misuse), in-memory LittleFS (short writes, rename quirks, directories, append, a partition size), ESP-NOW decoded as a display would |
+| `sim/sim_platform.cpp` | FreeRTOS queues and semaphores (flags mutex misuse), in-memory LittleFS (short writes, rename quirks, directories, append, a partition size), ESP-NOW decoded as a display would - with packets lost on the way if a scenario asks (`faults.radioLoss`) |
 | `tests/scenarios.cpp` | The scenarios and their checks |
 | `portal_tests.js` | The portal's teach-by-doing analysis, run in Node (`portal_teach`) |
 
