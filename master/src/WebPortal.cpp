@@ -747,6 +747,14 @@ function flipsOf(P,E,bit){
     in, after that step's first @p skip ms. @p durs are the steps' lengths,
     times are ms from the start. -1: none - a reading that straddles a change
     of step, or comes back after it, belongs to neither. */
+/** A run sized to how fast the master answers (@p answerMs, the slowest of a
+    few timed readings): the deadline for one reading, and each step made long
+    enough, after its first @p skip ms, for TEACH_MIN_READS+1 readings to be
+    asked and answered inside it. A fast master keeps the given lengths. */
+function teachPlan(durs,skip,answerMs){
+ const per=Math.max(150,answerMs);
+ const deadline=Math.min(8000,Math.max(1500,Math.ceil(2*per)));
+ return{deadline,durs:durs.map(d=>Math.max(d,Math.ceil(skip+(TEACH_MIN_READS+2)*per)))}}
 function teachSlot(durs,skip,tReq,tResp){
  let s=0;
  for(let i=0;i<durs.length;i++){const e=s+durs[i];if(tReq>=s+skip&&tResp<=e)return i;s=e}
@@ -1067,9 +1075,20 @@ async function teachStart(){
  // read. A drive is read throughout: it is compared with the car's own speed
  // and steering, poll by poll.
  const skip=kind==='mot'?0:kind==='val'?800:1500;
- const durs=steps.map(s=>s[2]),total=durs.reduce((a,b)=>a+b,0);
+ const url=kind==='mot'?'/api/bus?m=269,4102,4110,4108':'/api/bus?e=1';
  TEACH={m,kind,S:{},P:{}};steps.forEach(([k])=>{TEACH.S[k]=[];TEACH.P[k]=[]});
  $('#tBtn').disabled=true;$('#tRes').innerHTML='';
+ // How fast does the master answer right now? With the engine running and the
+ // bus busy it can take seconds; a deadline and steps sized for a fast one
+ // would then throw every reading away. Three timed readings, the slowest
+ // counts, and the run is planned around it (teachPlan).
+ $('#tStep').innerHTML='<div class="step">Get ready</div><span class="muted">checking how fast the master answers…</span>';
+ let slowest=0,answered=0;
+ for(let n=0;n<3;n++){const q=performance.now();
+  try{await req(url,null,8000);answered++;slowest=Math.max(slowest,performance.now()-q)}catch(e){}}
+ if(!answered){toast('The master does not answer - is this phone still on its Wi-Fi?');$('#tStep').innerHTML='';TEACH=null;$('#tBtn').disabled=false;return}
+ const plan=teachPlan(steps.map(s=>s[2]),skip,slowest),durs=plan.durs,total=durs.reduce((a,b)=>a+b,0);
+ TLAST={v:1,kind,m,toks:TTOK.slice(),steps:steps.map((s,i)=>[s[0],durs[i]]),skip,answer_ms:Math.round(slowest),deadline:plan.deadline,reads:[]};
  // The steps run on the clock, not on the master's answers: the countdown is
  // redrawn five times a second whatever the Wi-Fi does, and a reading counts
  // only for the step it was asked for and answered in (teachSlot) - one that
@@ -1083,8 +1102,9 @@ async function teachStart(){
  try{
   while(at()<total){
    const tq=at();let b=null;asked++;
-   try{b=await req(kind==='mot'?'/api/bus?m=269,4102,4110,4108':'/api/bus?e=1',null,1500)}catch(e){}
-   const i=b?teachSlot(durs,skip,tq,at()):-1;
+   try{b=await req(url,null,plan.deadline)}catch(e){}
+   const tr=at(),i=b?teachSlot(durs,skip,tq,tr):-1;
+   if(b)TLAST.reads.push({t:[Math.round(tq),Math.round(tr)],step:i,c:b.census.filter(c=>!c.ext).map(c=>[c.id,c.d||'',c.e||'']),m:b.m||null});
    if(i>=0){const k=steps[i][0];
     TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
     if(kind==='mot'){
@@ -1092,14 +1112,24 @@ async function teachStart(){
      // rate or lateral G already read from the bus (never one derived from these).
      const g=(id,raw)=>{const x=b.m&&b.m[id];return x&&x[1]<1500&&(!raw||x[2]===4)?x[0]:null},sa=b.m&&b.m[269];
      TEACH.P[k].push({t:Date.now()-(sa?sa[1]:0),v:g(269),st:g(4102),yaw:g(4110,1),lat:g(4108,1)})}}
-   else if(!b||at()-tq>1000)late++;
+   else if(!b||tr-tq>plan.deadline/2)late++;
    const wait=150-(at()-tq);if(wait>0)await sleep(wait)}
   $('#tStep').innerHTML='<div class="step">Done</div>';
-  teachAnalyze(steps.map(p=>p[0]));
   const thin=steps.map(([k,t],i)=>TEACH.S[k].length<TEACH_MIN_READS?`step ${i+1} (${plain(t)})`:'').filter(Boolean);
-  if(thin.length)$('#tRes').insertAdjacentHTML('afterbegin',`<p class="say warn" style="margin-top:8px">The master answered slowly: too few readings in ${esc(thin.join(', '))} - ${late} of ${asked} came back late or not at all. `+
-   `${TRES.length?'What was found may be wrong or incomplete. ':''}Stay close to the master, close other pages open on it, and try again.</p>`)}
+  const got=steps.reduce((n,[k])=>n+TEACH.S[k].length,0);
+  if(got<steps.length*2){
+   // Too little to judge: say so, rather than "nothing followed".
+   $('#tRes').innerHTML=`<p class="say warn" style="margin-top:8px">The master did not answer in time: only ${got} usable reading${got===1?'':'s'} in ${steps.length} steps (${late} of ${asked} late or lost; it took up to ${Math.round(slowest)} ms before the start). Nothing could be judged. Stay close to the master, close other pages open on it, and try again.</p>`}
+  else{
+   teachAnalyze(steps.map(p=>p[0]));
+   if(thin.length)$('#tRes').insertAdjacentHTML('afterbegin',`<p class="say warn" style="margin-top:8px">The master answered slowly: too few readings in ${esc(thin.join(', '))} - ${late} of ${asked} came back late or not at all. `+
+    `${TRES.length?'What was found may be wrong or incomplete. ':''}Stay close to the master, close other pages open on it, and try again.</p>`)}
+  $('#tRes').insertAdjacentHTML('beforeend',`<p class="say" style="margin-top:8px"><a href="#" class="acc" onclick="teachSave();return false">Save these readings</a> - a file with everything the master sent during this run, to look into a teach that did not work.</p>`)}
  finally{clearInterval(tick);TEACH=null;$('#tBtn').disabled=false}}
+let TLAST=null;
+function teachSave(){if(!TLAST)return;
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(TLAST)],{type:'application/json'}));
+ a.download=`teach-${TLAST.kind}-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 const ROLE_NAME={L:'Left turn signal',R:'Right turn signal',H:'Hazard lights',both:'Either indicator'};
 const ROLE_SAY={L:' with the left indicator only',R:' with the right indicator only',H:' with the hazard lights only',
  both:' with either indicator: it cannot tell the side, so it is not used'};

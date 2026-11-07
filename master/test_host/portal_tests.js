@@ -25,9 +25,9 @@ const core = [...page.matchAll(/\/\*<teach-core>\*\/([\s\S]*?)\/\*<\/teach-core>
 if (!core) { console.log('FAIL: no teach-core block in portal_page.html'); process.exit(1); }
 const T = {};
 vm.createContext(T);
-vm.runInContext(core + '\n;globalThis.__x={teachFind,teachBits,teachPositions,teachTurns,teachSlot,posValue,posLabel,extract,hb,TEACH_MIN_READS,' +
+vm.runInContext(core + '\n;globalThis.__x={teachFind,teachBits,teachPositions,teachTurns,teachSlot,teachPlan,posValue,posLabel,extract,hb,TEACH_MIN_READS,' +
     'motionRef,teachFindMotion,dtcName,tlgToCsv};', T);
-const { teachFind, teachSlot, posValue, posLabel, TEACH_MIN_READS, motionRef, teachFindMotion, dtcName, tlgToCsv } = T.__x;
+const { teachFind, teachSlot, teachPlan, posValue, posLabel, TEACH_MIN_READS, motionRef, teachFindMotion, dtcName, tlgToCsv } = T.__x;
 
 let failures = 0;
 function check(ok, what, info) {
@@ -47,14 +47,14 @@ function rng(seed) {
  * every @p frameMs), @p key being the step the driver is acting on - @p react
  * ms behind the page's. The phone asks as teachStart does: a request, its
  * answer @p latency(k) ms later (a snapshot taken half-way, while the master
- * serves it; past 1500 ms the page gives up on it), the next one no sooner
+ * serves it; past @p deadline ms the page gives up on it), the next one no sooner
  * than @p pollMs after the last, from @p start on. Each answer is filed with
  * the page's teachSlot, which drops the first @p skipMs of every step and
  * anything answered after its step ended. @p edges false = a master without
  * flip counters.
  */
 function session(steps, frame, { frameMs = 20, pollMs = 150, skipMs = 1500, edges = true,
-                                 latency = () => 40, react = 0, start = 0 } = {}) {
+                                 latency = () => 40, react = 0, start = 0, deadline = 1500 } = {}) {
     const durs = steps.map(s => s.ms), total = durs.reduce((a, b) => a + b, 0);
     const keyAt = t => { let s = 0; for (const st of steps) { s += st.ms; if (t < s) return st.key; } return steps[steps.length - 1].key; };
     const S = {};
@@ -76,11 +76,11 @@ function session(steps, frame, { frameMs = 20, pollMs = 150, skipMs = 1500, edge
             }
         }
         if (t < tq) continue;
-        if (lat <= 1500 && snap === null && t >= tq + lat / 2)
+        if (lat <= deadline && snap === null && t >= tq + lat / 2)
             snap = new Map(Object.keys(last).map(id => [+id, { b: last[id].slice(), e: edges ? flips[id].slice() : null }]));
-        const done = tq + Math.min(lat, 1500);
+        const done = tq + Math.min(lat, deadline);
         if (t >= done) {
-            if (lat <= 1500 && snap) {
+            if (lat <= deadline && snap) {
                 const i = teachSlot(durs, skipMs, tq, done);
                 if (i >= 0) S[steps[i].key].push(snap);
             }
@@ -406,6 +406,29 @@ console.log('--- back in P at the end: a bit that only happened to change is dro
     });
     const r4 = teachFind('pos', S4, posKeys(PRND), PRND);
     check(r4[0] && JSON.stringify(r4[0].bits) === '[52,53,54]', 'one pass: the field, still without it', r4[0] && JSON.stringify(r4[0].bits));
+}
+
+console.log('--- the lever with a master that takes 2.5 s to answer (engine running, bus busy)');
+{
+    // What the car did on 2026-11-07: every answer slower than the 1.5 s the
+    // page used to wait, so every reading was dropped - "nothing followed".
+    // The page now times the master first and plans the run around it.
+    const PRNDP = ['P', 'R', 'N', 'D', 'P'];
+    const frame = (t, n, step) => leverFrame([0, 1, 2, 4, 0])(t, n, step);
+    const rnd = rng(5), slow = () => 2300 + Math.floor(rnd() * 400);
+    const old = session(posSteps(PRNDP), frame, { latency: slow });
+    check(PRNDP.every((t, i) => old['p' + i].length === 0), 'a 1.5 s deadline and 5 s steps: not one reading kept');
+    const plan = teachPlan(posSteps(PRNDP).map(s => s.ms), 1500, 2700);
+    check(plan.deadline >= 2700 && plan.durs.every(d => d > 5000), 'the plan: a later deadline, longer steps',
+          `deadline ${plan.deadline} ms, steps ${plan.durs.join('/')} ms`);
+    const S = session(PRNDP.map((t, i) => ({ key: 'p' + i, ms: plan.durs[i] })), frame,
+                      { latency: slow, deadline: plan.deadline });
+    check(PRNDP.every((t, i) => S['p' + i].length >= TEACH_MIN_READS), 'every step gets enough readings',
+          PRNDP.map((t, i) => S['p' + i].length).join('/'));
+    const r = teachFind('pos', S, posKeys(PRNDP), PRNDP);
+    check(r[0] && JSON.stringify(r[0].bits) === '[52,53,54]', 'and the lever is found', r[0] && JSON.stringify(r[0].bits));
+    const fast = teachPlan([5000, 6000], 1500, 120);
+    check(fast.deadline === 1500 && fast.durs.join() === '5000,6000', 'a fast master keeps the usual run', JSON.stringify(fast));
 }
 
 console.log('--- positions in different frames: one switch per position');
