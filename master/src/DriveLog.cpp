@@ -9,6 +9,7 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <algorithm>
+#include <string>
 #include <vector>
 
 #include "MasterConfig.h"
@@ -75,6 +76,10 @@ static uint32_t logBytes(const std::vector<Entry> &v) {
  */
 static bool makeRoom(size_t more) {
     const uint32_t cap = Cfg.logMaxKb * 1024UL;
+    // Drives that would not delete: esp_littlefs will not unlink a file that
+    // is open - one being downloaded from the portal. Passed over, or the
+    // loop would try the same one for ever.
+    std::vector<std::string> stuck;
     for (;;) {
         std::vector<Entry> v = scan();
         const bool capOk  = logBytes(v) + more <= cap;
@@ -83,12 +88,21 @@ static bool makeRoom(size_t more) {
         if (capOk && diskOk) return true;
         // The oldest that is not the drive being written.
         const Entry *victim = nullptr;
-        for (const auto &e : v) if (!s_rec || strcmp(e.name, s_name)) { victim = &e; break; }
+        for (const auto &e : v) {
+            if (s_rec && !strcmp(e.name, s_name)) continue;
+            if (std::find(stuck.begin(), stuck.end(), e.name) != stuck.end()) continue;
+            victim = &e;
+            break;
+        }
         if (!victim) return false;
         char p[24];
         snprintf(p, sizeof p, "%s/%s", DIR, victim->name);
         masterBusStall();
-        LittleFS.remove(p);
+        if (!LittleFS.remove(p)) {
+            log_w("log: could not delete %s (open?) - trying the next", victim->name);
+            stuck.push_back(victim->name);
+            continue;
+        }
         log_i("log: deleted %s to make room", victim->name);
     }
 }

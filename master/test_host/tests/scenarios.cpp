@@ -496,6 +496,30 @@ static void scConfigTmpOnly() {
     check(simfs::files.count("/config.json") == 1, "and commits it");
 }
 
+/** A mount that fails once at power-up (the supply sagging while the car
+ *  cranks) must not format the partition: that erases the settings, every
+ *  learned signal, the evidence log and the drive logs. */
+static void scConfigMountGlitch() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"broadcast_ms":77})";
+    simfs::files["/log/00001.tlg"] = "TLG1";
+    simfs::mountFails = 1;
+    boot();
+    runUntil(3);
+    check(simfs::formats == 0, "one failed mount does not format", fmt("%d formats", simfs::formats));
+    check(Cfg.broadcastMs == 77, "the saved settings are loaded", fmt("broadcast_ms %u", Cfg.broadcastMs));
+    check(simfs::files.count("/log/00001.tlg") == 1, "the drive logs are kept");
+}
+
+/** A partition never formatted (the first flash) is still formatted once. */
+static void scConfigFirstMount() {
+    simfs::blank = true;
+    boot();
+    runUntil(3);
+    check(simfs::formats == 1, "a blank partition is formatted", fmt("%d formats", simfs::formats));
+    Cfg.save();
+    check(simfs::files.count("/config.json") == 1, "and settings can be saved on it");
+}
+
 /** Car switched off: the master sleeps. */
 static void scSleep() {
     simfs::files["/config.json"] = R"({"cfg_ver":5,"sleep_idle_s":20})";
@@ -2233,6 +2257,84 @@ static void scDtcSilent() {
     commonChecks();
 }
 
+/** One list unanswered while the rest of the read works (its reply lost, the
+ *  bus busy a moment): its codes stay on the displays - not gone for a minute.
+ *  A list that answers again says what is really there. */
+static void scDtcPartialRead() {
+    ecu.ecmStored  = {0x0700};
+    ecu.tcmStored  = {0x1718};
+    ecu.tcmPending = {0x0705};
+    boot();
+    runUntil(20);
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 3, "three codes after the first read",
+          fmt("%.0f", shownValue(METRIC_ID_DTC_TOTAL)));
+    int lost = 0;
+    ecu.ignoreIso = [&lost](bool tcm, uint8_t svc) { return tcm && svc == 0x07 && lost++ < 1; };
+    runUntil(80);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 2 && lost == 1 && cs.list[1][1] == LIST_NO_REPLY,
+          "second read: the transmission's pending list went unanswered", fmt("%u reads, %d lost", cs.reads, lost));
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 3 && shownCode(2) == "P0705 pending transmission",
+          "its code is still shown", shownCode(2));
+    check(std::strstr(cs.note, "kept from the last read") != nullptr, "and the portal says so", cs.note);
+    ecu.tcmPending.clear();
+    runUntil(140);
+    codesGetStatus(cs);
+    check(cs.reads == 3 && cs.list[1][1] == LIST_ANSWERED && shownValue(METRIC_ID_DTC_TOTAL) == 2,
+          "answered again: the code that went is gone", fmt("%u reads, %.0f codes", cs.reads, shownValue(METRIC_ID_DTC_TOTAL)));
+    ecu.ignoreIso = [](bool tcm, uint8_t svc) { return !tcm && svc == 0x03; };
+    runUntil(400);
+    codesGetStatus(cs);
+    check(cs.list[0][0] == LIST_NO_REPLY && cs.n == 1 && shownCode(0) == "P1718 stored transmission",
+          "a list unanswered read after read is not kept for ever", fmt("%u codes, first %s", cs.n, shownCode(0).c_str()));
+    commonChecks();
+}
+
+/** dtc_poll_s 0 (only when asked), a read from the portal, then polling
+ *  switched back on: it starts without waiting for an ignition cycle. */
+static void scDtcPollResume() {
+    ecu.ecmStored = {0x0700};
+    storedConfig(R"({"dtc_poll_s":0})");
+    boot();
+    runUntil(30);
+    check(isoReq(0x7E0, 0x03) == 0, "dtc_poll_s 0: no read on its own");
+    codesRequestRead();
+    runUntil(35);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 1, "a read from the portal", cs.note);
+    portalPost(R"({"dtc_poll_s":60})");
+    runUntil(160);
+    codesGetStatus(cs);
+    check(cs.reads >= 2, "polling switched on: reads again with the car still on", fmt("%u reads", cs.reads));
+    commonChecks();
+}
+
+/** An ECM that refuses service 09 is asked for its identity once, not three
+ *  more requests at every read for the rest of the drive. */
+static void scDtcIdentRefused() {
+    ecu.vehicleInfo = false;
+    boot();
+    runUntil(140);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 3, "three reads", fmt("%u reads", cs.reads));
+    check(isoReq(0x7E0, 0x09) == 3, "service 09 refused: VIN, calibration and CVN asked once",
+          fmt("%d requests", isoReq(0x7E0, 0x09)));
+    check(!cs.vin[0] && !cs.calId[0][0], "and nothing made up");
+    commonChecks();
+}
+
+/** More distinct values than the store holds: the one that does not fit is
+ *  reported once in the log, not dropped without a word. */
+static void scMetricStoreFull() {
+    boot();
+    runUntil(5);
+    for (uint16_t i = 0; i < 200; i++) publishMetric(0xE000 + i, 1.0f, SRC_DERIVED);
+    for (uint16_t i = 0; i < 200; i++) publishMetric(0xE000 + i, 2.0f, SRC_DERIVED);
+    int told = 0;
+    for (const auto &l : sim::logLines) if (l.find("store full") != std::string::npos) told++;
+    check(told == 1, "store full: said once", fmt("%d lines", told));
+}
+
 /** Oil change due by the odometer SSM2 reads (123456 km in the simulator). */
 static void scServiceDue() {
     storedConfig(R"({"oil_every_km":7500,"oil_at_km":116000})");
@@ -2389,6 +2491,32 @@ static void scDriveLog() {
     commonChecks();
 }
 
+/** The oldest drive cannot be deleted to make room - it is open, being
+ *  downloaded from the portal: the next oldest goes instead, and the logger
+ *  does not spin on the one it cannot delete. */
+static void scDriveLogHeldFile() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_max_kb":64,
+      "log_ids":[268,269,4097,273,260,261,262,263,264,265,266,267,270,271,272,274,275,276,277,278,279,280,281,282]})");
+    std::string old(28 * 1024, '\0');
+    std::memcpy(&old[0], "TLG1", 4);
+    simfs::files["/log/00001.tlg"] = old;
+    simfs::files["/log/00002.tlg"] = old;
+    simfs::held.insert("/log/00001.tlg");
+    boot();
+    runUntil(35);
+    DriveLogStatus st; driveLogStatus(st);
+    check(simfs::files.count("/log/00001.tlg") && !simfs::files.count("/log/00002.tlg"),
+          "the next oldest made room, the open one kept");
+    check(st.recording && !std::strcmp(st.file, "00003.tlg"), "still recording", st.note);
+    // 28 KB that cannot go and the new drive reach the 64 KB cap: it stops,
+    // and says why.
+    runUntil(70);
+    driveLogStatus(st);
+    check(!st.recording && std::strstr(st.note, "log space full"), "full: stopped, not stuck", st.note);
+    check(simfs::removes < 10, "no delete tried over and over", fmt("%d removes", simfs::removes));
+    commonChecks();
+}
+
 /** The space it may use: the oldest drive goes to make room, and the settings
  *  always keep 128 KB of the partition. */
 static void scDriveLogFull() {
@@ -2512,7 +2640,6 @@ static void scSignalTable() {
     body.lever = 'M';                                    // code 7: not in the table
     runUntil(10);
     double v = 0;
-    bool ok = false;
     check(!shownNow(METRIC_ID_GEAR_LEVER, v), "a position not in the table publishes nothing (it goes stale)",
           fmt("%.0f", v));
     check(!shown(METRIC_ID_CUSTOM_1), "a raw value never in its table is never published");
@@ -2672,6 +2799,7 @@ static const Scenario SCENARIOS[] = {
     {"ssm_size_limit", scSsmSizeLimit, 0}, {"obd_functional", scObdFunctional, 0},
     {"obd_drops", scObdDrops, 0}, {"config_migration", scConfigMigration, 0},
     {"config_faults", scConfigFaults, 0}, {"config_tmp_only", scConfigTmpOnly, 0},
+    {"config_mount_glitch", scConfigMountGlitch, 0}, {"config_first_mount", scConfigFirstMount, 0},
     {"sleep", scSleep, 0}, {"clock_wrap", scClockWrap, 0}, {"both", scBoth, 0},
     {"obd_only", scObdOnly, 0}, {"ecu_off", scEcuOff, 0}, {"ssm_stmin", scSsmStmin, 0},
     {"ssm_stmin_reserved", scSsmStminReserved, 0}, {"ssm_cut", scSsmCut, 0}, {"ssm_dead", scSsmDead, 0},
@@ -2709,6 +2837,11 @@ static const Scenario SCENARIOS[] = {
     {"dtc_clear", scDtcClear, 0},
     {"dtc_tcm_functional", scDtcTcmFunctional, 0},
     {"dtc_silent", scDtcSilent, 0},
+    {"dtc_partial_read", scDtcPartialRead, 0},
+    {"dtc_poll_resume", scDtcPollResume, 0},
+    {"dtc_ident_refused", scDtcIdentRefused, 0},
+    {"metric_store_full", scMetricStoreFull, 0},
+    {"drive_log_held_file", scDriveLogHeldFile, 0},
     {"service_due", scServiceDue, 0},
     {"service_unset", scServiceUnset, 0},
     {"g_derived", scGDerived, 0},

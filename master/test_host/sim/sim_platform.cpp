@@ -241,6 +241,10 @@ std::map<std::string, std::string> files;
 long writeBudget = -1;
 bool renameOverwrites = true;
 bool mountOk = true;
+int  mountFails = 0;
+bool blank = false;
+int  formats = 0;
+std::set<std::string> held;
 int  renames = 0, removes = 0;
 size_t totalBytes = 1536 * 1024;
 std::set<std::string> dirs;
@@ -268,9 +272,25 @@ File File::openNextFile() {
     return f;
 }
 
-bool LittleFSFS::begin(bool) { return simfs::mountOk; }
+bool LittleFSFS::begin(bool formatOnFail) {
+    if (!simfs::mountOk) return false;
+    bool fails = simfs::blank;
+    if (simfs::mountFails > 0) { simfs::mountFails--; fails = true; }
+    if (!fails) return true;
+    if (!formatOnFail) return false;
+    // The core formats a partition that will not mount, then mounts it.
+    simfs::formats++;
+    simfs::files.clear();
+    simfs::dirs.clear();
+    simfs::blank = false;
+    return true;
+}
 bool LittleFSFS::exists(const char *p) { return simfs::files.count(p) > 0; }
-bool LittleFSFS::remove(const char *p) { simfs::removes++; return simfs::files.erase(p) > 0; }
+bool LittleFSFS::remove(const char *p) {
+    simfs::removes++;
+    if (simfs::held.count(p)) return false;
+    return simfs::files.erase(p) > 0;
+}
 bool LittleFSFS::rename(const char *from, const char *to) {
     simfs::renames++;
     if (!simfs::files.count(from)) return false;

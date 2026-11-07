@@ -1144,10 +1144,11 @@ async function poll(){
   const c=$('#conn');c.className='pill crit';c.lastChild.textContent='offline';return}
  const now=Date.now();
  // The master restarted (its counters went back): no rate from across that.
+ // (bits is a 32-bit count that wraps every few hours: >>>0 takes the difference across it)
  if(PREV&&(d.bus.rx<PREV.rx||d.bus.tx<PREV.tx||d.bus.err<PREV.err))PREV=null;
  if(PREV){const dt=(now-PREV.t)/1000;if(dt>0){
   RATES.fps=(d.bus.rx-PREV.rx)/dt;RATES.tx=(d.bus.tx-PREV.tx)/dt;RATES.errs=d.bus.err-PREV.err;
-  RATES.load=100*((d.bus.bits-PREV.bits)+(d.bus.tx-PREV.tx)*125)/(dt*(d.bus.bitrate||500)*1000)}}
+  RATES.load=100*(((d.bus.bits-PREV.bits)>>>0)+(d.bus.tx-PREV.tx)*125)/(dt*(d.bus.bitrate||500)*1000)}}
  PREV={t:now,rx:d.bus.rx,tx:d.bus.tx,err:d.bus.err,bits:d.bus.bits};
  L=d;
  // Pick up what the learner and verifier did to the signal table.

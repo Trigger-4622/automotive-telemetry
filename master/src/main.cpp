@@ -298,6 +298,13 @@ void publishMetric(uint16_t id, float value, uint8_t source) {
         }
     }
     portEXIT_CRITICAL(&s_metricMux);
+    // Store full: say so once, rather than a value that silently never shows.
+    static volatile bool s_storeFullTold = false;
+    if (!slot && !s_storeFullTold) {
+        s_storeFullTold = true;
+        log_w("metrics: store full (%u values) - 0x%04X and any other new value are not published",
+              (unsigned)MAX_MASTER_METRICS, id);
+    }
     // Every requested value is a reference the learner can match the bus
     // against - that is how requests teach the master to stop requesting.
     if (source == SRC_OBD || source == SRC_SSM) learnerOnRef(id, value);
@@ -1645,10 +1652,12 @@ static void gDerive() {
     static float    vs[N];
     static int      n = 0, head = 0;
     static uint32_t lastStamp = 0;
-    float v; uint32_t age; uint8_t src;
+    float v; uint32_t age, stamp; uint8_t src;
+    // The sample's own time stamp, not millis() minus its age: two clock
+    // reads a tick apart made the same sample look new, and it went in twice.
+    if (!metricRef(METRIC_ID_SPEED, v, stamp, src)) { n = 0; return; }
     const uint32_t now = millis();
-    if (!metricLookup(METRIC_ID_SPEED, v, age, src) || age > 1500) { n = 0; return; }
-    const uint32_t stamp = now - age;
+    if ((int32_t)(now - stamp) > 1500) { n = 0; return; }
     if (stamp != lastStamp) {
         lastStamp = stamp;
         ts[head] = stamp; vs[head] = v;

@@ -5,6 +5,7 @@
  */
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -33,6 +34,10 @@ struct EcuConfig {
     bool     tcmPhysical     = true;   ///< TCM answers 0x7E1 (else only 0x7DF).
     bool     permanentCodes  = false;  ///< Service 0A supported (a 2009 car: no).
     bool     clearNeedsEngineOff = false;  ///< Service 04 refused (0x22) while it runs.
+    bool     vehicleInfo     = true;   ///< Service 09 answered (false: NRC 0x11, as some ECUs).
+    /** A request the computer lets go unanswered (a reply lost, a busy ECU):
+     *  return true to send nothing. */
+    std::function<bool(bool tcm, uint8_t svc)> ignoreIso;
     double   odometerKm      = 123456; ///< What SSM2 address 0x10E reads.
 };
 

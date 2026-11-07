@@ -807,6 +807,7 @@ static void obdIsoHandle(IsoNode &n, const std::vector<uint8_t> &req, bool funct
     const uint8_t svc = req[0];
     const uint64_t at = simrtos::nowUs() + (tcm ? 1500 : ecu.replyLatencyUs);
     auto refuse = [&](uint8_t code) { if (!functional) nodeSend(n, {0x7F, svc, code}, at); };
+    if (ecu.ignoreIso && ecu.ignoreIso(tcm, svc)) return;
     if (svc == 0x03 || svc == 0x07 || svc == 0x0A) {
         if (svc == 0x0A && !ecu.permanentCodes) { refuse(0x11); return; }
         const std::vector<uint16_t> c = codesOf(tcm, svc);
@@ -823,7 +824,7 @@ static void obdIsoHandle(IsoNode &n, const std::vector<uint8_t> &req, bool funct
         nodeSend(n, {0x44}, at);
         return;
     }
-    if (svc == 0x09 && req.size() >= 2 && !tcm) {
+    if (svc == 0x09 && req.size() >= 2 && !tcm && ecu.vehicleInfo) {
         std::vector<uint8_t> r = {0x49, req[1]};
         if (req[1] == 0x02) {
             r.push_back(1);

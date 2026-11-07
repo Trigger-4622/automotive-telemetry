@@ -46,7 +46,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   safety behaviour must add to it (the bus guard, the power-on settle wait,
   listen-only are all opt-out-able extras), never remove requests or learning.
 - **The master's saved settings and learned signals must survive every
-  firmware update.** Config is `/config.json` on LittleFS (`MasterConfig`).
+  firmware update.** Config is `/config.json` on LittleFS (`MasterConfig`;
+  mounted three times before it is ever formatted - `config_mount_glitch`).
   New keys get defaults when absent; do not bump `CFG_VERSION` without a
   migration that touches only what changed, and never re-seed tables for a
   newer version (that once erased every learned signal). The harness scenario
@@ -212,7 +213,8 @@ field always outranks the derived value.
   ECM (0x7E0) and TCM (0x7E1, through 0x7DF with flow control to 0x7E1 if it
   never answers its own address), read 8 s after the bus comes up, every
   `dtc_poll_s` (60; 0 = only when asked) and when the MIL or PID 01's count
-  changes; never with the bus quiet, listen-only or the guard up (they go
+  changes (a list left unanswered keeps its codes for two reads); never
+  with the bus quiet, listen-only or the guard up (they go
   through `isoExchange()` in Ssm2.cpp - the SSM2 ISO-TP transport, lent out
   under the same lock). Published as `DTC_TOTAL` and `DTC_1..8` (packed:
   raw | kind << 16 | module << 18). Clear (service 04) only from the portal,
@@ -230,7 +232,8 @@ field always outranks the derived value.
   (`gDerive`, SRC_DERIVED: a taught field outranks it). ISO 8855 signs.
 - **Drive log** (`master/src/DriveLog.*`): `log_on`, `log_hz`, `log_ids`,
   `log_max_kb`; `/log/NNNNN.tlg` on the settings partition, oldest deleted
-  first, 128 KB always left for settings saves, 4 KB writes announced with
+  first (one open for a download will not delete and is passed over), 128 KB
+  always left for settings saves, 4 KB writes announced with
   `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::

@@ -33,6 +33,12 @@ static CodesStatus       s_st = {};
 static volatile bool     s_readWanted = false, s_clearWanted = false;
 static uint32_t          s_readAtMs = 0;
 static bool              s_identDone = false;
+static uint8_t           s_identTries = 0;
+static constexpr uint8_t IDENT_TRIES = 3;     /**< Reads with service-09 replies missing. */
+/** Reads in a row each list went unanswered (lost reply, bus busy). */
+static uint8_t           s_missed[2][3] = {};
+/** Reads a list's codes are kept for while it goes unanswered. */
+static constexpr uint8_t KEEP_READS = 2;
 
 /* ───────────────────────────── one request ─────────────────────────────── */
 
@@ -83,33 +89,42 @@ static void readIdentity() {
     char why[40];
     const uint8_t vin[2] = { 0x09, 0x02 }, cal[2] = { 0x09, 0x04 }, cvn[2] = { 0x09, 0x06 };
     char v[18] = "", c[2][17] = { "", "" }, h[2][9] = { "", "" };
-    bool any = false;
+    bool gotV = false, gotC = false, gotH = false;
+    int  settled = 0;                        // answered, or refused: no use asking again
+    IsoResult r;
     // 49 02 01 <17 characters>
-    if (ask(DTC_ENGINE, vin, 2, rsp, sizeof rsp, got, why, sizeof why) == ISO_OK && got >= 20 &&
-        rsp[0] == 0x49 && rsp[1] == 0x02) {
+    r = ask(DTC_ENGINE, vin, 2, rsp, sizeof rsp, got, why, sizeof why);
+    settled += r == ISO_OK || r == ISO_NRC;
+    if (r == ISO_OK && got >= 20 && rsp[0] == 0x49 && rsp[1] == 0x02) {
         ascii(&rsp[got - 17], 17, v, sizeof v);
-        any = true;
+        gotV = true;
     }
     // 49 04 <count> <16 characters each>
-    if (ask(DTC_ENGINE, cal, 2, rsp, sizeof rsp, got, why, sizeof why) == ISO_OK && got >= 19 &&
-        rsp[0] == 0x49 && rsp[1] == 0x04) {
+    r = ask(DTC_ENGINE, cal, 2, rsp, sizeof rsp, got, why, sizeof why);
+    settled += r == ISO_OK || r == ISO_NRC;
+    if (r == ISO_OK && got >= 19 && rsp[0] == 0x49 && rsp[1] == 0x04) {
         for (size_t i = 0; i < 2 && 3 + 16 * (i + 1) <= got; i++) ascii(&rsp[3 + 16 * i], 16, c[i], 17);
-        any = true;
+        gotC = true;
     }
     // 49 06 <count> <4 bytes each>
-    if (ask(DTC_ENGINE, cvn, 2, rsp, sizeof rsp, got, why, sizeof why) == ISO_OK && got >= 7 &&
-        rsp[0] == 0x49 && rsp[1] == 0x06) {
+    r = ask(DTC_ENGINE, cvn, 2, rsp, sizeof rsp, got, why, sizeof why);
+    settled += r == ISO_OK || r == ISO_NRC;
+    if (r == ISO_OK && got >= 7 && rsp[0] == 0x49 && rsp[1] == 0x06) {
         for (size_t i = 0; i < 2 && 3 + 4 * (i + 1) <= got; i++)
             snprintf(h[i], 9, "%02X%02X%02X%02X", rsp[3 + 4 * i], rsp[4 + 4 * i], rsp[5 + 4 * i], rsp[6 + 4 * i]);
-        any = true;
+        gotH = true;
     }
-    if (!any) return;
-    s_identDone = true;
+    // Done once each has an answer - an ECU that refuses service 09 is not
+    // asked three more times a minute for ever - or after a few reads with
+    // replies missing.
+    if (settled == 3 || ++s_identTries >= IDENT_TRIES) s_identDone = true;
+    if (!gotV && !gotC && !gotH) return;
     xSemaphoreTake(s_mx, portMAX_DELAY);
-    strlcpy(s_st.vin, v, sizeof s_st.vin);
+    // Only what was read: one that went unanswered keeps what an earlier read found.
+    if (gotV) strlcpy(s_st.vin, v, sizeof s_st.vin);
     for (int i = 0; i < 2; i++) {
-        strlcpy(s_st.calId[i], c[i], sizeof s_st.calId[i]);
-        strlcpy(s_st.cvn[i], h[i], sizeof s_st.cvn[i]);
+        if (gotC) strlcpy(s_st.calId[i], c[i], sizeof s_st.calId[i]);
+        if (gotH) strlcpy(s_st.cvn[i], h[i], sizeof s_st.cvn[i]);
     }
     xSemaphoreGive(s_mx);
     log_i("OBD-II: VIN %s, calibration %s %s, CVN %s", v[0] ? v : "-", c[0][0] ? c[0] : "-", c[1], h[0]);
@@ -123,8 +138,13 @@ static void readIdentity() {
     Cfg.unlock();
 }
 
-/** @return false when nothing could be sent at all (try again soon). */
-static bool readCodes() {
+enum ReadResult : uint8_t {
+    READ_NOTHING_SENT,      /**< Not one request left: try again soon.          */
+    READ_DONE,
+    READ_SOME_BUSY,         /**< Done, but the bus was busy for a list: soon.   */
+};
+
+static ReadResult readCodes() {
     DtcEntry codes[CODES_MAX];
     uint8_t  n = 0, list[2][3] = {};
     uint8_t  rsp[128];
@@ -158,14 +178,36 @@ static bool readCodes() {
             }
         }
     }
-    if (!sent) return false;
+    if (!sent) return READ_NOTHING_SENT;
 
-    bool answered = false;
-    for (auto &row : list) for (uint8_t v : row) answered |= v == LIST_ANSWERED;
+    bool answered = false, busy = false;
+    for (uint8_t m = 0; m < 2; m++)
+        for (uint8_t k = 0; k < 3; k++) {
+            const uint8_t l = list[m][k];
+            answered |= l == LIST_ANSWERED;
+            busy     |= l == LIST_NOT_ASKED;
+            if (l == LIST_ANSWERED || l == LIST_REFUSED) s_missed[m][k] = 0;
+            else if (s_missed[m][k] < 255) s_missed[m][k]++;
+        }
+    // A list that went unanswered this time - its reply lost, the bus busy -
+    // keeps the codes it had for a read or two: a code does not drop off the
+    // displays for a minute because one request of six went unanswered.
+    bool kept = false;
+    xSemaphoreTake(s_mx, portMAX_DELAY);
+    for (uint8_t i = 0; i < s_st.n && n < CODES_MAX; i++) {
+        const DtcEntry &e = s_st.codes[i];
+        if (e.module < 2 && e.kind < 3 && s_missed[e.module][e.kind] &&
+            s_missed[e.module][e.kind] <= KEEP_READS) {
+            codes[n++] = e;
+            kept = true;
+        }
+    }
+    xSemaphoreGive(s_mx);
     char note[96];
     if (!answered) snprintf(note, sizeof note, "Neither computer answered (%s)", why[0] ? why : "no reply");
     else if (!n)   snprintf(note, sizeof note, "No codes");
-    else           snprintf(note, sizeof note, "%u code%s", n, n == 1 ? "" : "s");
+    else           snprintf(note, sizeof note, "%u code%s%s", n, n == 1 ? "" : "s",
+                            kept ? " (an unanswered list kept from the last read)" : "");
 
     xSemaphoreTake(s_mx, portMAX_DELAY);
     if (answered) {
@@ -191,7 +233,7 @@ static bool readCodes() {
     } else {
         log_w("codes: %s", note);
     }
-    return true;
+    return busy ? READ_SOME_BUSY : READ_DONE;
 }
 
 static void clearCodes() {
@@ -284,12 +326,13 @@ static void codesTask(void *) {
                 nextRead = millis() + 1500;      // and read what is left
             } else {
                 s_readWanted = false;
-                if (readCodes()) {
-                    if (!s_identDone) readIdentity();
-                    nextRead = Cfg.dtcPollS ? millis() + Cfg.dtcPollS * 1000UL : 0;
-                } else {
-                    nextRead = millis() + RETRY_MS;
-                }
+                const ReadResult r = readCodes();
+                if (r != READ_NOTHING_SENT && !s_identDone) readIdentity();
+                // With dtc_poll_s 0 the next read still has a time, so that
+                // switching polling on in the portal starts it (it is only
+                // due while dtc_poll_s is not 0).
+                const uint32_t every = (Cfg.dtcPollS ? Cfg.dtcPollS : 60) * 1000UL;
+                nextRead = millis() + (r == READ_DONE ? every : RETRY_MS);
             }
             xSemaphoreTake(s_mx, portMAX_DELAY);
             s_st.busy = false;

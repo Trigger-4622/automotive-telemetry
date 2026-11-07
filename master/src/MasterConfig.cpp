@@ -259,7 +259,21 @@ void MasterConfig::reseedPids() {
 void MasterConfig::begin() {
     loadDefaults();
 
-    if (!LittleFS.begin(true)) {                // true: format if unformatted
+    // Formatting is the last resort, never the first move: it erases the
+    // settings, every learned signal and the logs. A mount can fail once at
+    // power-up (the supply sags while the car cranks); only a partition that
+    // still will not mount after a pause - a blank one on the first flash -
+    // is formatted.
+    bool mounted = false;
+    for (int i = 0; i < 3 && !mounted; i++) {
+        if (i) delay(50);
+        mounted = LittleFS.begin(false);
+    }
+    if (!mounted) {
+        log_w("config: LittleFS will not mount - formatting (expected on the first flash)");
+        mounted = LittleFS.begin(true);
+    }
+    if (!mounted) {
         log_e("config: LittleFS mount failed, running on compiled defaults");
         return;
     }
