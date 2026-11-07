@@ -21,6 +21,7 @@ using std::max;
 using std::min;
 #define constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 #define IRAM_ATTR
+#define DRAM_ATTR
 
 inline uint32_t millis() { return (uint32_t)(simrtos::nowUs() / 1000u); }
 inline uint32_t micros() { return (uint32_t)simrtos::nowUs(); }

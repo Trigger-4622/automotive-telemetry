@@ -89,6 +89,7 @@ void TelemetryStore::ingestRaw(const uint8_t *mac, const uint8_t *data, int len)
 
         s->flags        = e.flags;
         s->lastUpdateMs = now;
+        s->srcMs        = pkt->timestamp_ms;
         if (e.flags & METRIC_FLAG_VALID) {
             s->raw = e.value;
             // Exponential moving average at packet rate
@@ -141,6 +142,20 @@ bool TelemetryStore::peek(uint16_t id, MetricSample &out) {
     }
     portEXIT_CRITICAL(&_mux);
     return found;
+}
+
+bool TelemetryStore::stamped(uint16_t id, float &raw, uint32_t &masterMs) {
+    const uint32_t now = millis();
+    bool ok = false;
+    portENTER_CRITICAL(&_mux);
+    Slot *s = find(id);
+    if (s && (s->flags & METRIC_FLAG_VALID) && now - s->lastUpdateMs <= _staleMs) {
+        raw      = s->raw;
+        masterMs = s->srcMs;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&_mux);
+    return ok;
 }
 
 size_t TelemetryStore::snapshot(MetricView *out, size_t max) {

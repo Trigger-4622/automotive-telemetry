@@ -15,6 +15,10 @@
 #include <WebServer.h>
 #include <WiFi.h>
 
+#include <LittleFS.h>
+
+#include "DiagCodes.h"
+#include "DriveLog.h"
 #include "Learner.h"
 #include "MasterConfig.h"
 #include "MasterTelemetry.h"
@@ -164,9 +168,11 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
    operate, press Start and follow the steps. The master finds the bits or bytes that followed you. A flashing turn signal is
    fine: leave it flashing through the ON step. For the gear lever, pick <b>Gear lever</b>, foot on the brake, and move it
    through the positions as asked: it ends back in P, so every bit is checked twice. The master learns the lever as one value
-   from whichever bits change with it, in one byte or several.</p>
+   from whichever bits change with it, in one byte or several. For the G-meter, pick <b>Longitudinal G</b> and brake firmly to a
+   stop, or <b>Lateral G</b> or <b>Yaw rate</b> and drive through a corner: the master compares every field with what the speed
+   and the steering say, and works out the scale.</p>
   <div class="row"><select id="tM" style="flex:1;min-width:180px"></select>
-   <select id="tK"><option value="bit">On / off</option><option value="val">A moving value</option><option value="pos">Positions</option></select>
+   <select id="tK"><option value="bit">On / off</option><option value="val">A moving value</option><option value="pos">Positions</option><option value="mot">A corner or a hard stop</option></select>
    <button class="b p" id="tBtn" onclick="teachStart()">Start</button></div>
   <div class="row" id="tPRow" hidden style="margin-top:8px"><span class="muted">Positions, in the order you will select them:</span>
    <input id="tP" style="flex:1;min-width:120px" value="P R N D"></div>
@@ -222,6 +228,18 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="f"><div class="l"><b>Update every</b><span>ms</span></div><input type="number" data-k="broadcast_ms" min="20" max="1000"></div>
   <div class="f"><div class="l"><b>Drop a value after</b><span>ms without news</span></div><input type="number" data-k="metric_ttl_ms" min="200"></div>
  </div>
+ <div class="card"><h2>Oil change <small id="svSub"></small></h2>
+  <div class="f"><div class="l"><b>Change the oil every</b><span>km</span></div><input type="number" data-k="oil_every_km" min="500" max="100000"></div>
+  <div class="f"><div class="l"><b>Last changed at</b><span>odometer reading, km · -1 = no reminder</span></div><input type="number" data-k="oil_at_km" min="-1"></div>
+  <p class="say" id="svSay" style="margin:8px 0 10px"></p>
+  <div class="row"><button class="b" onclick="serviceReset()">Oil changed now</button></div></div>
+ <div class="card"><h2>Drive log <small>to the master's flash</small></h2>
+  <div class="f"><div class="l"><b>Record every drive</b><span>from the car coming on to it going off, one file a drive · the files are on the Diagnostics tab</span></div><input type="checkbox" data-k="log_on"></div>
+  <div class="f"><div class="l"><b>Rows per second</b></div><input type="number" data-k="log_hz" min="1" max="20"></div>
+  <div class="f"><div class="l"><b>Space for logs</b><span>KB of the 1.5 MB settings partition · the oldest drive goes first</span></div><input type="number" data-k="log_max_kb" min="64" max="1200"></div>
+  <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
+   <div id="lgIds" class="row" style="margin-top:8px"></div>
+   <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
  <div class="card"><h2>Power</h2>
   <div class="f"><div class="l"><b>Sleep when the car is off</b><span>wakes on the first CAN activity</span></div><input type="checkbox" data-k="sleep_enabled"></div>
   <div class="f"><div class="l"><b>Sleep after</b><span>seconds of silence on the bus</span></div><input type="number" data-k="sleep_idle_s" min="10" max="3600"></div>
@@ -263,6 +281,22 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 </section>
 
 <section id="t-diag" hidden>
+ <div class="card"><h2>Trouble codes <small id="dcSub"></small>
+   <button class="b" style="margin-left:auto" onclick="post('/api/codes/read','Reading the codes',()=>setTimeout(pollCodes,2500))">Read now</button>
+   <button class="b d" onclick="codesClear()">Clear…</button></h2>
+  <p class="say" style="margin:0 0 8px">Stored, pending and permanent codes from the engine and the transmission computer (OBD-II
+   services 03, 07 and 0A), read when the car comes on and every minute after. The screens show them on the check-engine card.</p>
+  <div class="wrap"><table><thead><tr><th>Code</th><th>Meaning</th><th>Computer</th><th>Kind</th></tr></thead><tbody id="dcTab"></tbody></table></div>
+  <p class="say" id="dcSay" style="margin:8px 0 0"></p></div>
+ <div class="card"><h2>Engine computer</h2>
+  <p class="say" style="margin:0 0 8px">RomRaider lists its ROM definitions by the <b>calibration ID</b> (its "internal ID") and its
+   logger definitions by the <b>ROM ID</b> SSM2 reports. If its definition files list this calibration ID, RomRaider can read and
+   edit this ROM: check that before buying a cable.</p>
+  <div class="wrap"><table><tbody id="idTab"></tbody></table></div></div>
+ <div class="card"><h2>Drive logs <small id="lgSub"></small>
+   <button class="b d" style="margin-left:auto" onclick="if(confirm('Delete every drive log?'))post('/api/log/clear','Deleted',pollLogs)">Delete all</button></h2>
+  <p class="say" id="lgSay" style="margin:0 0 8px"></p>
+  <div class="wrap"><table><thead><tr><th>Drive</th><th>Length</th><th>Rows</th><th>Size</th><th></th></tr></thead><tbody id="lgTab"></tbody></table></div></div>
  <div class="card"><h2>Evidence log <small id="evN"></small>
   <button class="b" style="margin-left:auto" onclick="if(confirm('Clear the evidence log?'))post('/api/evlog/clear','Cleared',pollEvlog)">Clear</button></h2>
   <p class="say" style="margin:0 0 8px">Kept on the master's flash across reboots and firmware updates: every boot with its reset reason,
@@ -276,13 +310,14 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 <div id="toast"></div>
 <script>
 'use strict';
-const META={257:["MIL lamp", "", "Status & switches", 0],259:["Fuel system status", "", "Status & switches", 0],260:["Engine load", "%", "Engine", 1],261:["Coolant", "°C", "Temperatures", 0],262:["STFT B1", "%", "Fuel & mixture", 1],263:["LTFT B1", "%", "Fuel & mixture", 1],264:["STFT B2", "%", "Fuel & mixture", 1],265:["LTFT B2", "%", "Fuel & mixture", 1],266:["Fuel press", "kPa", "Fuel & mixture", 0],267:["MAP", "kPa", "Engine", 0],268:["RPM", "rpm", "Engine", 0],269:["Speed", "km/h", "Driving", 0],270:["Timing", "°", "Engine", 1],271:["IAT", "°C", "Temperatures", 0],272:["MAF", "g/s", "Engine", 1],273:["Throttle", "%", "Engine", 1],276:["O2 B1S1", "V", "Fuel & mixture", 2],277:["O2 B1S2", "V", "Fuel & mixture", 2],280:["O2 B2S1", "V", "Fuel & mixture", 2],281:["O2 B2S2", "V", "Fuel & mixture", 2],287:["Run time", "s", "Driving", 0],289:["Dist MIL", "km", "Driving", 0],290:["Fuel rail (vac)", "kPa", "Fuel & mixture", 0],291:["Fuel rail gauge", "kPa", "Fuel & mixture", 0],292:["WB B1S1", "λ", "Fuel & mixture", 3],296:["WB B2S1", "λ", "Fuel & mixture", 3],300:["EGR cmd", "%", "Fuel & mixture", 1],301:["EGR error", "%", "Fuel & mixture", 1],302:["Evap purge", "%", "Fuel & mixture", 1],303:["Fuel level", "%", "Fuel & mixture", 1],304:["Warm-ups", "", "Driving", 0],305:["Dist cleared", "km", "Driving", 0],306:["Evap vapor", "Pa", "Fuel & mixture", 0],307:["Barometric", "kPa", "Engine", 0],308:["WB B1S1 λ (I)", "λ", "Fuel & mixture", 3],312:["WB B2S1 λ (I)", "λ", "Fuel & mixture", 3],316:["Cat temp", "°C", "Temperatures", 0],317:["Cat temp B2S1", "°C", "Temperatures", 0],318:["Cat temp B1S2", "°C", "Temperatures", 0],319:["Cat temp B2S2", "°C", "Temperatures", 0],322:["Battery", "V", "Electrical", 2],323:["Abs load", "%", "Engine", 1],324:["Cmd", "λ", "Engine", 3],325:["Rel throttle", "%", "Engine", 1],326:["Ambient", "°C", "Temperatures", 0],327:["Abs throttle B", "%", "Engine", 1],328:["Throttle C", "%", "Engine", 1],329:["Pedal D", "%", "Engine", 1],330:["Pedal E", "%", "Engine", 1],331:["Pedal F", "%", "Engine", 1],332:["Cmd throttle", "%", "Engine", 1],333:["Time MIL on", "min", "Driving", 0],334:["Time since clear", "min", "Driving", 0],337:["Fuel type", "", "Status & switches", 0],338:["Ethanol", "%", "Fuel & mixture", 1],339:["Evap abs", "kPa", "Fuel & mixture", 0],345:["Fuel rail abs", "kPa", "Fuel & mixture", 0],346:["Relative pedal", "%", "Engine", 1],347:["Hybrid SOC", "%", "Engine", 1],348:["Oil temp", "°C", "Temperatures", 0],349:["Injection timing", "°", "Fuel & mixture", 1],350:["Fuel rate", "L/h", "Fuel & mixture", 1],353:["Demand torque", "%", "Engine", 1],354:["Actual torque", "%", "Engine", 1],355:["Reference torque", "Nm", "Engine", 0],422:["Odometer", "km", "Driving", 0],769:["DTC count", "", "Status & switches", 0],788:["O2 B1S1 trim", "%", "Fuel & mixture", 1],789:["O2 B1S2 trim", "%", "Fuel & mixture", 1],792:["O2 B2S1 trim", "%", "Fuel & mixture", 1],793:["O2 B2S2 trim", "%", "Fuel & mixture", 1],804:["WB B1S1", "V", "Fuel & mixture", 2],808:["WB B2S1", "V", "Fuel & mixture", 2],820:["WB B1S1", "mA", "Fuel & mixture", 1],824:["WB B2S1", "mA", "Fuel & mixture", 1],4097:["Boost", "bar", "Engine", 2],4098:["AFR", "AFR", "Fuel & mixture", 1],4099:["Oil press", "bar", "Engine", 2],4100:["EGT", "°C", "Temperatures", 0],4101:["Gear", "", "Driving", 0],4102:["Steering", "°", "Driving", 1],4103:["Brake", "bar", "Driving", 2],4104:["Wheel FL", "km/h", "Driving", 0],4105:["Wheel FR", "km/h", "Driving", 0],4106:["Wheel RL", "km/h", "Driving", 0],4107:["Wheel RR", "km/h", "Driving", 0],4108:["Lateral G", "g", "Driving", 2],4109:["Longitudinal G", "g", "Driving", 2],4110:["Yaw rate", "°/s", "Driving", 1],4111:["Gear lever", "", "Driving", 0],4112:["Cruise set", "km/h", "Driving", 0],4113:["ATF temp", "°C", "Temperatures", 0],4353:["Batt current", "A", "Electrical", 1],4354:["Batt SOC", "%", "Electrical", 1],4355:["Batt SOH", "%", "Electrical", 1],4356:["Batt temp", "°C", "Temperatures", 0],4357:["Alternator", "V", "Electrical", 2],4358:["Alternator", "A", "Electrical", 1],4359:["Alternator load", "%", "Electrical", 1],4360:["12V rail", "V", "Electrical", 2],4361:["Elec load", "W", "Electrical", 0],4362:["Charge status", "", "Status & switches", 0],4609:["Left turn signal", "", "Status & switches", 0],4610:["Right turn signal", "", "Status & switches", 0],4611:["High beam", "", "Status & switches", 0],4612:["Door open", "", "Status & switches", 0],4613:["Handbrake", "", "Status & switches", 0],4614:["Seatbelt unfastened", "", "Status & switches", 0],4615:["Cruise active", "", "Status & switches", 0],4616:["Reverse", "", "Status & switches", 0],4617:["Lever in P", "", "Status & switches", 0],4618:["Lever in N", "", "Status & switches", 0],4619:["Lever in D", "", "Status & switches", 0],4620:["Hazard lights", "", "Status & switches", 0],4621:["Cruise main", "", "Status & switches", 0],4622:["Front fog", "", "Status & switches", 0],4623:["Rear fog", "", "Status & switches", 0],4624:["Door FL", "", "Status & switches", 0],4625:["Door FR", "", "Status & switches", 0],4626:["Door RL", "", "Status & switches", 0],4627:["Door RR", "", "Status & switches", 0],4628:["Trunk open", "", "Status & switches", 0],4629:["Hood open", "", "Status & switches", 0],4630:["VDC off", "", "Status & switches", 0],4631:["Passenger belt unfastened", "", "Status & switches", 0],7937:["Night sense", "", "System", 0],7938:["Master uptime", "s", "System", 0],7939:["CAN frames/s", "", "System", 0],7940:["CAN IDs", "", "System", 0],7941:["OBD replies/s", "", "System", 0],7942:["SSM2 exch/s", "", "System", 0],8193:["Knock corr", "°", "Engine", 1],8194:["Knock corr fine", "°", "Engine", 1],8195:["A/F learn", "%", "Fuel & mixture", 1],8196:["A/F corr", "%", "Fuel & mixture", 1],8197:["Inj duty", "%", "Fuel & mixture", 1],8198:["Target boost", "bar", "Engine", 2],8199:["Wastegate", "%", "Engine", 1],8200:["A/F corr 2", "%", "Fuel & mixture", 1],8201:["A/F learn 2", "%", "Fuel & mixture", 1],8202:["Front O2 #1", "V", "Fuel & mixture", 2],8203:["Rear O2", "V", "Fuel & mixture", 2],8204:["Front O2 #2", "V", "Fuel & mixture", 2],8205:["MAF sensor", "V", "Engine", 2],8206:["TPS", "V", "Engine", 2],8207:["Atmospheric", "kPa", "Engine", 0],8208:["Manifold rel", "kPa", "Engine", 0],8209:["Tank press", "kPa", "Engine", 0],8210:["Learned timing", "°", "Engine", 1],8211:["Accel pedal", "%", "Engine", 1],8212:["Fuel temp", "°C", "Temperatures", 0],8213:["Wastegate 2", "%", "Engine", 1],8214:["CPC duty", "%", "Fuel & mixture", 1],8215:["ISC duty", "%", "Engine", 1],8216:["A/F lean", "%", "Fuel & mixture", 1],8217:["A/F heater", "%", "Fuel & mixture", 1],8218:["ISC step", "", "Engine", 0],8219:["EGR steps", "", "Fuel & mixture", 0],8220:["Alternator duty", "%", "Electrical", 1],8221:["Fuel pump", "%", "Fuel & mixture", 1],8222:["Intake VVT R", "°", "Engine", 1],8223:["Intake VVT L", "°", "Engine", 1],8224:["Intake OCV R", "%", "Engine", 1],8225:["Intake OCV L", "%", "Engine", 1],8226:["A/F current", "mA", "Fuel & mixture", 1],8227:["Lambda", "λ", "Fuel & mixture", 3],8228:["Lambda 2", "λ", "Fuel & mixture", 3],8229:["Throttle motor", "%", "Engine", 1],8230:["Main TPS", "V", "Engine", 2],8231:["Main APS", "V", "Engine", 2],8232:["Brake boost", "kPa", "Driving", 0],8233:["Fuel HP", "MPa", "Fuel & mixture", 2],8235:["Exhaust VVT R", "°", "Engine", 1],8236:["Exhaust VVT L", "°", "Engine", 1],8237:["Rough cyl 1", "", "Engine", 0],8238:["Rough cyl 2", "", "Engine", 0],8239:["Rough cyl 3", "", "Engine", 0],8240:["Rough cyl 4", "", "Engine", 0],8241:["Inj 2 pulse", "ms", "Fuel & mixture", 2],8242:["Cold start inj", "ms", "Engine", 2],8243:["Alternator mode", "", "Status & switches", 0],8244:["Fuel sender", "V", "Fuel & mixture", 2],8245:["Radiator fan", "%", "Engine", 1],8246:["Learned ign corr", "°", "Engine", 1],8247:["Boost feedback", "%", "Engine", 1],8248:["Target RPM", "rpm", "Engine", 0],8249:["SI-Drive", "", "Status & switches", 0],8250:["Odometer (SSM)", "km", "Driving", 0],8251:["EPS current", "A", "Electrical", 1],8252:["Fuel pump", "A", "Fuel & mixture", 1],8254:["Inj 1 pulse", "ms", "Fuel & mixture", 2],8449:["Brake switch", "", "Status & switches", 0],8450:["Clutch switch", "", "Status & switches", 0],8451:["Neutral switch", "", "Status & switches", 0],8452:["A/C switch", "", "Status & switches", 0],8453:["Idle switch", "", "Status & switches", 0],8454:["Knock signal", "", "Status & switches", 0],8455:["Electrical load", "", "Status & switches", 0],8456:["Light switch", "", "Status & switches", 0],8457:["Radiator fan 1", "", "Status & switches", 0],8458:["Radiator fan 2", "", "Status & switches", 0],8459:["A/C compressor", "", "Status & switches", 0],8460:["Fuel pump relay", "", "Status & switches", 0],8461:["Oil pressure switch", "", "Status & switches", 0],8462:["Starter", "", "Status & switches", 0],8463:["Rear defogger", "", "Status & switches", 0],8464:["Blower", "", "Status & switches", 0],8465:["Wiper switch", "", "Status & switches", 0],8466:["Ignition", "", "Status & switches", 0],8467:["Stop lamp switch", "", "Status & switches", 0],8468:["Knock signal 2", "", "Status & switches", 0],12289:["Custom 1", "", "Custom", 0],12290:["Custom 2", "", "Custom", 0],12291:["Custom 3", "", "Custom", 0],12292:["Custom 4", "", "Custom", 0],12293:["Custom 5", "", "Custom", 0],12294:["Custom 6", "", "Custom", 0],12295:["Custom 7", "", "Custom", 0],12296:["Custom 8", "", "Custom", 0],12297:["Custom 9", "", "Custom", 0],12298:["Custom 10", "", "Custom", 0],12299:["Custom 11", "", "Custom", 0],12300:["Custom 12", "", "Custom", 0],12301:["Custom 13", "", "Custom", 0],12302:["Custom 14", "", "Custom", 0],12303:["Custom 15", "", "Custom", 0],12304:["Custom 16", "", "Custom", 0]};
+const META={257:["MIL lamp", "", "Status & switches", 0],259:["Fuel system status", "", "Status & switches", 0],260:["Engine load", "%", "Engine", 1],261:["Coolant", "°C", "Temperatures", 0],262:["STFT B1", "%", "Fuel & mixture", 1],263:["LTFT B1", "%", "Fuel & mixture", 1],264:["STFT B2", "%", "Fuel & mixture", 1],265:["LTFT B2", "%", "Fuel & mixture", 1],266:["Fuel press", "kPa", "Fuel & mixture", 0],267:["MAP", "kPa", "Engine", 0],268:["RPM", "rpm", "Engine", 0],269:["Speed", "km/h", "Driving", 0],270:["Timing", "°", "Engine", 1],271:["IAT", "°C", "Temperatures", 0],272:["MAF", "g/s", "Engine", 1],273:["Throttle", "%", "Engine", 1],276:["O2 B1S1", "V", "Fuel & mixture", 2],277:["O2 B1S2", "V", "Fuel & mixture", 2],280:["O2 B2S1", "V", "Fuel & mixture", 2],281:["O2 B2S2", "V", "Fuel & mixture", 2],287:["Run time", "s", "Driving", 0],289:["Dist MIL", "km", "Driving", 0],290:["Fuel rail (vac)", "kPa", "Fuel & mixture", 0],291:["Fuel rail gauge", "kPa", "Fuel & mixture", 0],292:["WB B1S1", "λ", "Fuel & mixture", 3],296:["WB B2S1", "λ", "Fuel & mixture", 3],300:["EGR cmd", "%", "Fuel & mixture", 1],301:["EGR error", "%", "Fuel & mixture", 1],302:["Evap purge", "%", "Fuel & mixture", 1],303:["Fuel level", "%", "Fuel & mixture", 1],304:["Warm-ups", "", "Driving", 0],305:["Dist cleared", "km", "Driving", 0],306:["Evap vapor", "Pa", "Fuel & mixture", 0],307:["Barometric", "kPa", "Engine", 0],308:["WB B1S1 λ (I)", "λ", "Fuel & mixture", 3],312:["WB B2S1 λ (I)", "λ", "Fuel & mixture", 3],316:["Cat temp", "°C", "Temperatures", 0],317:["Cat temp B2S1", "°C", "Temperatures", 0],318:["Cat temp B1S2", "°C", "Temperatures", 0],319:["Cat temp B2S2", "°C", "Temperatures", 0],322:["Battery", "V", "Electrical", 2],323:["Abs load", "%", "Engine", 1],324:["Cmd", "λ", "Engine", 3],325:["Rel throttle", "%", "Engine", 1],326:["Ambient", "°C", "Temperatures", 0],327:["Abs throttle B", "%", "Engine", 1],328:["Throttle C", "%", "Engine", 1],329:["Pedal D", "%", "Engine", 1],330:["Pedal E", "%", "Engine", 1],331:["Pedal F", "%", "Engine", 1],332:["Cmd throttle", "%", "Engine", 1],333:["Time MIL on", "min", "Driving", 0],334:["Time since clear", "min", "Driving", 0],337:["Fuel type", "", "Status & switches", 0],338:["Ethanol", "%", "Fuel & mixture", 1],339:["Evap abs", "kPa", "Fuel & mixture", 0],345:["Fuel rail abs", "kPa", "Fuel & mixture", 0],346:["Relative pedal", "%", "Engine", 1],347:["Hybrid SOC", "%", "Engine", 1],348:["Oil temp", "°C", "Temperatures", 0],349:["Injection timing", "°", "Fuel & mixture", 1],350:["Fuel rate", "L/h", "Fuel & mixture", 1],353:["Demand torque", "%", "Engine", 1],354:["Actual torque", "%", "Engine", 1],355:["Reference torque", "Nm", "Engine", 0],422:["Odometer", "km", "Driving", 0],769:["DTC count", "", "Status & switches", 0],788:["O2 B1S1 trim", "%", "Fuel & mixture", 1],789:["O2 B1S2 trim", "%", "Fuel & mixture", 1],792:["O2 B2S1 trim", "%", "Fuel & mixture", 1],793:["O2 B2S2 trim", "%", "Fuel & mixture", 1],804:["WB B1S1", "V", "Fuel & mixture", 2],808:["WB B2S1", "V", "Fuel & mixture", 2],820:["WB B1S1", "mA", "Fuel & mixture", 1],824:["WB B2S1", "mA", "Fuel & mixture", 1],1024:["Trouble codes", "", "Status & switches", 0],1025:["Trouble code 1", "", "Status & switches", 0],1026:["Trouble code 2", "", "Status & switches", 0],1027:["Trouble code 3", "", "Status & switches", 0],1028:["Trouble code 4", "", "Status & switches", 0],1029:["Trouble code 5", "", "Status & switches", 0],1030:["Trouble code 6", "", "Status & switches", 0],1031:["Trouble code 7", "", "Status & switches", 0],1032:["Trouble code 8", "", "Status & switches", 0],4097:["Boost", "bar", "Engine", 2],4098:["AFR", "AFR", "Fuel & mixture", 1],4099:["Oil press", "bar", "Engine", 2],4100:["EGT", "°C", "Temperatures", 0],4101:["Gear", "", "Driving", 0],4102:["Steering", "°", "Driving", 1],4103:["Brake", "bar", "Driving", 2],4104:["Wheel FL", "km/h", "Driving", 0],4105:["Wheel FR", "km/h", "Driving", 0],4106:["Wheel RL", "km/h", "Driving", 0],4107:["Wheel RR", "km/h", "Driving", 0],4108:["Lateral G", "g", "Driving", 2],4109:["Longitudinal G", "g", "Driving", 2],4110:["Yaw rate", "°/s", "Driving", 1],4111:["Gear lever", "", "Driving", 0],4112:["Cruise set", "km/h", "Driving", 0],4113:["ATF temp", "°C", "Temperatures", 0],4353:["Batt current", "A", "Electrical", 1],4354:["Batt SOC", "%", "Electrical", 1],4355:["Batt SOH", "%", "Electrical", 1],4356:["Batt temp", "°C", "Temperatures", 0],4357:["Alternator", "V", "Electrical", 2],4358:["Alternator", "A", "Electrical", 1],4359:["Alternator load", "%", "Electrical", 1],4360:["12V rail", "V", "Electrical", 2],4361:["Elec load", "W", "Electrical", 0],4362:["Charge status", "", "Status & switches", 0],4609:["Left turn signal", "", "Status & switches", 0],4610:["Right turn signal", "", "Status & switches", 0],4611:["High beam", "", "Status & switches", 0],4612:["Door open", "", "Status & switches", 0],4613:["Handbrake", "", "Status & switches", 0],4614:["Seatbelt unfastened", "", "Status & switches", 0],4615:["Cruise active", "", "Status & switches", 0],4616:["Reverse", "", "Status & switches", 0],4617:["Lever in P", "", "Status & switches", 0],4618:["Lever in N", "", "Status & switches", 0],4619:["Lever in D", "", "Status & switches", 0],4620:["Hazard lights", "", "Status & switches", 0],4621:["Cruise main", "", "Status & switches", 0],4622:["Front fog", "", "Status & switches", 0],4623:["Rear fog", "", "Status & switches", 0],4624:["Door FL", "", "Status & switches", 0],4625:["Door FR", "", "Status & switches", 0],4626:["Door RL", "", "Status & switches", 0],4627:["Door RR", "", "Status & switches", 0],4628:["Trunk open", "", "Status & switches", 0],4629:["Hood open", "", "Status & switches", 0],4630:["VDC off", "", "Status & switches", 0],4631:["Passenger belt unfastened", "", "Status & switches", 0],7937:["Night sense", "", "System", 0],7938:["Master uptime", "s", "System", 0],7939:["CAN frames/s", "", "System", 0],7940:["CAN IDs", "", "System", 0],7941:["OBD replies/s", "", "System", 0],7942:["SSM2 exch/s", "", "System", 0],7952:["Oil change due", "km", "System", 0],8193:["Knock corr", "°", "Engine", 1],8194:["Knock corr fine", "°", "Engine", 1],8195:["A/F learn", "%", "Fuel & mixture", 1],8196:["A/F corr", "%", "Fuel & mixture", 1],8197:["Inj duty", "%", "Fuel & mixture", 1],8198:["Target boost", "bar", "Engine", 2],8199:["Wastegate", "%", "Engine", 1],8200:["A/F corr 2", "%", "Fuel & mixture", 1],8201:["A/F learn 2", "%", "Fuel & mixture", 1],8202:["Front O2 #1", "V", "Fuel & mixture", 2],8203:["Rear O2", "V", "Fuel & mixture", 2],8204:["Front O2 #2", "V", "Fuel & mixture", 2],8205:["MAF sensor", "V", "Engine", 2],8206:["TPS", "V", "Engine", 2],8207:["Atmospheric", "kPa", "Engine", 0],8208:["Manifold rel", "kPa", "Engine", 0],8209:["Tank press", "kPa", "Engine", 0],8210:["Learned timing", "°", "Engine", 1],8211:["Accel pedal", "%", "Engine", 1],8212:["Fuel temp", "°C", "Temperatures", 0],8213:["Wastegate 2", "%", "Engine", 1],8214:["CPC duty", "%", "Fuel & mixture", 1],8215:["ISC duty", "%", "Engine", 1],8216:["A/F lean", "%", "Fuel & mixture", 1],8217:["A/F heater", "%", "Fuel & mixture", 1],8218:["ISC step", "", "Engine", 0],8219:["EGR steps", "", "Fuel & mixture", 0],8220:["Alternator duty", "%", "Electrical", 1],8221:["Fuel pump", "%", "Fuel & mixture", 1],8222:["Intake VVT R", "°", "Engine", 1],8223:["Intake VVT L", "°", "Engine", 1],8224:["Intake OCV R", "%", "Engine", 1],8225:["Intake OCV L", "%", "Engine", 1],8226:["A/F current", "mA", "Fuel & mixture", 1],8227:["Lambda", "λ", "Fuel & mixture", 3],8228:["Lambda 2", "λ", "Fuel & mixture", 3],8229:["Throttle motor", "%", "Engine", 1],8230:["Main TPS", "V", "Engine", 2],8231:["Main APS", "V", "Engine", 2],8232:["Brake boost", "kPa", "Driving", 0],8233:["Fuel HP", "MPa", "Fuel & mixture", 2],8235:["Exhaust VVT R", "°", "Engine", 1],8236:["Exhaust VVT L", "°", "Engine", 1],8237:["Rough cyl 1", "", "Engine", 0],8238:["Rough cyl 2", "", "Engine", 0],8239:["Rough cyl 3", "", "Engine", 0],8240:["Rough cyl 4", "", "Engine", 0],8241:["Inj 2 pulse", "ms", "Fuel & mixture", 2],8242:["Cold start inj", "ms", "Engine", 2],8243:["Alternator mode", "", "Status & switches", 0],8244:["Fuel sender", "V", "Fuel & mixture", 2],8245:["Radiator fan", "%", "Engine", 1],8246:["Learned ign corr", "°", "Engine", 1],8247:["Boost feedback", "%", "Engine", 1],8248:["Target RPM", "rpm", "Engine", 0],8249:["SI-Drive", "", "Status & switches", 0],8250:["Odometer (SSM)", "km", "Driving", 0],8251:["EPS current", "A", "Electrical", 1],8252:["Fuel pump", "A", "Fuel & mixture", 1],8254:["Inj 1 pulse", "ms", "Fuel & mixture", 2],8449:["Brake switch", "", "Status & switches", 0],8450:["Clutch switch", "", "Status & switches", 0],8451:["Neutral switch", "", "Status & switches", 0],8452:["A/C switch", "", "Status & switches", 0],8453:["Idle switch", "", "Status & switches", 0],8454:["Knock signal", "", "Status & switches", 0],8455:["Electrical load", "", "Status & switches", 0],8456:["Light switch", "", "Status & switches", 0],8457:["Radiator fan 1", "", "Status & switches", 0],8458:["Radiator fan 2", "", "Status & switches", 0],8459:["A/C compressor", "", "Status & switches", 0],8460:["Fuel pump relay", "", "Status & switches", 0],8461:["Oil pressure switch", "", "Status & switches", 0],8462:["Starter", "", "Status & switches", 0],8463:["Rear defogger", "", "Status & switches", 0],8464:["Blower", "", "Status & switches", 0],8465:["Wiper switch", "", "Status & switches", 0],8466:["Ignition", "", "Status & switches", 0],8467:["Stop lamp switch", "", "Status & switches", 0],8468:["Knock signal 2", "", "Status & switches", 0],12289:["Custom 1", "", "Custom", 0],12290:["Custom 2", "", "Custom", 0],12291:["Custom 3", "", "Custom", 0],12292:["Custom 4", "", "Custom", 0],12293:["Custom 5", "", "Custom", 0],12294:["Custom 6", "", "Custom", 0],12295:["Custom 7", "", "Custom", 0],12296:["Custom 8", "", "Custom", 0],12297:["Custom 9", "", "Custom", 0],12298:["Custom 10", "", "Custom", 0],12299:["Custom 11", "", "Custom", 0],12300:["Custom 12", "", "Custom", 0],12301:["Custom 13", "", "Custom", 0],12302:["Custom 14", "", "Custom", 0],12303:["Custom 15", "", "Custom", 0],12304:["Custom 16", "", "Custom", 0]};
 const $=q=>document.querySelector(q);
 const hex=(n,w)=>'0x'+Number(n).toString(16).toUpperCase().padStart(w,'0');
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const nm=id=>META[id]?META[id][0]:hex(id,4);
 const un=id=>META[id]?META[id][1]:'';
-const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.round(v));const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
+const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.round(v));
+ if(id>0x400&&id<=0x408)return dtcName(v);const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
 const SRC={1:['SSM2','ssm'],2:['OBD-II','obd'],3:['calc','calc'],4:['bus','raw']};
 let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='dash',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
 function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2400)}
@@ -291,7 +326,7 @@ function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v)}
 function go(t){TAB=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
  ['dash','bus','src','set','adv','diag'].forEach(x=>$('#t-'+x).hidden=x!==t);
  if(t==='bus')pollBus();if(t==='src')renderSources();if(t==='dash'&&L)renderDash();if(t==='adv'){renderAdv();jsonShow()}
- if(t==='diag')pollEvlog()}
+ if(t==='diag'){pollEvlog();pollCodes();pollLogs()}if(t==='set')pollCodes()}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
 /* ───────────── settings: every input bound to the config by data-k ───────────── */
@@ -304,7 +339,7 @@ function parseEl(el){
 function fillBound(){
  document.querySelectorAll('[data-k]').forEach(el=>{const v=C[el.dataset.k];if(v===undefined)return;
   if(el.type==='checkbox')el.checked=!!v;else if(document.activeElement!==el)el.value=v});
- const t=MODE_TOG[C.diag_mode]||[1,1];$('#sObd').checked=!!t[0];$('#sSsm').checked=!!t[1]}
+ const t=MODE_TOG[C.diag_mode]||[1,1];$('#sObd').checked=!!t[0];$('#sSsm').checked=!!t[1];renderLogIds()}
 /* Settings that would lock this page away: the AP will not start without a
    name, nor with a key WPA2 cannot use; and with the Wi-Fi off at boot only
    the BOOT button brings the page back. */
@@ -342,7 +377,7 @@ async function load(soft){
  if(!inside('#t-src'))renderSources();
  if(TAB==='adv'&&!inside('#t-adv')){renderAdv();jsonShow()}}
 const REBOOT_KEYS=['bitrate_kbps','wifi_channel','ap_ssid','ap_pass','portal_on','can_sp875','can_timing'];
-const RO_KEYS=['cfg_ver','ecu_id','ecu_sys_id','ecu_flags'];
+const RO_KEYS=['cfg_ver','ecu_id','ecu_sys_id','ecu_flags','ecu_cal_id','vin'];
 const sigKey=s=>[s.can_id,s.ext?1:0,s.start,s.len,s.be?1:0,s.metric].join(':');
 /* Three-way merge of the signal table: what the master holds now, plus exactly
    the edits made on this page since it loaded. Writing back the table as it was
@@ -418,6 +453,13 @@ const ADV=[
   ['night_source','Night mode from','sel',[[2,"The car's light switch"],[1,'Light sensor on GPIO'],[0,'Never']]],
   ['ldr_dark','Light sensor: night below','num','ADC',0,4095],
   ['ldr_light','Light sensor: day above','num','ADC',0,4095]]],
+ ['Codes, oil change, drive log',[
+  ['dtc_poll_s','Read the trouble codes every','num','s while the car is on · 0 = only when asked',0,3600],
+  ['oil_every_km','Oil change every','num','km',500,100000],
+  ['oil_at_km','Oil last changed at','num','km on the odometer · -1 = no reminder',-1,9999999],
+  ['log_on','Record every drive','bool'],
+  ['log_hz','Drive log rows per second','num','1–20',1,20],
+  ['log_max_kb','Space for drive logs','num','KB',64,1200]]],
  ['Power',[
   ['sleep_enabled','Sleep when the car is off','bool'],
   ['sleep_idle_s','Sleep after','num','s',10,3600],
@@ -775,14 +817,101 @@ function teachFind(kind,S,steps,toks){
   if(r.l!==1&&out.some(t=>t.id===r.id&&t.l!==1&&bytesOf(t).some(b=>bytesOf(r).includes(b))))continue;
   out.push(r);if(out.length>=8)break}
  return out}
+/** G and yaw: what a field should read at each poll, from what the master
+    knows then. @p P: one {t (ms), v (km/h), st (steering °), yaw (°/s), lat (g)}
+    per poll, null where unknown. Longitudinal G is the speed's slope (least
+    squares over ±0.6 s: OBD-II speed comes in whole km/h). Lateral G is speed
+    × yaw rate when the yaw rate is known, else the steering's turn at this
+    speed (ratio 15, wheelbase 2.67 m: the scale is then approximate, and the
+    sign is whatever the steering's is). Yaw rate likewise. */
+const STEER_RATIO=15,WHEELBASE=2.67,G0=9.80665;
+function motionRef(m,P){
+ const out=new Array(P.length).fill(null),rad=Math.PI/180;
+ const sp=P.filter(p=>p.v!=null).filter((p,i,a)=>!i||p.t!==a[i-1].t);
+ for(let i=0;i<P.length;i++){
+  const p=P[i];if(p.v==null)continue;const ms=p.v/3.6;
+  if(m===0x100D){
+   const w=sp.filter(q=>Math.abs(q.t-p.t)<=600);if(w.length<4)continue;
+   const n=w.length,mt=w.reduce((a,q)=>a+q.t,0)/n,mv=w.reduce((a,q)=>a+q.v,0)/n;
+   let sxy=0,sxx=0;for(const q of w){sxy+=(q.t-mt)*(q.v-mv);sxx+=(q.t-mt)**2}
+   if(sxx>0)out[i]=sxy/sxx*1000/3.6/G0}
+  else if(m===0x100C){
+   if(p.yaw!=null)out[i]=ms*p.yaw*rad/G0;
+   else if(p.st!=null)out[i]=ms*ms*Math.tan(p.st/STEER_RATIO*rad)/WHEELBASE/G0}
+  else if(m===0x100E){
+   if(p.lat!=null&&p.v>5)out[i]=p.lat*G0/ms/rad;
+   else if(p.st!=null)out[i]=ms*Math.tan(p.st/STEER_RATIO*rad)/WHEELBASE/rad}}
+ return out}
+/** The field that follows a reference: @p X the payloads, @p R what the value
+    should be at each (null = unknown). The best |r| of the 8- and 16-bit
+    readings, signed or not, with up to 3 polls of lag either way (the
+    reference comes from slower values); a straight-line fit gives the scale
+    and offset that turn its raw value into the reference's units. */
+function teachMotion(id,X,R,dlc){
+ const res=[],idx=[];for(let i=0;i<R.length;i++)if(R[i]!=null&&Number.isFinite(R[i]))idx.push(i);
+ if(idx.length<12)return res;
+ const ry=idx.map(i=>R[i]);if(!(Math.max(...ry)-Math.min(...ry)>0))return res;
+ const fit=(x,y)=>{const n=x.length;let mx=0,my=0;for(let i=0;i<n;i++){mx+=x[i];my+=y[i]}mx/=n;my/=n;
+  let a=0,b=0,c=0;for(let i=0;i<n;i++){const dx=x[i]-mx,dy=y[i]-my;a+=dx*dy;b+=dx*dx;c+=dy*dy}
+  return b>0&&c>0?{r:a/Math.sqrt(b*c),k:a/b,o:my-a/b*mx}:null};
+ for(let k=0;k<dlc;k++){
+  const fl=[[8*k,8,false]];if(k+1<dlc)fl.push([8*k,16,false],[8*k+7,16,true]);
+  let best=null;
+  for(const [st,len,be] of fl)for(const sg of [false,true]){
+   const xs=X.map(b=>extract(b,st,len,be,sg));
+   if(new Set(xs).size<6)continue;
+   for(let lag=-3;lag<=3;lag++){
+    const x=[],y=[];
+    for(const i of idx){const j=i+lag;if(j>=0&&j<xs.length){x.push(xs[j]);y.push(R[i])}}
+    if(x.length<10)continue;
+    const f=fit(x,y);if(!f)continue;const r=Math.abs(f.r);
+    if(r>=0.8&&(!best||r>best.score+1e-9))
+     best={id,s:st,l:len,be,sg,score:r,k:f.k,o:f.o,lag,mn:Math.min(...xs),mx:Math.max(...xs)}}}
+  if(best)res.push(best)}
+ return res}
+/** teachMotion over every identifier: @p S maps each step to its polls (an
+    identifier to {b}), @p R each step to the reference per poll. Best first,
+    one per stretch of bytes, at most 8. */
+function teachFindMotion(S,R,steps){
+ const ids=new Set();steps.forEach(k=>(S[k]||[]).forEach(poll=>poll.forEach((x,id)=>ids.add(id))));
+ const res=[];
+ for(const id of ids){
+  if(id>=0x7DF&&id<=0x7EF)continue;
+  const X=[],Y=[];
+  for(const k of steps)(S[k]||[]).forEach((poll,i)=>{const x=poll.get(id);if(x){X.push(x.b);Y.push((R[k]||[])[i])}});
+  if(X.length<12)continue;
+  res.push(...teachMotion(id,X,Y,Math.max(...X.map(b=>b.length))))}
+ res.sort((a,b)=>b.score-a.score);
+ const out=[];
+ for(const r of res){
+  const k0=r.s>>3,by=r.l>8?[k0,k0+1]:[k0];
+  if(out.some(t=>t.id===r.id&&by.some(b=>t.by.includes(b))))continue;
+  out.push({...r,by});if(out.length>=8)break}
+ return out}
+/** A trouble-code channel's value (raw | kind << 16 | module << 18) as "P1718". */
+function dtcName(v){const raw=(Math.round(v)>>>0)&0xFFFF,h=x=>x.toString(16).toUpperCase();
+ return'PCBU'[raw>>14]+((raw>>12)&3)+h((raw>>8)&15)+h((raw>>4)&15)+h(raw&15)}
+/** A drive log (.tlg, see DriveLog.h) as CSV: time in seconds, then one column
+    per value, headed by @p name(id); a value that was not fresh is empty. */
+function tlgToCsv(b,name){
+ if(b.length<16||String.fromCharCode(b[0],b[1],b[2],b[3])!=='TLG1')return'';
+ const dv=new DataView(b.buffer,b.byteOffset,b.byteLength),n=b[6],ids=[];
+ for(let i=0;i<n;i++)ids.push(dv.getUint16(16+2*i,true));
+ const row=4+4*n,q=x=>'"'+String(x).replace(/"/g,'""')+'"',lines=['time_s,'+ids.map(id=>q(name(id))).join(',')];
+ for(let p=16+2*n;p+row<=b.length;p+=row){
+  const c=[(dv.getUint32(p,true)/1000).toFixed(3)];
+  for(let i=0;i<n;i++){const v=dv.getFloat32(p+4+4*i,true);c.push(Number.isFinite(v)?String(+v.toPrecision(7)):'')}
+  lines.push(c.join(','))}
+ return lines.join('\r\n')+'\r\n'}
 /*</teach-core>*/
 const isSwitch=id=>(id&0xFF00)===0x1200||(id&0xFF00)===0x2100||id===0x0101;
 const TEACH_FIRST=id=>(id&0xFF00)===0x1200||(id>=0x1005&&id<=0x10FF)||(id&0xFF00)===0x3000||(id&0xFF00)===0x2100;
 let TEACH=null,TRES=[],TTOK=[];
 $('#tM').innerHTML='<optgroup label="Body, chassis and custom">'+metricOpts(0x1201,TEACH_FIRST)+'</optgroup><optgroup label="Everything else">'+metricOpts(0,id=>!TEACH_FIRST(id))+'</optgroup>';
 function teachKindShown(){$('#tPRow').hidden=$('#tK').value!=='pos'}
+const isMotion=id=>id>=0x100C&&id<=0x100E;
 $('#tM').onchange=()=>{const m=+$('#tM').value;
- $('#tK').value=TEACH_POS[m]?'pos':isSwitch(m)?'bit':'val';
+ $('#tK').value=TEACH_POS[m]?'pos':isSwitch(m)?'bit':isMotion(m)?'mot':'val';
  if(TEACH_POS[m])$('#tP').value=TEACH_POS[m];teachKindShown()};
 $('#tK').onchange=teachKindShown;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -790,28 +919,37 @@ async function teachStart(){
  const m=+$('#tM').value,kind=$('#tK').value;
  TTOK=kind==='pos'?$('#tP').value.trim().split(/[\s,]+/).filter(Boolean).slice(0,8):[];
  if(kind==='pos'&&TTOK.length<2){toast('List at least two positions');return}
- const phases=kind==='bit'?[['A','Leave it OFF',4000],['B','Turn it ON now, and hold it (flashing is fine)',4000],['C','Turn it OFF again',4000]]:
+ if(kind==='mot'&&!isMotion(m)){toast('A corner or a hard stop teaches lateral G, longitudinal G or yaw rate');return}
+ const phases=kind==='mot'?[['A','Drive straight on at a steady speed',4000],
+   ['B',m===0x100D?'Now brake firmly to a stop (or accelerate hard)':'Now drive through a corner, or a few',10000]]:
+  kind==='bit'?[['A','Leave it OFF',4000],['B','Turn it ON now, and hold it (flashing is fine)',4000],['C','Turn it OFF again',4000]]:
   kind==='pos'?TTOK.map((t,i)=>['p'+i,`Put it in <b>${esc(t)}</b> and hold it there`,5000]):
   [['A','Hold it still',3000],['B','Move it slowly through its whole range, back and forth',9000]];
  // Moving a lever takes a moment: its first second and a half is not sampled.
- const skip=kind==='pos'?1500:800;
- TEACH={m,kind,S:{}};phases.forEach(([k])=>TEACH.S[k]=[]);$('#tBtn').disabled=true;$('#tRes').innerHTML='';
+ const skip=kind==='pos'?1500:kind==='mot'?0:800;
+ TEACH={m,kind,S:{},P:{}};phases.forEach(([k])=>{TEACH.S[k]=[];TEACH.P[k]=[]});$('#tBtn').disabled=true;$('#tRes').innerHTML='';
  for(const [k,txt,dur] of phases){
   const t0=Date.now();
   while(Date.now()-t0<dur){
    $('#tStep').innerHTML=`<div class="step">${txt}</div><span class="muted">${Math.ceil((dur-(Date.now()-t0))/1000)} s</span>`;
-   try{const b=await fetch('/api/bus?e=1').then(r=>r.json());
-    if(Date.now()-t0>skip)TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])))}catch(e){}
+   try{const b=await fetch(kind==='mot'?'/api/bus?m=269,4102,4110,4108':'/api/bus?e=1').then(r=>r.json());
+    if(Date.now()-t0>skip){TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
+     // The car as the master knows it at this poll: speed, steering, and a yaw
+     // rate or lateral G already read from the bus (never one derived from these).
+     const g=(id,raw)=>{const x=b.m&&b.m[id];return x&&x[1]<1500&&(!raw||x[2]===4)?x[0]:null},sa=b.m&&b.m[269];
+     TEACH.P[k].push({t:Date.now()-(sa?sa[1]:0),v:g(269),st:g(4102),yaw:g(4110,1),lat:g(4108,1)})}}catch(e){}
    await sleep(60)}}
  $('#tStep').innerHTML='<div class="step">Done</div>';
  teachAnalyze(phases.map(p=>p[0]));TEACH=null;$('#tBtn').disabled=false}
 function teachAnalyze(steps){
  const {S,kind,m}=TEACH;
- TRES=teachFind(kind,S,steps,TTOK);
+ if(kind==='mot'){const R={};steps.forEach(k=>R[k]=motionRef(m,TEACH.P[k]));TRES=teachFindMotion(S,R,steps)}
+ else TRES=teachFind(kind,S,steps,TTOK);
  if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}
  const pat=(c,n)=>Array.from({length:n},(_,i)=>(c>>i)&1).join('');
  const say=r=>r.codes?r.names.map((t,g)=>`${esc(t)} <span class="mono">${pat(r.codes[g],r.bits.length)}</span>`).join(' • '):
   r.pos!==undefined?`on only in ${esc(r.names[r.pos])}${r.inv?' (inverted)':''} - as ${esc(nm(r.metric))}`:
+  kind==='mot'?`followed ${(r.score*100).toFixed(0)}% · scale ${+r.k.toPrecision(3)}${Math.abs(r.o)>1e-3?', offset '+(+r.o.toPrecision(3)):''}${m!==0x100D?' (approximate)':''}`:
   r.l===1?(r.blink?`flashed ${r.blink} time${r.blink>1?'s':''}${r.inv?' (inverted)':''}`:`followed ${(Math.min(1,r.score)*100).toFixed(0)}%${r.inv?' (inverted)':''}`):
   `raw ${r.mn} … ${r.mx} while moving`;
  $('#tRes').innerHTML='<p class="say" style="margin-top:8px">These followed you, best first:</p>'+TRES.map((r,i)=>
@@ -829,7 +967,10 @@ async function teachUse(i){
   await addSignal({name:nm(bm).slice(0,15),can_id:r.id,ext:false,start:r.s,len:1,be:false,signed:false,
    scale:r.inv?-1:1,offset:r.inv?1:0,metric:bm,mode:1,ref:0,learned:false});
   toast(`${nm(bm)} is now read from the bus`);if(r.metric===undefined)$('#tRes').innerHTML='';return}
- BUS=BUS||{census:[]};mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
+ BUS=BUS||{census:[]};
+ if(r.k!==undefined){mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
+  toast('Check it reads right (round the scale), then Use this value');return}
+ mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
  toast('Set the scale so the value reads right, then Use this value')}
 
 /* ───────────── sources ───────────── */
@@ -926,16 +1067,88 @@ async function pollEvlog(){
  if(!s)s=`<span class="ok">${boots.length} boot${boots.length===1?'':'s'}, no brown-out, no guard trip, no bus-off</span> — if the lamp still came on, the master was not the one disturbing the bus.`;
  $('#evSay').innerHTML=s}
 
+/* ───────────── trouble codes, the engine computer, oil change, drive logs ───────────── */
+const KIND=['stored','pending','permanent'],MOD=['Engine','Transmission'],LIST_SAY=['not asked yet','answered','no reply','not kept'];
+let CODES=null,LOGS=null;
+const ago=s=>s<90?`${s} s ago`:s<5400?`${Math.round(s/60)} min ago`:`${Math.round(s/3600)} h ago`;
+async function pollCodes(){
+ if(TAB!=='diag'&&TAB!=='set')return;
+ try{CODES=await fetch('/api/codes').then(r=>r.json())}catch(e){return}
+ renderCodes()}
+function renderCodes(){
+ const d=CODES;if(!d)return;
+ $('#dcSub').textContent=d.busy?'reading…':d.read?`read ${ago(d.age)}`:'not read yet';
+ $('#dcTab').innerHTML=d.codes.length?d.codes.map(c=>`<tr><td class="mono ${c.kind===0?'crit':'warn'}"><b>${esc(c.code)}</b></td>
+  <td style="white-space:normal">${esc(c.text)}</td><td>${MOD[c.mod]||'?'}</td><td>${KIND[c.kind]||'?'}</td></tr>`).join(''):
+  `<tr><td colspan="4" class="empty">${d.read?'No codes in either computer.':'Read a few seconds after the car comes on, or press Read now.'}</td></tr>`;
+ const lists=(d.lists||[]).map((row,m)=>`${MOD[m]}: `+row.map((v,k)=>`${KIND[k]} ${LIST_SAY[v]||'?'}`).join(', ')).join(' · ');
+ $('#dcSay').innerHTML=(d.note?`<b>${esc(d.note)}</b>. `:'')+esc(lists)+(d.tcm_func?' · the transmission answers only on 0x7DF':'')+
+  (d.clear?`<br>Last clear: ${esc(d.clear.replace(/^Clear: ?/,''))}`:'');
+ const id=d.ident||{},row=(k,v,s)=>`<tr><td class="muted">${k}</td><td class="mono"><b>${v?esc(v):'<span class="muted">—</span>'}</b>${s?` <span class="muted">${s}</span>`:''}</td></tr>`;
+ $('#idTab').innerHTML=row('Calibration ID',id.cal,id.cal2?'and '+esc(id.cal2):'OBD-II 09 04')+row('ROM ID',id.rom,'SSM2')+
+  row('SYS ID',id.sys,'SSM2')+row('VIN',id.vin,'')+row('CVN',id.cvn,'')+
+  (id.cal||id.rom?'':`<tr><td colspan="2" class="empty">Read with the ignition on.</td></tr>`)+
+  (id.cal||id.rom?`<tr><td colspan="2" class="muted" style="white-space:normal">${id.live?'Read from the car just now.':'Remembered from the last time the car answered.'}</td></tr>`:'');
+ const sv=d.service||{};
+ if(sv.at<0)$('#svSay').innerHTML='Set the odometer reading of the last oil change, or press <b>Oil changed now</b>: the screens then show a lamp when the next one is due.';
+ else{const due=sv.at+sv.every;
+  $('#svSay').innerHTML=sv.odo==null?`Next oil change at <b>${due} km</b>. The odometer has not been read yet (SSM2, with the ignition on).`:
+   sv.odo>=due?`<span class="crit">Overdue by <b>${sv.odo-due} km</b></span> (odometer ${sv.odo} km, due at ${due} km).`:
+   `Next oil change at <b>${due} km</b>: <b>${due-sv.odo} km</b> to go (odometer ${sv.odo} km).`}
+ $('#svSub').textContent=sv.odo!=null?`odometer ${sv.odo} km`:''}
+async function codesClear(){
+ if(!confirm('Clear the trouble codes in the engine and the transmission computer?\n\nThe check-engine lamp goes out and the readiness '+
+  'monitors start again: an emissions test then needs a few drives first. A code whose fault is still there comes back.\n\n'+
+  'The car must be standing; if the engine computer refuses, switch the engine off and leave the ignition on.'))return;
+ try{const r=await fetch('/api/codes/clear',{method:'POST'}),j=await r.json();toast(r.ok?'Clearing…':j.error||'Failed');
+  setTimeout(pollCodes,3000)}catch(e){toast('Failed')}}
+async function serviceReset(){
+ if(!confirm('Oil changed now: the reminder starts again from the odometer?'))return;
+ try{const r=await fetch('/api/service/reset',{method:'POST'}),j=await r.json();toast(r.ok?'Reminder reset':j.error||'Failed');
+  if(r.ok)await load(true);pollCodes()}catch(e){toast('Failed')}}
+const kb=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixed(2)+' MB';
+const dur=s=>{s=Math.round(s);return s<60?s+' s':Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s'};
+async function pollLogs(){
+ if(TAB!=='diag')return;
+ try{LOGS=await fetch('/api/logs').then(r=>r.json())}catch(e){return}
+ const d=LOGS;
+ $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on flash`;
+ $('#lgSay').innerHTML=!d.on?'Recording is off: switch it on under Settings, Drive log.':
+  d.rec?`<span class="ok">Recording <b>${esc(d.file)}</b></span>: ${d.rows} rows so far.`:
+  d.note?`<span class="warn">${esc(d.note)}</span>`:'Recording starts when the car comes on.';
+ $('#lgTab').innerHTML=d.files.length?d.files.slice().reverse().map(f=>`<tr><td class="mono">${esc(f.name.replace('.tlg',''))}${f.rec?' <span class="ok">● now</span>':''}</td>
+  <td>${dur(f.secs)}</td><td>${f.rows}</td><td>${kb(f.bytes)}</td>
+  <td><button class="b s p" onclick="logGet('${esc(f.name)}')">CSV</button> <button class="b s d" onclick="logDel('${esc(f.name)}')">Delete</button></td></tr>`).join(''):
+  '<tr><td colspan="5" class="empty">No drives recorded.</td></tr>'}
+async function logGet(n){
+ toast('Downloading…');
+ try{const b=await fetch('/api/log?f='+encodeURIComponent(n)).then(r=>{if(!r.ok)throw 0;return r.arrayBuffer()});
+  const csv=tlgToCsv(new Uint8Array(b),id=>nm(id)+(un(id)?' ('+un(id)+')':''));if(!csv)throw 0;
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download='drive-'+n.replace('.tlg','')+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+ catch(e){toast('Download failed')}}
+function logDel(n){if(confirm('Delete drive '+n.replace('.tlg','')+'?'))post('/api/log/delete?f='+encodeURIComponent(n),'Deleted',pollLogs)}
+function renderLogIds(){
+ const ids=C.log_ids||[];if(!$('#lgIds'))return;
+ $('#lgIds').innerHTML=ids.map((id,i)=>`<span class="pill">${esc(nm(id))}<button class="x" onclick="logRm(${i})">✕</button></span>`).join('')||
+  '<span class="muted">Nothing chosen: nothing is recorded.</span>';
+ const hz=C.log_hz||10,bps=(4+4*ids.length)*hz,cap=(C.log_max_kb||1024)*1024;
+ $('#lgEst').textContent=ids.length?`${ids.length} of 24 · ${(bps/1024).toFixed(2)} KB a second · about ${Math.round(cap/bps/60)} min of driving fit`:'';
+ if(document.activeElement!==$('#lgAdd'))$('#lgAdd').innerHTML='<option value="0">Add a value…</option>'+metricOpts(-1,id=>!ids.includes(id))}
+function logAdd(){const id=+$('#lgAdd').value,ids=C.log_ids||[];if(!id||ids.length>=24)return;C.log_ids=ids.concat(id);setDirty(true);renderLogIds()}
+function logRm(i){C.log_ids=(C.log_ids||[]).filter((_,k)=>k!==i);setDirty(true);renderLogIds()}
+
 /* ───────────── polling ───────────── */
 async function poll(){
  let d;try{d=await fetch('/api/live').then(r=>r.json())}catch(e){
   const c=$('#conn');c.className='pill crit';c.lastChild.textContent='offline';return}
  const now=Date.now();
  // The master restarted (its counters went back): no rate from across that.
+ // (bits is a 32-bit count that wraps every few hours: >>>0 takes the difference across it)
  if(PREV&&(d.bus.rx<PREV.rx||d.bus.tx<PREV.tx||d.bus.err<PREV.err))PREV=null;
  if(PREV){const dt=(now-PREV.t)/1000;if(dt>0){
   RATES.fps=(d.bus.rx-PREV.rx)/dt;RATES.tx=(d.bus.tx-PREV.tx)/dt;RATES.errs=d.bus.err-PREV.err;
-  RATES.load=100*((d.bus.bits-PREV.bits)+(d.bus.tx-PREV.tx)*125)/(dt*(d.bus.bitrate||500)*1000)}}
+  RATES.load=100*(((d.bus.bits-PREV.bits)>>>0)+(d.bus.tx-PREV.tx)*125)/(dt*(d.bus.bitrate||500)*1000)}}
  PREV={t:now,rx:d.bus.rx,tx:d.bus.tx,err:d.bus.err,bits:d.bus.bits};
  L=d;
  // Pick up what the learner and verifier did to the signal table.
@@ -951,6 +1164,7 @@ async function poll(){
  if(TAB==='bus')renderBusTiles();
  if(TAB==='src'||TAB==='set')updateSourceText()}
 load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);
+setInterval(pollCodes,3000);setInterval(pollLogs,3000);
 </script></body></html>
 )HTML";
 
@@ -1074,6 +1288,10 @@ void WebPortal::setupRoutes() {
         JsonDocument doc;
         doc["uptime"] = millis() / 1000;
         doc["heap"]   = ESP.getFreeHeap();
+        // The least stack any CAN-side task has had left: an overflow is a
+        // panic, and a panic restarts the master mid-drive.
+        doc["stack"]      = st.stackMinFree;
+        doc["stack_task"] = st.stackMinTask;
         // The MAC the displays see is the one the broadcast leaves from, and
         // with the portal up that is the AP interface, not the station's.
         doc["mac"]    = Portal.running() ? WiFi.softAPmacAddress() : WiFi.macAddress();
@@ -1238,6 +1456,24 @@ void WebPortal::setupRoutes() {
         char hx[17], chx[17];
         // ?e=1 (teach by doing): each bit's flip counter as well, 128 hex digits.
         const bool edges = s_server.arg("e") == "1";
+        // ?m=269,4102 (teach a G or yaw field): those values with their age,
+        // sampled with the frames: {"269":[value, age ms]}.
+        if (s_server.hasArg("m")) {
+            JsonObject mo = doc["m"].to<JsonObject>();
+            String list = s_server.arg("m");
+            int from = 0;
+            for (int k = 0; k < 8 && from < (int)list.length(); k++) {
+                int comma = list.indexOf(',', from);
+                if (comma < 0) comma = list.length();
+                const long id = list.substring(from, comma).toInt();
+                from = comma + 1;
+                float v; uint32_t age; uint8_t src;
+                if (id > 0 && id <= 0xFFFF && metricLookup((uint16_t)id, v, age, src)) {
+                    JsonArray a = mo[String(id)].to<JsonArray>();
+                    a.add(v); a.add(age); a.add(src);
+                }
+            }
+        }
         char ehx[129];
         uint8_t ed[64];
         for (size_t i = 0; i < nc; i++) {
@@ -1284,6 +1520,115 @@ void WebPortal::setupRoutes() {
         }
         sendJson(doc);
     });
+    /*
+     * Trouble codes and the engine computer's identity (DiagCodes), the oil
+     * change reminder, and the drive logs.
+     */
+    s_server.on("/api/codes", HTTP_GET, []() {
+        static CodesStatus cs;
+        codesGetStatus(cs);
+        Ssm2Status ss;
+        ssm2GetStatus(ss);
+        JsonDocument doc;
+        doc["read"]  = cs.haveRead;
+        doc["age"]   = cs.readAgeMs / 1000;
+        doc["busy"]  = cs.busy;
+        doc["note"]  = cs.note;
+        doc["clear"] = cs.clearNote;
+        doc["tcm_func"] = cs.tcmFunctional;
+        JsonArray la = doc["lists"].to<JsonArray>();
+        for (auto &row : cs.list) { JsonArray r = la.add<JsonArray>(); for (uint8_t v : row) r.add(v); }
+        JsonArray ca = doc["codes"].to<JsonArray>();
+        for (uint8_t i = 0; i < cs.n; i++) {
+            JsonObject o = ca.add<JsonObject>();
+            char c[6];
+            codesName(cs.codes[i].raw, c);
+            o["code"] = c;
+            o["text"] = codesText(cs.codes[i].raw);
+            o["kind"] = cs.codes[i].kind;
+            o["mod"]  = cs.codes[i].module;
+        }
+        JsonObject id = doc["ident"].to<JsonObject>();
+        id["vin"]    = cs.vin[0] ? cs.vin : Cfg.vin;
+        id["cal"]    = cs.calId[0][0] ? cs.calId[0] : Cfg.ecuCalId;
+        id["cal2"]   = cs.calId[1];
+        id["cvn"]    = cs.cvn[0];
+        id["rom"]    = ss.initOk ? ss.ecuId : Cfg.ecuId;
+        id["sys"]    = ss.initOk ? ss.sysId : Cfg.ecuSysId;
+        id["live"]   = cs.vin[0] || cs.calId[0][0];
+        JsonObject sv = doc["service"].to<JsonObject>();
+        float odo;
+        if (masterOdometer(odo)) sv["odo"] = lroundf(odo);
+        sv["every"] = Cfg.oilEveryKm;
+        sv["at"]    = Cfg.oilAtKm;
+        sendJson(doc);
+    });
+    s_server.on("/api/codes/read", HTTP_POST, []() { codesRequestRead(); sendOk(); });
+    s_server.on("/api/codes/clear", HTTP_POST, []() {
+        char why[64];
+        if (codesRequestClear(why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = why;
+        String out;
+        serializeJson(d, out);
+        s_server.send(409, "application/json", out);
+    });
+    s_server.on("/api/service/reset", HTTP_POST, []() {
+        char why[80];
+        if (masterServiceReset(why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = why;
+        String out;
+        serializeJson(d, out);
+        s_server.send(409, "application/json", out);
+    });
+
+    s_server.on("/api/logs", HTTP_GET, []() {
+        DriveLogStatus st;
+        driveLogStatus(st);
+        static LogFileInfo li[64];
+        const size_t n = driveLogList(li, 64);
+        JsonDocument doc;
+        doc["on"]      = st.on;
+        doc["rec"]     = st.recording;
+        doc["file"]    = st.file;
+        doc["rows"]    = st.rows;
+        doc["used_kb"] = st.usedKb;
+        doc["cap_kb"]  = st.capKb;
+        doc["free_kb"] = st.freeKb;
+        doc["note"]    = st.note;
+        JsonArray fa = doc["files"].to<JsonArray>();
+        for (size_t i = 0; i < n; i++) {
+            JsonObject o = fa.add<JsonObject>();
+            o["name"] = li[i].name;
+            o["bytes"] = li[i].bytes;
+            o["rows"] = li[i].rows;
+            o["secs"] = li[i].seconds;
+            o["hz"]   = li[i].hz;
+            o["cols"] = li[i].cols;
+            o["rec"]  = li[i].recording;
+        }
+        sendJson(doc);
+    });
+    // The file as recorded; the page turns it into CSV with the metrics' names.
+    s_server.on("/api/log", HTTP_GET, []() {
+        char path[32];
+        driveLogFlush();                       // the rows still in RAM, too
+        if (!driveLogPath(s_server.arg("f").c_str(), path, sizeof path)) {
+            s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
+            return;
+        }
+        File f = LittleFS.open(path, "r");
+        if (!f) { s_server.send(404, "application/json", "{\"error\":\"no such log\"}"); return; }
+        s_server.streamFile(f, "application/octet-stream");
+        f.close();
+    });
+    s_server.on("/api/log/delete", HTTP_POST, []() {
+        if (driveLogDelete(s_server.arg("f").c_str())) sendOk();
+        else s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
+    });
+    s_server.on("/api/log/clear", HTTP_POST, []() { driveLogDeleteAll(); sendOk(); });
+
     s_server.on("/api/evlog/clear", HTTP_POST, []() { masterEventLogClear(); sendOk(); });
 
     s_server.on("/api/census/reset", HTTP_POST, []() { masterResetCensus(); sendOk(); });

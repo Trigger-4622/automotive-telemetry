@@ -24,8 +24,9 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 S1, S2 = "screens/screen1-round", "screens/screen2-cluster"
 SHARED = ["include/Palette.h", "include/TelltaleIcons.h", "src/ui/Telltales.h",
-          "src/ui/Telltales.cpp", "tools/embed_studio.py", "tools/make_icons.py",
-          "tools/telltale_icons.json"]
+          "src/ui/Telltales.cpp", "src/ui/PerfTimer.h", "src/ui/PerfTimer.cpp",
+          "src/ui/DriveViews.h", "src/ui/DriveViews.cpp", "tools/embed_studio.py",
+          "tools/make_icons.py", "tools/telltale_icons.json"]
 SKIP_DIRS = {"build", "shots", "__pycache__"}
 problems = []
 
@@ -125,6 +126,8 @@ def main():
     print("identical copies")
     same(["master/include/MasterPacket.h", S1 + "/include/MasterPacket.h",
           S2 + "/include/MasterPacket.h"], "MasterPacket.h in master and both screens")
+    same(["master/include/DtcText.h", S1 + "/include/DtcText.h",
+          S2 + "/include/DtcText.h"], "DtcText.h in master and both screens")
     for f in SHARED:
         same([S1 + "/" + f, S2 + "/" + f], f + " in both screens")
     t1, t2 = tree(S1 + "/test_host"), tree(S2 + "/test_host")

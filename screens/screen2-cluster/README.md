@@ -25,7 +25,17 @@ board loads here unchanged, it just will not use the extra room.
 ## Screen types
 
 Shared with the round board: `arc_gauge`, `meter_gauge`, `quad`, `text_list`,
-`chart`, `diag`.
+`chart`, `diag`, and the two driving screens:
+
+- **`gmeter`** — a friction circle: a dot for the car's acceleration (up
+  speeding up, down braking, left in a left-hand bend), the rim at `max_g`
+  (default 1 g), with lateral and longitudinal G in figures beside it.
+- **`perf`** — 0-100 km/h, 80-120 km/h and the quarter mile, timed on the
+  display (`src/ui/PerfTimer.*`) from the master's speed on the master's own
+  clock. Stand still for half a second to arm a standing start.
+
+Layout version 3 adds both to an existing layout once, before `diag`;
+deleted in the studio, they stay deleted.
 
 Added here, because they need the width:
 

@@ -39,6 +39,10 @@
 #include "hal/twai_ll.h"
 #include "esp_rom_gpio.h"
 #include "soc/gpio_sig_map.h"
+#if defined(ESP_PLATFORM)
+#include "soc/gpio_reg.h"         // the restart latch (__wrap_esp_restart_noos)
+#include "soc/rtc_cntl_reg.h"
+#endif
 
 #include "MasterPacket.h"
 #include "CanDecoderConfig.h"
@@ -46,6 +50,8 @@
 #include "MasterTelemetry.h"
 #include "Learner.h"
 #include "Ssm2.h"
+#include "DiagCodes.h"
+#include "DriveLog.h"
 #include "WebPortal.h"
 
 /**
@@ -296,6 +302,13 @@ void publishMetric(uint16_t id, float value, uint8_t source) {
         }
     }
     portEXIT_CRITICAL(&s_metricMux);
+    // Store full: say so once, rather than a value that silently never shows.
+    static volatile bool s_storeFullTold = false;
+    if (!slot && !s_storeFullTold) {
+        s_storeFullTold = true;
+        log_w("metrics: store full (%u values) - 0x%04X and any other new value are not published",
+              (unsigned)MAX_MASTER_METRICS, id);
+    }
     // Every requested value is a reference the learner can match the bus
     // against - that is how requests teach the master to stop requesting.
     if (source == SRC_OBD || source == SRC_SSM) learnerOnRef(id, value);
@@ -369,6 +382,23 @@ bool diagBusAlive() {
     const uint32_t last = s_lastCanMs;
     return last && millis() - last < BUS_QUIET_MS;
 }
+
+/**
+ * Nothing heard for this long and nothing is sent. A running car puts a frame
+ * on the bus every millisecond or so, and every request is answered within
+ * P2CAN (50 ms), so a quarter second of silence means the car has gone off -
+ * or our receiver has. Either way a frame of ours would be on wires nobody is
+ * listening to: unacknowledged, retransmitted back to back by the controller
+ * (an error-passive sender's acknowledgement errors never put it bus-off),
+ * the kind of traffic that wakes sleeping modules. busGuardTask aborts one
+ * already queued once this much has passed.
+ */
+static constexpr uint32_t TX_LIVE_MS = 250;
+static bool heardWithin(uint32_t ms) {
+    const uint32_t last = s_lastCanMs;
+    return last && millis() - last < ms;
+}
+bool masterHeardWithin(uint32_t ms) { return heardWithin(ms); }
 
 static volatile bool s_obdSettled = false;   /**< One full OBD pass done. */
 bool diagObdSettled() { return s_obdSettled; }
@@ -451,6 +481,13 @@ static SemaphoreHandle_t s_twaiCtl = nullptr;
  *  request task gets it at once. Order: s_twaiCtl before s_twaiReg. */
 static SemaphoreHandle_t s_twaiReg = nullptr;
 
+/** The tasks whose stack headroom the portal and the heartbeat report: an
+ *  overflow is a panic, and a panic is a restart in the middle of a drive. */
+static struct { TaskHandle_t h; const char *name; } s_tasks[] = {
+    { nullptr, "twai_rx" }, { nullptr, "obd_poll" }, { nullptr, "broadcast" },
+    { nullptr, "housekeep" }, { nullptr, "busguard" },
+};
+
 /** @brief Milliseconds of guard pause left (0 = not paused). */
 static uint32_t guardPauseLeft() {
     const uint32_t len = s_guardPauseMs, elapsed = millis() - s_guardPauseAt;
@@ -502,8 +539,12 @@ uint32_t diagSettleLeftMs() { return settleLeft(); }
 
 bool diagGuardOk() {
     // A listen-only controller cannot transmit whatever the guard setting,
-    // and nothing is sent while the bus settles.
+    // and nothing is sent while the bus settles, onto a bus that has gone
+    // quiet, in SILENT (the moment it is chosen, not once the controller has
+    // been switched), or while the driver is being replaced or removed.
     if (s_guardSilent || s_rxGuardSilent || s_twaiSilentNow || settleLeft()) return false;
+    if (!heardWithin(TX_LIVE_MS) || Cfg.diagMode == DIAG_MODE_SILENT) return false;
+    if (s_twaiReinstall || s_twaiShutdown) return false;
     if (!Cfg.guardEnabled) return true;
     return guardPauseLeft() == 0;
 }
@@ -1117,9 +1158,7 @@ static bool obdRequest(uint8_t pid, bool functional) {
     msg.data[2] = pid;
     // Pad with 0x00, as J2534 interfaces do and as this ECU pads its replies.
     for (int i = 3; i < 8; i++) msg.data[i] = 0x00;
-    if (twai_transmit(&msg, pdMS_TO_TICKS(20)) != ESP_OK) return false;
-    masterCountTx();
-    return true;
+    return masterTransmit(msg, 20);
 }
 
 /**
@@ -1348,6 +1387,9 @@ static uint32_t s_obdCooldownMs = 0;   /**< ...and how long to hold off after it
 static uint32_t s_reqLastSendMs = 0;   /**< Last OBD-II request, for req_max_hz.     */
 /** @} */
 
+/** Requests in a row with no answer at all that mean the ECU has stopped. */
+static constexpr uint8_t OBD_GONE_RUN = 10;
+
 static void obdPollTask(void *) {
     static uint32_t nextDue[256] = {};
     static uint8_t  misses[256]  = {};
@@ -1356,6 +1398,8 @@ static void obdPollTask(void *) {
     uint32_t lastProbe = 0, lastRanges = 0;
     uint8_t  probeFails = 0, rangeTries = 0;
     bool     rangesComplete = true;
+    uint8_t  unanswered = 0;           /**< Requests in a row nothing answered. */
+    bool     wasGone = false;          /**< Back to probing after such a run.   */
 
     for (;;) {
         if (!diagObdWanted() || !diagBusAlive() || !diagGuardOk()) {
@@ -1378,7 +1422,19 @@ static void obdPollTask(void *) {
             if (now - lastProbe >= (probeFails < 3 ? 1000u : 10000u)) {
                 lastProbe = lastRanges = now;
                 const AskResult r = obdProbe(rangesComplete);
-                if (r == ASK_OK) { probeFails = 0; diagReportObd(true); }
+                if (r == ASK_OK) {
+                    // Back after being away (a probe went unanswered first):
+                    // every PID straight back on its normal period, not on the
+                    // back-off it ran up while nothing answered.
+                    if (wasGone && probeFails) {
+                        memset(misses, 0, sizeof(misses));
+                        memset(nextDue, 0, sizeof(nextDue));
+                        log_i("OBD-II: the ECU answers again - polling resumed");
+                    }
+                    wasGone = false;
+                    probeFails = 0;
+                    diagReportObd(true);
+                }
                 else if (r != ASK_BUSY) {
                     probeFails = (uint8_t)min(probeFails + 1, 200);
                     if (probeFails == 3) {
@@ -1441,6 +1497,26 @@ static void obdPollTask(void *) {
                 s_obdCooldownMs = Cfg.obdP2CanMs;
             } else if (r == ASK_OK) {
                 s_obdCooldownMs = 0;             // answered: nothing to wait for
+            }
+            // A run of requests nothing answered - not one PID, all of them: the
+            // ECU has stopped (ignition off with the bus kept up by another
+            // module, or not answering at all). Each PID's own back-off would
+            // still ask every one of them every 10 s - with the car's 60-odd
+            // PIDs, six requests a second for as long as the bus stays up, the
+            // kind of traffic that keeps modules from going to sleep. Back to
+            // the probe instead: one request every 10 s until it answers.
+            if (r == ASK_OK || r == ASK_NRC) unanswered = 0;
+            else if (r == ASK_NO_REPLY && ++unanswered >= OBD_GONE_RUN) {
+                unanswered = 0;
+                wasGone = true;
+                s_pidSupportKnown = false;
+                s_obdActive = false;
+                probeFails = 0;
+                lastProbe = millis();
+                diagReportObd(false);
+                log_w("OBD-II: %u requests in a row unanswered - the ECU has stopped; probing "
+                      "it instead of polling every PID", (unsigned)OBD_GONE_RUN);
+                break;
             }
             uint32_t period = p.periodMs ? p.periodMs : 100;
             if (r == ASK_OK) {
@@ -1539,6 +1615,88 @@ void masterUpdateDerived() {
             }
         if (known) publishMetric(METRIC_ID_DOOR_OPEN, open ? 1.0f : 0.0f, SRC_DERIVED);
     }
+
+    // Oil change due: the interval on from the odometer at the last change.
+    float odo;
+    if (Cfg.oilAtKm >= 0 && masterOdometer(odo))
+        publishMetric(METRIC_ID_SERVICE_KM,
+                      (float)((double)Cfg.oilAtKm + Cfg.oilEveryKm - odo), SRC_DERIVED);
+}
+
+bool masterOdometer(float &km) {
+    float v; uint32_t age; uint8_t src;
+    // SSM2 reads it every 5 s; OBD-II PID A6 on cars that have it.
+    if (metricLookup(METRIC_ID_SSM_ODOMETER, v, age, src) && age < 20000 && v > 0) { km = v; return true; }
+    if (metricLookup(METRIC_ID_ODOMETER, v, age, src) && age < 30000 && v > 0)     { km = v; return true; }
+    return false;
+}
+
+bool masterServiceReset(char *why, size_t cap) {
+    float odo;
+    if (!masterOdometer(odo)) {
+        snprintf(why, cap, "the odometer has not been read - switch the ignition on");
+        return false;
+    }
+    Cfg.lock();
+    Cfg.oilAtKm = (int32_t)lroundf(odo);
+    Cfg.unlock();
+    Cfg.requestSave();
+    log_i("service: oil changed at %ld km, next at %ld km", (long)Cfg.oilAtKm,
+          (long)(Cfg.oilAtKm + (int32_t)Cfg.oilEveryKm));
+    return true;
+}
+
+/**
+ * @brief Longitudinal and lateral G for the G-meter when the car does not
+ *        broadcast them, or they are not taught yet.
+ *
+ * Longitudinal: the slope of the speed over the last second (least squares -
+ * OBD-II speed comes in whole km/h, and a two-point difference of those is
+ * 0.14 g of noise at 5 Hz). Lateral: speed times yaw rate, when a yaw rate is
+ * known. Signs per ISO 8855: speeding up and turning left are positive.
+ * A field taught onto either outranks these (SRC_RAW over SRC_DERIVED).
+ * Called from the broadcast task only: it keeps its samples between calls.
+ */
+static void gDerive() {
+    static constexpr int N = 24;
+    static uint32_t ts[N];
+    static float    vs[N];
+    static int      n = 0, head = 0;
+    static uint32_t lastStamp = 0;
+    float v; uint32_t age, stamp; uint8_t src;
+    // The sample's own time stamp, not millis() minus its age: two clock
+    // reads a tick apart made the same sample look new, and it went in twice.
+    if (!metricRef(METRIC_ID_SPEED, v, stamp, src)) { n = 0; return; }
+    const uint32_t now = millis();
+    if ((int32_t)(now - stamp) > 1500) { n = 0; return; }
+    if (stamp != lastStamp) {
+        lastStamp = stamp;
+        ts[head] = stamp; vs[head] = v;
+        head = (head + 1) % N;
+        if (n < N) n++;
+    }
+    // Least squares over the samples of the last second.
+    double st = 0, sv = 0, stt = 0, stv = 0;
+    int k = 0;
+    uint32_t oldest = now;
+    for (int i = 0; i < n; i++) {
+        const int j = (head - 1 - i + N) % N;
+        if (now - ts[j] > 1000) break;
+        const double t = (double)(int32_t)(ts[j] - now) / 1000.0, x = vs[j];
+        st += t; sv += x; stt += t * t; stv += t * x; k++;
+        oldest = ts[j];
+    }
+    if (k >= 3 && now - oldest >= 300) {
+        const double den = k * stt - st * st;
+        if (den > 1e-9) {
+            const double kmhPerS = (k * stv - st * sv) / den;
+            publishMetric(METRIC_ID_LON_ACCEL, (float)(kmhPerS / 3.6 / 9.80665), SRC_DERIVED);
+        }
+    }
+    float yaw;
+    if (metricLookup(METRIC_ID_YAW_RATE, yaw, age, src) && age < 500 && src != SRC_DERIVED)
+        publishMetric(METRIC_ID_LAT_ACCEL,
+                      (float)(v / 3.6 * yaw * (M_PI / 180.0) / 9.80665), SRC_DERIVED);
 }
 
 static void setupTwai(bool silent);
@@ -1571,7 +1729,11 @@ static void sleepCheck();
  * txPadAttach() - or the next twai_driver_install() - routes the pad back to
  * the controller.
  */
+/** The pad is the controller's, and the controller was started in normal mode
+ *  with it: the one state a frame may be handed over in (masterTransmit). */
+static volatile bool s_txLive = false;
 static void txPadRecessive() {
+    s_txLive = false;
     gpio_set_level((gpio_num_t)CAN_TX_GPIO, 1);
     gpio_set_direction((gpio_num_t)CAN_TX_GPIO, GPIO_MODE_OUTPUT);
 }
@@ -1579,11 +1741,15 @@ static void txPadRecessive() {
  *  routes it with (after gpio_config, which txPadRecessive() has done). */
 static void txPadAttach() {
     esp_rom_gpio_connect_out_signal(CAN_TX_GPIO, TWAI_TX_IDX, false, false);
+    s_txLive = true;
 }
 static void txRecessiveBoot() {
-    gpio_hold_dis((gpio_num_t)CAN_TX_GPIO);   // release any latch from before sleep
+    // Drive it first, release the latch second: a latch from before a restart
+    // or a sleep keeps the pad recessive until the very moment the GPIO takes
+    // over, instead of leaving it unconfigured in between.
     txPadRecessive();                         // recessive = bus idle
     gpio_pullup_en((gpio_num_t)CAN_TX_GPIO);  // and pulled up should the pin float
+    gpio_hold_dis((gpio_num_t)CAN_TX_GPIO);   // release any latch from before
 }
 static void txRecessiveForSleep() {
     if (!Cfg.txRecessiveHold) return;
@@ -1591,6 +1757,37 @@ static void txRecessiveForSleep() {
     gpio_hold_en((gpio_num_t)CAN_TX_GPIO);    // latch it high for the whole sleep
     gpio_deep_sleep_hold_en();
 }
+
+/*
+ * The TX pad through a restart nobody planned. Every reset short of a power
+ * cut goes through esp_restart_noos(): esp_restart() (a planned restart), a
+ * panic (abort, a failed assert, a stack overflow, the interrupt watchdog) and
+ * the brownout interrupt. It resets the CPUs only - the CAN controller keeps
+ * its clock through the restart (start-up leaves the clocks of a CPU reset
+ * running), still in normal mode with the TX pad routed to it, until the next
+ * boot's setup() takes the pad back. And only a planned restart passes
+ * masterBeforeRestart(), which takes the pad and latches it. So the linker
+ * routes every esp_restart_noos() through the wrapper below first
+ * (-Wl,--wrap=esp_restart_noos in platformio.ini): the pad is taken from the
+ * controller, driven recessive and - with tx_hold, the default - latched by
+ * the RTC pad hold, which a restart leaves in place until txRecessiveBoot()
+ * releases it. Register writes and one ROM routine only: no locks and nothing
+ * in flash (the cache may be off), from either core, with interrupts off.
+ */
+/** Cfg.txRecessiveHold, in internal RAM for the wrapper (kept current by loop()). */
+static DRAM_ATTR volatile bool s_txHoldOnReset = true;
+#if defined(ESP_PLATFORM)
+static_assert(CAN_TX_GPIO >= 0 && CAN_TX_GPIO <= 21,
+              "the restart latch uses the RTC pad hold: bit n of RTC_CNTL_PAD_HOLD_REG is GPIO n for 0-21");
+extern "C" void __real_esp_restart_noos(void) __attribute__((noreturn));
+extern "C" void IRAM_ATTR __attribute__((noreturn)) __wrap_esp_restart_noos(void) {
+    REG_WRITE(GPIO_OUT_W1TS_REG, BIT(CAN_TX_GPIO));                            // latch high: recessive
+    esp_rom_gpio_connect_out_signal(CAN_TX_GPIO, SIG_GPIO_OUT_IDX, false, false); // pad from the latch (ROM)
+    REG_WRITE(GPIO_ENABLE_W1TS_REG, BIT(CAN_TX_GPIO));                         // as an output
+    if (s_txHoldOnReset) SET_PERI_REG_MASK(RTC_CNTL_PAD_HOLD_REG, BIT(CAN_TX_GPIO));
+    __real_esp_restart_noos();
+}
+#endif
 
 /** @name Passive transmit mode (Cfg.txPassive)
  *  TEC is set this high right after the controller starts in normal mode,
@@ -1615,15 +1812,48 @@ static volatile uint32_t s_lomTecRead = 0, s_lomRepins = 0;
  *  the listen-only fix - so busGuardTask never takes the jump for an error in
  *  our own frame. */
 static volatile uint32_t s_tecWrites = 0;
-/** Set TEC (reset mode for a moment: a frame being received is lost to us).
- *  Only with nothing of ours queued or on the wire - the caller makes sure. */
-static void tecSet(uint32_t tec) {
-    masterBusBlind();                // a frame arriving now is lost to us
-    s_tecWrites = s_tecWrites + 1;
-    twai_ll_enter_reset_mode(&TWAI);
-    twai_ll_set_tec(&TWAI, tec);
-    twai_ll_exit_reset_mode(&TWAI);
+/**
+ * The controller's error counters, from its own registers - never from
+ * twai_get_status_info(). In ESP-IDF v4.4.7 (the Arduino core this builds on)
+ * a driver installed listen-only reports TEC = REC = 0 there, whatever the
+ * controller holds ("frozen ... thus are meaningless", twai.c). Read that way
+ * the listen-only counters "fell to 0 within milliseconds" on the bench
+ * (2026-09-30) and busGuardTask pinned them again every 50 ms - 75 times in
+ * 4 s, each pin a moment in reset mode, deaf to the bus. Only with the driver
+ * installed (the peripheral clocked): callers hold s_twaiReg, under which
+ * nothing installs or removes it.
+ */
+static void twaiCounters(twai_status_info_t &st) {
+    st.tx_error_counter = twai_ll_get_tec(&TWAI);
+    st.rx_error_counter = twai_ll_get_rec(&TWAI);
 }
+/** The counters as busGuardTask last read them, for the portal. */
+static volatile uint32_t s_tecSeen = 0, s_recSeen = 0;
+
+/**
+ * Write TEC - and REC, when @p rec is not negative - in reset mode (a moment:
+ * a frame being received is lost to us), and read TEC back. A write meant to
+ * make the controller error-passive is tried up to three times until it reads
+ * that way: an error-active controller must not be given the TX pad on the
+ * strength of a write that did not take. Only with nothing of ours queued or
+ * on the wire - the caller makes sure.
+ * @return TEC as read back after the last write.
+ */
+static uint32_t tecWrite(uint32_t tec, int rec = -1) {
+    uint32_t got = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        masterBusBlind();            // a frame arriving now is lost to us
+        s_tecWrites = s_tecWrites + 1;
+        twai_ll_enter_reset_mode(&TWAI);
+        twai_ll_set_tec(&TWAI, tec);
+        if (rec >= 0) twai_ll_set_rec(&TWAI, (uint32_t)rec);
+        twai_ll_exit_reset_mode(&TWAI);
+        got = twai_ll_get_tec(&TWAI);
+        if (tec < 128 || got >= 128) break;
+    }
+    return got;
+}
+static void tecSet(uint32_t tec) { tecWrite(tec); }
 
 /**
  * @brief Passive mode: bring TEC back up before a request goes out.
@@ -1638,13 +1868,37 @@ static void txPassiveTopUp() {
     if (!Cfg.txPassive || s_twaiSilentNow || !s_twaiReg) return;
     if (xSemaphoreTake(s_twaiReg, pdMS_TO_TICKS(40)) != pdTRUE) return;
     twai_status_info_t st;
-    if (!s_twaiReinstall && !s_twaiSilentNow && twai_get_status_info(&st) == ESP_OK &&
-        st.state == TWAI_STATE_RUNNING && st.msgs_to_tx == 0 && st.tx_error_counter < TEC_PASSIVE_LOW) {
-        tecSet(TEC_PASSIVE);
+    if (!s_twaiReinstall && !s_twaiSilentNow && twai_get_status_info(&st) == ESP_OK) {
+        twaiCounters(st);
+        if (st.state == TWAI_STATE_RUNNING && st.msgs_to_tx == 0 && st.tx_error_counter < TEC_PASSIVE_LOW)
+            tecSet(TEC_PASSIVE);
     }
     xSemaphoreGive(s_twaiReg);
 }
 /** @} */
+
+/**
+ * @brief Every frame the master sends goes through here.
+ *
+ * Under the register lock, which every start, stop, reinstall and TEC write
+ * holds, so the controller cannot change state between the check and the
+ * hand-over: a frame is only ever given to a controller running in normal
+ * mode with its pad attached, never to one in reset mode for a TEC write -
+ * where the transmit buffer's addresses are the acceptance filter, so the
+ * frame would overwrite the filter and the driver would wait for ever for a
+ * completion that never comes - and never to one being replaced or removed.
+ * The guard is asked again here too: everything that makes the master quiet
+ * (listen-only, the settle wait, a quiet bus, SILENT) holds from the frame
+ * it happens before, not from the next request.
+ */
+bool masterTransmit(const twai_message_t &msg, uint32_t waitMs) {
+    if (!s_twaiReg || xSemaphoreTake(s_twaiReg, pdMS_TO_TICKS(waitMs)) != pdTRUE) return false;
+    const bool ok = s_txLive && !s_twaiSilentNow && diagGuardOk() &&
+                    twai_transmit(&msg, pdMS_TO_TICKS(waitMs)) == ESP_OK;
+    xSemaphoreGive(s_twaiReg);
+    if (ok) masterCountTx();
+    return ok;
+}
 
 /**
  * @brief Espressif's listen-only erratum - fixed here, because the Arduino core
@@ -1684,15 +1938,13 @@ static void listenOnlyErratumFix() {
      * should only move when the controller transmits, which it never does in
      * listen-only - but the S3 on the car read 128 back as 127 at once, so
      * it is written as TEC_LISTEN, and busGuardTask pins it again should it
-     * ever wind down below TEC_LISTEN_LOW.
+     * ever wind down below TEC_LISTEN_LOW. (The "REC back at 0" above, and the
+     * bench's "TEC and REC 0 within milliseconds" of 2026-09-30, were read
+     * through twai_get_status_info(), which reports 0 for a driver installed
+     * listen-only whatever the controller holds - see twaiCounters(). Both
+     * counters are written all the same: it costs nothing.)
      */
-    masterBusBlind();                // a frame arriving now is lost to us
-    s_tecWrites = s_tecWrites + 1;
-    twai_ll_enter_reset_mode(&TWAI);
-    twai_ll_set_tec(&TWAI, TEC_LISTEN);
-    twai_ll_set_rec(&TWAI, 128);
-    twai_ll_exit_reset_mode(&TWAI);
-    const uint32_t tec = twai_ll_get_tec(&TWAI);
+    const uint32_t tec = tecWrite(TEC_LISTEN, 128);
     s_lomTecRead = tec;
     if (tec < 128) log_e("listen-only erratum fix did not take (TEC %u)", (unsigned)tec);
 }
@@ -1712,12 +1964,21 @@ static void listenOnlyErratumFix() {
  */
 static bool twaiGoLive(bool silent) {
     txPadRecessive();
+    gpio_hold_dis((gpio_num_t)CAN_TX_GPIO);   // setupTwai's latch: the pad is a recessive GPIO now
     if (twai_start() != ESP_OK) return false;
     if (silent) {
         listenOnlyErratumFix();
         return true;
     }
-    if (Cfg.txPassive) tecSet(TEC_PASSIVE);
+    if (Cfg.txPassive) {
+        const uint32_t tec = tecWrite(TEC_PASSIVE);
+        // Requests are not given up for it (the owner's rule): the controller
+        // goes on the bus as it would with tx_passive off, and the receive-
+        // error guard watches it as it would then.
+        if (tec < 128)
+            log_e("errors let pass did not take: TEC %u after three writes - this "
+                  "controller can flag errors actively", (unsigned)tec);
+    }
     txPadAttach();
     return true;
 }
@@ -1756,9 +2017,18 @@ static void twaiRxTask(void *) {
             s_twaiReinstall = false;
             masterBusBlind();
             txPadRecessive();                // off the bus while it changes
+            // No driver at all (an install that failed): nothing to remove.
+            twai_status_info_t had;
+            const bool installed = twai_get_status_info(&had) == ESP_OK;
             twai_stop();
-            twai_driver_uninstall();
-            setupTwai(s_twaiWantSilent);
+            if (!installed || twai_driver_uninstall() == ESP_OK) {
+                setupTwai(s_twaiWantSilent);
+            } else {
+                // Bus-off recovery still running: the driver keeps the
+                // controller. The TX pad stays off it; busGuardTask restarts
+                // or replaces it once the recovery is over.
+                log_w("TWAI mode switch deferred: the controller is recovering from bus-off");
+            }
             xSemaphoreGive(s_twaiReg);
             xSemaphoreGive(s_twaiCtl);
         }
@@ -1780,6 +2050,13 @@ static void twaiRxTask(void *) {
         }
         noDriver = 0;
         if (rr != ESP_OK) continue;
+        // As the driver hands it over: a DLC of 9-15 (legal on the wire, 8
+        // bytes follow) comes with data[8], and a remote frame keeps its DLC
+        // but carries no data (the driver zeroes it). Nothing below may read
+        // past data[8], and a remote frame is bus activity, not values.
+        if (msg.data_length_code > 8) msg.data_length_code = 8;
+        const bool remote = msg.rtr;
+        if (remote) msg.data_length_code = 0;
         s_canFramesRx++;
         s_rxByMode[s_twaiSilentNow ? 1 : 0]++;
         const uint32_t rxMs = millis();
@@ -1794,6 +2071,7 @@ static void twaiRxTask(void *) {
         s_lastCanMs = rxMs;          // the sleep timer's only input
         // SOF..EOF + IFS is 47 bits standard, 67 extended, plus ~10% stuffing.
         s_busBitsRx += ((msg.extd ? 67 : 47) + 8 * msg.data_length_code) * 11 / 10;
+        if (remote) continue;                // nothing to decode, learn or count as a period
         censusAdd(msg);
         if (ssm2FeedFrame(msg)) continue;   // mid-exchange SSM2 reply
 
@@ -1919,6 +2197,7 @@ static void broadcastTask(void *) {
         // this after each reply, but values read from the bus arrive with no
         // reply at all - listening only, boost and AFR would otherwise freeze.
         masterUpdateDerived();
+        gDerive();
 
         const uint32_t now = millis();
         const bool night = s_night;
@@ -2049,6 +2328,10 @@ static void busGuardTask(void *) {
     uint32_t rxWinStart = 0, rxWinErrs = 0;   /**< Receive-side errors, per window. */
     bool     wasPassive = false, wasSettling = false;
     bool     ctrlRunning = false;             /**< Last status read said RUNNING. */
+    /** Last status read said bus-off or recovering: the driver will not be
+     *  uninstalled then (twai_driver_uninstall wants STOPPED or BUS_OFF, and a
+     *  recovery in progress must finish), so no mode switch is asked for. */
+    bool     ctrlOffBus = false;
     for (;;) {
         // Mode follows the settings. Turning the guard off also ends a
         // listen-only it imposed: the user has taken responsibility.
@@ -2081,7 +2364,7 @@ static void busGuardTask(void *) {
         // every 2 s so nothing is retried in a tight loop. Never while the
         // controller is recovering from bus-off: the driver cannot be replaced
         // mid-recovery.
-        if (wantSilent != s_twaiSilentNow && !s_twaiReinstall &&
+        if (wantSilent != s_twaiSilentNow && !s_twaiReinstall && !ctrlOffBus &&
             ((wantSilent && ctrlRunning) || millis() - lastSwitch > 2000)) {
             lastSwitch = millis();
             s_twaiWantSilent = wantSilent;
@@ -2099,7 +2382,7 @@ static void busGuardTask(void *) {
          */
         uint32_t alerts = 0;
         twai_status_info_t st = {};
-        bool haveStatus = false, wentBusOff = false;
+        bool haveStatus = false, wentBusOff = false, deadAbort = false;
         // The mode the status below belongs to, read under the same lock the
         // RX task holds to reinstall: s_twaiSilentNow itself can change the
         // moment the lock is released, and a listen-only REC (frozen at 128 by
@@ -2115,6 +2398,9 @@ static void busGuardTask(void *) {
             xSemaphoreTake(s_twaiReg, portMAX_DELAY);
             if (twai_get_status_info(&st) == ESP_OK) {
                 haveStatus = true;
+                twaiCounters(st);            // the driver's are 0 in listen-only
+                s_tecSeen = st.tx_error_counter;
+                s_recSeen = st.rx_error_counter;
                 stSilent = s_twaiSilentNow;
                 tecWrites = s_tecWrites;
                 ecc = (uint8_t)(TWAI.error_code_capture_reg.val & 0xFF);
@@ -2132,11 +2418,32 @@ static void busGuardTask(void *) {
                     listenOnlyErratumFix();
                     s_lomRepins = s_lomRepins + 1;
                 }
-                if (!s_twaiReinstall &&
+                // A frame of ours that nobody is there to acknowledge: the car
+                // went off under a request (TX_LIVE_MS). The controller would
+                // retransmit it back to back until the settle wait took it off
+                // the bus 2 s later - or for ever with start_delay_s 0. Dropped:
+                // the queue behind it, then the frame itself (no retransmission
+                // after the attempt on the wire; the driver counts it as failed).
+                if (!stSilent && st.state == TWAI_STATE_RUNNING && st.msgs_to_tx > 0 &&
+                    !heardWithin(TX_LIVE_MS)) {
+                    twai_clear_transmit_queue();
+                    twai_ll_set_cmd_abort_tx(&TWAI);
+                    deadAbort = true;
+                }
+                if (!s_twaiReinstall && !s_twaiShutdown &&
                     (st.state == TWAI_STATE_BUS_OFF || st.state == TWAI_STATE_STOPPED)) {
                     if (st.state == TWAI_STATE_BUS_OFF) {
                         wentBusOff = true;
                         twai_initiate_recovery();
+                    } else if (wantSilent && !s_twaiSilentNow) {
+                        // Recovered, but listen-only is wanted now (a bus-off
+                        // latch, a guard trip, SILENT chosen meanwhile).
+                        // Restarted as it was, it would be back on the bus in
+                        // normal mode - TX pad attached - until the switch:
+                        // replace it now, while it is stopped.
+                        lastSwitch = millis();
+                        s_twaiWantSilent = true;
+                        s_twaiReinstall  = true;
                     } else {
                         twaiGoLive(s_twaiSilentNow);   // recovery finished: counters at 0
                     }
@@ -2149,7 +2456,15 @@ static void busGuardTask(void *) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        if (deadAbort) {
+            static uint32_t loggedSession = 0;
+            if (loggedSession != s_busSession) {
+                loggedSession = s_busSession;
+                log_w("bus quiet with a frame of ours unacknowledged - aborted it, not retransmitting");
+            }
+        }
         ctrlRunning = st.state == TWAI_STATE_RUNNING;
+        ctrlOffBus  = st.state == TWAI_STATE_BUS_OFF || st.state == TWAI_STATE_RECOVERING;
         radioObserve(diagBusAlive());
         // Frames dropped for a full queue or FIFO: the master was deaf to them,
         // and the ones it kept were late.
@@ -2286,6 +2601,25 @@ static void busGuardTask(void *) {
  */
 
 /**
+ * @brief Take the controller off the bus for good: a sleep or a restart
+ *        follows. The RX task removes the driver - uninstalling it from here
+ *        would free the queue that task is blocked on (within 200 ms it notices
+ *        the request) - and the TX pad is left a recessive GPIO.
+ */
+static void canShutdown() {
+    s_twaiShutdown = true;               // diagGuardOk() refuses from now on
+    for (int i = 0; i < 50 && !s_twaiDown; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (!s_twaiDown) {                   // RX task stuck: do it anyway
+        xSemaphoreTake(s_twaiCtl, pdMS_TO_TICKS(500));
+        xSemaphoreTake(s_twaiReg, pdMS_TO_TICKS(500));
+        txPadRecessive();
+        twai_stop();
+        twai_driver_uninstall();
+    }
+    txPadRecessive();
+}
+
+/**
  * @brief Enter deep sleep, arming a wake on the first CAN activity.
  *
  * Does not return: the chip resets on wake, which is why configuration lives
@@ -2299,18 +2633,8 @@ static void enterDeepSleep() {
     evSaveNow();                     // and the evidence log
     Serial.flush();
 
-    // Leave the bus and the radio cleanly rather than mid-transfer. The RX
-    // task removes the driver: uninstalling it here would free the queue that
-    // task is blocked on (within 200 ms it notices the request).
-    s_twaiShutdown = true;
-    for (int i = 0; i < 50 && !s_twaiDown; i++) vTaskDelay(pdMS_TO_TICKS(10));
-    if (!s_twaiDown) {                   // RX task stuck: do it anyway
-        xSemaphoreTake(s_twaiCtl, pdMS_TO_TICKS(500));
-        xSemaphoreTake(s_twaiReg, pdMS_TO_TICKS(500));
-        txPadRecessive();
-        twai_stop();
-        twai_driver_uninstall();
-    }
+    // Leave the bus and the radio cleanly rather than mid-transfer.
+    canShutdown();
     esp_now_deinit();
     WiFi.mode(WIFI_OFF);
 
@@ -2485,11 +2809,18 @@ void masterGetStats(MasterStats &out) {
     out.busBitsRx  = s_busBitsRx;
     out.canTx      = s_canTxCount;
     out.bitrate    = Cfg.bitrateKbps;
+    out.stackMinFree = 0;
+    out.stackMinTask = "";
+    for (const auto &t : s_tasks) {
+        if (!t.h) continue;
+        const uint32_t freeB = (uint32_t)uxTaskGetStackHighWaterMark(t.h);   // bytes on ESP-IDF
+        if (!out.stackMinTask[0] || freeB < out.stackMinFree) { out.stackMinFree = freeB; out.stackMinTask = t.name; }
+    }
     out.tec = out.rec = 0;
     out.busErrors = out.arbLost = out.txFailed = out.rxMissed = out.rxOverrun = 0;
     if (twai_get_status_info(&st) == ESP_OK) {
-        out.tec       = st.tx_error_counter;
-        out.rec       = st.rx_error_counter;
+        out.tec       = s_tecSeen;       // the controller's, not the driver's 0 in listen-only
+        out.rec       = s_recSeen;
         out.busErrors = st.bus_error_count;
         out.arbLost   = st.arb_lost_count;
         out.txFailed  = st.tx_failed_count;
@@ -2634,6 +2965,14 @@ void masterEventLogClear() {
 void masterBeforeRestart() {
     Cfg.serviceSave();               // a save another task asked for
     evSaveNow();                     // and the evidence log's last few seconds
+    // Off the bus for the restart, the TX pad latched recessive until the new
+    // firmware's setup() drives it itself (txRecessiveBoot releases the latch).
+    // In between it would be an unconfigured pad, and a transceiver input
+    // left floating can read dominant - while the car is on, since that is
+    // when the portal is used. The latch is the RTC pad hold, which a software
+    // restart leaves in place. Opt out with tx_hold, as for sleep.
+    canShutdown();
+    if (Cfg.txRecessiveHold) gpio_hold_en((gpio_num_t)CAN_TX_GPIO);
 }
 
 void masterResetCensus() {
@@ -2715,6 +3054,14 @@ static void setupTwai(bool silent) {
     t.triple_sampling = Cfg.canTiming == 2 && Cfg.bitrateKbps != 1000;
     twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
+    // The TX pad latched recessive for the install: twai_driver_install()
+    // routes it to the controller before it resets the peripheral, and after
+    // a restart - which resets only the CPUs - that is still the last run's
+    // controller, clocked and in whatever state it was left. twaiGoLive()
+    // releases the latch with the pad a recessive GPIO. (A failed install
+    // leaves it latched: there is no controller to give it to.)
+    txPadRecessive();
+    if (Cfg.txRecessiveHold) gpio_hold_en((gpio_num_t)CAN_TX_GPIO);
     if (twai_driver_install(&g, &t, &f) != ESP_OK) {
         log_e("TWAI init failed — check CAN_TX/RX_GPIO wiring");
         return;
@@ -2805,6 +3152,7 @@ void setup() {
     // Configuration first: TWAI mode, bitrate and the ESP-NOW channel are all
     // decided from it during the bring-up that follows.
     Cfg.begin();
+    s_txHoldOnReset = Cfg.txRecessiveHold;
     analogReadResolution(12);
 
     // The evidence log lives beside the config on the filesystem, so it survives
@@ -2825,13 +3173,17 @@ void setup() {
     applyRadioPower();
 
     // CAN work pinned to core 1; Wi-Fi stack lives on core 0.
-    xTaskCreatePinnedToCore(twaiRxTask,      "twai_rx",   6144, nullptr, 10, nullptr, 1);
-    xTaskCreatePinnedToCore(obdPollTask,     "obd_poll",  4096, nullptr,  5, nullptr, 1);
-    xTaskCreatePinnedToCore(broadcastTask,   "broadcast", 6144, nullptr,  8, nullptr, 0);
-    xTaskCreatePinnedToCore(housekeepingTask,"housekeep", 4096, nullptr,  3, nullptr, 0);
-    xTaskCreatePinnedToCore(busGuardTask,    "busguard",  3072, nullptr,  9, nullptr, 1);
+    xTaskCreatePinnedToCore(twaiRxTask,      "twai_rx",   6144, nullptr, 10, &s_tasks[0].h, 1);
+    xTaskCreatePinnedToCore(obdPollTask,     "obd_poll",  4096, nullptr,  5, &s_tasks[1].h, 1);
+    xTaskCreatePinnedToCore(broadcastTask,   "broadcast", 6144, nullptr,  8, &s_tasks[2].h, 0);
+    xTaskCreatePinnedToCore(housekeepingTask,"housekeep", 4096, nullptr,  3, &s_tasks[3].h, 0);
+    // 4 KB, not 3: its error paths format log lines several calls deep, and a
+    // stack overflow is a panic - a restart in the middle of a drive.
+    xTaskCreatePinnedToCore(busGuardTask,    "busguard",  4096, nullptr,  9, &s_tasks[4].h, 1);
     ssm2Begin();
     learnerBegin();
+    codesBegin();
+    driveLogBegin();
 }
 
 /**
@@ -2924,10 +3276,18 @@ void loop() {
             masterGetStats(ls);
             Serial.printf("[ctrl ] TEC %u REC %u | errors: %u during our frames, %u otherwise | "
                           "tx failed %u, arbitration lost %u | listen-only pin: TEC %u, "
-                          "pinned again %u\n",
+                          "pinned again %u | least stack left %u B (%s)\n",
                           (unsigned)ls.tec, (unsigned)ls.rec, (unsigned)ls.errWhileTx,
                           (unsigned)ls.errIdle, (unsigned)ls.txFailed, (unsigned)ls.arbLost,
-                          (unsigned)ls.lomTecRead, (unsigned)ls.lomRepins);
+                          (unsigned)ls.lomTecRead, (unsigned)ls.lomRepins,
+                          (unsigned)ls.stackMinFree, ls.stackMinTask);
+            static bool stackWarned = false;
+            if (!stackWarned && ls.stackMinTask[0] && ls.stackMinFree < 512) {
+                stackWarned = true;
+                log_w("stack: %s has had only %u bytes left - an overflow would restart the master",
+                      ls.stackMinTask, (unsigned)ls.stackMinFree);
+            }
+            s_txHoldOnReset = Cfg.txRecessiveHold;
             if (ls.expected[0] || ls.expected[1] || ls.errRadioChecked)
                 Serial.printf("[link ] missed %u of %u normal, %u of %u listen-only | "
                               "errors near the radio %u of %u (radio busy %u.%u%%)\n",

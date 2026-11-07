@@ -46,7 +46,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   safety behaviour must add to it (the bus guard, the power-on settle wait,
   listen-only are all opt-out-able extras), never remove requests or learning.
 - **The master's saved settings and learned signals must survive every
-  firmware update.** Config is `/config.json` on LittleFS (`MasterConfig`).
+  firmware update.** Config is `/config.json` on LittleFS (`MasterConfig`;
+  mounted three times before it is ever formatted - `config_mount_glitch`).
   New keys get defaults when absent; do not bump `CFG_VERSION` without a
   migration that touches only what changed, and never re-seed tables for a
   newer version (that once erased every learned signal). The harness scenario
@@ -64,11 +65,14 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 
 ## Things that must stay in sync (`scripts/check_sync.py` enforces them)
 
-- `include/MasterPacket.h` byte-identical in master and both screens. Metric
-  store sizes move together on all three nodes.
+- `include/MasterPacket.h` and `include/DtcText.h` (trouble-code names)
+  byte-identical in master and both screens. Metric store sizes move together
+  on all three nodes. DtcText.h's table is `static`: one source file per
+  project includes it (DiagCodes.cpp, Telltales.cpp).
 - Shared by the two screens, change both: `include/Palette.h`,
-  `include/TelltaleIcons.h`, `src/ui/Telltales.*`, `tools/embed_studio.py`,
-  `tools/make_icons.py`, `tools/telltale_icons.json` and all of `test_host/`.
+  `include/TelltaleIcons.h`, `src/ui/Telltales.*`, `src/ui/PerfTimer.*`,
+  `src/ui/DriveViews.*`, `tools/embed_studio.py`, `tools/make_icons.py`,
+  `tools/telltale_icons.json` and all of `test_host/`.
 - Generated, never edit by hand: `master/src/WebPortal.cpp` (from
   `master/tools/portal_page.html` + `WebPortal.cpp.in` via build_portal.py),
   the studio metric catalogue in `screens/*/data/www/index.html` (from
@@ -95,7 +99,19 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   (`TouchCal`), not a coordinate mapping.
 - Master bus rules: only the TWAI RX task may reinstall or uninstall the
   driver; everything that transmits goes through `diagGuardOk()` /
-  `diagBusLock()`; in normal mode the controller also ACKs and error-flags.
+  `diagBusLock()` and hands its frame over with `masterTransmit()` (under
+  `s_twaiReg`: only to a controller running in normal mode with its pad
+  attached, never into reset mode or a reinstall); in normal mode the
+  controller also ACKs and error-flags.
+- **Off means off** (`car_off_tx*`, `ecu_gone_quiet`, `restart_off_bus`):
+  nothing is sent once nothing has been heard for 250 ms (`TX_LIVE_MS`), and
+  `busGuardTask` aborts a frame of ours left unacknowledged on a quiet bus - a
+  controller retransmits one back to back for ever (an error-passive sender's
+  ACK errors never make it bus-off). Ten requests in a row unanswered and the
+  OBD-II poller drops back to the PID 0x00 probe (every 10 s) instead of
+  asking every PID while the ECU is off. `masterBeforeRestart()` takes the
+  controller off the bus and latches the TX pad recessive (RTC hold) across
+  every portal restart; `txRecessiveBoot()` drives the pin before releasing it.
 - **Listen-only is NOT silent on this chip by itself.** Espressif erratum
   (ESP32/S2/S3/C3): a listen-only TWAI controller still sends ACTIVE error
   flags, and listen-only freezes its error counters, so one started with REC 0
@@ -110,14 +126,43 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   of its own unheard error flags, each counted (7.8 errors per misread in
   `lom_tec_hold` without the fix). So TEC is written well clear of 128 and
   `busGuardTask` pins it again below `TEC_LISTEN_LOW`; the sim models the
-  drop (`faults.tecExitDrop`, on by default). **That does not hold on the
-  car's S3 either** (bench boot 2026-09-30, no bus traffic): TEC 200 read
-  back as 200, then TEC and REC were 0 within milliseconds and the pin was
-  applied 75 times in 4 s. This chip keeps no counters in listen-only, so a
-  listening controller is error-active whatever is written - only the
-  detached TX pad keeps it off the bus. Proposed, waiting for the owner's
-  go-ahead: silent periods in NORMAL mode with the TX pad detached and TEC
-  220, where the counters do hold (no MIL with `tx_passive` on the car).
+  drop (`faults.tecExitDrop`, on by default). The 2026-09-30 bench boot
+  (TEC 200 read back as 200, then TEC and REC "0 within milliseconds", the
+  pin applied 75 times in 4 s) was NOT the chip: ESP-IDF v4.4.7's
+  `twai_get_status_info()` reports TEC = REC = 0 for any driver installed
+  listen-only, whatever the controller holds ("frozen ... meaningless",
+  twai.c), and the guard, the portal and the serial log all read them through
+  it - so the guard re-pinned every 50 ms, each time a moment in reset mode,
+  deaf to the bus. The counters are read from the registers now
+  (`twaiCounters()`; `lom_counters_real`), and the sim's driver mock reports
+  0 in listen-only as the real one does (that is why the harness never showed
+  it). Espressif documents the counters as frozen in listen-only. On the car,
+  `[ctrl ]`'s "pinned again" should now stay 0 - if it does not, that is real
+  evidence of a chip that loses its counters; the proposal of silent periods
+  in normal mode rested on the old reading and waits on that evidence. Never
+  read TEC/REC through `twai_get_status_info()` for a decision.
+- **TX pad through restarts and installs** (TX/RX sweep, 2026-11-07, against
+  the v4.4.7 driver source and Espressif's errata - the S3 has no TWAI
+  errata of its own beyond the listen-only one). `esp_restart_noos()`
+  resets only the CPUs and start-up keeps peripheral clocks after a CPU
+  reset, so the CAN controller runs on through a restart, attached to the
+  pad, until `setup()`. Every software restart - a panic, abort, stack
+  overflow, interrupt watchdog, and `esp_restart()` - goes through
+  `__wrap_esp_restart_noos` (`-Wl,--wrap=esp_restart_noos`, verified in the
+  ELF: `esp_restart` and `panic_restart` call it, IRAM, register writes and
+  ROM `gpio_matrix_out` only): pad to the GPIO latch, high, RTC-held with
+  `tx_hold`. A brownout is a hardware reset on the S3 and cannot be hooked:
+  only a pull-up on the transceiver's TXD covers it. `setupTwai()` holds the
+  pad through `twai_driver_install()` (which routes it to the controller
+  before resetting the peripheral); `twaiGoLive()` releases it
+  (`install_pad_latched`). `tecWrite()` reads TEC back and retries before the
+  pad is given to a passive controller (`passive_tec_verified`). No mode
+  switch while bus-off/recovering (the driver refuses the uninstall), and a
+  recovered controller that should listen is replaced, not restarted in
+  normal mode (`busoff_latch_after_settle`). Received DLC is clamped to 8 and
+  remote frames are activity only (`rx_odd_frames`). Stack headroom of the
+  CAN tasks: `[ctrl ]` and `/api/live` (`stack`, `stack_task`); busguard has
+  4 KB.
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only
@@ -191,6 +236,38 @@ frame tells every position apart does it fall back to one bit per position
 combines into the lever; single doors likewise make `DOOR_OPEN`. A taught
 field always outranks the derived value.
 
+## Codes, oil change, G-meter, drive log, timers
+
+- **Trouble codes** (`master/src/DiagCodes.*`): services 03/07/0A from the
+  ECM (0x7E0) and TCM (0x7E1, through 0x7DF with flow control to 0x7E1 if it
+  never answers its own address), read 8 s after the bus comes up, every
+  `dtc_poll_s` (60; 0 = only when asked) and when the MIL or PID 01's count
+  changes (a list left unanswered keeps its codes for two reads); never
+  with the bus quiet, listen-only or the guard up (they go
+  through `isoExchange()` in Ssm2.cpp - the SSM2 ISO-TP transport, lent out
+  under the same lock). Published as `DTC_TOTAL` and `DTC_1..8` (packed:
+  raw | kind << 16 | module << 18). Clear (service 04) only from the portal,
+  refused while moving. Service 09 gives VIN, calibration ID and CVN
+  (remembered in `vin`/`ecu_cal_id`). The screens' check-engine card names the
+  codes one at a time; a card-only `codes` lamp covers them with the MIL off.
+- **Oil change**: `oil_every_km`, `oil_at_km` (-1 = off); `SERVICE_KM` from the
+  SSM2 odometer (address 0x10E); portal "Oil changed now"; a `service` lamp
+  (spanner, amber under 500 km).
+- **G-meter**: `LAT_ACCEL`/`LON_ACCEL`/`YAW_RATE`, taught from the stability
+  unit's frame with the Bus tab's "A corner or a hard stop" (`motionRef`,
+  `teachMotion` in teach-core: correlation with the speed's slope, or with
+  speed x yaw / the steering, and a fitted scale). Until then the master
+  derives longitudinal G from the speed's slope and lateral G from speed x yaw
+  (`gDerive`, SRC_DERIVED: a taught field outranks it). ISO 8855 signs.
+- **Drive log** (`master/src/DriveLog.*`): `log_on`, `log_hz`, `log_ids`,
+  `log_max_kb`; `/log/NNNNN.tlg` on the settings partition, oldest deleted
+  first (one open for a download will not delete and is passed over), 128 KB
+  always left for settings saves, 4 KB writes announced with
+  `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
+- **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
+  display from the master's speed, on the master's clock (`TelemetryStore::
+  stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once.
+
 ## Open items
 
 - Master power-on settle wait (`start_delay_s`, 10 s default): flashed
@@ -217,6 +294,11 @@ field always outranks the derived value.
   are" before changing firmware for it.
 - Screens: warning lamps, dash screen and the cluster redesign are built and
   tested in the harness but not yet flashed or seen on hardware.
+- Codes, oil change, G-meter, drive log and timers (above): harness only. On
+  the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
+  service 03 at all; that the SSM2 odometer matches the cluster; which frame
+  carries the VDC unit's G and yaw (teach it); and how many CAN frames each
+  4 KB log write costs (Bus tab misses while logging).
 - Cluster: whether the Arduino_GFX driver cured the panel speckle is
   unconfirmed on hardware.
 

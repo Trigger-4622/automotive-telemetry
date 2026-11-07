@@ -458,15 +458,15 @@ SCENARIO(migrate_v1_layout) {
     const size_t before = s.size();
     boot(d);
 
-    CHECK((Config.layout()["version"] | 0) == 2, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 3, "version not bumped");
     CHECK(Config.layout()["screens"].size() == before + 1, "dash not added");
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "dash not first");
     CHECK(Config.layout()["warnings"].is<JsonObject>(), "warnings block not added");
     CHECK(UI._screens[0].dash == 0, "dash screen not built");
-    // Saved, so the next boot sees version 2 already.
+    // Saved, so the next boot sees version 3 already.
     JsonDocument saved;
     deserializeJson(saved, hostfs::files["/layout.json"]);
-    CHECK((saved["version"] | 0) == 2, "migration not saved");
+    CHECK((saved["version"] | 0) == 3, "migration not saved");
     CHECK(!hostfs::files.count("/layout.tmp"), "temporary file left behind");
 
     // The user deletes the dash; a reboot must not bring it back.
@@ -491,8 +491,8 @@ SCENARIO(default_layout) {
     UI.begin();
     run(500);
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "default has no dash");
-    CHECK((Config.layout()["version"] | 0) == 2, "default is not version 2");
-    CHECK(UI._screens.size() == 3, "default built %zu screens", UI._screens.size());
+    CHECK((Config.layout()["version"] | 0) == 3, "default is not version 3");
+    CHECK(UI._screens.size() == 5, "default built %zu screens", UI._screens.size());
     shot("default_dash");
 }
 
@@ -1268,6 +1268,172 @@ SCENARIO(tour_with_lamps) {
             shot(nm);
         }
     }
+}
+
+/* ───────────── trouble codes, oil change, timers, G-meter ─────────────── */
+
+/** A DTC_n channel's value: raw | kind << 16 | module << 18 (MasterPacket.h). */
+static float dtc(uint16_t raw, int kind, int module) {
+    return (float)((uint32_t)raw | (uint32_t)kind << 16 | (uint32_t)module << 18);
+}
+
+/* A v2 layout - the owner's displays - gains the G-meter and the timers once,
+ * before the diagnostics screen; deleted in the studio, they stay deleted. */
+SCENARIO(migrate_v2_layout) {
+    JsonDocument d = shippedLayout();
+    d["version"] = 2;
+    JsonArray s = d["screens"].as<JsonArray>();
+    for (size_t i = s.size(); i-- > 0;)
+        if (!strcmp(s[i]["type"] | "", "gmeter") || !strcmp(s[i]["type"] | "", "perf")) s.remove(i);
+    const size_t before = s.size();
+    boot(d);
+    JsonArray now = Config.layout()["screens"].as<JsonArray>();
+    CHECK((Config.layout()["version"] | 0) == 3, "version not bumped");
+    CHECK(now.size() == before + 2, "screens: %zu, want %zu", now.size(), before + 2);
+    const int g = screenOf("gmeter"), p = screenOf("perf"), dg = screenOf("diag");
+    CHECK(g >= 0 && p == g + 1 && dg == p + 1, "G-meter %d, timers %d, diagnostics %d", g, p, dg);
+    CHECK(g >= 0 && UI._screens[g].gmeter >= 0 && p >= 0 && UI._screens[p].perf >= 0, "not built");
+    // Deleted in the studio: a reboot does not bring them back.
+    now.remove((size_t)p);
+    now.remove((size_t)g);
+    Config.persistLayout();
+    Config.begin();
+    CHECK(Config.layout()["screens"].size() == before, "came back after being deleted");
+    CHECK(!Config.migrateLayout(), "migration ran twice");
+}
+
+/* The master read P0700 (engine) and P1718 (transmission): the check-engine
+ * card names them, one at a time. With the car's lamp off and a code still
+ * there, the codes card comes up once - and lights no check-engine symbol. */
+SCENARIO(trouble_code_card) {
+    engineOn();
+    car.set(METRIC_ID_MIL, 1);
+    car.set(METRIC_ID_DTC_COUNT, 1);
+    car.set(METRIC_ID_DTC_TOTAL, 2);
+    car.set(METRIC_ID_DTC_1, dtc(0x0700, 0, 0));
+    car.set(METRIC_ID_DTC_2, dtc(0x1718, 0, 1));
+    boot();
+    gotoPlain();
+    UI._lamps._snoozeMs = 0;
+    run(800);
+    CHECK(alertIsLamp("mil"), "check-engine card not up");
+    auto seen = [&]() { return alertName() + " | " + alertDetail(); };
+    // One code at a time, the next every 3 s.
+    std::string a = seen();
+    for (int k = 0; k < 8 && a.find("P0700") == std::string::npos; k++) { run(500); a = seen(); }
+    CHECK(a == "P0700 1/2 | Transmission asks for the lamp", "first code: '%s'", a.c_str());
+    shot("trouble_code_card_1");
+    std::string b = a;
+    for (int k = 0; k < 8 && b == a; k++) { run(500); b = seen(); }
+    CHECK(b == "P1718 TCM 2/2 | AT CAN communication circuit", "second code: '%s'", b.c_str());
+    shot("trouble_code_card_2");
+    CHECK(!lamp("codes").on, "the codes card stands down while the check-engine card names them");
+
+    // The car's lamp goes out; a pending code is left.
+    UI._lamps.acknowledge((size_t)UI._lamps.find("mil"), millis());
+    car.set(METRIC_ID_MIL, 0);
+    car.set(METRIC_ID_DTC_TOTAL, 1);
+    car.set(METRIC_ID_DTC_1, dtc(0x0171, 1, 0));
+    car.drop(METRIC_ID_DTC_2);
+    run(1500);
+    CHECK(alertIsLamp("codes"), "codes card not up with the lamp off");
+    CHECK(seen() == "P0171 PENDING | System too lean B1", "pending code: '%s'", seen().c_str());
+    uint32_t rgb; bool lit;
+    CHECK(!UI._lamps.iconState(ICON_MIL, rgb, lit), "a check-engine symbol lit with the car's lamp off");
+    CHECK(!UI._lamps.onStrip((size_t)UI._lamps.find("codes")), "the codes card is on the strip");
+    shot("trouble_code_card_pending");
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* Oil change due: amber for the last 500 km, then overdue, gone once reset. */
+SCENARIO(service_lamp) {
+    engineOn();
+    car.set(METRIC_ID_SERVICE_KM, 4000);
+    boot();
+    gotoPlain();
+    run(1500);
+    CHECK(!lamp("service").on, "service lamp on 4000 km before");
+    car.set(METRIC_ID_SERVICE_KM, 320);
+    run(1500);
+    CHECK(lamp("service").on && alertIsLamp("service"), "service lamp/card not up at 320 km");
+    CHECK(alertDetail() == (ROUND ? "320 km" : "BOOK THE SERVICE"), "card: '%s'", alertDetail().c_str());
+    if (!ROUND) CHECK(alertValue() == "320 km", "value: '%s'", alertValue().c_str());
+    shot("service_lamp");
+    car.set(METRIC_ID_SERVICE_KM, -120);
+    run(800);
+    char v[32];
+    UI._lamps.valueText((size_t)UI._lamps.find("service"), v, sizeof v);
+    CHECK(!strcmp(v, "OVERDUE 120 km"), "overdue: '%s'", v);
+    car.set(METRIC_ID_SERVICE_KM, 7500);
+    run(1500);
+    CHECK(!lamp("service").on, "still on after the oil change");
+}
+
+/* 0-100, 80-120 and the quarter mile, timed here from the speed the master
+ * sends: whole km/h every 100 ms, a steady 10.8 km/h a second to 140. */
+SCENARIO(perf_timers) {
+    engineOn();
+    boot();
+    gotoType("perf");
+    run(1500);                                   // standing still: armed
+    const PerfView &pv = UI._perfViews[0];
+    CHECK(std::string(lv_label_get_text(pv.status)) == "READY - GO", "status '%s'",
+          lv_label_get_text(pv.status));
+    const uint32_t t0 = millis();
+    for (int k = 0; k < 220; k++) {
+        const double s = (millis() - t0) / 1000.0;
+        car.set(METRIC_ID_SPEED, (float)(long)std::min(140.0, 10.8 * s));
+        car.set(METRIC_ID_RPM, (float)(1500 + 30 * std::min(140.0, 10.8 * s)));
+        if (k == 50) shot("perf_timers_running");
+        run(100);
+    }
+    const PerfTimer &p = UI._perf;
+    const float z = p.last(PerfTimer::ZERO_100).secs, m = p.last(PerfTimer::MID_80_120).secs,
+                q = p.last(PerfTimer::QUARTER).secs, trap = p.last(PerfTimer::QUARTER).trapKmh;
+    CHECK(fabsf(z - 9.26f) < 0.15f, "0-100 %.2f s, truth 9.26", z);
+    CHECK(fabsf(m - 3.70f) < 0.15f, "80-120 %.2f s, truth 3.70", m);
+    CHECK(fabsf(q - 16.82f) < 0.2f && fabsf(trap - 140) < 1.5f, "quarter %.2f s @ %.0f, truth 16.82 @ 140", q, trap);
+    run(300);
+    char want[16];
+    snprintf(want, sizeof want, "%.2fs", z);
+    CHECK(std::string(lv_label_get_text(pv.val[0])) == want, "0-100 shows '%s'", lv_label_get_text(pv.val[0]));
+    shot("perf_timers");
+    // A lift before 100: no time.
+    car.set(METRIC_ID_SPEED, 0);
+    run(1500);
+    for (int k = 0; k < 60; k++) {
+        const double s = k / 10.0;
+        car.set(METRIC_ID_SPEED, (float)(long)(s < 4 ? 10.8 * s : 43 - 8 * (s - 4)));
+        run(100);
+    }
+    CHECK(fabsf(p.last(PerfTimer::ZERO_100).secs - z) < 1e-6f, "a lifted run replaced the time");
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* The G-meter: braking in a right-hand bend puts the dot low and right. */
+SCENARIO(gmeter_screen) {
+    engineOn();
+    boot();
+    gotoType("gmeter");
+    run(800);
+    const GMeterView &g = UI._gmeters[0];
+    CHECK(hidden(g.dot), "a dot with no G known");
+    car.set(METRIC_ID_LAT_ACCEL, -0.5f);         // right-hand bend
+    car.set(METRIC_ID_LON_ACCEL, -0.3f);         // braking
+    run(2500);
+    CHECK(!hidden(g.dot), "no dot");
+    const int x = lv_obj_get_x(g.dot) + 8, y = lv_obj_get_y(g.dot) + 8;
+    CHECK(fabsf(x - (g.cx + 0.5f * g.r)) <= 3 && fabsf(y - (g.cy + 0.3f * g.r)) <= 3,
+          "dot at %d,%d; want %.0f,%.0f", x, y, g.cx + 0.5f * g.r, g.cy + 0.3f * g.r);
+    CHECK(std::string(lv_label_get_text(g.lat)) == "R 0.50" && std::string(lv_label_get_text(g.lon)) == "BRK 0.30",
+          "readouts '%s' '%s'", lv_label_get_text(g.lat), lv_label_get_text(g.lon));
+    shot("gmeter");
+    car.set(METRIC_ID_LAT_ACCEL, 3.0f);          // beyond the rim: held at it
+    car.set(METRIC_ID_LON_ACCEL, 0);
+    run(3000);
+    const int x2 = lv_obj_get_x(g.dot) + 8;
+    CHECK(x2 >= g.cx - g.r - 1 && x2 <= g.cx - g.r + 3, "dot not held at the rim: %d (rim %d)", x2, g.cx - g.r);
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
 }
 
 /* ─────────────────────────────── main ──────────────────────────────────── */

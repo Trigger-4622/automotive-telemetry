@@ -1,6 +1,6 @@
 {
   "_doc": "Telemetry Display layout schema v1. Keys starting with '_' are documentation only — the firmware ignores them. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; upload with 'pio run -t uploadfs' or POST /api/layout.",
-  "version": 2,
+  "version": 3,
 
   "global": {
     "_doc": "smoothing_alpha: EMA coefficient 0-1 applied at packet rate (higher = snappier, lower = smoother). lerp_speed: fraction moved toward target per UI tick (needle glide). stale_timeout_ms: metric age before it renders as '--'. Colors are #RRGGBB.",
@@ -183,7 +183,20 @@
     },
 
     {
-      "_doc": "SCREEN 7 — Link diagnostics: packet rate, drops (from sequence_id gaps), heap, uptime, plus a live GPIO scan for identifying the side button. Hold the button: the pin that reads L is the one to set as global.button_gpio.",
+      "_doc": "SCREEN 7 — G-meter: the car's acceleration as a dot in a friction circle, from the lateral and longitudinal G the master sends (taught from the stability unit's frame, or worked out from the speed and the yaw rate). Up is speeding up, down braking, left a left-hand bend. max_g: the rim, in g.",
+      "id": "gmeter",
+      "type": "gmeter",
+      "label": "G",
+      "max_g": 1.0
+    },
+    {
+      "_doc": "SCREEN 8 — Performance timers: 0-100 km/h, 80-120 km/h and the quarter mile, timed here on the display from the master's speed (and RPM). Stand still for half a second to arm a standing start; 80-120 times itself whenever the speed passes 80 on the way up.",
+      "id": "perf",
+      "type": "perf",
+      "label": "PERF"
+    },
+    {
+      "_doc": "SCREEN 9 — Link diagnostics: packet rate, drops (from sequence_id gaps), heap, uptime, plus a live GPIO scan for identifying the side button. Hold the button: the pin that reads L is the one to set as global.button_gpio.",
       "id": "diag",
       "type": "diag"
     }

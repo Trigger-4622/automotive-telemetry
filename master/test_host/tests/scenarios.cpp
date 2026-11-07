@@ -6,13 +6,18 @@
  */
 #include <ArduinoJson.h>
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
 
 #include "Arduino.h"
 #include "LittleFS.h"
+#include "DiagCodes.h"
+#include "DriveLog.h"
+#include "DtcText.h"
 #include "Learner.h"
 #include "MasterConfig.h"
 #include "MasterPacket.h"
@@ -105,7 +110,19 @@ static bool isObd(const twai_message_t &m, int pid = -1) {
            (pid < 0 || m.data[2] == pid);
 }
 static bool isObdReq(const twai_message_t &m) { return isObd(m); }   // any PID, for txCount
-static bool isSsm(const twai_message_t &m) { return m.identifier == 0x7E0 && !isObd(m); }
+/** A request of the OBD-II services carried by ISO-TP - trouble codes (03 07
+ *  0A), clear (04), vehicle information (09) - to the ECM, the TCM or all. */
+static bool isObdIso(const twai_message_t &m) {
+    if (m.identifier != 0x7E0 && m.identifier != 0x7E1 && m.identifier != 0x7DF) return false;
+    if ((m.data[0] & 0xF0) != 0x00) return false;
+    const uint8_t s = m.data[1];
+    return s == 0x03 || s == 0x04 || s == 0x07 || s == 0x0A || s == 0x09;
+}
+/** An SSM2 request frame (single, first or consecutive; not our flow control,
+ *  which answers whichever service the ECU is replying to). */
+static bool isSsm(const twai_message_t &m) {
+    return m.identifier == 0x7E0 && !isObd(m) && !isObdIso(m) && (m.data[0] & 0xF0) != 0x30;
+}
 static bool anyFrame(const twai_message_t &) { return true; }
 
 static const sim::Shown *shown(uint16_t id) {
@@ -146,7 +163,8 @@ static int simBugs() {
     for (const auto &l : sim::logLines) if (l.find("SIM-BUG") != std::string::npos) n++;
     return n;
 }
-static void commonChecks() {
+/** @param allowedErr An error line containing this is expected (the scenario's own subject). */
+static void commonChecks(const char *allowedErr = nullptr) {
     MasterStats st; masterGetStats(st);
     check(simBugs() == 0, "no misuse of RTOS/driver detected by the simulator", fmt("%d", simBugs()));
     check(sim::bugUninstallWhileWaiting == 0, "driver never uninstalled under a waiting task");
@@ -155,7 +173,9 @@ static void commonChecks() {
     check(sim::espSeqGaps == 0, "ESP-NOW sequence has no gaps", fmt("%llu", (unsigned long long)sim::espSeqGaps));
     check(sim::espPackets > 0, "the displays received packets", fmt("%llu", (unsigned long long)sim::espPackets));
     std::vector<std::string> errs;
-    for (const auto &l : sim::logLines) if (l.find("] E ") != std::string::npos) errs.push_back(l);
+    for (const auto &l : sim::logLines)
+        if (l.find("] E ") != std::string::npos && (!allowedErr || l.find(allowedErr) == std::string::npos))
+            errs.push_back(l);
     check(errs.empty(), "no error lines in the firmware log", errs.empty() ? "" : errs[0]);
     // A fit better than perfect means the regression lost its precision.
     double worst = 0;
@@ -479,6 +499,30 @@ static void scConfigTmpOnly() {
     check(simfs::files.count("/config.json") == 1, "and commits it");
 }
 
+/** A mount that fails once at power-up (the supply sagging while the car
+ *  cranks) must not format the partition: that erases the settings, every
+ *  learned signal, the evidence log and the drive logs. */
+static void scConfigMountGlitch() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"broadcast_ms":77})";
+    simfs::files["/log/00001.tlg"] = "TLG1";
+    simfs::mountFails = 1;
+    boot();
+    runUntil(3);
+    check(simfs::formats == 0, "one failed mount does not format", fmt("%d formats", simfs::formats));
+    check(Cfg.broadcastMs == 77, "the saved settings are loaded", fmt("broadcast_ms %u", Cfg.broadcastMs));
+    check(simfs::files.count("/log/00001.tlg") == 1, "the drive logs are kept");
+}
+
+/** A partition never formatted (the first flash) is still formatted once. */
+static void scConfigFirstMount() {
+    simfs::blank = true;
+    boot();
+    runUntil(3);
+    check(simfs::formats == 1, "a blank partition is formatted", fmt("%d formats", simfs::formats));
+    Cfg.save();
+    check(simfs::files.count("/config.json") == 1, "and settings can be saved on it");
+}
+
 /** Car switched off: the master sleeps. */
 static void scSleep() {
     simfs::files["/config.json"] = R"({"cfg_ver":5,"sleep_idle_s":20})";
@@ -721,7 +765,7 @@ static void scSleepHeld() {
     check(sleepEntered, "but sleeps within the 5-minute cap", fmt("at %.0f s", tNow()));
 }
 
-static bool isRequest(const twai_message_t &m) { return isObd(m) || isSsm(m); }
+static bool isRequest(const twai_message_t &m) { return isObd(m) || isSsm(m) || isObdIso(m); }
 static bool logHas(const char *text) {
     for (const auto &l : logLines) if (l.find(text) != std::string::npos) return true;
     return false;
@@ -1212,6 +1256,66 @@ static void lomTecHold(bool drain) {
 static void scLomTecHold()  { lomTecHold(false); }
 static void scLomTecDrain() { lomTecHold(true); }
 
+/**
+ * ESP-IDF v4.4.7's twai_get_status_info() reports TEC = REC = 0 for any driver
+ * installed listen-only, whatever the controller holds ("frozen ... thus are
+ * meaningless"). Read through it, the counters "fell to 0 within
+ * milliseconds" on the bench (2026-09-30), the guard pinned them again every
+ * 50 ms - 75 times in 4 s - and each pin was a moment in reset mode, deaf to
+ * the bus. Read from the controller's own registers they hold, as Espressif
+ * says listen-only keeps them: nothing to pin, no deaf moments, and the portal
+ * shows the counters the controller really has.
+ */
+static void scLomCountersReal() {
+    loadCarConfig();
+    portalPostBeforeBoot(R"({"diag_mode":4})");
+    boot();
+    runUntil(5);
+    const uint64_t resets0 = sim::resetModeEntries;
+    runUntil(65);
+    MasterStats st; masterGetStats(st);
+    check(st.lomRepins == 0, "listen-only counters never pinned again", fmt("%u times", st.lomRepins));
+    check(sim::resetModeEntries == resets0, "never deaf for a pin while listening",
+          fmt("%llu reset-mode entries in 60 s", (unsigned long long)(sim::resetModeEntries - resets0)));
+    // (199 with faults.tecExitDrop, on by default: one lower once out of reset mode.)
+    check(st.tec >= 199 && st.rec == 128, "the portal shows the controller's counters, not the driver's zeros",
+          fmt("TEC %u, REC %u", st.tec, st.rec));
+    check(st.tec == controller().tec && st.rec == controller().rec, "the ones the controller holds",
+          fmt("controller TEC %u, REC %u", controller().tec, controller().rec));
+    commonChecks();
+}
+
+/**
+ * Frames the data bytes of which are not all there. A DLC of 9-15 is legal on
+ * the wire (8 bytes follow) and the driver hands it over as it came, with
+ * data[8]; a remote frame keeps its DLC with no data at all (the driver
+ * zeroes the bytes). Neither may be read past data[8], nor decoded as values.
+ */
+static void scRxOddFrames() {
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"start_delay_s":0,"diag_mode":4,"signals":[{"can_id":1911,
+      "ext":false,"start":0,"len":8,"be":false,"signed":false,"scale":1,"offset":0,"metric":4097,"mode":1,"ref":0,
+      "learned":false,"name":"t"}]})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(3);
+    twai_message_t rtr = {};
+    rtr.identifier = 0x777;                         // the taught signal's frame, as a remote request
+    rtr.rtr = 1;
+    rtr.data_length_code = 8;
+    sim::injectFrame(rtr);
+    twai_message_t big = {};
+    big.identifier = 0x7E8;                         // an OBD-II reply, DLC 15, length nibble 15
+    big.dlc_non_comp = 1;
+    big.data_length_code = 15;
+    const uint8_t b[8] = {0x0F, 0x41, 0xA6, 1, 2, 3, 4, 5};
+    memcpy(big.data, b, 8);
+    sim::injectFrame(big);
+    runUntil(4);
+    check(!shown(4097), "a remote frame is not decoded as the signal's value");
+    MasterStats st; masterGetStats(st);
+    check(st.canRx > 0, "frames counted", fmt("%u", st.canRx));
+    commonChecks();
+}
+
 /** The default bit timing: the Arduino-CAN profile - 87.5 %, SJW 2, triple sampling. */
 static void scTimingDefault() {
     boot();
@@ -1332,6 +1436,27 @@ static void scPassiveOff() {
     check(!Cfg.txPassive, "the setting is off");
     check(sim::activeFlagStarts >= 1, "able to send error frames, as asked (and the simulator sees it)",
           fmt("%d", sim::activeFlagStarts));
+}
+
+/**
+ * Errors let pass: the TX pad goes back to the controller only once TEC really
+ * reads error-passive. A TEC write that does not take - the register keeping
+ * the 0 twai_start() left - is written again; a controller able to flag errors
+ * actively never reaches the bus. Here the write at the switch from the settle
+ * wait to requesting, and the first top-up after it, are both lost.
+ */
+static void scPassiveTecVerified() {
+    s_keepSettle = true;                              // every default: tx_passive on
+    boot();
+    runUntil(9.5);                                    // still listening (settle wait)
+    faults.tecWriteIgnored = 2;
+    runUntil(30);
+    check(controller().mode == TWAI_MODE_NORMAL && controller().tec >= 128, "requesting, error-passive",
+          fmt("TEC %u", controller().tec));
+    check(sim::activeFlagStarts == 0, "never on the bus able to send an error frame",
+          fmt("%d times", sim::activeFlagStarts));
+    check(txCount(isRequest, 12, 30) > 0, "and requesting", fmt("%llu", (unsigned long long)txCount(isRequest, 12, 30)));
+    commonChecks();
 }
 
 /**
@@ -1733,6 +1858,48 @@ static void scBusOffGuardOff() {
     check(unexpectedErrors("bus-off") == 0 && simBugs() == 0, "no other errors");
 }
 
+/**
+ * Bus-off with the receive-error guard's latch (the bus guard off, as on the
+ * car): listen-only is wanted from that moment on. The driver will not
+ * uninstall a controller in the middle of its bus-off recovery, so a mode
+ * switch asked for then fails - and the controller used to come back from
+ * the recovery in NORMAL mode, TX pad attached, until the next try 2 s later.
+ * With errors flagged actively (tx_passive off) that is exactly the traffic
+ * the latch is there to stop. Sampled every half millisecond.
+ */
+static void busOffLatchNoNormal(double at) {
+    loadCarConfig();                                // guard false, rx_guard true
+    portalPostBeforeBoot(R"({"tx_passive":false})");
+    boot();
+    runUntil(at);
+    faults.busOffNow = true;
+    int onBusNormal = 0;
+    double firstBad = -1, silentAt = -1;
+    for (double t = at; t <= at + 6; t += 0.0005) {
+        runUntil(t);
+        MasterStats st; masterGetStats(st);
+        if (!st.rxGuardSilent) continue;            // not latched yet
+        const sim::CtrlView c = controller();
+        if (c.installed && c.state == TWAI_STATE_RUNNING && c.mode == TWAI_MODE_NORMAL &&
+            sim::txPadOnController()) {
+            if (!onBusNormal++) firstBad = t;
+        }
+        if (silentAt < 0 && c.installed && c.state == TWAI_STATE_RUNNING && c.mode == TWAI_MODE_LISTEN_ONLY)
+            silentAt = t;
+    }
+    check(onBusNormal == 0, "never back on the bus in normal mode once listen-only is latched",
+          onBusNormal ? fmt("%d samples, first at %.4f s", onBusNormal, firstBad) : std::string("0"));
+    check(silentAt > 0 && silentAt < at + 0.5, "listen-only as soon as the recovery is over",
+          fmt("at %.4f s", silentAt));
+    check(unexpectedErrors("bus-off") == 0, "no failed reinstall (\"TWAI init failed\")");
+    commonChecks("bus-off");
+}
+/** Long after the last mode switch. */
+static void scBusOffLatchNoNormal() { busOffLatchNoNormal(20); }
+/** Half a second after the settle wait switched to normal - inside the 2 s
+ *  throttle on mode switches, the likeliest moment for a marginal link. */
+static void scBusOffLatchAfterSettle() { busOffLatchNoNormal(10.6); }
+
 static double minObdGapMs(double fromS, double toS) {
     double best = 1e9, last = -1;
     for (const auto &r : sim::transmitted) {
@@ -1918,6 +2085,29 @@ static void scTxHold() {
     check(evCount(EVT_SLEEP) == 1, "sleep recorded in the evidence log");
 }
 
+/**
+ * twai_driver_install() routes the TX pad to the controller before it resets
+ * the peripheral, and after a restart (which resets only the CPUs) that is
+ * still the last run's controller, clocked, in whatever state it was left. So
+ * every install - at boot, on each switch to listen-only and back - is made
+ * with the pad latched recessive, and the latch is gone once requesting.
+ */
+static void scInstallPadLatched() {
+    s_keepSettle = true;                              // settle wait: listen-only first, then normal
+    boot();
+    runUntil(15);
+    portalPost(R"({"diag_mode":4})");
+    runUntil(20);
+    portalPost(R"({"diag_mode":0})");
+    runUntil(30);
+    check(sim::reinstalls >= 4, "installed at boot and on every switch", fmt("%d installs", sim::reinstalls));
+    check(sim::installsUnheld == 0, "every one with the TX pad latched", fmt("%d not", sim::installsUnheld));
+    check(controller().mode == TWAI_MODE_NORMAL && gpioHoldEnabled == 0 && sim::txPadOnController(),
+          "and released for requesting");
+    check(txCount(isRequest, 25, 30) > 0, "requests going out", fmt("%llu", (unsigned long long)txCount(isRequest, 25, 30)));
+    commonChecks();
+}
+
 /** ...and the latch is the owner's to turn off. */
 static void scTxHoldOff() {
     simfs::files["/config.json"] = R"({"cfg_ver":5,"sleep_idle_s":20,"tx_hold":false})";
@@ -1928,6 +2118,585 @@ static void scTxHoldOff() {
     ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;
     runUntil(60);
     check(sleepEntered && gpioHoldEnabled == 0, "tx_hold off: no latch across sleep (adjustable)");
+}
+
+/* ─────────────── off means off; on means sending properly ─────────────── */
+
+static uint32_t txQueued() {
+    twai_status_info_t st = {};
+    return twai_get_status_info(&st) == ESP_OK ? st.msgs_to_tx : 0;
+}
+
+/**
+ * The car switched off under a request. Every module goes quiet at once, so
+ * nobody acknowledges the master's frame - and a CAN controller retransmits an
+ * unacknowledged frame back to back for as long as it stays on the bus (an
+ * error-passive sender's acknowledgement errors do not count towards bus-off).
+ * Before, that lasted until the bus had been quiet for 2 s and the settle wait
+ * switched the controller to listen-only - and for ever with start_delay_s 0:
+ * a frame on the wires of a car that is off, the kind of traffic that wakes
+ * sleeping modules. Now nothing is sent once nothing has been heard for 250
+ * ms, and a frame nobody acknowledges is aborted.
+ */
+static void carOffUnderRequest(bool settle) {
+    loadCarConfig();                                 // the car's file: OBD-II only, obd_gap 10
+    if (!settle) portalPostBeforeBoot(R"({"start_delay_s":0})");
+    boot();
+    runUntil(40);
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 30, 40) > 50, "polling the running car");
+    const double off = tNow();
+    faults.silenceBus = true;                        // ignition off: every module at once
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;
+    faults.nobodyAcks = true;
+    runUntil(off + 5);
+    check(sim::deadBusTxUs < 300000, "a frame nobody acknowledges is not kept on the dead bus",
+          fmt("%.2f s of retransmissions", sim::deadBusTxUs / 1e6));
+    check(txCount(anyFrame, off + 0.3, off + 5) == 0, "nothing new sent once the car is quiet",
+          fmt("%llu frames", (unsigned long long)txCount(anyFrame, off + 0.3, off + 5)));
+    check(txQueued() == 0, "nothing left waiting in the controller", fmt("%u", txQueued()));
+    // Back on: the requests resume and are answered.
+    faults.nobodyAcks = false;
+    faults.silenceBus = false;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = true;
+    runUntil(off + 30);
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "values flow once the car is back on", info);
+    check(simBugs() == 0 && sim::txInReset == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+static void scCarOffTx()         { carOffUnderRequest(true); }
+static void scCarOffTxNoSettle() { carOffUnderRequest(false); }
+
+/**
+ * Ignition off while something else keeps the bus alive: the engine ECU no
+ * longer answers, but frames still flow. Every PID used to be asked down to
+ * once in 10 s each - with the car's 60-odd PIDs, six requests a second
+ * for as long as the bus stayed up, traffic that can keep the body modules
+ * from ever going to sleep. Once nothing has answered for a run of requests,
+ * the poller goes back to the probe (PID 0x00, every 10 s); one answer
+ * there and the full poll resumes.
+ */
+static void scEcuGoneQuiet() {
+    loadCarConfig();
+    boot();
+    runUntil(40);
+    const uint64_t before = txCount(isObdReq, 30, 40);
+    check(before > 50, "polling the running car", fmt("%llu requests in 10 s", (unsigned long long)before));
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;   // engine ECU off, bus still up
+    runUntil(160);
+    const double rate = txCount(anyFrame, 100, 160) / 60.0;
+    check(rate <= 0.2, "a switched-off ECU is probed, not polled", fmt("%.2f frames/s", rate));
+    check(txCount(isObdReq, 100, 160) > 0, "...but still probed", fmt("%llu", (unsigned long long)txCount(isObdReq, 100, 160)));
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = true;
+    runUntil(185);
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "the full poll is back once it answers", info);
+    check(txCount(isObdReq, 175, 185) > 50, "at the full rate", fmt("%llu in 10 s", (unsigned long long)txCount(isObdReq, 175, 185)));
+    check(simBugs() == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+
+/**
+ * A restart from the portal (Reboot, Factory reset, Safe bus settings, the
+ * BOOT rescue). The chip resets, and until the new firmware's first line runs
+ * the TX pin is an unconfigured pad: with the transceiver's input floating it
+ * can read low - dominant - and jam the car's bus, typically with the car on,
+ * since that is when the portal is used. masterBeforeRestart() now takes the
+ * controller off the bus and latches the pad recessive across the reset;
+ * setup() releases the latch once it drives the pin itself.
+ */
+static void scRestartOffBus() {
+    loadCarConfig();
+    boot();
+    sim::restartReturns = true;
+    runUntil(30);
+    check(controller().mode == TWAI_MODE_NORMAL && txCount(isObdReq, 20, 30) > 0, "polling before the restart");
+    masterBeforeRestart();                            // what every restart path calls first
+    const double t = tNow();
+    check(!sim::txPadOnController() && txDrivenHigh, "TX pad off the controller, driven recessive");
+    check(gpioHoldEnabled > 0, "...and latched there across the reset");
+    runUntil(t + 0.5);                                // the portal's 300 ms before ESP.restart()
+    check(txCount(anyFrame, t, t + 0.5) == 0, "nothing sent before the reset",
+          fmt("%llu", (unsigned long long)txCount(anyFrame, t, t + 0.5)));
+    check(sim::bugUninstallWhileWaiting == 0 && simBugs() == 0, "no misuse of the driver", fmt("%d", simBugs()));
+}
+
+/**
+ * The car's settings when it logged 47 bus-offs in 155 s: errors let pass,
+ * bus guard and receive-error guard both off. Every bus-off is recovered and
+ * the controller restarted - with TEC 220, so five more errors put it off
+ * again. However often that happens, a frame goes out only from a running
+ * controller in normal mode with its pad attached: never into reset mode (a
+ * TEC write), never with the pad routed away.
+ */
+static void scBusOffCycles() {
+    simfs::files["/config.json"] = R"({"cfg_ver":5,"diag_mode":3,"guard":false,"rx_guard":false})";
+    boot();
+    runUntil(20);
+    faults.errorPerOwnFrame = 0.25;                  // a failing transmit path
+    runUntil(140);
+    uint16_t tec = 0;
+    const int offs = evCount(EVT_BUS_OFF, &tec);
+    check(offs >= 10, "repeated bus-offs, recovered each time", fmt("%d", offs));
+    check(txCount(anyFrame, 130, 140) > 20, "still transmitting after the last of them",
+          fmt("%llu", (unsigned long long)txCount(anyFrame, 130, 140)));
+    check(sim::txInReset == 0 && simBugs() == 0, "never a frame into reset mode or a detached pad",
+          fmt("%d in reset, %d bugs", sim::txInReset, simBugs()));
+    check(sim::activeFlagStarts == 0, "never on the bus able to send an active error flag",
+          fmt("%d", sim::activeFlagStarts));
+}
+
+/* ═══════════ trouble codes, service reminder, G-meter, drive log ═══════════ */
+
+/** What a display shows in code slot @p slot: "P1718 stored transmission". */
+static std::string shownCode(int slot) {
+    const sim::Shown *s = shown(METRIC_ID_DTC_1 + slot);
+    if (!s || (simrtos::nowUs() - s->tUs) > 1500000) return "-";
+    uint16_t raw; uint8_t kind, mod;
+    dtcUnpack(s->value, raw, kind, mod);
+    char c[6];
+    dtcCode(raw, c);
+    return fmt("%s %s %s", c, DTC_KIND_NAME[kind], DTC_MODULE_NAME[mod]);
+}
+static int isoReq(uint32_t id, uint8_t svc) {
+    const auto it = sim::isoRequests.find(id << 8 | svc);
+    return it == sim::isoRequests.end() ? 0 : it->second;
+}
+/** Ignition off: every module at once, nobody left to acknowledge a frame. */
+static void carOff() {
+    faults.silenceBus = true;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;
+    faults.nobodyAcks = true;
+}
+static void carOn() {
+    faults.silenceBus = false;
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = true;
+    faults.nobodyAcks = false;
+}
+/** A stored settings file with these keys, as saved on an earlier drive. */
+static void storedConfig(const char *keys) {
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,)", (int)MasterConfig::CFG_VERSION) + (keys + 1);
+}
+static double shownValue(uint16_t id) {
+    const sim::Shown *s = shown(id);
+    return s && simrtos::nowUs() - s->tUs < 1500000 ? s->value : NAN;
+}
+
+/** Codes in both computers: read a few seconds after the car comes on, each
+ *  shown once with its name, read again every minute, never with the car off. */
+static void scDtcRead() {
+    ecu.ecmStored  = {0x0700};
+    ecu.ecmPending = {0x0171, 0x0700};          // a confirmed code is often pending too
+    ecu.tcmStored  = {0x1718};
+    boot();
+    runUntil(6);
+    check(txCount(isObdIso, 0) == 0, "nothing asked in the first seconds (probe and SSM2 first)");
+    runUntil(20);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.haveRead && cs.reads == 1, "read once the car has been on a few seconds", fmt("%u reads", cs.reads));
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 3, "three codes for the displays, P0700 once",
+          fmt("%.0f", shownValue(METRIC_ID_DTC_TOTAL)));
+    check(shownCode(0) == "P0700 stored engine", "first: the engine's stored code", shownCode(0));
+    check(shownCode(1) == "P1718 stored transmission", "then the transmission's", shownCode(1));
+    check(shownCode(2) == "P0171 pending engine", "then the pending one", shownCode(2));
+    check(shownCode(3) == "-", "no fourth slot");
+    check(!std::strcmp(dtcText(0x1718), "AT CAN communication circuit") &&
+          !std::strcmp(dtcText(0x0700), "Transmission asks for the lamp"), "named", dtcText(0x1718));
+    check(cs.list[0][2] == LIST_REFUSED && cs.list[1][2] == LIST_REFUSED,
+          "permanent codes: refused by both (a 2009 car keeps none)");
+    check(isoReq(0x7E0, 0x03) == 1 && isoReq(0x7E1, 0x03) == 1 && isoReq(0x7DF, 0x03) == 0,
+          "each computer asked on its own address, never through 0x7DF");
+    check(!std::strcmp(cs.vin, "JF1BL5KS59G000123") && !std::strcmp(cs.calId[0], "A2WC522N") &&
+          !std::strcmp(cs.cvn[0], "1A2B3C4D"), "VIN, calibration ID and CVN read",
+          fmt("%s %s %s", cs.vin, cs.calId[0], cs.cvn[0]));
+    runUntil(25);
+    JsonDocument d;
+    deserializeJson(d, simfs::files["/config.json"]);
+    check(!std::strcmp(d["ecu_cal_id"] | "", "A2WC522N") && !std::strcmp(d["vin"] | "", "JF1BL5KS59G000123"),
+          "calibration ID and VIN saved, for the portal with the car off");
+
+    runUntil(75);
+    codesGetStatus(cs);
+    check(cs.reads == 2, "read again a minute later", fmt("%u reads", cs.reads));
+    check(isoReq(0x7E0, 0x09) == 3, "the identity read once (VIN, calibration, CVN)",
+          fmt("%d", isoReq(0x7E0, 0x09)));
+    ecu.tcmPending.push_back(0x0705);
+    runUntil(135);
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 4 && shownCode(3) == "P0705 pending transmission",
+          "a new code shows at the next read", shownCode(3));
+
+    const double off = tNow();
+    carOff();
+    runUntil(off + 30);
+    check(txCount(anyFrame, off + 0.3) == 0, "nothing asked once the car is off");
+    check(std::isnan(shownValue(METRIC_ID_DTC_TOTAL)), "the displays let the codes go with the car");
+    char why[64];
+    check(!codesRequestClear(why, sizeof why), "no clear with the car off", why);
+    commonChecks();
+}
+
+/** Clear: refused while moving; at a standstill both computers clear and the
+ *  list is read again; an engine that must be off says so. */
+static void scDtcClear() {
+    ecu.ecmStored = {0x0700};
+    ecu.tcmStored = {0x1718};
+    sim::speedOverride = [](double t) { return t < 30 ? 50.0 : 0.0; };
+    boot();
+    runUntil(20);
+    char why[64] = "";
+    check(!codesRequestClear(why, sizeof why) && !std::strcmp(why, "stop the car first"),
+          "refused while moving", why);
+    check(isoReq(0x7E0, 0x04) == 0, "and nothing sent");
+    runUntil(35);
+    check(codesRequestClear(why, sizeof why), "accepted at a standstill", why);
+    runUntil(40);
+    CodesStatus cs; codesGetStatus(cs);
+    check(isoReq(0x7E0, 0x04) == 1 && isoReq(0x7E1, 0x04) == 1 && sim::codesCleared == 2,
+          "service 04 to each computer, once", cs.note);
+    check(std::strstr(cs.clearNote, "engine cleared") && std::strstr(cs.clearNote, "transmission cleared"),
+          "the portal says what each did", cs.clearNote);
+    check(cs.n == 0 && shownValue(METRIC_ID_DTC_TOTAL) == 0, "read again: nothing left",
+          fmt("%u codes", cs.n));
+
+    ecu.clearNeedsEngineOff = true;
+    ecu.ecmStored = {0x0420};
+    check(codesRequestClear(why, sizeof why), "asked again with the engine running");
+    runUntil(45);
+    codesGetStatus(cs);
+    check(std::strstr(cs.clearNote, "engine refused - switch the engine off") != nullptr,
+          "an engine that must be off: said in plain words", cs.clearNote);
+    check(cs.n == 1 && shownCode(0) == "P0420 stored engine", "and the code is still listed", shownCode(0));
+    commonChecks();
+}
+
+/** A transmission computer that answers only 0x7DF: asked there once its own
+ *  address stays silent, its reply picked out by ID, flow control to 0x7E1. */
+static void scDtcTcmFunctional() {
+    ecu.tcmPhysical = false;
+    ecu.tcmStored = {0x1718, 0x0705, 0x0710, 0x0715};   // a reply of several frames
+    boot();
+    runUntil(20);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.tcmFunctional, "fell back to 0x7DF for the transmission");
+    check(isoReq(0x7E1, 0x03) == 1 && isoReq(0x7DF, 0x03) == 1, "its own address first, then 0x7DF",
+          fmt("%d / %d", isoReq(0x7E1, 0x03), isoReq(0x7DF, 0x03)));
+    check(txCount([](const twai_message_t &m) { return m.identifier == 0x7E1 && (m.data[0] & 0xF0) == 0x30; }, 0) >= 1,
+          "flow control to the transmission's own address");
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 4 && shownCode(0) == "P1718 stored transmission",
+          "its four codes, the engine's answer to 0x7DF ignored", shownCode(0));
+    runUntil(75);
+    check(isoReq(0x7E1, 0x03) == 1 && isoReq(0x7DF, 0x03) == 2, "and straight to 0x7DF from then on");
+    commonChecks();
+}
+
+/** Listen-only: no code is asked for, and a clear is refused. */
+static void scDtcSilent() {
+    ecu.ecmStored = {0x0700};
+    storedConfig(R"({"diag_mode":4})");
+    boot();
+    runUntil(40);
+    check(txCount(anyFrame, 0) == 0, "not one frame sent");
+    char why[64];
+    check(!codesRequestClear(why, sizeof why) && std::strstr(why, "listen only"), "clear refused", why);
+    portalPost(R"({"dtc_poll_s":0,"diag_mode":0})");
+    runUntil(120);
+    check(txCount(isObdIso, 0) == 0, "dtc_poll_s 0: only when asked");
+    codesRequestRead();
+    runUntil(125);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 1 && shownValue(METRIC_ID_DTC_TOTAL) == 1, "asked: read", cs.note);
+    commonChecks();
+}
+
+/** One list unanswered while the rest of the read works (its reply lost, the
+ *  bus busy a moment): its codes stay on the displays - not gone for a minute.
+ *  A list that answers again says what is really there. */
+static void scDtcPartialRead() {
+    ecu.ecmStored  = {0x0700};
+    ecu.tcmStored  = {0x1718};
+    ecu.tcmPending = {0x0705};
+    boot();
+    runUntil(20);
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 3, "three codes after the first read",
+          fmt("%.0f", shownValue(METRIC_ID_DTC_TOTAL)));
+    int lost = 0;
+    ecu.ignoreIso = [&lost](bool tcm, uint8_t svc) { return tcm && svc == 0x07 && lost++ < 1; };
+    runUntil(80);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 2 && lost == 1 && cs.list[1][1] == LIST_NO_REPLY,
+          "second read: the transmission's pending list went unanswered", fmt("%u reads, %d lost", cs.reads, lost));
+    check(shownValue(METRIC_ID_DTC_TOTAL) == 3 && shownCode(2) == "P0705 pending transmission",
+          "its code is still shown", shownCode(2));
+    check(std::strstr(cs.note, "kept from the last read") != nullptr, "and the portal says so", cs.note);
+    ecu.tcmPending.clear();
+    runUntil(140);
+    codesGetStatus(cs);
+    check(cs.reads == 3 && cs.list[1][1] == LIST_ANSWERED && shownValue(METRIC_ID_DTC_TOTAL) == 2,
+          "answered again: the code that went is gone", fmt("%u reads, %.0f codes", cs.reads, shownValue(METRIC_ID_DTC_TOTAL)));
+    ecu.ignoreIso = [](bool tcm, uint8_t svc) { return !tcm && svc == 0x03; };
+    runUntil(400);
+    codesGetStatus(cs);
+    check(cs.list[0][0] == LIST_NO_REPLY && cs.n == 1 && shownCode(0) == "P1718 stored transmission",
+          "a list unanswered read after read is not kept for ever", fmt("%u codes, first %s", cs.n, shownCode(0).c_str()));
+    commonChecks();
+}
+
+/** dtc_poll_s 0 (only when asked), a read from the portal, then polling
+ *  switched back on: it starts without waiting for an ignition cycle. */
+static void scDtcPollResume() {
+    ecu.ecmStored = {0x0700};
+    storedConfig(R"({"dtc_poll_s":0})");
+    boot();
+    runUntil(30);
+    check(isoReq(0x7E0, 0x03) == 0, "dtc_poll_s 0: no read on its own");
+    codesRequestRead();
+    runUntil(35);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 1, "a read from the portal", cs.note);
+    portalPost(R"({"dtc_poll_s":60})");
+    runUntil(160);
+    codesGetStatus(cs);
+    check(cs.reads >= 2, "polling switched on: reads again with the car still on", fmt("%u reads", cs.reads));
+    commonChecks();
+}
+
+/** An ECM that refuses service 09 is asked for its identity once, not three
+ *  more requests at every read for the rest of the drive. */
+static void scDtcIdentRefused() {
+    ecu.vehicleInfo = false;
+    boot();
+    runUntil(140);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 3, "three reads", fmt("%u reads", cs.reads));
+    check(isoReq(0x7E0, 0x09) == 3, "service 09 refused: VIN, calibration and CVN asked once",
+          fmt("%d requests", isoReq(0x7E0, 0x09)));
+    check(!cs.vin[0] && !cs.calId[0][0], "and nothing made up");
+    commonChecks();
+}
+
+/** More distinct values than the store holds: the one that does not fit is
+ *  reported once in the log, not dropped without a word. */
+static void scMetricStoreFull() {
+    boot();
+    runUntil(5);
+    for (uint16_t i = 0; i < 200; i++) publishMetric(0xE000 + i, 1.0f, SRC_DERIVED);
+    for (uint16_t i = 0; i < 200; i++) publishMetric(0xE000 + i, 2.0f, SRC_DERIVED);
+    int told = 0;
+    for (const auto &l : sim::logLines) if (l.find("store full") != std::string::npos) told++;
+    check(told == 1, "store full: said once", fmt("%d lines", told));
+}
+
+/** Oil change due by the odometer SSM2 reads (123456 km in the simulator). */
+static void scServiceDue() {
+    storedConfig(R"({"oil_every_km":7500,"oil_at_km":116000})");
+    boot();
+    runUntil(30);
+    std::string info;
+    float odo = 0;
+    check(masterOdometer(odo) && std::fabs(odo - 123456) < 2.5, "odometer from SSM2", fmt("%.0f km", odo));
+    check(freshNear(METRIC_ID_SERVICE_KM, 116000 + 7500 - 123456, 2.5, info), "due in 44 km", info);
+    char why[64] = "";
+    check(masterServiceReset(why, sizeof why), "oil changed now", why);
+    runUntil(40);
+    check(freshNear(METRIC_ID_SERVICE_KM, 7500, 2.5, info), "the next one 7500 km away", info);
+    JsonDocument d;
+    deserializeJson(d, simfs::files["/config.json"]);
+    check((d["oil_at_km"] | -1L) == 123456L, "the reading is saved", fmt("%ld", d["oil_at_km"] | -1L));
+    commonChecks();
+}
+
+/** No last change set: no reminder. No odometer (OBD-II only): "oil changed
+ *  now" says why it cannot. */
+static void scServiceUnset() {
+    storedConfig(R"({"diag_mode":2})");
+    boot();
+    runUntil(40);
+    check(!shown(METRIC_ID_SERVICE_KM), "no reminder until the last change is set");
+    char why[80] = "";
+    check(!masterServiceReset(why, sizeof why) && std::strstr(why, "odometer"), "no odometer: refused", why);
+    commonChecks();
+}
+
+/** 0-100 km/h in 10 s, 10 s at 100, a stop in 5 s. */
+static double accelRun(double t) {
+    if (t < 10) return 0;
+    if (t < 20) return (t - 10) * 10;
+    if (t < 30) return 100;
+    if (t < 35) return 100 - (t - 30) * 20;
+    return 0;
+}
+
+/** G-meter without the stability unit's frame: longitudinal from speed. */
+static void scGDerived() {
+    sim::speedOverride = accelRun;
+    boot();
+    const double g0 = 100 / 3.6 / 10 / 9.80665, gb = -2 * g0;   // 0.283 g, -0.566 g
+    runUntil(15.5);
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL) - g0) < 0.03 && sourceOf(METRIC_ID_LON_ACCEL) == SRC_DERIVED,
+          "speeding up: from the speed", fmt("%.3f g (truth %.3f)", shownValue(METRIC_ID_LON_ACCEL), g0));
+    runUntil(25);
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL)) < 0.03, "steady: 0 g",
+          fmt("%.3f g", shownValue(METRIC_ID_LON_ACCEL)));
+    runUntil(33);
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL) - gb) < 0.05, "braking",
+          fmt("%.3f g (truth %.3f)", shownValue(METRIC_ID_LON_ACCEL), gb));
+    check(!shown(METRIC_ID_LAT_ACCEL), "no lateral G without a yaw rate");
+    commonChecks();
+}
+
+/** The stability unit's frame taught: its yaw rate gives lateral G (speed x
+ *  yaw); its own G fields, once taught, outrank anything derived. */
+static void scGTaught() {
+    sim::speedOverride = accelRun;
+    vdc.enabled = true;
+    vdc.yawDegS = 10;
+    boot();
+    portalPost(R"({"signals":[
+      {"name":"Yaw","can_id":212,"start":0,"len":16,"be":false,"signed":true,"scale":0.01,"offset":0,"metric":4110,"mode":1}]})");
+    runUntil(25);
+    const double lat = 100 / 3.6 * 10 * M_PI / 180 / 9.80665;   // 0.494 g
+    check(std::fabs(shownValue(METRIC_ID_YAW_RATE) - 10) < 0.02, "yaw rate read from the frame",
+          fmt("%.2f", shownValue(METRIC_ID_YAW_RATE)));
+    check(std::fabs(shownValue(METRIC_ID_LAT_ACCEL) - lat) < 0.02 && sourceOf(METRIC_ID_LAT_ACCEL) == SRC_DERIVED,
+          "lateral G = speed x yaw", fmt("%.3f g (truth %.3f)", shownValue(METRIC_ID_LAT_ACCEL), lat));
+    portalPost(R"({"signals":[
+      {"name":"Yaw","can_id":212,"start":0,"len":16,"be":false,"signed":true,"scale":0.01,"offset":0,"metric":4110,"mode":1},
+      {"name":"Lat G","can_id":212,"start":16,"len":16,"be":false,"signed":true,"scale":0.001,"offset":0,"metric":4108,"mode":1},
+      {"name":"Lon G","can_id":212,"start":32,"len":16,"be":false,"signed":true,"scale":0.001,"offset":0,"metric":4109,"mode":1}]})");
+    runUntil(32);
+    check(sourceOf(METRIC_ID_LAT_ACCEL) == SRC_RAW && sourceOf(METRIC_ID_LON_ACCEL) == SRC_RAW,
+          "taught fields outrank the derived values");
+    check(std::fabs(shownValue(METRIC_ID_LON_ACCEL) + 0.566) < 0.02, "braking G from the frame",
+          fmt("%.3f g", shownValue(METRIC_ID_LON_ACCEL)));
+    commonChecks();
+}
+
+/** A drive log file, parsed. */
+struct LogFile { bool ok = false; uint8_t hz = 0; std::vector<uint16_t> ids; uint32_t startMs = 0;
+                 std::vector<uint32_t> t; std::vector<std::vector<float>> rows; };
+static LogFile readLog(const std::string &path) {
+    LogFile L;
+    if (!simfs::files.count(path)) return L;
+    const std::string &d = simfs::files[path];
+    auto u8 = [&](size_t i) { return (uint8_t)d[i]; };
+    auto u32 = [&](size_t i) { return (uint32_t)(u8(i) | u8(i + 1) << 8 | u8(i + 2) << 16 | (uint32_t)u8(i + 3) << 24); };
+    if (d.size() < 16 || d.compare(0, 4, "TLG1")) return L;
+    L.hz = u8(5);
+    const size_t cols = u8(6);
+    L.startMs = u32(12);
+    size_t p = 16;
+    for (size_t i = 0; i < cols; i++, p += 2) L.ids.push_back((uint16_t)(u8(p) | u8(p + 1) << 8));
+    const size_t row = 4 + 4 * cols;
+    for (; p + row <= d.size(); p += row) {
+        L.t.push_back(u32(p));
+        std::vector<float> r(cols);
+        for (size_t i = 0; i < cols; i++) std::memcpy(&r[i], d.data() + p + 4 + 4 * i, 4);
+        L.rows.push_back(r);
+    }
+    L.ok = (d.size() - 16 - 2 * cols) % row == 0;
+    return L;
+}
+
+/** Recorded at 10 Hz into flash, one file a drive, values matching the car. */
+static void scDriveLog() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_ids":[268,269,4097]})");
+    boot();
+    runUntil(40);
+    DriveLogStatus st; driveLogStatus(st);
+    check(st.recording && !std::strcmp(st.file, "00001.tlg"), "recording into 00001.tlg", st.file);
+    check(st.flushes >= 2, "written to flash as it goes, not only at the end", fmt("%u writes", st.flushes));
+    carOff();
+    runUntil(45);
+    driveLogStatus(st);
+    check(!st.recording, "closed when the car went off", st.file);
+    const LogFile L = readLog("/log/00001.tlg");
+    check(L.ok && L.hz == 10 && L.ids == std::vector<uint16_t>({268, 269, 4097}), "header: 10 Hz, RPM, speed, boost");
+    const double secs = L.t.empty() ? 0 : L.t.back() / 1000.0;
+    check(std::fabs(L.rows.size() - secs * 10) < secs * 0.5 + 2 && secs > 38, "ten rows a second for the whole drive",
+          fmt("%zu rows over %.1f s", L.rows.size(), secs));
+    // Every row after the first seconds has the engine's values in it.
+    size_t good = 0, n = 0;
+    for (size_t i = 0; i < L.rows.size(); i++) {
+        const double at = tOf(((uint64_t)L.startMs + L.t[i]) * 1000);
+        if (at < 12) continue;
+        n++;
+        if (!std::isnan(L.rows[i][0]) && L.rows[i][0] > 600 && L.rows[i][0] < 4200 &&
+            !std::isnan(L.rows[i][1]) && L.rows[i][1] >= 0 && L.rows[i][1] < 120) good++;
+    }
+    check(n > 200 && good == n, "every row has RPM and speed", fmt("%zu of %zu", good, n));
+
+    carOn();
+    runUntil(70);
+    carOff();
+    runUntil(75);
+    LogFileInfo li[8];
+    const size_t nl = driveLogList(li, 8);
+    check(nl == 2 && !std::strcmp(li[1].name, "00002.tlg") && li[1].rows > 150, "the next drive: its own file",
+          nl == 2 ? fmt("%s %u rows %.0f s", li[1].name, li[1].rows, li[1].seconds) : fmt("%zu files", nl));
+    char path[32];
+    check(!driveLogPath("../config.json", path, sizeof path) && !driveLogPath("00009.tlg", path, sizeof path),
+          "only log files can be named");
+    check(driveLogDelete("00001.tlg") && !simfs::files.count("/log/00001.tlg"), "deleted on request");
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/config.json"]) && (d["log_on"] | false), "the settings untouched");
+    commonChecks();
+}
+
+/** The oldest drive cannot be deleted to make room - it is open, being
+ *  downloaded from the portal: the next oldest goes instead, and the logger
+ *  does not spin on the one it cannot delete. */
+static void scDriveLogHeldFile() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_max_kb":64,
+      "log_ids":[268,269,4097,273,260,261,262,263,264,265,266,267,270,271,272,274,275,276,277,278,279,280,281,282]})");
+    std::string old(28 * 1024, '\0');
+    std::memcpy(&old[0], "TLG1", 4);
+    simfs::files["/log/00001.tlg"] = old;
+    simfs::files["/log/00002.tlg"] = old;
+    simfs::held.insert("/log/00001.tlg");
+    boot();
+    runUntil(35);
+    DriveLogStatus st; driveLogStatus(st);
+    check(simfs::files.count("/log/00001.tlg") && !simfs::files.count("/log/00002.tlg"),
+          "the next oldest made room, the open one kept");
+    check(st.recording && !std::strcmp(st.file, "00003.tlg"), "still recording", st.note);
+    // 28 KB that cannot go and the new drive reach the 64 KB cap: it stops,
+    // and says why.
+    runUntil(70);
+    driveLogStatus(st);
+    check(!st.recording && std::strstr(st.note, "log space full"), "full: stopped, not stuck", st.note);
+    check(simfs::removes < 10, "no delete tried over and over", fmt("%d removes", simfs::removes));
+    commonChecks();
+}
+
+/** The space it may use: the oldest drive goes to make room, and the settings
+ *  always keep 128 KB of the partition. */
+static void scDriveLogFull() {
+    // 24 values: 100-byte rows, 1 KB a second.
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_max_kb":64,
+      "log_ids":[268,269,4097,273,260,261,262,263,264,265,266,267,270,271,272,274,275,276,277,278,279,280,281,282]})");
+    boot();
+    runUntil(40);
+    carOff(); runUntil(45);
+    carOn();  runUntil(85);
+    carOff(); runUntil(90);
+    LogFileInfo li[8];
+    size_t nl = driveLogList(li, 8);
+    uint32_t total = 0;
+    for (size_t i = 0; i < nl; i++) total += li[i].bytes;
+    check(nl == 1 && !std::strcmp(li[0].name, "00002.tlg") && total <= 64 * 1024,
+          "the first drive deleted to make room for the second", fmt("%zu files, %u bytes", nl, total));
+
+    // A partition nearly full of something else: the logger stops, settings saves still work.
+    simfs::totalBytes = simfs::usedBytes() + 140 * 1024;
+    carOn();
+    runUntil(180);
+    DriveLogStatus st; driveLogStatus(st);
+    check(std::strstr(st.note, "log space full") != nullptr, "stops when only the reserve is left", st.note);
+    check(simfs::usedBytes() + 100 * 1024 <= simfs::totalBytes, "the reserve is still free",
+          fmt("%zu KB free", (simfs::totalBytes - simfs::usedBytes()) / 1024));
+    portalPost(R"({"oil_every_km":8000})");
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/config.json"]) && (d["oil_every_km"] | 0) == 8000,
+          "a settings save still fits");
+    commonChecks();
 }
 
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
@@ -2020,7 +2789,6 @@ static void scSignalTable() {
     body.lever = 'M';                                    // code 7: not in the table
     runUntil(10);
     double v = 0;
-    bool ok = false;
     check(!shownNow(METRIC_ID_GEAR_LEVER, v), "a position not in the table publishes nothing (it goes stale)",
           fmt("%.0f", v));
     check(!shown(METRIC_ID_CUSTOM_1), "a raw value never in its table is never published");
@@ -2180,6 +2948,7 @@ static const Scenario SCENARIOS[] = {
     {"ssm_size_limit", scSsmSizeLimit, 0}, {"obd_functional", scObdFunctional, 0},
     {"obd_drops", scObdDrops, 0}, {"config_migration", scConfigMigration, 0},
     {"config_faults", scConfigFaults, 0}, {"config_tmp_only", scConfigTmpOnly, 0},
+    {"config_mount_glitch", scConfigMountGlitch, 0}, {"config_first_mount", scConfigFirstMount, 0},
     {"sleep", scSleep, 0}, {"clock_wrap", scClockWrap, 0}, {"both", scBoth, 0},
     {"obd_only", scObdOnly, 0}, {"ecu_off", scEcuOff, 0}, {"ssm_stmin", scSsmStmin, 0},
     {"ssm_stmin_reserved", scSsmStminReserved, 0}, {"ssm_cut", scSsmCut, 0}, {"ssm_dead", scSsmDead, 0},
@@ -2195,14 +2964,15 @@ static const Scenario SCENARIOS[] = {
     {"normal_confinement", scNormalConfinement, 0},
     {"lom_rec_drift", scLomRecDrift, 0}, {"passive_marginal", scPassiveMarginal, 0},
     {"lom_tec_hold", scLomTecHold, 0}, {"lom_tec_drain", scLomTecDrain, 0},
+    {"lom_counters_real", scLomCountersReal, 0}, {"rx_odd_frames", scRxOddFrames, 0},
     {"passive_off", scPassiveOff, 0}, {"passive_busoff", scPassiveBusOff, 0},
-    {"error_frames_never", scErrorFramesNever, 0}, {"bus_defaults", scBusDefaults, 0},
+    {"error_frames_never", scErrorFramesNever, 0}, {"passive_tec_verified", scPassiveTecVerified, 0}, {"bus_defaults", scBusDefaults, 0},
     {"link_misses", scLinkMisses, 0}, {"link_radio", scLinkRadio, 0},
     {"no_driver_retry", scNoDriverRetry, 0}, {"tec_write_not_ours", scTecWriteNotOurs, 0},
     {"link_bursts", scLinkBursts, 0}, {"timing_default", scTimingDefault, 0},
     {"portal_ap_safe", scPortalApSafe, 0}, {"portal_rescue", scPortalRescue, 0},
     {"timing_idf", scTimingIdf, 0}, {"timing_sp875_legacy", scTimingSp875Legacy, 0},
-    {"error_kinds", scErrorKinds, 0}, {"radio_power", scRadioPower, 0}, {"busoff_guard_off", scBusOffGuardOff, 0},
+    {"error_kinds", scErrorKinds, 0}, {"radio_power", scRadioPower, 0}, {"busoff_guard_off", scBusOffGuardOff, 0}, {"busoff_latch_no_normal", scBusOffLatchNoNormal, 0}, {"install_pad_latched", scInstallPadLatched, 0}, {"busoff_latch_after_settle", scBusOffLatchAfterSettle, 0},
     {"pacing_p2can", scPacingP2can, 0}, {"pacing_p2can_auto", scPacingP2canAuto, 0},
     {"budget", scBudget, 0}, {"no_functional", scNoFunctional, 0},
     {"crank_reset", scCrankReset, 0}, {"evlog", scEvlog, 0},
@@ -2210,6 +2980,24 @@ static const Scenario SCENARIOS[] = {
     {"teach_flips", scTeachFlips, 0}, {"signal_table", scSignalTable, 0},
     {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
     {"signal_bits", scSignalBits, 0},
+    {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
+    {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
+    {"busoff_cycles", scBusOffCycles, 0},
+    {"dtc_read", scDtcRead, 0},
+    {"dtc_clear", scDtcClear, 0},
+    {"dtc_tcm_functional", scDtcTcmFunctional, 0},
+    {"dtc_silent", scDtcSilent, 0},
+    {"dtc_partial_read", scDtcPartialRead, 0},
+    {"dtc_poll_resume", scDtcPollResume, 0},
+    {"dtc_ident_refused", scDtcIdentRefused, 0},
+    {"metric_store_full", scMetricStoreFull, 0},
+    {"drive_log_held_file", scDriveLogHeldFile, 0},
+    {"service_due", scServiceDue, 0},
+    {"service_unset", scServiceUnset, 0},
+    {"g_derived", scGDerived, 0},
+    {"g_taught", scGTaught, 0},
+    {"drive_log", scDriveLog, 0},
+    {"drive_log_full", scDriveLogFull, 0},
 };
 
 static const Scenario *s_sc = nullptr;

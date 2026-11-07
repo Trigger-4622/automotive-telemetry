@@ -111,3 +111,4 @@ esp_err_t twai_receive(twai_message_t *message, TickType_t ticks_to_wait);
 esp_err_t twai_read_alerts(uint32_t *alerts, TickType_t ticks_to_wait);
 esp_err_t twai_initiate_recovery(void);
 esp_err_t twai_get_status_info(twai_status_info_t *status_info);
+esp_err_t twai_clear_transmit_queue(void);

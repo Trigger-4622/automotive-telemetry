@@ -273,7 +273,8 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     // where a chapter ring would just crowd the text.
     // The dash draws its own tach arc where the bezel ring would be.
     const bool listLike = !strcmp(type, "diag") || !strcmp(type, "chart") ||
-                          !strcmp(type, "dash");
+                          !strcmp(type, "dash") || !strcmp(type, "gmeter") ||
+                          !strcmp(type, "perf");
     if (cfg["dial_face"] | !listLike) addDialFace(sd.root);
 
     if      (!strcmp(type, "arc_gauge"))   buildArcGauge(sd, cfg);
@@ -283,6 +284,8 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     else if (!strcmp(type, "text_list"))   buildTextList(sd, cfg);
     else if (!strcmp(type, "chart"))       buildChart(sd, cfg);
     else if (!strcmp(type, "dash"))        buildDash(sd, cfg);
+    else if (!strcmp(type, "gmeter"))      buildGMeter(sd, cfg);
+    else if (!strcmp(type, "perf"))        buildPerf(sd);
     else if (!strcmp(type, "diag"))      { buildDiag(sd); _diagIndex = _screens.size() - 1; }
     else                                   buildArcGauge(sd, cfg);   // fallback
 
@@ -1062,6 +1065,46 @@ void UIBuilder::buildDiag(ScreenDef &sd) {
     }
 }
 
+/* ═══════════════════════ driving: G-meter and timers ═════════════════════ */
+
+void UIBuilder::buildGMeter(ScreenDef &sd, JsonObject cfg) {
+    _gmeters.emplace_back();
+    sd.gmeter = (int)_gmeters.size() - 1;
+    gmeterBuild(_gmeters.back(), sd.root, LCD_WIDTH, LCD_HEIGHT, cfg["max_g"] | 1.0f);
+}
+
+void UIBuilder::buildPerf(ScreenDef &sd) {
+    _perfViews.emplace_back();
+    sd.perf = (int)_perfViews.size() - 1;
+    perfBuild(_perfViews.back(), sd.root, LCD_WIDTH, LCD_HEIGHT);
+}
+
+void UIBuilder::updateDrive(uint32_t now, float lerp) {
+    // Every new speed sample goes to the timers, on the master's clock.
+    float v;
+    uint32_t ms;
+    const bool speed = Telemetry.stamped(METRIC_ID_SPEED, v, ms);
+    if (speed && ms != _perfStamp) {
+        _perfStamp = ms;
+        _perfLocalMs = now;
+        float rpm;
+        uint32_t rms;
+        _perf.feed(ms, v, Telemetry.stamped(METRIC_ID_RPM, rpm, rms) ? rpm : NAN);
+    }
+
+    const ScreenDef &sd = _screens[_active];
+    if (sd.perf >= 0)
+        perfUpdate(_perfViews[sd.perf], _perf, _perfStamp + (now - _perfLocalMs), speed);
+    if (sd.gmeter >= 0) {
+        MetricSample la{}, lo{};
+        const bool latOk = sampleOnce(METRIC_ID_LAT_ACCEL, lerp, la) &&
+                           (la.flags & METRIC_FLAG_VALID) && !la.stale;
+        const bool lonOk = sampleOnce(METRIC_ID_LON_ACCEL, lerp, lo) &&
+                           (lo.flags & METRIC_FLAG_VALID) && !lo.stale;
+        gmeterUpdate(_gmeters[sd.gmeter], la.value, latOk, lo.value, lonOk);
+    }
+}
+
 /* ═══════════════════════════════ runtime ═════════════════════════════════ */
 
 void UIBuilder::uiTimerCb(lv_timer_t *t) {
@@ -1129,6 +1172,7 @@ void UIBuilder::tick() {
     const int dash = _screens[_active].dash;
     if (dash >= 0) updateDash(_dash[dash], lerp, now);
 
+    updateDrive(now, lerp);
     if (_diagIndex >= 0 && (size_t)_diagIndex == _active) updateDiag();
     updateTelltaleStrip();
     manageAlert();
@@ -1548,6 +1592,13 @@ void UIBuilder::showAlert(const AlertView &v, uint8_t othersActive) {
     }
 
     setLabelText(_alertName, _alertLastName, sizeof(_alertLastName), v.name);
+    if (v.scrollDetail != _alertDetailScroll) {
+        // Dots edit the label's own text; scrolling keeps all of it.
+        _alertDetailScroll = v.scrollDetail;
+        lv_label_set_long_mode(_alertDetail, v.scrollDetail ? LV_LABEL_LONG_SCROLL_CIRCULAR
+                                                            : LV_LABEL_LONG_DOT);
+        _alertLastDetail[0] = '\0';            // set it again under the new mode
+    }
     if (lamp) {
         // Three lines is all the card holds: the value when the lamp has one
         // ("9 %", "11.6 V"), otherwise what to do about it.
@@ -1668,7 +1719,7 @@ void UIBuilder::manageAlert() {
     const bool useLamp   = bl >= 0 && (!bw || (lampCrit && !watchCrit));
 
     AlertView v;
-    char value[28], detail[48];
+    char value[28], detail[48], codeLine[28];
     if (useLamp) {
         const Lamp &l = _lamps[bl];
         v.key    = ALERT_LAMP_KEY | (uint32_t)bl;
@@ -1679,6 +1730,13 @@ void UIBuilder::manageAlert() {
         _lamps.valueText((size_t)bl, value, sizeof(value));
         v.value  = value;
         v.detail = l.detail;
+        // Trouble codes: the code is the headline, what it means under it.
+        if (_lamps.codeText((size_t)bl, now, codeLine, sizeof(codeLine), detail, sizeof(detail))) {
+            v.name   = codeLine;
+            value[0] = '\0';
+            v.detail = detail;
+            v.scrollDetail = true;
+        }
         _lamps.shown((size_t)bl, now);
     } else {
         const WatchItem &w = *bw;

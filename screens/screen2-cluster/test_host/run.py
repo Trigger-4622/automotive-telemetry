@@ -36,7 +36,8 @@ LVGL = next((p for d in LIBDEPS for p in [os.path.join(d, "lvgl")] if os.path.is
 AJSON = next((p for d in LIBDEPS for p in [os.path.join(d, "ArduinoJson", "src")] if os.path.isdir(p)), None)
 
 SOURCES = [os.path.join(ROOT, "src", *p.split("/")) for p in (
-    "ui/UIBuilder.cpp", "ui/Telltales.cpp", "telemetry/TelemetryStore.cpp",
+    "ui/UIBuilder.cpp", "ui/Telltales.cpp", "ui/PerfTimer.cpp", "ui/DriveViews.cpp",
+    "telemetry/TelemetryStore.cpp",
     "config/ConfigManager.cpp")]
 SOURCES += sorted(glob.glob(os.path.join(HERE, "host", "*.cpp")))
 SOURCES += sorted(glob.glob(os.path.join(HERE, "tests", "*.cpp")))

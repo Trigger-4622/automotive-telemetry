@@ -18,7 +18,10 @@ NAMES = {
 0x1212:'Door RL',0x1213:'Door RR',0x1214:'Trunk open',0x1215:'Hood open',0x1216:'VDC off',
 0x1217:'Passenger belt unfastened',
 0x3001:'Custom 1',0x3002:'Custom 2',0x3003:'Custom 3',0x3004:'Custom 4',0x3005:'Custom 5',0x3006:'Custom 6',0x3007:'Custom 7',0x3008:'Custom 8',0x3009:'Custom 9',0x300A:'Custom 10',0x300B:'Custom 11',0x300C:'Custom 12',0x300D:'Custom 13',0x300E:'Custom 14',0x300F:'Custom 15',0x3010:'Custom 16',
-0x0101:'MIL lamp',0x0301:'DTC count',0x0103:'Fuel system status',
+0x0101:'MIL lamp',0x0301:'DTC count',
+0x0400:'Trouble codes',0x0401:'Trouble code 1',0x0402:'Trouble code 2',0x0403:'Trouble code 3',
+0x0404:'Trouble code 4',0x0405:'Trouble code 5',0x0406:'Trouble code 6',0x0407:'Trouble code 7',
+0x0408:'Trouble code 8',0x0103:'Fuel system status',
 0x0104:'Engine load %',0x0105:'Coolant °C',0x0106:'STFT B1 %',0x0107:'LTFT B1 %',
 0x0108:'STFT B2 %',0x0109:'LTFT B2 %',0x010A:'Fuel press kPa',0x010B:'MAP kPa',
 0x010C:'RPM',0x010D:'Speed km/h',0x010E:'Timing °',0x010F:'IAT °C',0x0110:'MAF g/s',
@@ -64,7 +67,7 @@ NAMES = {
 0x210E:'Starter',0x210F:'Rear defogger',0x2110:'Blower',0x2111:'Wiper switch',
 0x2112:'Ignition',0x2113:'Stop lamp switch',0x2114:'Knock signal 2',
 0x1F01:'Night sense',0x1F02:'Master uptime s',0x1F03:'CAN frames/s',0x1F04:'CAN IDs',
-0x1F05:'OBD replies/s',0x1F06:'SSM2 exch/s',
+0x1F05:'OBD replies/s',0x1F06:'SSM2 exch/s',0x1F10:'Oil change due km',
 }
 hdr = io.open(os.path.join(ROOT, "master", "include", "MasterPacket.h"),
               encoding="utf-8").read()

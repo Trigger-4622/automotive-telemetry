@@ -11,6 +11,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "driver/twai.h"
 
 /**
  * @brief Where a value came from, in ascending order of preference.
@@ -63,6 +64,7 @@ bool diagObdWanted();                 /**< The OBD-II poller should run.   */
 void diagReportSsm(bool answered);    /**< SSM2 init result, from its task.*/
 void diagReportObd(bool answered);    /**< OBD-II probe result.            */
 bool diagBusAlive();                  /**< Frames seen within the last 2 s.*/
+bool masterHeardWithin(uint32_t ms);  /**< A frame within the last @p ms.  */
 /** One diagnostic dialogue on the bus at a time. Both engines transmit to
  *  0x7E0 and listen on 0x7E8; interleaving them corrupts both. */
 bool diagBusLock(uint32_t timeoutMs);
@@ -108,6 +110,8 @@ struct MasterStats {
     uint32_t busBitsRx;  /**< Estimated bits received since boot.      */
     uint32_t canTx;      /**< Frames this node transmitted.            */
     uint16_t bitrate;    /**< kbit/s, for turning bits into a load %.  */
+    uint32_t stackMinFree;     /**< Least stack any CAN-side task has had left [B]. */
+    const char *stackMinTask;  /**< ...and which task that was.                     */
     uint32_t tec;        /**< Transmit error counter (ours).           */
     uint32_t rec;        /**< Receive error counter.                   */
     uint32_t busErrors;  /**< Bus errors seen by the controller.       */
@@ -252,6 +256,16 @@ bool masterPidSupported(uint8_t pid);
 /** @brief Count one frame this node put on the bus. */
 void masterCountTx();
 
+/**
+ * @brief Hand one frame to the controller - the only way the master
+ *        transmits. Refused (false) unless the controller is running in normal
+ *        mode with its TX pad attached and diagGuardOk() holds; checked and
+ *        handed over under the lock every controller change takes, so no start,
+ *        stop, reinstall or TEC write can come in between.
+ * @param waitMs How long to wait for the lock and for room in the queue.
+ */
+bool masterTransmit(const twai_message_t &msg, uint32_t waitMs);
+
 /** @brief Census snapshot in arrival order (no sorting), for the learner. */
 size_t masterCensusRaw(CensusView *out, size_t max);
 
@@ -288,3 +302,11 @@ bool diagObdSettled();
  *        and by the broadcaster before every burst (bus-read inputs).
  */
 void masterUpdateDerived();
+
+/** @brief The odometer [km]: SSM2's, else OBD-II PID A6. @return false if neither is fresh. */
+bool masterOdometer(float &km);
+/**
+ * @brief "Oil changed now": the odometer becomes the last change.
+ * @param[out] why Why not (the odometer not read yet).
+ */
+bool masterServiceReset(char *why, size_t cap);
