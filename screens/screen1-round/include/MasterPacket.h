@@ -78,6 +78,8 @@
  *   0x10xx — Raw-CAN decoded signals: powertrain/chassis (DBC-style).
  *   0x11xx — Raw-CAN decoded signals: ELECTRICAL SYSTEM (battery, alternator,
  *            charging, 12 V rail, load management).
+ *   0x04xx — Trouble codes the master read from the engine and
+ *            transmission computers (see METRIC_ID_DTC_1).
  *   0x20xx — Subaru SSM2 measurements with no OBD-II equivalent.
  *   0x21xx — Subaru SSM2 switches: 0 or 1, straight from the ECU's inputs
  *            and outputs.
@@ -365,6 +367,35 @@
 #define METRIC_ID_SW_IGNITION     0x2112  /**< Ignition switch                */
 #define METRIC_ID_SW_STOP_LIGHT   0x2113  /**< Stop light switch              */
 #define METRIC_ID_SW_KNOCK2       0x2114  /**< Knock signal #2                */
+
+/* ---- Trouble codes (0x04xx) ---------------------------------------------
+ * The master asks the engine computer (ECM, 0x7E0) and the transmission
+ * computer (TCM, 0x7E1) for their codes - OBD-II services 03 (stored), 07
+ * (pending) and 0A (permanent) - and publishes them one per channel, so a
+ * display can name them ("P1718"). Each DTC_n value is an integer a float
+ * holds exactly:
+ *     raw | kind << 16 | module << 18
+ *   raw     the two code bytes as the computer sends them: bits 15-14 the
+ *           letter (0 P, 1 C, 2 B, 3 U), then four digits (0x1718 = P1718)
+ *   kind    0 stored, 1 pending, 2 permanent
+ *   module  0 engine, 1 transmission
+ * DTC_TOTAL is how many there are: 0 once read and clean. Slots past it are
+ * not sent. include/DtcText.h decodes them and names the common ones.
+ */
+#define METRIC_ID_DTC_TOTAL       0x0400  /**< Trouble codes read       [-]  */
+#define METRIC_ID_DTC_1           0x0401  /**< Trouble code 1 (packed)       */
+#define METRIC_ID_DTC_2           0x0402  /**< Trouble code 2 (packed)       */
+#define METRIC_ID_DTC_3           0x0403  /**< Trouble code 3 (packed)       */
+#define METRIC_ID_DTC_4           0x0404  /**< Trouble code 4 (packed)       */
+#define METRIC_ID_DTC_5           0x0405  /**< Trouble code 5 (packed)       */
+#define METRIC_ID_DTC_6           0x0406  /**< Trouble code 6 (packed)       */
+#define METRIC_ID_DTC_7           0x0407  /**< Trouble code 7 (packed)       */
+#define METRIC_ID_DTC_8           0x0408  /**< Trouble code 8 (packed)       */
+#define DTC_SLOTS                 8       /**< DTC_1 … DTC_8                 */
+
+/** Distance left to the next oil change, from the odometer and the interval
+ *  set in the master's portal; negative once it is overdue. */
+#define METRIC_ID_SERVICE_KM      0x1F10  /**< Oil change due in        [km] */
 
 #define METRIC_ID_NIGHT_SENSE     0x1F01  /**< Night-mode source (>0.5 = night)*/
 /*

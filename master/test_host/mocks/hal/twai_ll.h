@@ -1,8 +1,9 @@
 /**
  * @file twai_ll.h
  * @brief Host mock of the ESP-IDF TWAI low-level register API: just the calls
- *        the master's listen-only erratum fix makes. Implemented against the
- *        simulated controller in sim_bus.cpp (reset mode, REC).
+ *        the master makes - reset mode and the TEC/REC writes, and abort
+ *        transmission. Implemented against the simulated controller in
+ *        sim_bus.cpp.
  */
 #pragma once
 #include <cstdint>
@@ -24,3 +25,6 @@ uint32_t twai_ll_get_rec(twai_dev_t *hw);
 void     twai_ll_set_rec(twai_dev_t *hw, uint32_t rec);
 uint32_t twai_ll_get_tec(twai_dev_t *hw);
 void     twai_ll_set_tec(twai_dev_t *hw, uint32_t tec);
+/** Abort transmission: the frame in the buffer is not retransmitted after its
+ *  current attempt (an aborted frame completes as failed). */
+void     twai_ll_set_cmd_abort_tx(twai_dev_t *hw);

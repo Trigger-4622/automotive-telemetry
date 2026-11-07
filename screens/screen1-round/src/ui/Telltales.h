@@ -37,6 +37,8 @@
 #include <ArduinoJson.h>
 #include <lvgl.h>
 
+#include "MasterPacket.h"
+
 class TelemetryStore;
 
 /** @brief Lamp colour, by what it asks of the driver (ISO 2575). */
@@ -66,7 +68,7 @@ enum class LampPopup : uint8_t {
 enum LampIcon : uint8_t {
     ICON_MIL, ICON_SEATBELT, ICON_DOOR, ICON_PARK, ICON_TURN_L, ICON_TURN_R,
     ICON_HIGH_BEAM, ICON_LIGHTS, ICON_CRUISE, ICON_FUEL, ICON_BATTERY,
-    ICON_OIL, ICON_COOLANT, ICON_KNOCK, ICON_WARN,
+    ICON_OIL, ICON_COOLANT, ICON_KNOCK, ICON_WARN, ICON_SERVICE,
     ICON_COUNT
 };
 
@@ -97,6 +99,12 @@ struct Lamp {
     uint16_t  holdMs;         /**< Stays lit this long after it clears.       */
     uint16_t  extraMetric;    /**< Shown as the alert's value, e.g. DTC count.*/
     uint8_t   decimals;       /**< Decimals of the alert's value.             */
+    /** The trouble codes ride on it (the check-engine and codes lamps): its
+     *  card names them. Set by the built-in table, not the layout. */
+    bool      codes;
+    /** Only a card: never on the strip or the dash (pending codes with the
+     *  car's own lamp off must not light a check-engine symbol). */
+    bool      cardOnly;
     /** @} */
 
     /** @name State — what the UI draws
@@ -138,7 +146,7 @@ class Telltales {
 public:
     /** Room for every built-in lamp plus a margin. At most 32: the strip
      *  keeps one bit per lamp. */
-    static constexpr size_t MAX_LAMPS = 20;
+    static constexpr size_t MAX_LAMPS = 22;
 
     /** Engine speed above which the engine counts as running [rpm]. */
     static constexpr float    ENGINE_RPM       = 400.0f;
@@ -283,6 +291,20 @@ public:
     void valueText(size_t i, char *out, size_t n) const;
 
     /**
+     * @brief The trouble code a code-carrying lamp's card shows now: one at a
+     *        time, the next every few seconds.
+     * @param i        Lamp index.
+     * @param now      millis().
+     * @param[out] code "P1718 TCM 1/2": the code, "TCM" for the transmission's,
+     *                 "PENDING" for one not confirmed, and which of how many.
+     * @param[out] text What it means ("AT CAN communication circuit").
+     * @return false when the lamp carries no codes or none are known.
+     */
+    bool codeText(size_t i, uint32_t now, char *code, size_t cn, char *text, size_t tn) const;
+    /** @return Trouble codes the master reported (DTC_TOTAL), -1 unknown. */
+    int codeCount() const { return _nCodes; }
+
+    /**
      * @brief Colour of the most urgent lit lamp drawn with @p icon.
      *
      * Two lamps can share a symbol (engine hot is red, engine cold blue) and a
@@ -340,6 +362,11 @@ private:
     bool     _peeking   = false;  /**< Full strip after a lamp came on.     */
     uint32_t _peekSince = 0;
     bool     _turnOn    = false;  /**< An indicator is on.                  */
+
+    /** The trouble codes from the master (METRIC_ID_DTC_1..), packed. */
+    float    _codes[DTC_SLOTS] = {};
+    int      _nCodes   = -1;      /**< DTC_TOTAL; -1 = not reported.        */
+    uint8_t  _nSlots   = 0;       /**< Of those, the ones received.         */
 
     float    _speed          = 0;
     bool     _engineRunning  = false;

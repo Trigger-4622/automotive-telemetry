@@ -50,6 +50,8 @@
 #include <lvgl.h>
 #include <vector>
 
+#include "DriveViews.h"
+#include "PerfTimer.h"
 #include "TelemetryStore.h"
 #include "Telltales.h"
 
@@ -214,6 +216,8 @@ struct ScreenDef {
      */
     bool      showTelltales = true;
     int       dash     = -1;       /**< Index into the dash list, or -1.     */
+    int       gmeter   = -1;       /**< Index into the G-meter list, or -1.  */
+    int       perf     = -1;       /**< Index into the timer list, or -1.    */
     std::vector<GaugeBinding> bindings;  /**< Metrics rendered here.         */
 };
 
@@ -231,6 +235,9 @@ struct AlertView {
     const char *name   = "";  /**< Metric name or lamp title.                 */
     const char *value  = "";  /**< Value and units; may be empty.             */
     const char *detail = "";  /**< Why, or what to do.                        */
+    /** The detail scrolls when it does not fit, rather than being cut short:
+     *  a trouble code's meaning is the point of its card. */
+    bool        scrollDetail = false;
 };
 
 /** Keys at or above this are lamps (low byte = lamp index), not metric IDs. */
@@ -430,6 +437,13 @@ private:
      * @param sd Screen being built. @param cfg Screen configuration.
      */
     void buildDash(ScreenDef &sd, JsonObject cfg);
+    /** @brief The G-meter: a friction-circle dot (`"max_g"`, default 1). */
+    void buildGMeter(ScreenDef &sd, JsonObject cfg);
+    /** @brief The performance timers: 0-100, 80-120, quarter mile. */
+    void buildPerf(ScreenDef &sd);
+    /** @brief Feed the timers every tick, whatever screen is up; draw the
+     *         G-meter or the timers when theirs is. */
+    void updateDrive(uint32_t now, float lerp);
     /**
      * @brief Fill one dash binding from its part of the configuration.
      * @param b     Binding to fill.
@@ -635,6 +649,13 @@ private:
     std::vector<WatchItem> _watch;      /**< the guard list — see class doc  */
     Telltales              _lamps;      /**< Warning lamps — see Telltales.h */
     std::vector<DashView>  _dash;       /**< Every dash screen's extras.     */
+    std::vector<GMeterView> _gmeters;   /**< Every G-meter screen.           */
+    std::vector<PerfView>   _perfViews; /**< Every timer screen.             */
+    /** The performance timers: timed on this display from the master's
+     *  speed, whichever screen is showing. */
+    PerfTimer _perf;
+    uint32_t  _perfStamp   = 0;         /**< Master time of the last sample fed. */
+    uint32_t  _perfLocalMs = 0;         /**< ...and millis() when it came.   */
 
     /** @brief One metric's sample, shared by every binding this tick. */
     struct TickSample {
@@ -707,6 +728,7 @@ private:
     char       _alertLastName[40]   = {0};  /**< Change guard for the name.  */
     char       _alertLastValue[40]  = {0};  /**< Change guard for the value. */
     char       _alertLastDetail[56] = {0};  /**< Change guard for the detail.*/
+    bool       _alertDetailScroll = false;  /**< Its long mode now.          */
     /** @} */
 
     /** @name Acknowledgement

@@ -7,6 +7,7 @@
 
 #include <math.h>
 
+#include "DtcText.h"    // the only file here that includes it (its table is static)
 #include "HardwareConfig.h"
 #include "MasterPacket.h"
 #include "Palette.h"
@@ -41,6 +42,7 @@ kIcons[ICON_COUNT] = {
     { &icon_coolant,   &icon_coolant_36,   "coolant"   },
     { &icon_knock,     &icon_knock_36,     "knock"     },
     { &icon_warn,      &icon_warn_36,      "warn"      },
+    { &icon_service,   &icon_service_36,   "service"   },
 };
 
 const lv_img_dsc_t *Telltales::iconImage(uint8_t icon, bool large) {
@@ -101,7 +103,25 @@ void Telltales::loadDefaults() {
                    ICON_MIL, LampTone::Amber, METRIC_ID_MIL, LampRule::On);
     l->popup = LampPopup::Once;  l->popupSecs = 10;
     l->extraMetric = METRIC_ID_DTC_COUNT;
+    l->codes = true;            // its card names the codes the master read
     strlcpy(l->units, "CODES", sizeof(l->units));
+
+    // Codes with the car's own lamp off: pending ones, or stored ones after
+    // the lamp went out. A card, once; never a check-engine symbol on the
+    // strip or the dash - the car's lamp is not on. With it on, the
+    // check-engine card names the codes and this one keeps quiet.
+    l = &add("codes", "TROUBLE CODES", "READ BY THE MASTER",
+             ICON_MIL, LampTone::Amber, METRIC_ID_DTC_TOTAL, LampRule::Above, 0.5f, 0.0f);
+    l->codes = true;  l->cardOnly = true;  l->strip = false;
+    l->popup = LampPopup::Once;  l->popupSecs = 12;
+
+    // Oil change due, from the odometer and the interval set on the master:
+    // amber for the last 500 km, like the car's own service reminder.
+    l = &add("service", "OIL CHANGE DUE", "BOOK THE SERVICE",
+             ICON_SERVICE, LampTone::Amber, METRIC_ID_SERVICE_KM, LampRule::Below,
+             500.0f, 50.0f);
+    l->popup = LampPopup::Once;  l->popupSecs = 10;
+    strlcpy(l->units, "km", sizeof(l->units));
 
     l = &add("oil", "OIL PRESSURE", "STOP THE ENGINE SAFELY",
              ICON_OIL, LampTone::Red, METRIC_ID_OIL_PRESSURE, LampRule::Below,
@@ -351,6 +371,17 @@ void Telltales::update(TelemetryStore &store, uint32_t now) {
     const float spd = usableRaw(store, METRIC_ID_SPEED);
     _speed = isnan(spd) ? 0.0f : spd;
 
+    // The codes the master read, for the cards that name them.
+    const float total = usableRaw(store, METRIC_ID_DTC_TOTAL);
+    _nCodes = isnan(total) ? -1 : (int)lroundf(total);
+    _nSlots = 0;
+    for (int k = 0; k < DTC_SLOTS && k < _nCodes; k++) {
+        const float v = usableRaw(store, (uint16_t)(METRIC_ID_DTC_1 + k));
+        if (isnan(v)) break;
+        _codes[_nSlots++] = v;
+    }
+    const int mil = find("mil");
+
     // Engine running = above cranking speed, continuously. Unknown RPM counts
     // as not running, which keeps every engine-gated lamp dark rather than
     // lighting oil and charging on a car whose ECU simply is not answering.
@@ -388,6 +419,8 @@ void Telltales::update(TelemetryStore &store, uint32_t now) {
             }
         }
         if (l.engine && !_engineSettled) c = false;
+        // The codes card stands down while the check-engine card names them.
+        if (l.cardOnly && l.codes && mil >= 0 && (size_t)mil != i && _lamps[mil].on) c = false;
         l.cond = c;
 
         const bool wasOn = l.on;
@@ -468,7 +501,7 @@ void Telltales::update(TelemetryStore &store, uint32_t now) {
 bool Telltales::onStrip(size_t i) const {
     if (i >= _n) return false;
     const Lamp &l = _lamps[i];
-    if (!l.on || !l.strip) return false;
+    if (!l.on || !l.strip || l.cardOnly) return false;
     return stripFull() || l.tone == LampTone::Red || l.tone == LampTone::Amber;
 }
 
@@ -517,15 +550,36 @@ void Telltales::valueText(size_t i, char *out, size_t n) const {
     if (l.extraMetric)                                          v = l.extra;
     else if (l.rule == LampRule::Above || l.rule == LampRule::Below) v = l.value;
     if (isnan(v)) return;
+    // A distance left that has gone below zero is overdue (the oil change).
+    if (l.rule == LampRule::Below && l.threshold > 0 && v < 0 && l.units[0]) {
+        snprintf(out, n, "OVERDUE %.*f %s", l.decimals, -v, l.units);
+        return;
+    }
     if (l.units[0]) snprintf(out, n, "%.*f %s", l.decimals, v, l.units);
     else            snprintf(out, n, "%.*f", l.decimals, v);
+}
+
+bool Telltales::codeText(size_t i, uint32_t now, char *code, size_t cn, char *text, size_t tn) const {
+    if (i >= _n || !_lamps[i].codes || _nSlots == 0) return false;
+    // One code at a time, the next every three seconds.
+    const uint8_t k = (uint8_t)((now / 3000u) % _nSlots);
+    uint16_t raw; uint8_t kind, mod;
+    dtcUnpack(_codes[k], raw, kind, mod);
+    char c[6];
+    dtcCode(raw, c);
+    char of[12] = "";
+    if (_nCodes > 1) snprintf(of, sizeof of, " %u/%d", k + 1, _nCodes);
+    snprintf(code, cn, "%s%s%s%s", c, mod == DTC_TRANSMISSION ? " TCM" : "",
+             kind == DTC_PENDING ? " PENDING" : kind == DTC_PERMANENT ? " PERM." : "", of);
+    strlcpy(text, dtcText(raw), tn);
+    return true;
 }
 
 bool Telltales::iconState(uint8_t icon, uint32_t &rgb, bool &lit) const {
     int best = -1;
     for (size_t i = 0; i < _n; i++) {
         const Lamp &l = _lamps[i];
-        if (!l.on || l.icon != icon) continue;
+        if (!l.on || l.icon != icon || l.cardOnly) continue;
         if (best < 0 || rank(i) < rank((size_t)best)) best = (int)i;
     }
     if (best < 0) return false;

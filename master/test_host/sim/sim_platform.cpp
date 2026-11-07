@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <deque>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -27,12 +28,13 @@
 
 /* ═════════════════════════════ FreeRTOS ═════════════════════════════════ */
 
-BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t, void *arg,
+BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t stack, void *arg,
                                    UBaseType_t prio, TaskHandle_t *handle, BaseType_t) {
-    if (handle) *handle = nullptr;
+    if (handle) *handle = (TaskHandle_t)(uintptr_t)stack;   // what uxTaskGetStackHighWaterMark reports from
     simrtos::createTask(fn, name, arg, (int)prio);
     return pdPASS;
 }
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task) { return (UBaseType_t)((uintptr_t)task / 2); }
 void vTaskDelay(TickType_t ticks) { simrtos::sleepUs(simTicksUs(ticks)); }
 TickType_t xTaskGetTickCount() { return (TickType_t)(simrtos::nowUs() / 1000); }
 
@@ -199,6 +201,7 @@ int analogRead(uint8_t) { return 2000; }
 
 namespace sim {
 int  gpioHoldEnabled = 0;
+bool txHeld = false;
 bool txDrivenHigh = false;
 bool txConfiguredOut = false;
 int  txGlitches = 0;
@@ -212,8 +215,9 @@ TimingView timing = {};
 
 esp_reset_reason_t esp_reset_reason() { return (esp_reset_reason_t)sim::resetReason; }
 
-esp_err_t gpio_hold_en(gpio_num_t)  { sim::gpioHoldEnabled++; return ESP_OK; }
-esp_err_t gpio_hold_dis(gpio_num_t) { if (sim::gpioHoldEnabled) sim::gpioHoldEnabled--; return ESP_OK; }
+// The pad hold is on or off, not counted: a second gpio_hold_en() changes nothing.
+esp_err_t gpio_hold_en(gpio_num_t)  { sim::gpioHoldEnabled = 1; sim::txHoldChanged(true);  return ESP_OK; }
+esp_err_t gpio_hold_dis(gpio_num_t) { sim::gpioHoldEnabled = 0; sim::txHoldChanged(false); return ESP_OK; }
 void      gpio_deep_sleep_hold_en()  {}
 void      gpio_deep_sleep_hold_dis() {}
 esp_err_t gpio_pullup_en(gpio_num_t) { return ESP_OK; }
@@ -241,13 +245,56 @@ std::map<std::string, std::string> files;
 long writeBudget = -1;
 bool renameOverwrites = true;
 bool mountOk = true;
+int  mountFails = 0;
+bool blank = false;
+int  formats = 0;
+std::set<std::string> held;
 int  renames = 0, removes = 0;
+size_t totalBytes = 1536 * 1024;
+std::set<std::string> dirs;
+size_t usedBytes() {
+    size_t n = 2 * 4096;                       // superblocks
+    for (const auto &kv : files) n += (kv.second.size() + 4095) / 4096 * 4096 + 4096;
+    return n;
+}
 }
 LittleFSFS LittleFS;
 
-bool LittleFSFS::begin(bool) { return simfs::mountOk; }
+bool LittleFSFS::mkdir(const char *p) { simfs::dirs.insert(p); return true; }
+size_t File::size() const { return _st ? _st->data.size() : 0; }
+const char *File::name() const {
+    if (!_st) return "";
+    const size_t k = _st->path.rfind('/');
+    return _st->path.c_str() + (k == std::string::npos ? 0 : k + 1);
+}
+File File::openNextFile() {
+    File f;
+    if (!_st || !_st->dir || _st->next >= _st->list.size()) return f;
+    f._st = std::make_shared<State>();
+    f._st->path = _st->list[_st->next++];
+    f._st->data = simfs::files[f._st->path];
+    return f;
+}
+
+bool LittleFSFS::begin(bool formatOnFail) {
+    if (!simfs::mountOk) return false;
+    bool fails = simfs::blank;
+    if (simfs::mountFails > 0) { simfs::mountFails--; fails = true; }
+    if (!fails) return true;
+    if (!formatOnFail) return false;
+    // The core formats a partition that will not mount, then mounts it.
+    simfs::formats++;
+    simfs::files.clear();
+    simfs::dirs.clear();
+    simfs::blank = false;
+    return true;
+}
 bool LittleFSFS::exists(const char *p) { return simfs::files.count(p) > 0; }
-bool LittleFSFS::remove(const char *p) { simfs::removes++; return simfs::files.erase(p) > 0; }
+bool LittleFSFS::remove(const char *p) {
+    simfs::removes++;
+    if (simfs::held.count(p)) return false;
+    return simfs::files.erase(p) > 0;
+}
 bool LittleFSFS::rename(const char *from, const char *to) {
     simfs::renames++;
     if (!simfs::files.count(from)) return false;
@@ -258,12 +305,26 @@ bool LittleFSFS::rename(const char *from, const char *to) {
 }
 File LittleFSFS::open(const char *path, const char *mode) {
     File f;
-    const bool w = mode && mode[0] == 'w';
-    if (!w && !simfs::files.count(path)) return f;
+    const bool w = mode && mode[0] == 'w', a = mode && mode[0] == 'a';
+    if (!w && !a && !simfs::files.count(path)) {
+        // A directory: a path made with mkdir, or one files live under.
+        const std::string pre = std::string(path) + "/";
+        std::vector<std::string> list;
+        for (const auto &kv : simfs::files)
+            if (kv.first.compare(0, pre.size(), pre) == 0 && kv.first.find('/', pre.size()) == std::string::npos)
+                list.push_back(kv.first);
+        if (list.empty() && !simfs::dirs.count(path)) return f;
+        f._st = std::make_shared<File::State>();
+        f._st->path = path;
+        f._st->dir = true;
+        f._st->list = list;
+        return f;
+    }
     f._st = std::make_shared<File::State>();
     f._st->path = path;
-    f._st->writing = w;
+    f._st->writing = w || a;
     if (w) simfs::files[path] = "";
+    else if (a) simfs::files[path];            // created if missing, kept if not
     else   f._st->data = simfs::files[path];
     return f;
 }

@@ -22,6 +22,15 @@ screens listen and draw them.
 Each firmware folder is a standalone PlatformIO project. They share one wire
 contract, `include/MasterPacket.h`, which must stay byte-identical in all three.
 
+Beyond the gauges: the master reads the engine and transmission computers'
+trouble codes (shown with their meaning in its portal and on the screens'
+check-engine card, with a Clear button in the portal), the VIN and calibration
+ID (what RomRaider's definitions are listed by), counts down to the next oil
+change from the odometer, records chosen values to its flash at up to 20 Hz
+(downloaded from the portal as CSV), and gives the screens lateral and
+longitudinal G for a G-meter. The screens time 0-100 km/h, 80-120 km/h and the
+quarter mile themselves.
+
 ## Build and flash
 
 Needs [PlatformIO](https://platformio.org/). Each project builds on its own:

@@ -112,3 +112,34 @@ uint32_t ssm2Responses();
 
 /** @brief Failed or timed-out SSM2 exchanges since boot. */
 uint32_t ssm2Errors();
+
+/** @brief How an isoExchange() went. */
+enum IsoResult : uint8_t {
+    ISO_OK,         /**< A reply to the request.                              */
+    ISO_NRC,        /**< A negative reply: rsp = 7F <service> <code>.         */
+    ISO_NO_REPLY,   /**< Sent, and nothing (or a broken reply) came back.     */
+    ISO_BUSY        /**< Never sent: guard up, bus quiet, lock not free.      */
+};
+
+/**
+ * @brief One ISO 15765-2 request and its reply, with any diagnostic address -
+ *        the SSM2 transport lent out, under the same bus lock and guard.
+ *
+ * Every frame goes through masterTransmit(), so it is refused while the bus is
+ * quiet, in listen-only, during the settle wait or while the guard is up.
+ * A negative reply 0x78 ("still working") extends the wait, as for SSM2.
+ *
+ * @param txId     Request ID: 0x7E0 engine, 0x7E1 transmission, or 0x7DF
+ *                 (every computer; the request must then fit one frame).
+ * @param rxId     The reply's ID (0x7E8 engine, 0x7E9 transmission).
+ * @param fcId     Where our flow control for a long reply goes: the
+ *                 responder's own request ID, also after a 0x7DF request.
+ * @param req      Service byte first.
+ * @param[out] rsp The reply, service byte (request + 0x40, or 0x7F) first.
+ * @param[out] got Reply length.
+ * @param timeoutMs How long the reply may take.
+ * @param[out] why Why it failed, in plain words ("" when it did not).
+ */
+IsoResult isoExchange(uint32_t txId, uint32_t rxId, uint32_t fcId,
+                      const uint8_t *req, size_t len, uint8_t *rsp, size_t max, size_t &got,
+                      uint32_t timeoutMs, char *why, size_t whyCap);

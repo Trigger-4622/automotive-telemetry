@@ -36,7 +36,7 @@ static constexpr const char *FS_PARTITION_LABEL = "spiffs";
  * (e.g. first flash without `pio run -t uploadfs`). The full annotated
  * example lives in data/layout.json. */
 static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
-  "version": 2,
+  "version": 3,
   "global": { "smoothing_alpha": 0.35, "lerp_speed": 0.18,
               "stale_timeout_ms": 1500, "swipe_anim_ms": 250,
               "day_bg": "#101418", "night_bg": "#000000" },
@@ -54,6 +54,8 @@ static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
         "warning":  { "value": 6200, "hysteresis": 200, "color": "#FFC400" },
         "critical": { "value": 7000, "hysteresis": 150, "color": "#FF1744",
                       "overlay_text": "SHIFT!" } } },
+    { "id": "gmeter", "type": "gmeter", "label": "G", "max_g": 1.0 },
+    { "id": "perf", "type": "perf", "label": "PERF" },
     { "id": "diag", "type": "diag" }
   ]
 })JSON";
@@ -131,7 +133,7 @@ void ConfigManager::begin() {
         }
     }
     if (migrateLayout()) {
-        log_i("layout: updated to version 2 (warning lamps, dash screen)");
+        log_i("layout: updated to version 3 (warning lamps, dash, G-meter, timers)");
         persistLayout();
     }
 }
@@ -228,8 +230,45 @@ bool ConfigManager::writeLayoutText(const char *text, size_t len) {
 }
 
 bool ConfigManager::migrateLayout() {
-    if ((_layout["version"] | 1) >= 2) return false;
+    const int version = _layout["version"] | 1;
+    if (version >= 3) return false;
+    if (version < 2) migrateToV2();
 
+    // Version 3: the G-meter and the performance timers, once, before the
+    // diagnostics screen. Deleted in the studio, they stay deleted.
+    bool hasG = false, hasP = false;
+    for (JsonObject s : _layout["screens"].as<JsonArray>()) {
+        hasG |= !strcmp(s["type"] | "", "gmeter");
+        hasP |= !strcmp(s["type"] | "", "perf");
+    }
+    if (!hasG || !hasP) {
+        JsonDocument old;
+        old.set(_layout["screens"]);
+        JsonArray screens = _layout["screens"].to<JsonArray>();
+        bool added = false;
+        auto addNew = [&]() {
+            if (added) return;
+            added = true;
+            if (!hasG) {
+                JsonObject g = screens.add<JsonObject>();
+                g["id"] = "gmeter"; g["type"] = "gmeter"; g["label"] = "G"; g["max_g"] = 1.0;
+            }
+            if (!hasP) {
+                JsonObject p = screens.add<JsonObject>();
+                p["id"] = "perf"; p["type"] = "perf"; p["label"] = "PERF";
+            }
+        };
+        for (JsonVariantConst v : old.as<JsonArrayConst>()) {
+            if (!strcmp(v["type"] | "", "diag")) addNew();
+            screens.add(v);
+        }
+        addNew();
+    }
+    _layout["version"] = 3;
+    return true;
+}
+
+void ConfigManager::migrateToV2() {
     bool hasDash = false;
     for (JsonObject s : _layout["screens"].as<JsonArray>())
         hasDash |= !strcmp(s["type"] | "", "dash");
@@ -249,7 +288,6 @@ bool ConfigManager::migrateLayout() {
         _layout["warnings"] = w.as<JsonObjectConst>();
     }
     _layout["version"] = 2;
-    return true;
 }
 
 void ConfigManager::writeDefaultLayout() {

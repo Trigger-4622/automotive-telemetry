@@ -66,9 +66,23 @@ the chip resets, so it is free as a runtime input, and holding it while plugging
 in USB still enters the ROM bootloader.
 
 Gauge Studio lets you add/edit screens (arc gauges, needle tachometers, 2/4-way
-splits, text lists, trend charts, diagnostics), map any metric ID, tune
+splits, text lists, trend charts, the G-meter, the performance timers,
+diagnostics), map any metric ID, tune
 colors/angles/thresholds with a live circular preview, upload background images
 (LVGL `.bin`), and save the layout to the device.
+
+**Driving screens.** `gmeter` draws the car's acceleration as a dot in a
+friction circle (up speeding up, down braking, left in a left-hand bend; rim
+`max_g`). `perf` times 0-100 km/h, 80-120 km/h and the quarter mile here on the
+display, from the master's speed on the master's clock: stand still for half a
+second to arm a standing start; 80-120 times itself whenever the speed passes
+80 on the way up. Layout version 3 adds both to an existing layout once.
+
+**Trouble codes and the oil change.** The check-engine card names the codes the
+master read (`P1718 TCM 2/2`, then what it means), one every 3 s; with the
+car's lamp off, a `codes` card shows pending or remaining codes once. The
+`service` lamp (a spanner) comes on amber 500 km before the oil change the
+master's portal is set for, and reads `OVERDUE` after it.
 
 ## The watchdog (guard)
 
@@ -115,7 +129,7 @@ LittleFS on *every* repaint, so prefer `bg_grad` (free) or `texture`
 | `include/MasterPacket.h` | ESP-NOW data contract (metric registry, flags, packing) |
 | `include/lv_conf.h` | LVGL v8 configuration |
 | `src/` | `main` + `DisplayManager` `TouchManager` `NetworkManager` `ConfigManager` `UIBuilder` `TelemetryStore` |
-| `data/layout.json` | Annotated example layout (dash, tach, coolant, electrical, powertrain, overview, diag) |
+| `data/layout.json` | Annotated example layout (dash, tach, coolant, electrical, powertrain, overview, G-meter, timers, diag) |
 | `data/www/index.html` | Gauge Studio single-page app (compiled into the firmware by `tools/embed_studio.py`) |
 | `data/assets/*.bin` | Uploadable backgrounds: carbon weave, brushed metal, HUD rings |
 | `src/ui/Textures.h` | **Generated** — compiled-in textures and the GT dial face |

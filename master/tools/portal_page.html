@@ -136,7 +136,9 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
    <b>Left turn signal</b>, <b>Right turn signal</b> or <b>Hazard lights</b>: one run teaches all three - the left indicator, the right one,
    then the hazard lights, each left flashing for a few seconds - so the master can tell the two sides apart. For the gear
    lever, pick <b>Gear lever</b>, foot on the brake, and move it through the positions as asked: it ends back in P, so every
-   bit is checked twice.</p>
+   bit is checked twice. For the G-meter, pick <b>Longitudinal G</b> and brake firmly to a stop, or <b>Lateral G</b> or
+   <b>Yaw rate</b> and drive through a corner: the master compares every field with what the speed and the steering say, and
+   works out the scale.</p>
   <div class="row"><select id="tM" style="flex:1;min-width:180px"></select>
    <select id="tK"></select>
    <button class="b p" id="tBtn" onclick="teachStart()">Start</button></div>
@@ -194,6 +196,18 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="f"><div class="l"><b>Update every</b><span>ms</span></div><input type="number" data-k="broadcast_ms" min="20" max="1000"></div>
   <div class="f"><div class="l"><b>Drop a value after</b><span>ms without news</span></div><input type="number" data-k="metric_ttl_ms" min="200"></div>
  </div>
+ <div class="card"><h2>Oil change <small id="svSub"></small></h2>
+  <div class="f"><div class="l"><b>Change the oil every</b><span>km</span></div><input type="number" data-k="oil_every_km" min="500" max="100000"></div>
+  <div class="f"><div class="l"><b>Last changed at</b><span>odometer reading, km · -1 = no reminder</span></div><input type="number" data-k="oil_at_km" min="-1"></div>
+  <p class="say" id="svSay" style="margin:8px 0 10px"></p>
+  <div class="row"><button class="b" onclick="serviceReset()">Oil changed now</button></div></div>
+ <div class="card"><h2>Drive log <small>to the master's flash</small></h2>
+  <div class="f"><div class="l"><b>Record every drive</b><span>from the car coming on to it going off, one file a drive · the files are on the Diagnostics tab</span></div><input type="checkbox" data-k="log_on"></div>
+  <div class="f"><div class="l"><b>Rows per second</b></div><input type="number" data-k="log_hz" min="1" max="20"></div>
+  <div class="f"><div class="l"><b>Space for logs</b><span>KB of the 1.5 MB settings partition · the oldest drive goes first</span></div><input type="number" data-k="log_max_kb" min="64" max="1200"></div>
+  <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
+   <div id="lgIds" class="row" style="margin-top:8px"></div>
+   <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
  <div class="card"><h2>Power</h2>
   <div class="f"><div class="l"><b>Sleep when the car is off</b><span>wakes on the first CAN activity</span></div><input type="checkbox" data-k="sleep_enabled"></div>
   <div class="f"><div class="l"><b>Sleep after</b><span>seconds of silence on the bus</span></div><input type="number" data-k="sleep_idle_s" min="10" max="3600"></div>
@@ -235,6 +249,22 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 </section>
 
 <section id="t-diag" hidden>
+ <div class="card"><h2>Trouble codes <small id="dcSub"></small>
+   <button class="b" style="margin-left:auto" onclick="post('/api/codes/read','Reading the codes',()=>setTimeout(pollCodes,2500))">Read now</button>
+   <button class="b d" onclick="codesClear()">Clear…</button></h2>
+  <p class="say" style="margin:0 0 8px">Stored, pending and permanent codes from the engine and the transmission computer (OBD-II
+   services 03, 07 and 0A), read when the car comes on and every minute after. The screens show them on the check-engine card.</p>
+  <div class="wrap"><table><thead><tr><th>Code</th><th>Meaning</th><th>Computer</th><th>Kind</th></tr></thead><tbody id="dcTab"></tbody></table></div>
+  <p class="say" id="dcSay" style="margin:8px 0 0"></p></div>
+ <div class="card"><h2>Engine computer</h2>
+  <p class="say" style="margin:0 0 8px">RomRaider lists its ROM definitions by the <b>calibration ID</b> (its "internal ID") and its
+   logger definitions by the <b>ROM ID</b> SSM2 reports. If its definition files list this calibration ID, RomRaider can read and
+   edit this ROM: check that before buying a cable.</p>
+  <div class="wrap"><table><tbody id="idTab"></tbody></table></div></div>
+ <div class="card"><h2>Drive logs <small id="lgSub"></small>
+   <button class="b d" style="margin-left:auto" onclick="if(confirm('Delete every drive log?'))post('/api/log/clear','Deleted',pollLogs)">Delete all</button></h2>
+  <p class="say" id="lgSay" style="margin:0 0 8px"></p>
+  <div class="wrap"><table><thead><tr><th>Drive</th><th>Length</th><th>Rows</th><th>Size</th><th></th></tr></thead><tbody id="lgTab"></tbody></table></div></div>
  <div class="card"><h2>Evidence log <small id="evN"></small>
   <button class="b" style="margin-left:auto" onclick="if(confirm('Clear the evidence log?'))post('/api/evlog/clear','Cleared',pollEvlog)">Clear</button></h2>
   <p class="say" style="margin:0 0 8px">Kept on the master's flash across reboots and firmware updates: every boot with its reset reason,
@@ -254,7 +284,8 @@ const hex=(n,w)=>'0x'+Number(n).toString(16).toUpperCase().padStart(w,'0');
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const nm=id=>META[id]?META[id][0]:hex(id,4);
 const un=id=>META[id]?META[id][1]:'';
-const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.round(v));const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
+const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.round(v));
+ if(id>0x400&&id<=0x408)return dtcName(v);const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
 const SRC={1:['SSM2','ssm'],2:['OBD-II','obd'],3:['calc','calc'],4:['bus','raw']};
 let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='dash',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
 function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2400)}
@@ -274,7 +305,7 @@ function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v)}
 function go(t){TAB=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
  ['dash','bus','src','set','adv','diag'].forEach(x=>$('#t-'+x).hidden=x!==t);
  if(t==='bus')pollBus();if(t==='src')renderSources();if(t==='dash'&&L)renderDash();if(t==='adv'){renderAdv();jsonShow()}
- if(t==='diag')pollEvlog()}
+ if(t==='diag'){pollEvlog();pollCodes();pollLogs()}if(t==='set')pollCodes()}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
 /* ───────────── settings: every input bound to the config by data-k ───────────── */
@@ -287,7 +318,7 @@ function parseEl(el){
 function fillBound(){
  document.querySelectorAll('[data-k]').forEach(el=>{const v=C[el.dataset.k];if(v===undefined)return;
   if(el.type==='checkbox')el.checked=!!v;else if(document.activeElement!==el)el.value=v});
- const t=MODE_TOG[C.diag_mode]||[1,1];$('#sObd').checked=!!t[0];$('#sSsm').checked=!!t[1]}
+ const t=MODE_TOG[C.diag_mode]||[1,1];$('#sObd').checked=!!t[0];$('#sSsm').checked=!!t[1];renderLogIds()}
 /* Settings that would lock this page away: the AP will not start without a
    name, nor with a key WPA2 cannot use; and with the Wi-Fi off at boot only
    the BOOT button brings the page back. */
@@ -327,7 +358,7 @@ async function load(soft){
  if(!inside('#t-src'))renderSources();
  if(TAB==='adv'&&!inside('#t-adv')){renderAdv();jsonShow()}}
 const REBOOT_KEYS=['bitrate_kbps','wifi_channel','ap_ssid','ap_pass','portal_on','can_sp875','can_timing'];
-const RO_KEYS=['cfg_ver','ecu_id','ecu_sys_id','ecu_flags'];
+const RO_KEYS=['cfg_ver','ecu_id','ecu_sys_id','ecu_flags','ecu_cal_id','vin'];
 const sigKey=s=>[s.can_id,s.ext?1:0,s.start,s.len,s.be?1:0,s.metric].join(':');
 /* Three-way merge of the signal table: what the master holds now, plus exactly
    the edits made on this page since it loaded. Writing back the table as it was
@@ -404,6 +435,13 @@ const ADV=[
   ['night_source','Night mode from','sel',[[2,"The car's light switch"],[1,'Light sensor on GPIO'],[0,'Never']]],
   ['ldr_dark','Light sensor: night below','num','ADC',0,4095],
   ['ldr_light','Light sensor: day above','num','ADC',0,4095]]],
+ ['Codes, oil change, drive log',[
+  ['dtc_poll_s','Read the trouble codes every','num','s while the car is on · 0 = only when asked',0,3600],
+  ['oil_every_km','Oil change every','num','km',500,100000],
+  ['oil_at_km','Oil last changed at','num','km on the odometer · -1 = no reminder',-1,9999999],
+  ['log_on','Record every drive','bool'],
+  ['log_hz','Drive log rows per second','num','1–20',1,20],
+  ['log_max_kb','Space for drive logs','num','KB',64,1200]]],
  ['Power',[
   ['sleep_enabled','Sleep when the car is off','bool'],
   ['sleep_idle_s','Sleep after','num','s',10,3600],
@@ -841,6 +879,92 @@ function teachFind(kind,S,steps,toks){
   if(r.l!==1&&out.some(t=>t.id===r.id&&t.l!==1&&bytesOf(t).some(b=>bytesOf(r).includes(b))))continue;
   out.push(r);if(out.length>=8)break}
  return out}
+/** G and yaw: what a field should read at each poll, from what the master
+    knows then. @p P: one {t (ms), v (km/h), st (steering °), yaw (°/s), lat (g)}
+    per poll, null where unknown. Longitudinal G is the speed's slope (least
+    squares over ±0.6 s: OBD-II speed comes in whole km/h). Lateral G is speed
+    × yaw rate when the yaw rate is known, else the steering's turn at this
+    speed (ratio 15, wheelbase 2.67 m: the scale is then approximate, and the
+    sign is whatever the steering's is). Yaw rate likewise. */
+const STEER_RATIO=15,WHEELBASE=2.67,G0=9.80665;
+function motionRef(m,P){
+ const out=new Array(P.length).fill(null),rad=Math.PI/180;
+ const sp=P.filter(p=>p.v!=null).filter((p,i,a)=>!i||p.t!==a[i-1].t);
+ for(let i=0;i<P.length;i++){
+  const p=P[i];if(p.v==null)continue;const ms=p.v/3.6;
+  if(m===0x100D){
+   const w=sp.filter(q=>Math.abs(q.t-p.t)<=600);if(w.length<4)continue;
+   const n=w.length,mt=w.reduce((a,q)=>a+q.t,0)/n,mv=w.reduce((a,q)=>a+q.v,0)/n;
+   let sxy=0,sxx=0;for(const q of w){sxy+=(q.t-mt)*(q.v-mv);sxx+=(q.t-mt)**2}
+   if(sxx>0)out[i]=sxy/sxx*1000/3.6/G0}
+  else if(m===0x100C){
+   if(p.yaw!=null)out[i]=ms*p.yaw*rad/G0;
+   else if(p.st!=null)out[i]=ms*ms*Math.tan(p.st/STEER_RATIO*rad)/WHEELBASE/G0}
+  else if(m===0x100E){
+   if(p.lat!=null&&p.v>5)out[i]=p.lat*G0/ms/rad;
+   else if(p.st!=null)out[i]=ms*Math.tan(p.st/STEER_RATIO*rad)/WHEELBASE/rad}}
+ return out}
+/** The field that follows a reference: @p X the payloads, @p R what the value
+    should be at each (null = unknown). The best |r| of the 8- and 16-bit
+    readings, signed or not, with up to 3 polls of lag either way (the
+    reference comes from slower values); a straight-line fit gives the scale
+    and offset that turn its raw value into the reference's units. */
+function teachMotion(id,X,R,dlc){
+ const res=[],idx=[];for(let i=0;i<R.length;i++)if(R[i]!=null&&Number.isFinite(R[i]))idx.push(i);
+ if(idx.length<12)return res;
+ const ry=idx.map(i=>R[i]);if(!(Math.max(...ry)-Math.min(...ry)>0))return res;
+ const fit=(x,y)=>{const n=x.length;let mx=0,my=0;for(let i=0;i<n;i++){mx+=x[i];my+=y[i]}mx/=n;my/=n;
+  let a=0,b=0,c=0;for(let i=0;i<n;i++){const dx=x[i]-mx,dy=y[i]-my;a+=dx*dy;b+=dx*dx;c+=dy*dy}
+  return b>0&&c>0?{r:a/Math.sqrt(b*c),k:a/b,o:my-a/b*mx}:null};
+ for(let k=0;k<dlc;k++){
+  const fl=[[8*k,8,false]];if(k+1<dlc)fl.push([8*k,16,false],[8*k+7,16,true]);
+  let best=null;
+  for(const [st,len,be] of fl)for(const sg of [false,true]){
+   const xs=X.map(b=>extract(b,st,len,be,sg));
+   if(new Set(xs).size<6)continue;
+   for(let lag=-3;lag<=3;lag++){
+    const x=[],y=[];
+    for(const i of idx){const j=i+lag;if(j>=0&&j<xs.length){x.push(xs[j]);y.push(R[i])}}
+    if(x.length<10)continue;
+    const f=fit(x,y);if(!f)continue;const r=Math.abs(f.r);
+    if(r>=0.8&&(!best||r>best.score+1e-9))
+     best={id,s:st,l:len,be,sg,score:r,k:f.k,o:f.o,lag,mn:Math.min(...xs),mx:Math.max(...xs)}}}
+  if(best)res.push(best)}
+ return res}
+/** teachMotion over every identifier: @p S maps each step to its polls (an
+    identifier to {b}), @p R each step to the reference per poll. Best first,
+    one per stretch of bytes, at most 8. */
+function teachFindMotion(S,R,steps){
+ const ids=new Set();steps.forEach(k=>(S[k]||[]).forEach(poll=>poll.forEach((x,id)=>ids.add(id))));
+ const res=[];
+ for(const id of ids){
+  if(id>=0x7DF&&id<=0x7EF)continue;
+  const X=[],Y=[];
+  for(const k of steps)(S[k]||[]).forEach((poll,i)=>{const x=poll.get(id);if(x){X.push(x.b);Y.push((R[k]||[])[i])}});
+  if(X.length<12)continue;
+  res.push(...teachMotion(id,X,Y,Math.max(...X.map(b=>b.length))))}
+ res.sort((a,b)=>b.score-a.score);
+ const out=[];
+ for(const r of res){
+  const k0=r.s>>3,by=r.l>8?[k0,k0+1]:[k0];
+  if(out.some(t=>t.id===r.id&&by.some(b=>t.by.includes(b))))continue;
+  out.push({...r,by});if(out.length>=8)break}
+ return out}
+/** A trouble-code channel's value (raw | kind << 16 | module << 18) as "P1718". */
+function dtcName(v){const raw=(Math.round(v)>>>0)&0xFFFF,h=x=>x.toString(16).toUpperCase();
+ return'PCBU'[raw>>14]+((raw>>12)&3)+h((raw>>8)&15)+h((raw>>4)&15)+h(raw&15)}
+/** A drive log (.tlg, see DriveLog.h) as CSV: time in seconds, then one column
+    per value, headed by @p name(id); a value that was not fresh is empty. */
+function tlgToCsv(b,name){
+ if(b.length<16||String.fromCharCode(b[0],b[1],b[2],b[3])!=='TLG1')return'';
+ const dv=new DataView(b.buffer,b.byteOffset,b.byteLength),n=b[6],ids=[];
+ for(let i=0;i<n;i++)ids.push(dv.getUint16(16+2*i,true));
+ const row=4+4*n,q=x=>'"'+String(x).replace(/"/g,'""')+'"',lines=['time_s,'+ids.map(id=>q(name(id))).join(',')];
+ for(let p=16+2*n;p+row<=b.length;p+=row){
+  const c=[(dv.getUint32(p,true)/1000).toFixed(3)];
+  for(let i=0;i<n;i++){const v=dv.getFloat32(p+4+4*i,true);c.push(Number.isFinite(v)?String(+v.toPrecision(7)):'')}
+  lines.push(c.join(','))}
+ return lines.join('\r\n')+'\r\n'}
 /*</teach-core>*/
 const isSwitch=id=>(id&0xFF00)===0x1200||(id&0xFF00)===0x2100||id===0x0101;
 const TEACH_FIRST=id=>(id&0xFF00)===0x1200||(id>=0x1005&&id<=0x10FF)||(id&0xFF00)===0x3000||(id&0xFF00)===0x2100;
@@ -848,8 +972,10 @@ let TEACH=null,TRES=[],TTOK=[];
 $('#tM').innerHTML='<optgroup label="Body, chassis and custom">'+metricOpts(0x1201,TEACH_FIRST)+'</optgroup><optgroup label="Everything else">'+metricOpts(0,id=>!TEACH_FIRST(id))+'</optgroup>';
 /** What can be taught for @p m: positions only for a lever or selector, the
     indicators' run only for the indicators. */
+const isMotion=id=>id>=0x100C&&id<=0x100E;
 function teachKinds(m){
  if(TEACH_POS[m])return[['pos','Positions'],['val','A moving value']];
+ if(isMotion(m))return[['mot','A corner or a hard stop'],['val','A moving value']];
  if(m===TURN_ROLE.L||m===TURN_ROLE.R||m===TURN_ROLE.H)return[['turn','Left, right and hazard, in one go'],['bit','On / off']];
  return isSwitch(m)?[['bit','On / off'],['val','A moving value']]:[['val','A moving value'],['bit','On / off']]}
 function teachKindShown(){$('#tPRow').hidden=$('#tK').value!=='pos'}
@@ -866,16 +992,21 @@ async function teachStart(){
  const m=+$('#tM').value,kind=$('#tK').value;
  TTOK=kind==='pos'?$('#tP').value.trim().split(/[\s,]+/).filter(Boolean).slice(0,8):[];
  if(kind==='pos'&&TTOK.length<2){toast('List at least two positions');return}
+ if(kind==='mot'&&!isMotion(m)){toast('A corner or a hard stop teaches lateral G, longitudinal G or yaw rate');return}
  const off=k=>[k,'<b>Off</b>: indicators and hazard lights off',5000];
- const steps=kind==='bit'?[['A','Leave it OFF',5000],['B','Turn it ON now, and leave it on (flashing is fine)',6000],['C','Turn it OFF again',5000]]:
+ const steps=kind==='mot'?[['A','Drive straight on at a steady speed',4000],
+   ['B',m===0x100D?'Now brake firmly to a stop (or accelerate hard)':'Now drive through a corner, or a few',10000]]:
+  kind==='bit'?[['A','Leave it OFF',5000],['B','Turn it ON now, and leave it on (flashing is fine)',6000],['C','Turn it OFF again',5000]]:
   kind==='turn'?[off('A'),['L','<b>Left</b> indicator on - let it flash',6000],off('B'),['R','<b>Right</b> indicator on - let it flash',6000],
    off('C'),['H','<b>Hazard lights</b> on',6000],off('D')]:
   kind==='pos'?TTOK.map((t,i)=>['p'+i,`Put it in <b>${esc(t)}</b> and hold it there`,5000]):
   [['A','Hold it still',3000],['B','Move it slowly through its whole range, back and forth',9000]];
- // A hand takes a moment to do what a step asks: the start of each is not read.
- const skip=kind==='val'?800:1500;
+ // A hand takes a moment to do what a step asks: the start of each is not
+ // read. A drive is read throughout: it is compared with the car's own speed
+ // and steering, poll by poll.
+ const skip=kind==='mot'?0:kind==='val'?800:1500;
  const durs=steps.map(s=>s[2]),total=durs.reduce((a,b)=>a+b,0);
- TEACH={m,kind,S:{}};steps.forEach(([k])=>TEACH.S[k]=[]);
+ TEACH={m,kind,S:{},P:{}};steps.forEach(([k])=>{TEACH.S[k]=[];TEACH.P[k]=[]});
  $('#tBtn').disabled=true;$('#tRes').innerHTML='';
  // The steps run on the clock, not on the master's answers: the countdown is
  // redrawn five times a second whatever the Wi-Fi does, and a reading counts
@@ -890,9 +1021,15 @@ async function teachStart(){
  try{
   while(at()<total){
    const tq=at();let b=null;asked++;
-   try{b=await req('/api/bus?e=1',null,1500)}catch(e){}
+   try{b=await req(kind==='mot'?'/api/bus?m=269,4102,4110,4108':'/api/bus?e=1',null,1500)}catch(e){}
    const i=b?teachSlot(durs,skip,tq,at()):-1;
-   if(i>=0)TEACH.S[steps[i][0]].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
+   if(i>=0){const k=steps[i][0];
+    TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
+    if(kind==='mot'){
+     // The car as the master knows it at this poll: speed, steering, and a yaw
+     // rate or lateral G already read from the bus (never one derived from these).
+     const g=(id,raw)=>{const x=b.m&&b.m[id];return x&&x[1]<1500&&(!raw||x[2]===4)?x[0]:null},sa=b.m&&b.m[269];
+     TEACH.P[k].push({t:Date.now()-(sa?sa[1]:0),v:g(269),st:g(4102),yaw:g(4110,1),lat:g(4108,1)})}}
    else if(!b||at()-tq>1000)late++;
    const wait=150-(at()-tq);if(wait>0)await sleep(wait)}
   $('#tStep').innerHTML='<div class="step">Done</div>';
@@ -905,8 +1042,9 @@ const ROLE_NAME={L:'Left turn signal',R:'Right turn signal',H:'Hazard lights',bo
 const ROLE_SAY={L:' with the left indicator only',R:' with the right indicator only',H:' with the hazard lights only',
  both:' with either indicator: it cannot tell the side, so it is not used'};
 function teachAnalyze(steps){
- const {S,kind}=TEACH;
- TRES=teachFind(kind,S,steps,TTOK);
+ const {S,kind,m}=TEACH;
+ if(kind==='mot'){const R={};steps.forEach(k=>R[k]=motionRef(m,TEACH.P[k]));TRES=teachFindMotion(S,R,steps)}
+ else TRES=teachFind(kind,S,steps,TTOK);
  if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':
   kind==='turn'?'Let each one flash through its whole step and switch it off as soon as the next step asks, or they may not be broadcast.':
   'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}
@@ -914,6 +1052,7 @@ function teachAnalyze(steps){
  const say=r=>r.role?(r.how==='flash'?`flashed ${r.blink} time${r.blink>1?'s':''}`:'held on')+ROLE_SAY[r.role]+(r.inv?' (inverted)':''):
   r.codes?r.names.map((t,g)=>`${esc(t)} <span class="mono">${pat(r.codes[g],r.bits.length)}</span>`).join(' • '):
   r.pos!==undefined?`on only in ${esc(r.names[r.pos])}${r.inv?' (inverted)':''} - as ${esc(nm(r.metric))}`:
+  kind==='mot'?`followed ${(r.score*100).toFixed(0)}% · scale ${+r.k.toPrecision(3)}${Math.abs(r.o)>1e-3?', offset '+(+r.o.toPrecision(3)):''}${m!==0x100D?' (approximate)':''}`:
   r.l===1?(r.blink?`flashed ${r.blink} time${r.blink>1?'s':''}${r.inv?' (inverted)':''}`:`followed ${(Math.min(1,r.score)*100).toFixed(0)}%${r.inv?' (inverted)':''}`):
   `raw ${r.mn} … ${r.mx} while moving`;
  let head='<p class="say" style="margin-top:8px">These followed you, best first:</p>';
@@ -951,7 +1090,10 @@ async function teachAdd(list){
  setDirty(true);await save();return true}
 async function teachUse(i){
  const r=TRES[i],m=r.metric||+$('#tM').value;
- if(!r.codes&&r.l!==1){BUS=BUS||{census:[]};mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
+ if(!r.codes&&r.l!==1){BUS=BUS||{census:[]};
+  if(r.k!==undefined){mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
+   toast('Check it reads right (round the scale), then Use this value');return}
+  mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
   toast('Set the scale so the value reads right, then Use this value');return}
  if(!await teachAdd([teachSig(r,m)]))return;
  toast(`${nm(m)} is now read from the bus`);
@@ -1056,6 +1198,79 @@ async function pollEvlogOnce(){
  if(!s)s=`<span class="ok">${boots.length} boot${boots.length===1?'':'s'}, no brown-out, no guard trip, no bus-off</span> — if the lamp still came on, the master was not the one disturbing the bus.`;
  $('#evSay').innerHTML=s}
 
+/* ───────────── trouble codes, the engine computer, oil change, drive logs ───────────── */
+const KIND=['stored','pending','permanent'],MOD=['Engine','Transmission'],LIST_SAY=['not asked yet','answered','no reply','not kept'];
+let CODES=null,LOGS=null;
+const ago=s=>s<90?`${s} s ago`:s<5400?`${Math.round(s/60)} min ago`:`${Math.round(s/3600)} h ago`;
+function pollCodes(){return solo('codes',pollCodesOnce)}
+async function pollCodesOnce(){
+ if((TAB!=='diag'&&TAB!=='set')||TEACH)return;
+ try{CODES=await req('/api/codes',null,5000)}catch(e){return}
+ renderCodes()}
+function renderCodes(){
+ const d=CODES;if(!d)return;
+ $('#dcSub').textContent=d.busy?'reading…':d.read?`read ${ago(d.age)}`:'not read yet';
+ $('#dcTab').innerHTML=d.codes.length?d.codes.map(c=>`<tr><td class="mono ${c.kind===0?'crit':'warn'}"><b>${esc(c.code)}</b></td>
+  <td style="white-space:normal">${esc(c.text)}</td><td>${MOD[c.mod]||'?'}</td><td>${KIND[c.kind]||'?'}</td></tr>`).join(''):
+  `<tr><td colspan="4" class="empty">${d.read?'No codes in either computer.':'Read a few seconds after the car comes on, or press Read now.'}</td></tr>`;
+ const lists=(d.lists||[]).map((row,m)=>`${MOD[m]}: `+row.map((v,k)=>`${KIND[k]} ${LIST_SAY[v]||'?'}`).join(', ')).join(' · ');
+ $('#dcSay').innerHTML=(d.note?`<b>${esc(d.note)}</b>. `:'')+esc(lists)+(d.tcm_func?' · the transmission answers only on 0x7DF':'')+
+  (d.clear?`<br>Last clear: ${esc(d.clear.replace(/^Clear: ?/,''))}`:'');
+ const id=d.ident||{},row=(k,v,s)=>`<tr><td class="muted">${k}</td><td class="mono"><b>${v?esc(v):'<span class="muted">—</span>'}</b>${s?` <span class="muted">${s}</span>`:''}</td></tr>`;
+ $('#idTab').innerHTML=row('Calibration ID',id.cal,id.cal2?'and '+esc(id.cal2):'OBD-II 09 04')+row('ROM ID',id.rom,'SSM2')+
+  row('SYS ID',id.sys,'SSM2')+row('VIN',id.vin,'')+row('CVN',id.cvn,'')+
+  (id.cal||id.rom?'':`<tr><td colspan="2" class="empty">Read with the ignition on.</td></tr>`)+
+  (id.cal||id.rom?`<tr><td colspan="2" class="muted" style="white-space:normal">${id.live?'Read from the car just now.':'Remembered from the last time the car answered.'}</td></tr>`:'');
+ const sv=d.service||{};
+ if(sv.at<0)$('#svSay').innerHTML='Set the odometer reading of the last oil change, or press <b>Oil changed now</b>: the screens then show a lamp when the next one is due.';
+ else{const due=sv.at+sv.every;
+  $('#svSay').innerHTML=sv.odo==null?`Next oil change at <b>${due} km</b>. The odometer has not been read yet (SSM2, with the ignition on).`:
+   sv.odo>=due?`<span class="crit">Overdue by <b>${sv.odo-due} km</b></span> (odometer ${sv.odo} km, due at ${due} km).`:
+   `Next oil change at <b>${due} km</b>: <b>${due-sv.odo} km</b> to go (odometer ${sv.odo} km).`}
+ $('#svSub').textContent=sv.odo!=null?`odometer ${sv.odo} km`:''}
+async function codesClear(){
+ if(!confirm('Clear the trouble codes in the engine and the transmission computer?\n\nThe check-engine lamp goes out and the readiness '+
+  'monitors start again: an emissions test then needs a few drives first. A code whose fault is still there comes back.\n\n'+
+  'The car must be standing; if the engine computer refuses, switch the engine off and leave the ignition on.'))return;
+ try{const r=await fetch('/api/codes/clear',{method:'POST'}),j=await r.json();toast(r.ok?'Clearing…':j.error||'Failed');
+  setTimeout(pollCodes,3000)}catch(e){toast('Failed')}}
+async function serviceReset(){
+ if(!confirm('Oil changed now: the reminder starts again from the odometer?'))return;
+ try{const r=await fetch('/api/service/reset',{method:'POST'}),j=await r.json();toast(r.ok?'Reminder reset':j.error||'Failed');
+  if(r.ok)await load(true);pollCodes()}catch(e){toast('Failed')}}
+const kb=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixed(2)+' MB';
+const dur=s=>{s=Math.round(s);return s<60?s+' s':Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s'};
+function pollLogs(){return solo('logs',pollLogsOnce)}
+async function pollLogsOnce(){
+ if(TAB!=='diag'||TEACH)return;
+ try{LOGS=await req('/api/logs',null,5000)}catch(e){return}
+ const d=LOGS;
+ $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on flash`;
+ $('#lgSay').innerHTML=!d.on?'Recording is off: switch it on under Settings, Drive log.':
+  d.rec?`<span class="ok">Recording <b>${esc(d.file)}</b></span>: ${d.rows} rows so far.`:
+  d.note?`<span class="warn">${esc(d.note)}</span>`:'Recording starts when the car comes on.';
+ $('#lgTab').innerHTML=d.files.length?d.files.slice().reverse().map(f=>`<tr><td class="mono">${esc(f.name.replace('.tlg',''))}${f.rec?' <span class="ok">● now</span>':''}</td>
+  <td>${dur(f.secs)}</td><td>${f.rows}</td><td>${kb(f.bytes)}</td>
+  <td><button class="b s p" onclick="logGet('${esc(f.name)}')">CSV</button> <button class="b s d" onclick="logDel('${esc(f.name)}')">Delete</button></td></tr>`).join(''):
+  '<tr><td colspan="5" class="empty">No drives recorded.</td></tr>'}
+async function logGet(n){
+ toast('Downloading…');
+ try{const b=await fetch('/api/log?f='+encodeURIComponent(n)).then(r=>{if(!r.ok)throw 0;return r.arrayBuffer()});
+  const csv=tlgToCsv(new Uint8Array(b),id=>nm(id)+(un(id)?' ('+un(id)+')':''));if(!csv)throw 0;
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download='drive-'+n.replace('.tlg','')+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+ catch(e){toast('Download failed')}}
+function logDel(n){if(confirm('Delete drive '+n.replace('.tlg','')+'?'))post('/api/log/delete?f='+encodeURIComponent(n),'Deleted',pollLogs)}
+function renderLogIds(){
+ const ids=C.log_ids||[];if(!$('#lgIds'))return;
+ $('#lgIds').innerHTML=ids.map((id,i)=>`<span class="pill">${esc(nm(id))}<button class="x" onclick="logRm(${i})">✕</button></span>`).join('')||
+  '<span class="muted">Nothing chosen: nothing is recorded.</span>';
+ const hz=C.log_hz||10,bps=(4+4*ids.length)*hz,cap=(C.log_max_kb||1024)*1024;
+ $('#lgEst').textContent=ids.length?`${ids.length} of 24 · ${(bps/1024).toFixed(2)} KB a second · about ${Math.round(cap/bps/60)} min of driving fit`:'';
+ if(document.activeElement!==$('#lgAdd'))$('#lgAdd').innerHTML='<option value="0">Add a value…</option>'+metricOpts(-1,id=>!ids.includes(id))}
+function logAdd(){const id=+$('#lgAdd').value,ids=C.log_ids||[];if(!id||ids.length>=24)return;C.log_ids=ids.concat(id);setDirty(true);renderLogIds()}
+function logRm(i){C.log_ids=(C.log_ids||[]).filter((_,k)=>k!==i);setDirty(true);renderLogIds()}
+
 /* ───────────── polling ─────────────
    While a teach runs, nothing else is asked: its readings have the master to
    themselves, and are not held up behind a full status document. */
@@ -1066,10 +1281,11 @@ async function pollOnce(){
   const c=$('#conn');c.className='pill crit';c.lastChild.textContent='offline';return}
  const now=Date.now();
  // The master restarted (its counters went back): no rate from across that.
+ // (bits is a 32-bit count that wraps every few hours: >>>0 takes the difference across it)
  if(PREV&&(d.bus.rx<PREV.rx||d.bus.tx<PREV.tx||d.bus.err<PREV.err))PREV=null;
  if(PREV){const dt=(now-PREV.t)/1000;if(dt>0){
   RATES.fps=(d.bus.rx-PREV.rx)/dt;RATES.tx=(d.bus.tx-PREV.tx)/dt;RATES.errs=d.bus.err-PREV.err;
-  RATES.load=100*((d.bus.bits-PREV.bits)+(d.bus.tx-PREV.tx)*125)/(dt*(d.bus.bitrate||500)*1000)}}
+  RATES.load=100*(((d.bus.bits-PREV.bits)>>>0)+(d.bus.tx-PREV.tx)*125)/(dt*(d.bus.bitrate||500)*1000)}}
  PREV={t:now,rx:d.bus.rx,tx:d.bus.tx,err:d.bus.err,bits:d.bus.bits};
  L=d;
  // Pick up what the learner and verifier did to the signal table.
@@ -1085,4 +1301,5 @@ async function pollOnce(){
  if(TAB==='bus')renderBusTiles();
  if(TAB==='src'||TAB==='set')updateSourceText()}
 load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);
+setInterval(pollCodes,3000);setInterval(pollLogs,3000);
 </script></body></html>

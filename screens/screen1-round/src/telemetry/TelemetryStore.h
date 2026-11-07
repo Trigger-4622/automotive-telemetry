@@ -117,6 +117,14 @@ public:
     bool peek(uint16_t id, MetricSample &out);
 
     /**
+     * @brief The latest valid raw value and the master's clock when it was
+     *        sent (the packet's timestamp_ms) - for timing on the display (the
+     *        performance timers): the radio's jitter does not count.
+     * @return false if never received, not valid, or stale.
+     */
+    bool stamped(uint16_t id, float &raw, uint32_t &masterMs);
+
+    /**
      * @brief Copy every active slot, for the web portal's `/api/live`.
      * @param[out] out Destination array.
      * @param max      Capacity of @p out.
@@ -156,6 +164,7 @@ private:
         float    peak;          /**< Highest raw value since reset.         */
         uint8_t  flags;         /**< METRIC_FLAG_* from the last packet.    */
         uint32_t lastUpdateMs;  /**< millis() of the last update.           */
+        uint32_t srcMs;         /**< The master's clock when it sent it.    */
     };
 
     /**

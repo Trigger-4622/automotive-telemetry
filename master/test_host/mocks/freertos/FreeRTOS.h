@@ -32,5 +32,8 @@ typedef void (*TaskFunction_t)(void *);
 BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t stack,
                                    void *arg, UBaseType_t prio, TaskHandle_t *handle,
                                    BaseType_t core);
+/** Free stack at its lowest [bytes, as on ESP-IDF]: the host cannot measure
+ *  the device's, so the handle carries the stack size and half is reported. */
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);
 void vTaskDelay(TickType_t ticks);
 TickType_t xTaskGetTickCount();

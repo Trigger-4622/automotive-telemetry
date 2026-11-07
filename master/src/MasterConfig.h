@@ -354,6 +354,26 @@ public:
     char     ecuId[12]     = "";   /**< ROM ID as hex, e.g. "4B12785206". */
     char     ecuSysId[8]   = "";   /**< SYS ID as hex.                    */
     char     ecuFlags[200] = "";   /**< Capability bytes as hex.          */
+    char     ecuCalId[17]  = "";   /**< OBD-II calibration ID (09 04).    */
+    char     vin[18]       = "";   /**< VIN (09 02).                      */
+    /** @} */
+
+    /** @name Trouble codes, service reminder, drive log
+     *  New keys: a stored file without them gets these defaults.
+     *  @{ */
+    /** Read the trouble codes this often while the car is on, seconds
+     *  (0 = only when the portal asks). */
+    uint16_t dtcPollS    = 60;
+    uint32_t oilEveryKm  = 7500;   /**< Oil change interval [km].           */
+    /** Odometer at the last oil change [km]; -1 = not set: no reminder. */
+    int32_t  oilAtKm     = -1;
+    bool     logOn       = false;  /**< Record drives to flash.             */
+    uint8_t  logHz       = 10;     /**< Rows per second (1-20).             */
+    uint16_t logMaxKb    = 1024;   /**< Flash the logs may use [KB].        */
+    std::vector<uint16_t> logIds;  /**< Recorded metrics, in column order.  */
+    /** @brief What a drive log records out of the box: enough to compare
+     *         SI-Drive modes (boost against its target, load, timing). */
+    static void defaultLogIds(std::vector<uint16_t> &ids);
     /** @} */
 
     MasterConfig() {
