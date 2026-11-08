@@ -486,7 +486,7 @@ static SemaphoreHandle_t s_twaiReg = nullptr;
  *  overflow is a panic, and a panic is a restart in the middle of a drive. */
 static struct { TaskHandle_t h; const char *name; } s_tasks[] = {
     { nullptr, "twai_rx" }, { nullptr, "obd_poll" }, { nullptr, "broadcast" },
-    { nullptr, "housekeep" }, { nullptr, "busguard" },
+    { nullptr, "housekeep" }, { nullptr, "busguard" }, { nullptr, "loopTask" },
 };
 
 /** @brief Milliseconds of guard pause left (0 = not paused). */
@@ -3175,7 +3175,17 @@ static void setupEspNow() {
  * CAN work is pinned to core 1 and radio work to core 0, so a busy bus cannot
  * delay a broadcast and vice versa.
  */
+/*
+ * Arduino's loop task runs the portal - and so every settings save: the web
+ * server, the whole configuration as a JSON document and LittleFS, one on top
+ * of the other. 12 KB instead of the core's 8 KB. It is created before
+ * setup(), so it comes out of what the learner sizes itself to, not out of
+ * the reserve the learner keeps for Wi-Fi and the portal.
+ */
+SET_LOOP_TASK_STACK_SIZE(12 * 1024);
+
 void setup() {
+    s_tasks[5].h = xTaskGetCurrentTaskHandle();     // setup() runs on the loop task
     Serial.begin(115200);
     log_i("CAN Telemetry Master v%s (proto v%d)", FIRMWARE_VERSION,
           TELEMETRY_PROTO_VERSION);
@@ -3224,9 +3234,13 @@ void setup() {
     // stack overflow is a panic - a restart in the middle of a drive.
     xTaskCreatePinnedToCore(busGuardTask,    "busguard",  4096, nullptr,  9, &s_tasks[4].h, 1);
     ssm2Begin();
-    learnerBegin();
     codesBegin();
     driveLogBegin();
+    // Last: the learner sizes its tables to the heap free now, keeping 95 KB
+    // for Wi-Fi, the portal and its saves. Anything started after it would
+    // take its share out of that reserve - the trouble codes and the drive
+    // log did, 13 KB, and saves failed and the master restarted on the car.
+    learnerBegin();
 }
 
 /**
@@ -3286,11 +3300,11 @@ void loop() {
          */
         Serial.printf("[stats] CAN rx: %u | OBD resp: %u | SSM2: %u ok/%u err "
                       "(%.0f/s, %u addr) | ESP-NOW: %.0f frame/s, %.0f metric/s "
-                      "(%u sent, %u fail) | night: %d | heap: %u\n",
+                      "(%u sent, %u fail) | night: %d | heap: %u (lowest %u, largest block %u)\n",
                       s_canFramesRx, s_obdResponses, ss.responses, ss.errors,
                       ss.exchPerSec, ss.batch, fps, mps,
                       s_espnowFrames, s_espnowFailed,
-                      (int)s_night, ESP.getFreeHeap());
+                      (int)s_night, ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
         static const char *MODES[] = {"AUTO", "SSM2", "OBD-II", "BOTH", "SILENT"};
         char settleTxt[48] = "";
         const uint32_t settle = settleLeft();

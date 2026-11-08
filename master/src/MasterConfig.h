@@ -181,6 +181,11 @@ public:
     /** @brief Perform a pending requestSave(). Called from loop(). */
     void serviceSave();
 
+    /** The allocator save() builds its document with; null = ArduinoJson's
+     *  own (always, on the device). The harness sets one that runs out, to
+     *  prove a save that does not fit in memory writes nothing. */
+    ArduinoJson::Allocator *jsonAlloc = nullptr;
+
     /**
      * @brief Add parameters this firmware knows about that the stored config
      *        does not, preserving every user choice on the ones it already had.

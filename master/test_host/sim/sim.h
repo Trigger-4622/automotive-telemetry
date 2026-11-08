@@ -124,6 +124,8 @@ struct BusFaults {
 extern EcuConfig ecu;
 extern BusFaults faults;
 extern uint32_t  heapFree;             ///< What ESP.getFreeHeap() reports.
+/** Every task the firmware created, in order (xTaskCreatePinnedToCore). */
+extern std::vector<std::string> tasksCreated;
 
 /* ── observations ───────────────────────────────────────────────────────── */
 struct TxRecord { uint64_t tUs; twai_message_t msg; };

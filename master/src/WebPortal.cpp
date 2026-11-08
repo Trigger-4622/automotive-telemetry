@@ -1492,9 +1492,15 @@ void WebPortal::setupRoutes() {
     });
 
     s_server.on("/api/config", HTTP_POST, []() {
-        JsonDocument doc;
-        if (deserializeJson(doc, s_server.arg("plain")) ||
-            !Cfg.fromJson(doc.as<JsonVariantConst>(), true)) {   // not an object
+        bool parsed;
+        {
+            // Freed before the save builds its document of the whole
+            // configuration: the two at once were the save's peak of memory.
+            JsonDocument doc;
+            parsed = !deserializeJson(doc, s_server.arg("plain")) &&
+                     Cfg.fromJson(doc.as<JsonVariantConst>(), true);   // false: not an object
+        }
+        if (!parsed) {
             s_server.send(400, "application/json", "{\"error\":\"bad json\"}");
             return;
         }
@@ -1517,6 +1523,10 @@ void WebPortal::setupRoutes() {
         JsonDocument doc;
         doc["uptime"] = millis() / 1000;
         doc["heap"]   = ESP.getFreeHeap();
+        // The lowest it has been since boot, and the largest single block: a
+        // save needs ~30 KB of the car's settings at once.
+        doc["heap_min"]   = ESP.getMinFreeHeap();
+        doc["heap_block"] = ESP.getMaxAllocHeap();
         // The least stack any CAN-side task has had left: an overflow is a
         // panic, and a panic restarts the master mid-drive.
         doc["stack"]      = st.stackMinFree;

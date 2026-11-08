@@ -490,6 +490,69 @@ static void scConfigFaults() {
     check(mode0 == SIG_REJECTED, "mode 260 is clamped, not wrapped to 4", fmt("%u", mode0));
 }
 
+static void loadCarConfig();
+
+/** An allocator that runs out after @p limit bytes, as a tight heap does. */
+class TightAllocator : public ArduinoJson::Allocator {
+public:
+    explicit TightAllocator(size_t limit) : _left(limit) {}
+    void *allocate(size_t n) override { if (n > _left) return nullptr; _left -= n; return malloc(n); }
+    void deallocate(void *p) override { free(p); }
+    void *reallocate(void *p, size_t n) override {
+        if (n > _left) return nullptr;
+        _left -= n;
+        return realloc(p, n);
+    }
+private:
+    size_t _left;
+};
+
+/**
+ * A save that runs out of memory part way through building the settings
+ * document: ArduinoJson drops what does not fit without a word, and the
+ * truncated document used to be written as if it were whole - one save on a
+ * tight heap could cost every learned signal. It must fail and leave the
+ * stored settings as they were.
+ */
+static void scConfigSaveOutOfMemory() {
+    loadCarConfig();                                // the car's file: 18 signals, 72 SSM, 66 PIDs
+    boot();
+    runUntil(3);
+    const std::string before = simfs::files["/config.json"];
+    TightAllocator tight(8 * 1024);                 // far less than the whole document needs
+    Cfg.jsonAlloc = &tight;
+    portalPost(R"({"broadcast_ms":41})");           // fromJson, then save, as the portal does
+    Cfg.jsonAlloc = nullptr;
+    check(simfs::files["/config.json"] == before, "out of memory: the stored settings are untouched",
+          fmt("%zu bytes before, %zu after", before.size(), simfs::files["/config.json"].size()));
+    check(Cfg.save(), "the next save, with memory to spare, succeeds");
+    JsonDocument d; deserializeJson(d, simfs::files["/config.json"]);
+    check(d["signals"].size() == 18 && d["ssm"].size() == 72 && d["broadcast_ms"] == 41,
+          "with every signal, every SSM parameter and the new value",
+          fmt("%zu signals, %zu ssm", d["signals"].size(), d["ssm"].size()));
+    commonChecks("config:");
+}
+
+/**
+ * The learner sizes its tables to the heap that is free when it starts,
+ * keeping 95 KB for Wi-Fi, the portal and its saves. A task created after it
+ * takes its stack out of that reserve - two did (the trouble codes and the
+ * drive log, 6 KB each), and a save on the car then failed and the master
+ * restarted. It goes last.
+ */
+static void scLearnerSizesLast() {
+    boot();
+    runUntil(2);
+    const auto &t = sim::tasksCreated;
+    const auto it = std::find(t.begin(), t.end(), std::string("learner"));
+    check(it != t.end(), "the learner started");
+    std::string after;
+    if (it != t.end())
+        for (auto j = it + 1; j != t.end(); ++j) after += (after.empty() ? "" : ", ") + *j;
+    check(it != t.end() && it + 1 == t.end(), "no task created after the learner sized itself",
+          after.empty() ? std::string("none") : after);
+}
+
 /** Interrupted save: only config.tmp exists at boot. */
 static void scConfigTmpOnly() {
     simfs::files["/config.tmp"] = R"({"cfg_ver":5,"broadcast_ms":77})";
@@ -3027,7 +3090,8 @@ static const Scenario SCENARIOS[] = {
     {"ssm_size_limit", scSsmSizeLimit, 0}, {"obd_functional", scObdFunctional, 0},
     {"obd_drops", scObdDrops, 0}, {"config_migration", scConfigMigration, 0},
     {"config_faults", scConfigFaults, 0}, {"config_tmp_only", scConfigTmpOnly, 0},
-    {"config_mount_glitch", scConfigMountGlitch, 0}, {"config_first_mount", scConfigFirstMount, 0},
+    {"config_mount_glitch", scConfigMountGlitch, 0}, {"config_save_out_of_memory", scConfigSaveOutOfMemory, 0},
+    {"learner_sizes_last", scLearnerSizesLast, 0}, {"config_first_mount", scConfigFirstMount, 0},
     {"sleep", scSleep, 0}, {"clock_wrap", scClockWrap, 0}, {"both", scBoth, 0},
     {"obd_only", scObdOnly, 0}, {"ecu_off", scEcuOff, 0}, {"ssm_stmin", scSsmStmin, 0},
     {"ssm_stmin_reserved", scSsmStminReserved, 0}, {"ssm_cut", scSsmCut, 0}, {"ssm_dead", scSsmDead, 0},

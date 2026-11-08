@@ -459,8 +459,17 @@ bool MasterConfig::save() {
 }
 
 bool MasterConfig::saveLocked() {
-    JsonDocument doc;
+    JsonDocument doc = jsonAlloc ? JsonDocument(jsonAlloc) : JsonDocument();
     toJson(doc);
+    // Out of memory part way through, ArduinoJson drops what does not fit
+    // without a word: written, that would be a valid-looking file without
+    // the learned signals or the SSM table. Nothing is written instead.
+    if (doc.overflowed()) {
+        log_e("config: out of memory building the settings (%u bytes free, largest block %u) - "
+              "nothing written, the stored settings are kept",
+              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+        return false;
+    }
 
     /*
      * Written to a temporary file and then renamed, so a power cut midway

@@ -163,6 +163,18 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   remote frames are activity only (`rx_odd_frames`). Stack headroom of the
   CAN tasks: `[ctrl ]` and `/api/live` (`stack`, `stack_task`); busguard has
   4 KB.
+- **Heap** (a save failed and the master restarted, 2026-11-08): the learner
+  sizes its tables at the END of `setup()` to the free heap minus 95 KB kept
+  for Wi-Fi, the portal and its saves. Anything started after it eats that
+  reserve - the trouble-code and drive-log tasks did (13 KB) - so start new
+  tasks before `learnerBegin()` (`learner_sizes_last`). A save builds the whole
+  car config (~20 KB of JSON, ~30 KB in ArduinoJson); out of memory it used to
+  write the truncated document as a valid file (learned signals gone), now it
+  writes nothing (`config_save_out_of_memory`). The loop task (portal and
+  saves) has 12 KB (`SET_LOOP_TASK_STACK_SIZE`). Heap now, lowest and largest
+  block: serial `[stats]` and `/api/live` (`heap`, `heap_min`, `heap_block`);
+  the loop task's stack is in the `[ctrl ]` headroom figure. The sim's heap is
+  a constant 180 KB, so it cannot show exhaustion itself.
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only
