@@ -22,6 +22,7 @@ using std::min;
 #define constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
 #define IRAM_ATTR
 #define DRAM_ATTR
+#define SET_LOOP_TASK_STACK_SIZE(sz)
 
 inline uint32_t millis() { return (uint32_t)(simrtos::nowUs() / 1000u); }
 inline uint32_t micros() { return (uint32_t)simrtos::nowUs(); }
@@ -78,6 +79,8 @@ extern HardwareSerialMock Serial;
 class EspClassMock {
 public:
     uint32_t getFreeHeap();
+    uint32_t getMinFreeHeap();
+    uint32_t getMaxAllocHeap();
     void restart();
 };
 extern EspClassMock ESP;

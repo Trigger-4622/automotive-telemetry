@@ -198,7 +198,10 @@ Every supported PID reduces to `value = raw × scale + offset` with `raw = A` or
 
 Scheduling: each PID has its own period (RPM at 50 ms, fuel level at 5 s); the poll
 task keeps **one request in flight at a time** with ≥ 60 ms spacing — polite to slow
-ECUs and gateway modules.
+ECUs and gateway modules. The request keeps the bus until it is answered or P2CAN
+(`obd_p2can`) has passed, and when more PIDs are due than there is time for, the one
+most overdue for its own period goes first (`obd_order`; "Asking the car" and "OBD-II
+poll order" in CLAUDE.md).
 
 ### 4.2 Strategy B: passive raw-frame decoding (`RAW_SIGNAL_TABLE`)
 

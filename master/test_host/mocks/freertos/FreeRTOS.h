@@ -35,5 +35,7 @@ BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t
 /** Free stack at its lowest [bytes, as on ESP-IDF]: the host cannot measure
  *  the device's, so the handle carries the stack size and half is reported. */
 UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);
+/** The task calling it: here a stand-in carrying the loop task's 12 KB. */
+inline TaskHandle_t xTaskGetCurrentTaskHandle() { return (TaskHandle_t)(uintptr_t)(12 * 1024); }
 void vTaskDelay(TickType_t ticks);
 TickType_t xTaskGetTickCount();

@@ -486,7 +486,7 @@ static SemaphoreHandle_t s_twaiReg = nullptr;
  *  overflow is a panic, and a panic is a restart in the middle of a drive. */
 static struct { TaskHandle_t h; const char *name; } s_tasks[] = {
     { nullptr, "twai_rx" }, { nullptr, "obd_poll" }, { nullptr, "broadcast" },
-    { nullptr, "housekeep" }, { nullptr, "busguard" },
+    { nullptr, "housekeep" }, { nullptr, "busguard" }, { nullptr, "loopTask" },
 };
 
 /** @brief Milliseconds of guard pause left (0 = not paused). */
@@ -1160,6 +1160,30 @@ static volatile uint8_t  s_rangeGot = 0;
  */
 static volatile bool     s_obdPhysical = true;
 
+/**
+ * Who answers each PID: bit n = the computer replying on 0x7E8 + n (bit 0 the
+ * engine ECU), as of its last exchange. A request to every computer (0x7DF)
+ * is finished when each one known to answer it has, instead of at the first
+ * reply - the next request must not reach a computer still answering this
+ * one - and where the engine ECU answers a PID, another computer's reading of
+ * the same PID is not published over it: the transmission ECU's "no lamp, no
+ * codes" used to alternate with the engine ECU's on the same value.
+ */
+static volatile uint8_t  s_pidResponders[256] = {0};
+static volatile uint8_t  s_obdGot      = 0;        /**< Replied to the request in flight. */
+static volatile bool     s_obdPending  = false;    /**< ...with "still working" (0x78).   */
+/** @name How long the ECU takes to answer (Sources tab, serial [diag])
+ *  @{ */
+static volatile uint32_t s_obdSentAtUs = 0;        /**< micros() of the last request.     */
+static volatile uint8_t  s_obdLastPid  = 0xFF;     /**< Its PID...                        */
+static volatile bool     s_obdLastOpen = false;    /**< ...and that no reply has come.    */
+static volatile uint32_t s_obdLatAvgUs = 0, s_obdLatMaxUs = 0;
+static volatile uint32_t s_obdLate     = 0;        /**< Replies that came after the wait. */
+/** @} */
+/** After "still working" (0x78) the ECU has P2*CAN, 5 s by the standard; no
+ *  Service-01 answer takes that long, and the bus is held meanwhile. */
+static constexpr uint32_t OBD_PENDING_MS = 2000;
+
 static bool obdPidSupported(uint8_t pid) {
     if (!s_pidSupportKnown) return pid == 0x00;
     return (s_pidSupport[pid >> 3] >> (pid & 7)) & 1;
@@ -1210,9 +1234,9 @@ static void handleObdResponse(const twai_message_t &msg) {
      * answer is still coming, so the wait goes on.
      */
     if (len >= 3 && msg.data[1] == 0x7F && msg.data[2] == 0x01) {
-        if (msg.data[3] != 0x78 && s_obdWaitPhys && msg.identifier == OBD_RESPONSE_MIN &&
-            s_obdWaitPid != 0xFF && s_obdSem) {
-            s_obdNrc = msg.data[3] ? msg.data[3] : 0xFF;
+        if (s_obdWaitPhys && msg.identifier == OBD_RESPONSE_MIN && s_obdWaitPid != 0xFF && s_obdSem) {
+            if (msg.data[3] == 0x78) s_obdPending = true;          // obdAsk() waits on
+            else s_obdNrc = msg.data[3] ? msg.data[3] : 0xFF;
             xSemaphoreGive(s_obdSem);
         }
         return;
@@ -1221,6 +1245,22 @@ static void handleObdResponse(const twai_message_t &msg) {
     const uint8_t pid   = msg.data[2];
     const uint8_t avail = (uint8_t)min((int)len - 2, (int)msg.data_length_code - 3);
     const uint8_t *d    = &msg.data[3];
+    const uint8_t who   = (uint8_t)(1u << (msg.identifier - OBD_RESPONSE_MIN));
+    const bool engine   = msg.identifier == OBD_RESPONSE_MIN;
+    const bool awaited  = pid == s_obdWaitPid;
+
+    // How long the answer took - the first one to a request, and one that
+    // came after its wait had ended (late: obd_to and obd_p2can are both
+    // shorter than this ECU takes).
+    if (awaited ? s_obdGot == 0 : (pid == s_obdLastPid && s_obdLastOpen)) {
+        const uint32_t us = micros() - s_obdSentAtUs;
+        if (us < 5000000u) {
+            s_obdLatAvgUs = s_obdLatAvgUs ? s_obdLatAvgUs - s_obdLatAvgUs / 8 + us / 8 : us;
+            if (us > s_obdLatMaxUs) s_obdLatMaxUs = us;
+        }
+        if (!awaited) s_obdLate = s_obdLate + 1;
+        s_obdLastOpen = false;
+    }
 
     if ((pid & 0x1F) == 0 && pid <= 0xC0) {
         if (avail < 4) return;
@@ -1238,7 +1278,9 @@ static void handleObdResponse(const twai_message_t &msg) {
         // Only the engine ECU's list completes a range: the transmission
         // ECU's shorter one answering first must not stand in for it.
         if (msg.identifier == OBD_RESPONSE_MIN) s_rangeGot |= (uint8_t)(1 << (pid >> 5));
-    } else {
+    } else if (engine || !(s_pidResponders[pid] & 0x01)) {
+        // (Another computer's reading of a PID the engine ECU answers is
+        // left out - see s_pidResponders.)
         bool any = false;
         for (const auto &def : OBD_POLL_TABLE) {
             if (def.pid != pid || def.off + def.bytes > avail) continue;
@@ -1256,7 +1298,11 @@ static void handleObdResponse(const twai_message_t &msg) {
         }
         if (any) s_obdResponses++;
     }
-    if (pid == s_obdWaitPid && s_obdSem) xSemaphoreGive(s_obdSem);
+    s_pidResponders[pid] = s_pidResponders[pid] | who;
+    if (awaited && s_obdSem) {
+        s_obdGot = s_obdGot | who;
+        xSemaphoreGive(s_obdSem);
+    }
 }
 
 /** @brief How one request went. */
@@ -1279,20 +1325,56 @@ enum AskResult : uint8_t {
  *  can hold the bus for tens of ms first. */
 static uint32_t s_obdSentAtMs = 0;
 
+/**
+ * The bus stays ours until the request is settled: answered by every computer
+ * known to answer it, refused, or P2CAN (obd_p2can, 50 ms - what ISO 15765-4
+ * gives an ECU) has passed since it went out, whichever is first. obd_to
+ * alone used to end the wait - 20-25 ms on the car - and with it the hold on
+ * the bus: an ECU answering in 35 ms was counted as silent (its PIDs backed
+ * off to a trickle), and in AUTO the SSM2 engine put a 15-frame request into
+ * the window the ECU was still answering in. An ECU that answers at once is
+ * waited for exactly as long as before; obd_p2can 0 gives the old wait back.
+ */
 static AskResult obdAsk(uint8_t pid, uint32_t waitMs, bool functional) {
     if (!diagBusLock(250)) return ASK_BUSY;
     xSemaphoreTake(s_obdSem, 0);            // clear a stale give
     s_obdNrc = 0;
+    s_obdGot = 0;
+    s_obdPending = false;
     s_obdWaitPhys = !functional;
-    s_obdWaitPid = pid;
+    // Physical: the engine ECU alone. Functional: whoever answered this PID
+    // last time; nobody known yet (0) listens the window out, once.
+    const uint8_t expect = functional ? (uint8_t)s_pidResponders[pid] : 0x01;
+    s_obdLastOpen = false;
+    s_obdLastPid  = pid;
+    s_obdSentAtUs = micros();
+    s_obdWaitPid  = pid;
     const bool sent = obdRequest(pid, functional);
-    if (sent) s_obdSentAtMs = millis();
-    const bool got = sent && xSemaphoreTake(s_obdSem, pdMS_TO_TICKS(waitMs)) == pdTRUE;
+    const uint32_t sentAt = millis();
+    if (sent) { s_obdSentAtMs = sentAt; s_obdSentAtUs = micros(); }
+    uint32_t window = max(waitMs, (uint32_t)Cfg.obdP2CanMs);
+    while (sent) {
+        const uint32_t waited = millis() - sentAt;
+        if (waited >= window) break;
+        if (xSemaphoreTake(s_obdSem, pdMS_TO_TICKS(window - waited)) != pdTRUE) break;
+        if (s_obdPending) {                 // "still working": it answers later
+            s_obdPending = false;
+            window = max(window, (uint32_t)(millis() - sentAt) + OBD_PENDING_MS);
+            continue;
+        }
+        if (s_obdNrc) break;
+        if (expect && (s_obdGot & expect) == expect) break;
+    }
+    const uint8_t got = s_obdGot;
     s_obdWaitPid = 0xFF;
+    // Who answers this PID is whoever just did: one that has stopped is not
+    // waited for again, and its place as the preferred source goes with it.
+    if (functional && got) s_pidResponders[pid] = got;
+    if (sent && !got && !s_obdNrc) s_obdLastOpen = true;   // a reply from here on is late
     diagBusUnlock();
     if (!sent) return ASK_BUSY;
-    if (!got)  return ASK_NO_REPLY;
-    return s_obdNrc ? ASK_NRC : ASK_OK;
+    if (s_obdNrc) return ASK_NRC;
+    return got ? ASK_OK : ASK_NO_REPLY;
 }
 static AskResult obdAsk(uint8_t pid, uint32_t waitMs) {
     return obdAsk(pid, waitMs, !s_obdPhysical);
@@ -1390,6 +1472,119 @@ static bool obdPidCovered(uint8_t pid) {
     return anyRow;
 }
 
+/** @name OBD-II request pacing
+ *  The overall request budget (req_max_hz). The P2CAN wait behind an
+ *  unanswered request is obdAsk()'s: it keeps the bus until then.
+ *  @{ */
+static uint32_t s_reqLastSendMs = 0;   /**< Last OBD-II request, for req_max_hz.     */
+/** @} */
+
+/** Requests in a row with no answer at all that mean the ECU has stopped. */
+static constexpr uint8_t OBD_GONE_RUN = 10;
+
+/**
+ * @name OBD-II poll order
+ *
+ * The table asks for more than fits: the car's 66 PIDs at their periods come
+ * to some 200 requests a second, and with a 20 ms pause the bus carries about
+ * 40. Asked each in turn, every PID quicker than one round of the table was
+ * asked once a round - with all of them supported, engine speed (50 ms) and
+ * coolant (1000 ms) both every 1.3 s. The period meant nothing.
+ *
+ * So the PID asked next is the one most overdue for its own period: late by
+ * the largest share of it. With more due than there is time for, the quick
+ * ones are then slowed by the same factor rather than to the same interval;
+ * with time to spare, a 50 ms PID is not kept waiting behind ten 1 s ones
+ * that fell due together. Two limits keep that from costing the slow ones: no
+ * PID waits more than OBD_LATE_MAX_MS past its time, and none is left until
+ * its value would age out of the broadcast (metric_ttl_ms). Those go first,
+ * the longest over first - which with no time to spare at all is each in turn
+ * again.
+ *
+ * The requests and their pacing are the same; only which PID a request
+ * carries changes. obd_order 1 gives the old order back.
+ *
+ * Times are kept as "scheduled at" and "wait", and compared as time elapsed -
+ * never as a signed distance to a deadline: a deadline more than 24.8 days
+ * old reads as one in the future. (Zeroing the deadlines when the ECU answered
+ * again did exactly that on a master powered for longer: no PID was asked
+ * until the clock wrapped, up to 24.8 days on.)
+ * @{
+ */
+static constexpr uint32_t OBD_LATE_MAX_MS = 1000;
+
+static struct {
+    uint32_t at[256];      /**< millis() the PID was last scheduled: asked,
+                                found covered, or found the bus busy.         */
+    uint16_t wait[256];    /**< Not before this long after that: its period,
+                                or the back-off of one that does not answer.  */
+    uint8_t  misses[256];  /**< Requests in a row it did not answer.          */
+    uint8_t  seen[32];     /**< Bit per PID: scheduled since the poll began.  */
+} s_poll;
+
+static bool pollSeen(uint8_t pid) { return (s_poll.seen[pid >> 3] >> (pid & 7)) & 1; }
+
+/** @brief @p pid is not looked at again for @p waitMs. */
+static void pollSchedule(uint8_t pid, uint32_t waitMs) {
+    s_poll.at[pid]   = millis();
+    s_poll.wait[pid] = (uint16_t)min(waitMs, (uint32_t)60000);
+    s_poll.seen[pid >> 3] |= (uint8_t)(1 << (pid & 7));
+}
+
+/** @brief Begin again: every PID is asked once, in table order, and is back
+ *         on its own period (the ECU has been away). */
+static void pollRestart() {
+    memset(s_poll.misses, 0, sizeof(s_poll.misses));
+    memset(s_poll.seen, 0, sizeof(s_poll.seen));
+}
+
+/**
+ * @brief The PID to ask now.
+ * @param last     Index of the one chosen before ("each in turn" goes on from it).
+ * @param allSeen  Out: every enabled, supported PID has had its first turn.
+ * @param idleMs   Out: with nothing due, how long until something is (1-10 ms).
+ * @return Index into @p pids, or -1 with nothing due.
+ */
+static int obdPickNext(const std::vector<RtPid> &pids, int last, bool &allSeen, uint32_t &idleMs) {
+    const bool     inTurn  = Cfg.obdOrder == 1;
+    const uint32_t now     = millis();
+    const uint32_t ttl     = Cfg.metricTtlMs;
+    const uint32_t staleAt = ttl - min(ttl / 4, (uint32_t)500);   // with room for the ones ahead
+    const int      n       = (int)pids.size();
+    int      best = -1;
+    bool     bestFirst = false;        // the best so far has never been asked
+    bool     bestOver  = false;        // ...or is past one of the two limits
+    uint32_t bestBy = 0, bestLate = 0, bestWait = 1;
+    allSeen = true;
+    idleMs  = 10;
+    for (int k = 0; k < n; k++) {
+        const int    i = inTurn ? (int)(((uint32_t)(last + 1) + (uint32_t)k) % (uint32_t)n) : k;
+        const RtPid &p = pids[i];
+        if (!p.enabled || !obdPidSupported(p.pid)) continue;
+        const bool first = !pollSeen(p.pid);
+        if (first) allSeen = false;
+        if (bestFirst || (inTurn && best >= 0)) continue;     // chosen; only counting now
+        if (first) { best = i; bestFirst = true; continue; }  // its first turn, in table order
+        const uint32_t wait  = s_poll.wait[p.pid] ? s_poll.wait[p.pid] : 1;
+        const uint32_t since = now - s_poll.at[p.pid];
+        if (since < wait) { idleMs = min(idleMs, wait - since); continue; }
+        if (inTurn) { best = i; continue; }
+        const uint32_t late  = since - wait;
+        const uint32_t limit = min(wait + OBD_LATE_MAX_MS, max(wait, staleAt));
+        const bool     over  = since >= limit;
+        const uint32_t by    = over ? since - limit : 0;
+        bool better;
+        if (best < 0)              better = true;
+        else if (over != bestOver) better = over;
+        else if (over)             better = by > bestBy;
+        else                       better = (uint64_t)late * bestWait > (uint64_t)bestLate * wait;
+        if (better) { best = i; bestOver = over; bestBy = by; bestLate = late; bestWait = wait; }
+    }
+    if (idleMs < 1) idleMs = 1;
+    return best;
+}
+/** @} */
+
 /**
  * @brief PID scheduler with per-PID periods, one request in flight at a time.
  *
@@ -1404,22 +1599,7 @@ static bool obdPidCovered(uint8_t pid) {
  * the ECU asleep and the bus still awake that turns a steady stream of
  * unanswered requests into a trickle.
  */
-/** @name OBD-II request pacing
- *  P2CAN cool-down after a timeout, and the overall request budget. Kept as a
- *  start and a length, not an end time, so they read right across the millis()
- *  wrap (see the guard pause for the same reasoning).
- *  @{ */
-static uint32_t s_obdCooldownAt = 0;   /**< When the unanswered request was sent... */
-static uint32_t s_obdCooldownMs = 0;   /**< ...and how long to hold off after it.    */
-static uint32_t s_reqLastSendMs = 0;   /**< Last OBD-II request, for req_max_hz.     */
-/** @} */
-
-/** Requests in a row with no answer at all that mean the ECU has stopped. */
-static constexpr uint8_t OBD_GONE_RUN = 10;
-
 static void obdPollTask(void *) {
-    static uint32_t nextDue[256] = {};
-    static uint8_t  misses[256]  = {};
     std::vector<RtPid> pids;
     uint32_t pidGen = 0xFFFFFFFF;
     uint32_t lastProbe = 0, lastRanges = 0;
@@ -1427,6 +1607,7 @@ static void obdPollTask(void *) {
     bool     rangesComplete = true;
     uint8_t  unanswered = 0;           /**< Requests in a row nothing answered. */
     bool     wasGone = false;          /**< Back to probing after such a run.   */
+    int      last = -1;                /**< Index of the PID chosen last.       */
 
     for (;;) {
         if (!diagObdWanted() || !diagBusAlive() || !diagGuardOk()) {
@@ -1454,8 +1635,8 @@ static void obdPollTask(void *) {
                     // every PID straight back on its normal period, not on the
                     // back-off it ran up while nothing answered.
                     if (wasGone && probeFails) {
-                        memset(misses, 0, sizeof(misses));
-                        memset(nextDue, 0, sizeof(nextDue));
+                        pollRestart();
+                        last = -1;
                         log_i("OBD-II: the ECU answers again - polling resumed");
                     }
                     wasGone = false;
@@ -1490,81 +1671,68 @@ static void obdPollTask(void *) {
             }
         }
 
-        bool sentAny = false;
-        for (const auto &p : pids) {
-            if (!p.enabled || !obdPidSupported(p.pid)) continue;
-            const uint32_t now = millis();
-            if ((int32_t)(now - nextDue[p.pid]) < 0) continue;
-            if (obdPidCovered(p.pid)) { nextDue[p.pid] = now + 1000; continue; }
-            // Pace before sending: the overall request budget (req_max_hz, 0 =
-            // off) spreads requests over time, and the post-timeout P2CAN
-            // cool-down (obd_p2can) keeps the next request from landing in the
-            // tail of a reply a slow ECU is still sending. Both delay, never drop.
-            {
-                const uint32_t nowP = millis();
-                uint32_t wait = 0;
-                if (Cfg.reqMaxHz) {
-                    const uint32_t minGap = max((uint32_t)1, (uint32_t)(1000u / Cfg.reqMaxHz));
-                    const uint32_t since  = nowP - s_reqLastSendMs;
-                    if (since < minGap) wait = minGap - since;
-                }
-                const uint32_t sinceTimeout = nowP - s_obdCooldownAt;
-                if (sinceTimeout < s_obdCooldownMs)
-                    wait = max(wait, s_obdCooldownMs - sinceTimeout);
-                if (wait) vTaskDelay(pdMS_TO_TICKS(wait));
-            }
-            const AskResult r = obdAsk(p.pid, Cfg.obdTimeoutMs);
-            // Both paces count from when the request really went out (see
-            // s_obdSentAtMs); a request that never went out counts for neither.
-            const uint32_t sendMs = s_obdSentAtMs;
-            if (r != ASK_BUSY) s_reqLastSendMs = sendMs;
-            if (r == ASK_NO_REPLY || r == ASK_NRC) {
-                s_obdCooldownMs = 0;             // never a half-updated hold-off
-                s_obdCooldownAt = sendMs;
-                s_obdCooldownMs = Cfg.obdP2CanMs;
-            } else if (r == ASK_OK) {
-                s_obdCooldownMs = 0;             // answered: nothing to wait for
-            }
-            // A run of requests nothing answered - not one PID, all of them: the
-            // ECU has stopped (ignition off with the bus kept up by another
-            // module, or not answering at all). Each PID's own back-off would
-            // still ask every one of them every 10 s - with the car's 60-odd
-            // PIDs, six requests a second for as long as the bus stays up, the
-            // kind of traffic that keeps modules from going to sleep. Back to
-            // the probe instead: one request every 10 s until it answers.
-            if (r == ASK_OK || r == ASK_NRC) unanswered = 0;
-            else if (r == ASK_NO_REPLY && ++unanswered >= OBD_GONE_RUN) {
-                unanswered = 0;
-                wasGone = true;
-                s_pidSupportKnown = false;
-                s_obdActive = false;
-                probeFails = 0;
-                lastProbe = millis();
-                diagReportObd(false);
-                log_w("OBD-II: %u requests in a row unanswered - the ECU has stopped; probing "
-                      "it instead of polling every PID", (unsigned)OBD_GONE_RUN);
-                break;
-            }
-            uint32_t period = p.periodMs ? p.periodMs : 100;
-            if (r == ASK_OK) {
-                misses[p.pid] = 0;
-                masterUpdateDerived();
-            } else if (r == ASK_BUSY) {
-                period = 20;                 // not the ECU's fault: soon again
-            } else {
-                if (misses[p.pid] < 255) misses[p.pid]++;
-                if (misses[p.pid] >= 3) {
-                    const uint32_t back = min((uint32_t)10000,
-                                              (uint32_t)500 << min(misses[p.pid] - 3, 5));
-                    period = max(period, back);
-                }
-            }
-            nextDue[p.pid] = millis() + period;
-            sentAny = true;
-            vTaskDelay(pdMS_TO_TICKS(Cfg.obdGapMs ? Cfg.obdGapMs : 1));
+        // The PID to ask. One a better source already delivers is not asked:
+        // it is looked at again in a second, and the next one chosen.
+        int idx; bool allSeen; uint32_t idleMs;
+        for (;;) {
+            idx = obdPickNext(pids, last, allSeen, idleMs);
+            if (idx < 0) break;
+            last = idx;
+            if (!obdPidCovered(pids[idx].pid)) break;
+            pollSchedule(pids[idx].pid, 1000);
         }
-        s_obdSettled = true;                 // a full pass: coverage is known
-        if (!sentAny) vTaskDelay(pdMS_TO_TICKS(10));
+        if (allSeen) s_obdSettled = true;    // every PID has had a turn: coverage is known
+        if (idx < 0) { vTaskDelay(pdMS_TO_TICKS(idleMs)); continue; }
+        const RtPid &p = pids[idx];
+
+        // Pace before sending: the overall request budget (req_max_hz, 0 =
+        // off) spreads requests over time. It delays, never drops.
+        if (Cfg.reqMaxHz) {
+            const uint32_t minGap = max((uint32_t)1, (uint32_t)(1000u / Cfg.reqMaxHz));
+            const uint32_t since  = millis() - s_reqLastSendMs;
+            if (since < minGap) vTaskDelay(pdMS_TO_TICKS(minGap - since));
+        }
+        const AskResult r = obdAsk(p.pid, Cfg.obdTimeoutMs);
+        // The budget counts from when the request really went out (see
+        // s_obdSentAtMs); a request that never went out does not count.
+        if (r != ASK_BUSY) s_reqLastSendMs = s_obdSentAtMs;
+        // A run of requests nothing answered - not one PID, all of them: the
+        // ECU has stopped (ignition off with the bus kept up by another
+        // module, or not answering at all). Each PID's own back-off would
+        // still ask every one of them every 10 s - with the car's 60-odd
+        // PIDs, six requests a second for as long as the bus stays up, the
+        // kind of traffic that keeps modules from going to sleep. Back to
+        // the probe instead: one request every 10 s until it answers.
+        if (r == ASK_OK || r == ASK_NRC) unanswered = 0;
+        else if (r == ASK_NO_REPLY && ++unanswered >= OBD_GONE_RUN) {
+            unanswered = 0;
+            wasGone = true;
+            s_pidSupportKnown = false;
+            s_obdActive = false;
+            s_obdSettled = true;             // it has shown what it will answer
+            probeFails = 0;
+            lastProbe = millis();
+            diagReportObd(false);
+            log_w("OBD-II: %u requests in a row unanswered - the ECU has stopped; probing "
+                  "it instead of polling every PID", (unsigned)OBD_GONE_RUN);
+            continue;
+        }
+        uint32_t period = p.periodMs ? p.periodMs : 100;
+        if (r == ASK_OK) {
+            s_poll.misses[p.pid] = 0;
+            masterUpdateDerived();
+        } else if (r == ASK_BUSY) {
+            period = 20;                 // not the ECU's fault: soon again
+        } else {
+            if (s_poll.misses[p.pid] < 255) s_poll.misses[p.pid]++;
+            if (s_poll.misses[p.pid] >= 3) {
+                const uint32_t back = min((uint32_t)10000,
+                                          (uint32_t)500 << min(s_poll.misses[p.pid] - 3, 5));
+                period = max(period, back);
+            }
+        }
+        pollSchedule(p.pid, period);
+        vTaskDelay(pdMS_TO_TICKS(Cfg.obdGapMs ? Cfg.obdGapMs : 1));
     }
 }
 
@@ -2835,6 +3003,9 @@ void masterGetStats(MasterStats &out) {
     out.ssmAnswers = s_ssmAnswers;
     out.obdAnswers = s_obdAnswers;
     out.obdSupported = s_pidSupportKnown ? s_pidSupportCount : 0;
+    out.obdLatUs     = s_obdLatAvgUs;
+    out.obdLatMaxUs  = s_obdLatMaxUs;
+    out.obdLate      = s_obdLate;
     out.obdPhysical  = s_obdPhysical;
     // Listen-only the user chose or the guard imposed - not the settle wait,
     // nor the moment after it while the controller switches back to normal.
@@ -3175,7 +3346,17 @@ static void setupEspNow() {
  * CAN work is pinned to core 1 and radio work to core 0, so a busy bus cannot
  * delay a broadcast and vice versa.
  */
+/*
+ * Arduino's loop task runs the portal - and so every settings save: the web
+ * server, the whole configuration as a JSON document and LittleFS, one on top
+ * of the other. 12 KB instead of the core's 8 KB. It is created before
+ * setup(), so it comes out of what the learner sizes itself to, not out of
+ * the reserve the learner keeps for Wi-Fi and the portal.
+ */
+SET_LOOP_TASK_STACK_SIZE(12 * 1024);
+
 void setup() {
+    s_tasks[5].h = xTaskGetCurrentTaskHandle();     // setup() runs on the loop task
     Serial.begin(115200);
     log_i("CAN Telemetry Master v%s (proto v%d)", FIRMWARE_VERSION,
           TELEMETRY_PROTO_VERSION);
@@ -3224,9 +3405,13 @@ void setup() {
     // stack overflow is a panic - a restart in the middle of a drive.
     xTaskCreatePinnedToCore(busGuardTask,    "busguard",  4096, nullptr,  9, &s_tasks[4].h, 1);
     ssm2Begin();
-    learnerBegin();
     codesBegin();
     driveLogBegin();
+    // Last: the learner sizes its tables to the heap free now, keeping 95 KB
+    // for Wi-Fi, the portal and its saves. Anything started after it would
+    // take its share out of that reserve - the trouble codes and the drive
+    // log did, 13 KB, and saves failed and the master restarted on the car.
+    learnerBegin();
 }
 
 /**
@@ -3286,11 +3471,11 @@ void loop() {
          */
         Serial.printf("[stats] CAN rx: %u | OBD resp: %u | SSM2: %u ok/%u err "
                       "(%.0f/s, %u addr) | ESP-NOW: %.0f frame/s, %.0f metric/s "
-                      "(%u sent, %u fail) | night: %d | heap: %u\n",
+                      "(%u sent, %u fail) | night: %d | heap: %u (lowest %u, largest block %u)\n",
                       s_canFramesRx, s_obdResponses, ss.responses, ss.errors,
                       ss.exchPerSec, ss.batch, fps, mps,
                       s_espnowFrames, s_espnowFailed,
-                      (int)s_night, ESP.getFreeHeap());
+                      (int)s_night, ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
         static const char *MODES[] = {"AUTO", "SSM2", "OBD-II", "BOTH", "SILENT"};
         char settleTxt[48] = "";
         const uint32_t settle = settleLeft();

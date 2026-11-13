@@ -215,7 +215,7 @@ void MasterConfig::loadDefaults() {
     ssmSwitches = true;
     learnEnabled = true;
     learnR2 = 0.985f; learnMinN = 40; learnSteady = 0.10f; learnPhi = 0.95f; verifyN = 30;
-    obdGapMs = 8; obdTimeoutMs = 80; reqMaxHz = 0; obdAddressing = 0;
+    obdGapMs = 8; obdTimeoutMs = 80; reqMaxHz = 0; obdAddressing = 0; obdOrder = 0;
     ssmTimeoutMs = 1000; coverMs = 2500;
     keepaliveMs = 300; sourceHoldMs = 500; ldrDark = NIGHT_LDR_DARK_ADC; ldrLight = NIGHT_LDR_LIGHT_ADC;
     sleepEnabled = true;
@@ -459,8 +459,17 @@ bool MasterConfig::save() {
 }
 
 bool MasterConfig::saveLocked() {
-    JsonDocument doc;
+    JsonDocument doc = jsonAlloc ? JsonDocument(jsonAlloc) : JsonDocument();
     toJson(doc);
+    // Out of memory part way through, ArduinoJson drops what does not fit
+    // without a word: written, that would be a valid-looking file without
+    // the learned signals or the SSM table. Nothing is written instead.
+    if (doc.overflowed()) {
+        log_e("config: out of memory building the settings (%u bytes free, largest block %u) - "
+              "nothing written, the stored settings are kept",
+              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+        return false;
+    }
 
     /*
      * Written to a temporary file and then renamed, so a power cut midway
@@ -540,6 +549,7 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["obd_p2can"]    = obdP2CanMs;
     doc["req_max_hz"]   = reqMaxHz;
     doc["obd_addr"]     = obdAddressing;
+    doc["obd_order"]    = obdOrder;
     doc["ssm_to"]       = ssmTimeoutMs;
     doc["cover_ms"]     = coverMs;
     doc["keepalive_ms"] = keepaliveMs;
@@ -687,6 +697,7 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     obdP2CanMs   = (uint16_t)jint(v["obd_p2can"], obdP2CanMs, 0, 2000);
     reqMaxHz     = (uint16_t)jint(v["req_max_hz"], reqMaxHz, 0, 200);
     obdAddressing = v["obd_addr"]    | obdAddressing;
+    obdOrder     = (uint8_t)jint(v["obd_order"], obdOrder, 0, 1);
     ssmTimeoutMs = v["ssm_to"]       | ssmTimeoutMs;
     coverMs      = v["cover_ms"]     | coverMs;
     keepaliveMs  = v["keepalive_ms"] | keepaliveMs;

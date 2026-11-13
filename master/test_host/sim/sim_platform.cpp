@@ -31,6 +31,7 @@
 BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *name, uint32_t stack, void *arg,
                                    UBaseType_t prio, TaskHandle_t *handle, BaseType_t) {
     if (handle) *handle = (TaskHandle_t)(uintptr_t)stack;   // what uxTaskGetStackHighWaterMark reports from
+    sim::tasksCreated.push_back(name);
     simrtos::createTask(fn, name, arg, (int)prio);
     return pdPASS;
 }
@@ -157,6 +158,7 @@ int logErrors = 0, logWarnings = 0;
 std::vector<std::string> logLines;
 bool verbose = false;
 uint32_t heapFree = 180000;
+std::vector<std::string> tasksCreated;
 }
 
 void simLog(char level, const char *fmt, ...) {
@@ -190,6 +192,8 @@ size_t HardwareSerialMock::print(const char *s) { if (sim::verbose) std::printf(
 
 EspClassMock ESP;
 uint32_t EspClassMock::getFreeHeap() { return sim::heapFree; }
+uint32_t EspClassMock::getMinFreeHeap() { return sim::heapFree; }
+uint32_t EspClassMock::getMaxAllocHeap() { return sim::heapFree / 2; }
 void EspClassMock::restart() {
     if (sim::restartReturns) { sim::restarts++; std::printf("*** ESP.restart() (expected)\n"); return; }
     std::printf("*** ESP.restart()\n");

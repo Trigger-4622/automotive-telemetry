@@ -112,6 +112,39 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   asking every PID while the ECU is off. `masterBeforeRestart()` takes the
   controller off the bus and latches the TX pad recessive (RTC hold) across
   every portal restart; `txRecessiveBoot()` drives the pin before releasing it.
+- **Asking the car** (`pacing_p2can*`, `obd_two_ecus`, `obd_pending`,
+  `dtc_functional_fc`, `dtc_tcm_silent`): one request on the bus at a time,
+  whoever sends it - the OBD-II poller, SSM2 and the code reader all take
+  `diagBusLock()` - and the lock is kept until that request is settled:
+  answered by every computer known to answer it, refused, or P2CAN since it
+  went out (`obdAsk()`: the longer of `obd_to` and `obd_p2can`; "still
+  working", 0x78, is waited on for up to 2 s). `obd_to` alone used to end the
+  wait and free the bus: with the car's 25 ms, an ECU answering in 35 ms was
+  counted silent (its PIDs backed off to a trickle) and in Auto SSM2 put a
+  15-frame request into the answer. Anything new that asks must hold the lock
+  the same way. `s_pidResponders` is who answers each PID: a 0x7DF request
+  waits for each of them, and where the engine ECU answers a PID another
+  computer's reading of it is not published (the TCM's "lamp off" used to
+  alternate with the ECM's). A 0x7DF request through `isoExchange()` gives
+  every computer's first frame its flow control and keeps the bus until the
+  long answers have passed (`otherAnswer`, `othersFinish`). The code reader
+  waits 150 ms a request, and a transmission computer silent for three reads
+  is asked at every tenth (at once on "Read now" and when the car comes on).
+  The Sources tab shows how long the ECU takes ("answers in", `/api/live`
+  `obd.lat`, `lat_max`) and answers that came after their wait (`late`): if
+  that is not 0 on the car, raise `obd_p2can`.
+- **OBD-II poll order** (`obd_order`, `obd_poll_order`, `obd_poll_all`): the
+  table wants about 200 requests a second and the bus carries about 40, so
+  which PID goes first matters. The one most overdue for its own period does
+  (`obdPickNext`); one a second past its time (`OBD_LATE_MAX_MS`), or about to
+  age out of the broadcast (`metric_ttl_ms`), goes ahead of those. The same
+  requests at the same pace in another order: with the simulated ECU's 32
+  PIDs, engine speed went from every 504 ms to every 165, road speed to 315,
+  a 1 s value to every 2 s. `obd_order` 1 is each in turn, as before. Poll
+  times are kept as "scheduled at" and "wait" and compared as time elapsed -
+  never zero a timestamp or compare a signed distance to a deadline: powered
+  for 24.8 days, the old poller's zeroed deadlines read as in the future and
+  not one PID was asked after the next key-on (`obd_resume_old_clock`).
 - **Listen-only is NOT silent on this chip by itself.** Espressif erratum
   (ESP32/S2/S3/C3): a listen-only TWAI controller still sends ACTIVE error
   flags, and listen-only freezes its error counters, so one started with REC 0
@@ -163,6 +196,18 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   remote frames are activity only (`rx_odd_frames`). Stack headroom of the
   CAN tasks: `[ctrl ]` and `/api/live` (`stack`, `stack_task`); busguard has
   4 KB.
+- **Heap** (a save failed and the master restarted, 2026-11-08): the learner
+  sizes its tables at the END of `setup()` to the free heap minus 95 KB kept
+  for Wi-Fi, the portal and its saves. Anything started after it eats that
+  reserve - the trouble-code and drive-log tasks did (13 KB) - so start new
+  tasks before `learnerBegin()` (`learner_sizes_last`). A save builds the whole
+  car config (~20 KB of JSON, ~30 KB in ArduinoJson); out of memory it used to
+  write the truncated document as a valid file (learned signals gone), now it
+  writes nothing (`config_save_out_of_memory`). The loop task (portal and
+  saves) has 12 KB (`SET_LOOP_TASK_STACK_SIZE`). Heap now, lowest and largest
+  block: serial `[stats]` and `/api/live` (`heap`, `heap_min`, `heap_block`);
+  the loop task's stack is in the `[ctrl ]` headroom figure. The sim's heap is
+  a constant 180 KB, so it cannot show exhaustion itself.
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only
@@ -318,7 +363,12 @@ when it does not (`lamp_hazard_switch`).
   MIL. Suspect the master's transmit path - the transceiver board's own 120
   ohm terminator (CANH-CANL ~40 ohm instead of ~60), its RS pin, its ground
   to OBD pin 5, the supply - and confirm with the portal's "What the errors
-  are" before changing firmware for it.
+  are" before changing firmware for it. Measured in the simulator 2026-11-13,
+  nothing changed: with TEC held at 220 and topped up below 170, 5 % of our
+  own frames failing is 1 bus-off in 10 minutes, 10 % is 113 (the car's rate)
+  and 20 % is 1132; held at 184 / 168 it is 0, 43 and 931, still never
+  error-active. The figures and the choices are at the top of
+  P1718_DIAGNOSIS.md - the owner's decision.
 - Master flashed again 2026-09-30 evening (branch portal-teach-turns-hazard:
   the portal's time-limited requests and idle-connection fix, the indicators'
   teach run, the lever field and tolerant lever reading, lamp repeats). The
@@ -336,6 +386,12 @@ when it does not (`lamp_hazard_switch`).
   boot_app0-at-0xE000 notes as the round screen. Not yet seen on the car:
   the lamps, the dash screen, and whether the Arduino_GFX driver cured the
   panel speckle.
+- Communication review (2026-11-13: "Asking the car" and the poll order
+  above): harness only. On the car: the Sources tab's "answers in ... ms" and
+  "came late" (not 0: raise `obd_p2can`); whether the gauges fed by OBD-II -
+  road speed above all, and the timers and G-meter that use it - are livelier
+  (`obd_order` 1 puts the old order back); and what the code reader says about
+  the transmission computer.
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
   service 03 at all; that the SSM2 odometer matches the cluster; which frame

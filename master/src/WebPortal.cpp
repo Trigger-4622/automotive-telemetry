@@ -459,6 +459,7 @@ const ADV=[
   ['start_delay_s','Listen only after the bus comes up for','num','s · 0 = no wait',0,300],
   ['obd_addr','OBD-II addressing','sel',[[0,'Auto (engine ECU first)'],[1,'Engine ECU only (0x7E0)'],[2,'All ECUs (0x7DF)']]],
   ['obd_gap','Pause between OBD-II requests','num','ms',0,255],
+  ['obd_order','When more OBD-II values are due than there is time for','sel',[[0,'The most overdue for its period first'],[1,'Each in turn']]],
   ['obd_to','OBD-II reply timeout','num','ms',20,2000],
   ['obd_p2can','After an unanswered request, wait at least (ISO 15765-4 P2CAN)','num','ms from the send · 0 = off',0,2000],
   ['req_max_hz','Request budget','num','requests/s · 0 = no cap',0,200],
@@ -1255,7 +1256,8 @@ function renderSources(){
  updateSourceText()}
 function updateSourceText(){
  if(!L)return;const o=L.obd,s=L.ssm;
- $('#oSub').textContent=o.answers===1?`ECU supports ${o.supported} PIDs · ${o.active?'active':'idle'} · ${o.physical?'engine ECU only':'all ECUs'}`:o.answers===2?'the ECU does not answer':'not asked yet';
+ $('#oSub').textContent=o.answers===1?`ECU supports ${o.supported} PIDs · ${o.active?'active':'idle'} · ${o.physical?'engine ECU only':'all ECUs'}`+
+  (o.lat?` · answers in ${o.lat.toFixed(0)} ms (slowest ${o.lat_max.toFixed(0)} ms)`:'')+(o.late?` · ${o.late} came late`:''):o.answers===2?'the ECU does not answer':'not asked yet';
  $('#mSub').textContent=(s.init?`ECU supports ${s.supported} of ${s.total} · ${s.active?(s.rate||0).toFixed(0)+' requests/s, '+s.batch+' values each':'idle — OBD-II covers it'}`:s.answers===2?'the ECU does not answer':'waits for OBD-II')+
   (s.refused?` · ${s.refused} refused by the ECU`:'')+(s.last_err?` · last problem: ${s.last_err}`:'');
  $('#sEcu').innerHTML=s.ecu_id?`ECU <b>${esc(s.ecu_id)}</b> · SYS ${esc(s.sys_id)} · ${s.flags} capability bytes${s.init?'':' (remembered)'} · this master ${esc(L.mac)}`:`This master ${esc(L.mac)}`}
@@ -1492,9 +1494,15 @@ void WebPortal::setupRoutes() {
     });
 
     s_server.on("/api/config", HTTP_POST, []() {
-        JsonDocument doc;
-        if (deserializeJson(doc, s_server.arg("plain")) ||
-            !Cfg.fromJson(doc.as<JsonVariantConst>(), true)) {   // not an object
+        bool parsed;
+        {
+            // Freed before the save builds its document of the whole
+            // configuration: the two at once were the save's peak of memory.
+            JsonDocument doc;
+            parsed = !deserializeJson(doc, s_server.arg("plain")) &&
+                     Cfg.fromJson(doc.as<JsonVariantConst>(), true);   // false: not an object
+        }
+        if (!parsed) {
             s_server.send(400, "application/json", "{\"error\":\"bad json\"}");
             return;
         }
@@ -1517,6 +1525,10 @@ void WebPortal::setupRoutes() {
         JsonDocument doc;
         doc["uptime"] = millis() / 1000;
         doc["heap"]   = ESP.getFreeHeap();
+        // The lowest it has been since boot, and the largest single block: a
+        // save needs ~30 KB of the car's settings at once.
+        doc["heap_min"]   = ESP.getMinFreeHeap();
+        doc["heap_block"] = ESP.getMaxAllocHeap();
         // The least stack any CAN-side task has had left: an overflow is a
         // panic, and a panic restarts the master mid-drive.
         doc["stack"]      = st.stackMinFree;
@@ -1598,6 +1610,11 @@ void WebPortal::setupRoutes() {
         o["physical"]  = st.obdPhysical;
         o["supported"] = st.obdSupported;
         o["rx"]        = st.obdRx;
+        // How long the ECU takes to answer [ms], and answers that came after
+        // the wait for them had ended (obd_to / obd_p2can shorter than the ECU).
+        o["lat"]       = st.obdLatUs / 1000.0f;
+        o["lat_max"]   = st.obdLatMaxUs / 1000.0f;
+        o["late"]      = st.obdLate;
 
         JsonObject so = doc["ssm"].to<JsonObject>();
         so["answers"]   = st.ssmAnswers;

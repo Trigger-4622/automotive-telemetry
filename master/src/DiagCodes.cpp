@@ -25,8 +25,12 @@ static constexpr uint32_t FIRST_READ_MS = 8000;
 static constexpr uint32_t RETRY_MS      = 5000;
 /** Codes are re-published this often, so the displays keep them. */
 static constexpr uint32_t PUBLISH_MS    = 500;
-/** How long a computer has to answer (P2*CAN is 5 s, with 0x78 first). */
-static constexpr uint32_t REPLY_MS      = 500;
+/** How long a computer has to start answering. ISO 15765-4 gives it 50 ms
+ *  (P2CAN) - "still working" (0x78) included, after which the transport waits
+ *  on. The bus is held meanwhile and every polled value waits with it: this
+ *  was 500 ms, half a second of frozen gauges for each request to a computer
+ *  that does not answer. */
+static constexpr uint32_t REPLY_MS      = 150;
 
 static SemaphoreHandle_t s_mx = nullptr;
 static CodesStatus       s_st = {};
@@ -39,6 +43,16 @@ static constexpr uint8_t IDENT_TRIES = 3;     /**< Reads with service-09 replies
 static uint8_t           s_missed[2][3] = {};
 /** Reads a list's codes are kept for while it goes unanswered. */
 static constexpr uint8_t KEEP_READS = 2;
+/**
+ * A transmission computer that answers nothing - not on its own address, not
+ * through 0x7DF (a JDM car's need not speak OBD-II at all): after this many
+ * reads in a row it is asked at every tenth read only, instead of two
+ * requests a minute for ever, one of them to every computer on the bus. Asked
+ * at once again when the portal asks for a read, and when the car comes on.
+ */
+static constexpr uint8_t TCM_SILENT_READS = 3;
+static constexpr uint8_t TCM_ASK_EVERY    = 10;
+static uint8_t           s_tcmSilent = 0, s_tcmSkipped = 0;
 
 /* ───────────────────────────── one request ─────────────────────────────── */
 
@@ -144,7 +158,9 @@ enum ReadResult : uint8_t {
     READ_SOME_BUSY,         /**< Done, but the bus was busy for a list: soon.   */
 };
 
-static ReadResult readCodes() {
+/** @param everyone Ask the transmission computer whatever it did last time
+ *                  (the portal's "Read now"). */
+static ReadResult readCodes(bool everyone) {
     DtcEntry codes[CODES_MAX];
     uint8_t  n = 0, list[2][3] = {};
     uint8_t  rsp[128];
@@ -153,6 +169,13 @@ static ReadResult readCodes() {
     bool     sent = false, tcmFunc = s_st.tcmFunctional;
 
     for (uint8_t m = 0; m < 2; m++) {
+        if (m == DTC_TRANSMISSION && !everyone && s_tcmSilent >= TCM_SILENT_READS) {
+            if (++s_tcmSkipped < TCM_ASK_EVERY) {
+                list[m][0] = list[m][1] = list[m][2] = LIST_NO_REPLY;   // as it was: silent
+                continue;
+            }
+            s_tcmSkipped = 0;
+        }
         for (uint8_t k = 0; k < 3; k++) {
             const uint8_t req[1] = { SERVICE[k] };
             IsoResult r = ask(m, req, 1, rsp, sizeof rsp, got, why, sizeof why);
@@ -179,6 +202,21 @@ static ReadResult readCodes() {
         }
     }
     if (!sent) return READ_NOTHING_SENT;
+
+    // The transmission computer: silent again (asked, and nothing came), or
+    // there after all.
+    {
+        const uint8_t *t = list[DTC_TRANSMISSION];
+        const bool spoke = t[0] == LIST_ANSWERED || t[0] == LIST_REFUSED ||
+                           t[1] == LIST_ANSWERED || t[1] == LIST_REFUSED ||
+                           t[2] == LIST_ANSWERED || t[2] == LIST_REFUSED;
+        if (spoke) s_tcmSilent = s_tcmSkipped = 0;
+        else if (t[0] == LIST_NO_REPLY && s_tcmSilent < 255 &&
+                 (everyone || s_tcmSilent < TCM_SILENT_READS || s_tcmSkipped == 0)) s_tcmSilent++;
+        if (s_tcmSilent == TCM_SILENT_READS && !spoke && t[0] == LIST_NO_REPLY && s_tcmSkipped == 0)
+            log_i("codes: the transmission computer has not answered %u reads - asked at every %uth from now",
+                  (unsigned)TCM_SILENT_READS, (unsigned)TCM_ASK_EVERY);
+    }
 
     bool answered = false, busy = false;
     for (uint8_t m = 0; m < 2; m++)
@@ -208,6 +246,8 @@ static ReadResult readCodes() {
     else if (!n)   snprintf(note, sizeof note, "No codes");
     else           snprintf(note, sizeof note, "%u code%s%s", n, n == 1 ? "" : "s",
                             kept ? " (an unanswered list kept from the last read)" : "");
+    if (answered && !kept && s_tcmSilent >= TCM_SILENT_READS)
+        strlcat(note, " - the transmission computer does not answer", sizeof note);
 
     xSemaphoreTake(s_mx, portMAX_DELAY);
     if (answered) {
@@ -302,6 +342,7 @@ static void codesTask(void *) {
         if (!wasAlive) {
             wasAlive = true;
             nextRead = now + FIRST_READ_MS;
+            s_tcmSilent = s_tcmSkipped = 0;      // the car came on: everyone is asked again
         }
         // The lamp or the ECM's own count changed: read again soon.
         float v; uint32_t age; uint8_t src;
@@ -325,8 +366,9 @@ static void codesTask(void *) {
                 clearCodes();
                 nextRead = millis() + 1500;      // and read what is left
             } else {
+                const bool byUser = s_readWanted;
                 s_readWanted = false;
-                const ReadResult r = readCodes();
+                const ReadResult r = readCodes(byUser);
                 if (r != READ_NOTHING_SENT && !s_identDone) readIdentity();
                 // With dtc_poll_s 0 the next read still has a time, so that
                 // switching polling on in the portal starts it (it is only

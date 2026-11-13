@@ -102,6 +102,9 @@ struct MasterStats {
     uint8_t  obdAnswers; /**< 0 unknown, 1 yes, 2 no.                  */
     uint8_t  obdSupported; /**< PIDs the ECU reports supporting.       */
     bool     obdPhysical;  /**< OBD requests go to 0x7E0, not 0x7DF.  */
+    uint32_t obdLatUs;     /**< How long the ECU takes to answer, typical [us]. */
+    uint32_t obdLatMaxUs;  /**< ...and the slowest answer since boot [us].      */
+    uint32_t obdLate;      /**< Answers that came after their wait had ended.   */
     bool     silent;     /**< Listen-only by choice (SILENT) or by the
                               guard - not the settle wait below.       */
     uint32_t settleMs;   /**< Settle wait left, ms (0 = over or off).  */
