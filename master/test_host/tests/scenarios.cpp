@@ -1974,13 +1974,32 @@ static double minObdGapMs(double fromS, double toS) {
     return best;
 }
 
+/** Frames of ours sent after an OBD-II request and before @p ms had passed -
+ *  while the ECU was still answering it, or still had the time to. */
+static int sentInsideReply(double fromS, double toS, double ms) {
+    int n = 0;
+    for (size_t i = 0; i < sim::transmitted.size(); i++) {
+        const auto &a = sim::transmitted[i];
+        const double t = tOf(a.tUs);
+        if (t < fromS || t >= toS || !isObd(a.msg)) continue;
+        for (size_t j = i + 1; j < sim::transmitted.size(); j++) {
+            if ((sim::transmitted[j].tUs - a.tUs) / 1000.0 >= ms - 0.5) break;
+            n++;
+        }
+    }
+    return n;
+}
+
 /**
  * SUSPECT 1, request pacing. The car's obd_to is 20 ms; ISO 15765-4 gives the
- * ECU 50 ms (P2CAN) to answer. An ECU that answers in 35 ms is timed out at
- * 20 ms, and the next request used to go out 10 ms later - into the reply the
- * ECU was still sending. After an unanswered request the next one now waits
- * until P2CAN has passed since the send (obd_p2can). The stored obd_to is left
- * as it is (device_config must show 0 differences); the wait is the extra.
+ * ECU 50 ms (P2CAN) to answer. An ECU that answers in 35 ms was timed out at
+ * 20 ms: the next request went out into the reply it was still sending, and
+ * - its answers all counted as misses - its PIDs backed off to a trickle. The
+ * wait for a reply now lasts until P2CAN (obd_p2can) with the bus held: that
+ * ECU is simply answered-for, at full rate, and nothing of ours is sent
+ * before its reply. One slower than the standard allows still gets P2CAN to
+ * itself. The stored obd_to is left as it is (device_config must show 0
+ * differences); the wait is the extra.
  */
 static void scPacingP2can() {
     loadCarConfig();
@@ -1991,15 +2010,31 @@ static void scPacingP2can() {
     boot();
     runUntil(30);
     check(masterPidSupported(0x0C), "the probe (150 ms wait) finds the ECU");
-    const double gap = minObdGapMs(12, 30);
-    check(gap >= 49.5, "after an unanswered request the next waits for P2CAN (50 ms)", fmt("min gap %.1f ms", gap));
-    check(txCount(isObdReq, 12, 30) > 20, "requests continue - spread over time, none dropped",
-          fmt("%llu", (unsigned long long)txCount(isObdReq, 12, 30)));
-    check(shown(METRIC_ID_COOLANT_TEMP) != nullptr, "the late replies are still decoded");
+    check(sentInsideReply(12, 30, 35) == 0, "nothing of ours is sent before the reply (35 ms) is in",
+          fmt("%d frames", sentInsideReply(12, 30, 35)));
+    MasterStats st; masterGetStats(st);
+    check(st.obdLate == 0 && st.obdLatUs > 30000 && st.obdLatUs < 40000,
+          "an answer inside P2CAN is an answer, not a miss - and the portal says how long it took",
+          fmt("%u late, typical %.1f ms, slowest %.1f ms", st.obdLate, st.obdLatUs / 1000.0, st.obdLatMaxUs / 1000.0));
+    check(txCount(isObdReq, 12, 30) > 150, "so its PIDs are polled at their rate, not backed off",
+          fmt("%llu requests in 18 s", (unsigned long long)txCount(isObdReq, 12, 30)));
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "values flow", info);
     check(Cfg.obdTimeoutMs == storedTo, "the stored obd_to is untouched", fmt("%u (stored %d)", Cfg.obdTimeoutMs, storedTo));
+
+    ecu.replyLatencyUs = 80000;                     // slower than the standard allows
+    runUntil(60);
+    const double gap = minObdGapMs(35, 60);
+    check(gap >= 49.5, "an ECU slower than P2CAN: the next request still waits P2CAN (50 ms)", fmt("min gap %.1f ms", gap));
+    check(sentInsideReply(35, 60, 50) == 0, "and nothing else of ours goes out in that time",
+          fmt("%d frames", sentInsideReply(35, 60, 50)));
+    masterGetStats(st);
+    check(st.obdLate > 0, "its late answers are counted for the portal", fmt("%u late, slowest %.1f ms", st.obdLate, st.obdLatMaxUs / 1000.0));
+    check(shown(METRIC_ID_COOLANT_TEMP) != nullptr, "and still decoded");
+
     portalPost(R"({"obd_p2can":0})");
-    runUntil(50);
-    const double gap0 = minObdGapMs(35, 50);
+    runUntil(80);
+    const double gap0 = minObdGapMs(65, 80);
     check(gap0 < 50.0, "obd_p2can 0 turns the wait off (adjustable)", fmt("min gap %.1f ms", gap0));
     portalPost(R"({"obd_p2can":5000})");
     check(Cfg.obdP2CanMs == 2000, "clamped to 2000 ms", fmt("%u", Cfg.obdP2CanMs));
@@ -2008,21 +2043,28 @@ static void scPacingP2can() {
     check((d["obd_p2can"] | -1) == 50, "saved in the file", fmt("%d", d["obd_p2can"] | -1));
 }
 
-/** The same P2CAN rule in AUTO mode, where SSM2 shares the bus. The cool-down
- *  counts from when a request really went out, not from when the poller asked
- *  for the bus - an SSM2 exchange in front of it can hold the bus for tens of
- *  ms, which with the car's 2026-09-26 settings (obd_to 25, obd_gap 20) left
- *  a 45 ms gap behind an unanswered request. */
+/**
+ * The same rule in AUTO mode, where SSM2 shares the bus - with the car's
+ * 2026-09-26 settings (obd_to 25, obd_gap 20). The wait used to be the OBD-II
+ * poller's alone: it gave the bus up at obd_to, and the SSM2 engine put a
+ * 15-frame request to the same ECU 25 ms after a question it had not answered
+ * yet (390 frames a minute in this scenario). The bus is kept until the reply
+ * or P2CAN now, whoever wants it next.
+ */
 static void scPacingP2canAuto() {
     loadCarConfig();
     portalPostBeforeBoot(R"({"diag_mode":0,"obd_to":25,"obd_gap":20})");
     ecu.replyLatencyUs = 35000;
     boot();
-    runUntil(40);
-    check(txCount([](const twai_message_t &m) { return isSsm(m); }, 12, 40) > 0, "SSM2 shares the bus");
-    const double gap = minObdGapMs(12, 40);
-    check(gap >= 49.5, "after an unanswered request the next still waits for P2CAN", fmt("min gap %.1f ms", gap));
-    check(txCount(isObdReq, 12, 40) > 20, "requests continue", fmt("%llu", (unsigned long long)txCount(isObdReq, 12, 40)));
+    runUntil(60);
+    check(txCount([](const twai_message_t &m) { return isSsm(m); }, 12, 60) > 0, "SSM2 shares the bus");
+    check(sentInsideReply(12, 60, 35) == 0, "no request of either engine while the ECU answers an OBD-II one",
+          fmt("%d frames", sentInsideReply(12, 60, 35)));
+    const double gap = minObdGapMs(12, 60);
+    check(gap >= 49.5, "the next OBD-II request comes after the reply and the gap", fmt("min gap %.1f ms", gap));
+    check(txCount(isObdReq, 12, 60) > 300, "OBD-II polling keeps its rate", fmt("%llu", (unsigned long long)txCount(isObdReq, 12, 60)));
+    MasterStats st; masterGetStats(st);
+    check(st.obdLate == 0, "no answer counted late", fmt("%u", st.obdLate));
 }
 
 /** The overall request budget: an adjustable ceiling on requests per second
@@ -2428,6 +2470,325 @@ static void scDtcClear() {
           "an engine that must be off: said in plain words", cs.clearNote);
     check(cs.n == 1 && shownCode(0) == "P0420 stored engine", "and the code is still listed", shownCode(0));
     commonChecks();
+}
+
+/** Frames of ours sent within @p ms after a request to every computer
+ *  (0x7DF) for one of @p pids - before the slower computer had answered. */
+static int sentInsideFunctional(double fromS, double toS, double ms, std::initializer_list<int> pids) {
+    int n = 0;
+    for (size_t i = 0; i < sim::transmitted.size(); i++) {
+        const auto &a = sim::transmitted[i];
+        const double t = tOf(a.tUs);
+        if (t < fromS || t >= toS || a.msg.identifier != 0x7DF || !isObd(a.msg)) continue;
+        if (std::find(pids.begin(), pids.end(), (int)a.msg.data[2]) == pids.end()) continue;
+        for (size_t j = i + 1; j < sim::transmitted.size(); j++) {
+            if ((sim::transmitted[j].tUs - a.tUs) / 1000.0 >= ms - 0.2) break;
+            n++;
+        }
+    }
+    return n;
+}
+
+/**
+ * Requests to every computer (obd_addr 2, or the fallback when the engine ECU
+ * ignores its own address): the transmission ECU answers some PIDs as well.
+ * Its "no lamp, no codes" (PID 01) and its coolant must not alternate with
+ * the engine ECU's on the same values, and the next request must not go out
+ * while the slower of the two is still answering.
+ */
+static void scObdTwoEcus() {
+    storedConfig(R"({"diag_mode":2,"obd_addr":2,"obd_gap":1,"learn":false,"dtc_poll_s":0})");
+    ecu.ecmMilOn = true;                            // the engine ECU: lamp on, one code
+    ecu.tcmLatencyUs = 9000;                        // the TCM answers after the engine ECU (4 ms)
+    boot();
+    runUntil(8);
+    MasterStats st; masterGetStats(st);
+    check(!st.obdPhysical && txCount(isFunctional, 5, 8) > 0, "asking every computer (0x7DF)");
+    int wrong = 0, seen = 0;
+    for (double t = 8; t <= 30; t += 0.011) {
+        runUntil(t);
+        const double mil = shownValue(METRIC_ID_MIL);
+        if (std::isnan(mil)) continue;
+        seen++;
+        if (mil != 1) wrong++;
+    }
+    check(seen > 500 && wrong == 0, "the lamp is the engine ECU's, never the TCM's \"off\" over it",
+          fmt("%d of %d samples wrong", wrong, seen));
+    const int early = sentInsideFunctional(8, 30, 9, {0x01, 0x05, 0x0D});
+    check(early == 0, "no request while the slower computer is still answering the last one",
+          fmt("%d frames", early));
+    check(txCount(isObdReq, 8, 30) > 200, "polling keeps going", fmt("%llu requests", (unsigned long long)txCount(isObdReq, 8, 30)));
+    // The engine ECU stops answering PID 01: the TCM's reading is better than none.
+    ecu.ecmMilOn = false;
+    commonChecks();
+}
+
+/**
+ * "Still working" (7F 01 78): the ECU answers the PID later, and until it has
+ * - or two seconds have passed - nothing else is asked of it.
+ */
+static void scObdPending() {
+    storedConfig(R"({"diag_mode":2,"learn":false,"dtc_poll_s":0})");
+    ecu.pendingPid = 0x05;                          // coolant: pending, the value 120 ms later
+    ecu.pendingUs  = 120000;
+    boot();
+    runUntil(20);
+    int early = 0, asked = 0;
+    for (size_t i = 0; i < sim::transmitted.size(); i++) {
+        const auto &a = sim::transmitted[i];
+        if (!isObd(a.msg, 0x05)) continue;
+        asked++;
+        for (size_t j = i + 1; j < sim::transmitted.size(); j++) {
+            if ((sim::transmitted[j].tUs - a.tUs) / 1000.0 >= 123.5) break;
+            early++;
+        }
+    }
+    check(asked >= 5, "the PID is asked", fmt("%d times", asked));
+    check(early == 0, "nothing sent between \"still working\" and the answer", fmt("%d frames", early));
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 3, info), "the late answer is the value shown", info);
+    check(txCount(isObdReq, 5, 20) > 100, "the other PIDs are polled as usual",
+          fmt("%llu requests", (unsigned long long)txCount(isObdReq, 5, 20)));
+    commonChecks();
+}
+
+/**
+ * Codes asked through 0x7DF (a TCM deaf to its own address): the engine ECU
+ * answers that request too, and with three or more codes its answer is a
+ * first frame waiting for flow control. It gets one - a tester that leaves it
+ * waiting leaves the engine ECU busy for a second each time.
+ */
+static void scDtcFunctionalFlowControl() {
+    ecu.tcmPhysical = false;
+    ecu.tcmStored = {0x1718};
+    ecu.ecmStored = {0x0700, 0x0171, 0x0420, 0x0300};   // 10 bytes: a first frame
+    boot();
+    runUntil(20);
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.tcmFunctional && cs.reads == 1, "codes read, the TCM through 0x7DF", cs.note);
+    check(cs.n == 5, "the engine ECU's four and the TCM's one", fmt("%u codes", cs.n));
+    check(sim::isoAbandoned == 0, "no long answer of the engine ECU left waiting for flow control",
+          fmt("%d abandoned", sim::isoAbandoned));
+    runUntil(140);
+    codesGetStatus(cs);
+    check(cs.reads == 3 && sim::isoAbandoned == 0, "nor at the later reads", fmt("%u reads, %d abandoned", cs.reads, sim::isoAbandoned));
+    commonChecks();
+}
+
+static double maxObdGapMs(double fromS, double toS) {
+    double worst = 0, last = -1;
+    for (const auto &r : sim::transmitted) {
+        const double t = tOf(r.tUs);
+        if (t < fromS || t >= toS || !isObd(r.msg)) continue;
+        if (last >= 0) worst = std::max(worst, (t - last) * 1000);
+        last = t;
+    }
+    return worst;
+}
+
+/**
+ * A transmission computer that does not speak OBD-II at all (a JDM car's may
+ * not). Every code read used to ask it twice - on 0x7E1 and through 0x7DF,
+ * the request that reaches every computer - and hold the bus half a second
+ * each time: a second a minute with every polled value frozen. Now a silent
+ * answer is waited for 150 ms, and after three silent reads it is asked only
+ * every tenth - at once again when "Read now" is pressed, or the car comes on.
+ */
+static void scDtcTcmSilent() {
+    storedConfig(R"({"diag_mode":2,"learn":false})");
+    ecu.tcmEnabled = false;
+    ecu.ecmStored = {0x0700};
+    boot();
+    runUntil(14);                                   // the first read, at ~8 s
+    CodesStatus cs; codesGetStatus(cs);
+    check(cs.reads == 1 && cs.n == 1, "the engine ECU's code is read", cs.note);
+    check(maxObdGapMs(5, 14) < 400, "a silent computer holds the polling up 150 ms a request, not 500",
+          fmt("longest gap %.0f ms", maxObdGapMs(5, 14)));
+    runUntil(8 * 60);                               // reads at 8, 68 ... 428 s: eight of them
+    codesGetStatus(cs);
+    const int own = isoReq(0x7E1, 0x03), all = isoReq(0x7DF, 0x03);
+    check(cs.reads >= 7, "the engine ECU is read every minute as before", fmt("%u reads", cs.reads));
+    check(own == 3 && all == 3, "the silent TCM: asked at three reads, then left alone",
+          fmt("%d on 0x7E1, %d through 0x7DF", own, all));
+    check(maxObdGapMs(200, 8 * 60) < 150, "and the polling is no longer held up at each read",
+          fmt("longest gap %.0f ms", maxObdGapMs(200, 8 * 60)));
+    codesRequestRead();                             // "Read now" asks everyone
+    runUntil(8 * 60 + 5);
+    check(isoReq(0x7E1, 0x03) == own + 1, "Read now asks it again", fmt("%d", isoReq(0x7E1, 0x03)));
+    ecu.tcmEnabled = true;                          // it wakes up (or was only slow to)
+    ecu.tcmStored = {0x1718};
+    codesRequestRead();
+    runUntil(8 * 60 + 10);
+    codesGetStatus(cs);
+    check(cs.n == 2 && shownCode(1) == "P1718 stored transmission", "and once it answers, its codes are back",
+          fmt("%u codes", cs.n));
+    runUntil(8 * 60 + 80);
+    check(isoReq(0x7E1, 0x03) >= own + 3, "and it is read every minute again",
+          fmt("%d", isoReq(0x7E1, 0x03)));
+    commonChecks();
+}
+
+/** How often one PID was asked in a window: the count, the mean interval and
+ *  the longest. */
+struct AskGaps { size_t asks = 0; double meanMs = 0, worstMs = 0; };
+static AskGaps askGaps(int pid, double fromS, double toS) {
+    AskGaps g;
+    double first = -1, last = -1;
+    for (const auto &r : sim::transmitted) {
+        const double t = tOf(r.tUs);
+        if (t < fromS || t >= toS || !isObd(r.msg, pid)) continue;
+        if (last < 0) first = t;
+        else g.worstMs = std::max(g.worstMs, (t - last) * 1000);
+        last = t;
+        g.asks++;
+    }
+    if (g.asks > 1) g.meanMs = (last - first) * 1000 / (double)(g.asks - 1);
+    return g;
+}
+
+/** The longest any PID of the table went between two requests, against its
+ *  own limit: a second past its period, or the age at which its value leaves
+ *  the broadcast (metric_ttl_ms) if that comes first - and its period if it
+ *  is slower than that. @return how many were over by more than @p slackMs. */
+static size_t pidsOverLimit(double fromS, double toS, double slackMs, std::string &worst, size_t *askedOut = nullptr) {
+    Cfg.lock();
+    const std::vector<RtPid> pids = Cfg.pids;
+    const uint32_t ttl = Cfg.metricTtlMs;
+    Cfg.unlock();
+    const double staleAt = ttl - std::min(ttl / 4.0, 500.0);
+    size_t over = 0, asked = 0;
+    double worstBy = -1e9;
+    for (const auto &p : pids) {
+        const AskGaps g = askGaps(p.pid, fromS, toS);
+        if (g.asks) asked++;
+        if (g.asks < 2) continue;                       // a 30 s one: no interval to measure
+        const double limit = std::min<double>(p.periodMs + 1000.0, std::max<double>(p.periodMs, staleAt));
+        const double by = g.worstMs - limit;
+        if (by > worstBy) { worstBy = by; worst = fmt("PID %02X (%u ms): longest %.0f ms", p.pid, p.periodMs, g.worstMs); }
+        if (by > slackMs) over++;
+    }
+    if (askedOut) *askedOut = asked;
+    return over;
+}
+
+/**
+ * More to ask than there is time for. The table's PIDs at their own periods
+ * come to far more requests than the bus carries with the car's 20 ms pause
+ * (about 40 a second): 120 a second for the 32 this ECU supports. Asked each
+ * in turn, every PID quicker than one round of the table was asked once a
+ * round - engine speed (every 50 ms, says the table) and the fuel trim (every
+ * 250 ms) both every half second: the period meant nothing. Now the PID most
+ * overdue for its own period goes first, so the quick ones keep their share,
+ * and a PID a second past its time goes ahead of them. The number of requests
+ * is the same; obd_order 1 gives the old order back.
+ */
+static void scObdPollOrder() {
+    loadCarConfig();
+    // OBD-II only and nothing learned or mapped: every value is the poller's.
+    portalPostBeforeBoot(R"({"diag_mode":2,"learn":false,"signals":[],"obd_gap":20,"obd_to":25,"dtc_poll_s":0})");
+    boot();
+    runUntil(100);
+    const double from = 30, to = 100;
+    const double rate = txCount(isObdReq, from, to) / (to - from);
+    check(rate > 38 && rate < 46, "requests at the pace the pause allows", fmt("%.1f/s", rate));
+    const AskGaps rpm = askGaps(0x0C, from, to), spd = askGaps(0x0D, from, to), trim = askGaps(0x06, from, to),
+                  clt = askGaps(0x05, from, to);
+    check(rpm.meanMs > 0 && rpm.meanMs < 220, "engine speed (50 ms) asked five times a second or more",
+          fmt("every %.0f ms", rpm.meanMs));
+    check(spd.meanMs > 0 && spd.meanMs < 400, "road speed (100 ms) about three times a second",
+          fmt("every %.0f ms", spd.meanMs));
+    check(rpm.meanMs * 1.5 < spd.meanMs && spd.meanMs * 1.5 < trim.meanMs && trim.meanMs * 1.5 < clt.meanMs,
+          "the quicker its period, the more often a PID is asked",
+          fmt("50 ms: %.0f, 100 ms: %.0f, 250 ms: %.0f, 1 s: %.0f ms", rpm.meanMs, spd.meanMs, trim.meanMs, clt.meanMs));
+    std::string worst, info;
+    size_t asked = 0;
+    const size_t late = pidsOverLimit(from, to, 300, worst, &asked);
+    check(asked == 32, "every PID the ECU supports still asked", fmt("%zu", asked));
+    check(late == 0, "none kept waiting much more than a second past its time", worst);
+    check(freshNear(METRIC_ID_RPM, truth().rpm, 400, info), "engine speed follows the car", info);
+    check(freshNear(METRIC_ID_DIST_CLEARED, 1234, 1, info), "a 10 s value is still on the displays", info);
+    // Each in turn, as before: the same requests in the old order.
+    portalPost(R"({"obd_order":1})");
+    runUntil(170);
+    const AskGaps rpm1 = askGaps(0x0C, 110, 170), trim1 = askGaps(0x06, 110, 170);
+    const double rate1 = txCount(isObdReq, 110, 170) / 60.0;
+    check(rpm1.meanMs > 400 && std::fabs(rpm1.meanMs - trim1.meanMs) < 50,
+          "obd_order 1: each in turn again - the quick ones once a round",
+          fmt("50 ms: %.0f, 250 ms: %.0f ms", rpm1.meanMs, trim1.meanMs));
+    check(std::fabs(rate1 - rate) < 2, "at the same number of requests", fmt("%.1f/s", rate1));
+    commonChecks();
+}
+
+/**
+ * The same with an ECU that supports every PID of the table, 66 of them: 200
+ * requests a second wanted, 40 to be had. Each in turn, a round took 1.3 s.
+ * The two limits must hold when nearly everything is up against them: no PID
+ * much more than a second past its time, and none left until its value would
+ * age out of the broadcast - the car's metric_ttl_ms is 10 s, and so is the
+ * period of eight of its PIDs.
+ */
+static void scObdPollAll() {
+    loadCarConfig();
+    ecu.supportAllPids = true;
+    portalPostBeforeBoot(R"({"diag_mode":2,"learn":false,"signals":[],"obd_gap":20,"obd_to":25,"dtc_poll_s":0})");
+    boot();
+    runUntil(110);
+    const double from = 30, to = 110;
+    const double rate = txCount(isObdReq, from, to) / (to - from);
+    check(rate > 38 && rate < 46, "requests at the pace the pause allows", fmt("%.1f/s", rate));
+    const AskGaps rpm = askGaps(0x0C, from, to), spd = askGaps(0x0D, from, to), clt = askGaps(0x05, from, to);
+    check(rpm.meanMs > 0 && rpm.meanMs < 500, "engine speed (50 ms) still asked more than twice a second",
+          fmt("every %.0f ms", rpm.meanMs));
+    check(spd.meanMs > 0 && spd.meanMs < 900, "road speed (100 ms) more than once a second",
+          fmt("every %.0f ms", spd.meanMs));
+    check(clt.meanMs < 2200, "a 1 s PID every 2 s or so", fmt("every %.0f ms", clt.meanMs));
+    std::string worst, info;
+    size_t asked = 0;
+    const size_t late = pidsOverLimit(from, to, 500, worst, &asked);
+    check(asked == 66, "every PID still asked", fmt("%zu", asked));
+    check(late == 0, "none kept waiting much more than a second past its time, none left to go stale", worst);
+    const AskGaps slow = askGaps(0x31, from, to);
+    check(slow.worstMs < 10600, "a 10 s PID asked again before its value leaves the broadcast",
+          fmt("longest %.0f ms", slow.worstMs));
+    check(freshNear(METRIC_ID_DIST_CLEARED, 1234, 1, info), "...so it is still on the displays", info);
+    check(freshNear(METRIC_ID_SPEED, truth().speed, 6, info), "road speed follows the car", info);
+    commonChecks();
+}
+
+/**
+ * Powered for more than 24.8 days - the OBD port is live with the key out, and
+ * sleep is off in the car's settings - and then an ordinary key-off and key-on.
+ * When the ECU answered again every PID's deadline was set to zero, "due now";
+ * but a deadline that long ago reads, as a signed difference, as one in the
+ * future. Not one PID was asked again until the clock wrapped, up to 24.8 days
+ * later (or the master was restarted): the supported-PID probe answered, the
+ * portal said OBD-II active, and no value came. Times are now compared as time
+ * elapsed, which has no such horizon.
+ */
+static void scObdResumeOldClock() {
+    loadCarConfig();
+    boot();
+    runUntil(30);
+    const uint64_t DAY = 86400ull * 1000000ull;
+    simrtos::jumpUs(20 * DAY);
+    runUntil(tNow() + 30);
+    simrtos::jumpUs(5 * DAY);
+    runUntil(tNow() + 40);
+    check(millis() > 0x80000000u, "powered for more than 24.8 days", fmt("millis %u", millis()));
+    const double t0 = tNow();
+    check(txCount(isObdReq, t0 - 10, t0) > 50, "polling the running car",
+          fmt("%llu requests in 10 s", (unsigned long long)txCount(isObdReq, t0 - 10, t0)));
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = false;   // key off, the bus still up
+    runUntil(t0 + 60);
+    check(txCount(isObdReq, t0 + 30, t0 + 60) <= 4, "the switched-off ECU is probed, not polled",
+          fmt("%llu", (unsigned long long)txCount(isObdReq, t0 + 30, t0 + 60)));
+    ecu.obdEnabled = ecu.ssmEnabled = ecu.tcmEnabled = true;    // key on
+    runUntil(t0 + 90);
+    check(txCount(isObdReq, t0 + 80, t0 + 90) > 50, "the full poll is back once it answers",
+          fmt("%llu requests in 10 s", (unsigned long long)txCount(isObdReq, t0 + 80, t0 + 90)));
+    std::string info;
+    check(freshNear(METRIC_ID_SPEED, truth().speed, 6, info), "road speed (OBD-II only on this car) flows again", info);
+    check(simBugs() == 0, "no misuse of the driver", fmt("%d", simBugs()));
 }
 
 /** A transmission computer that answers only 0x7DF: asked there once its own
@@ -3134,6 +3495,10 @@ static const Scenario SCENARIOS[] = {
     {"dtc_partial_read", scDtcPartialRead, 0},
     {"dtc_poll_resume", scDtcPollResume, 0},
     {"dtc_ident_refused", scDtcIdentRefused, 0},
+    {"obd_two_ecus", scObdTwoEcus, 0}, {"obd_pending", scObdPending, 0},
+    {"dtc_functional_fc", scDtcFunctionalFlowControl, 0}, {"dtc_tcm_silent", scDtcTcmSilent, 0},
+    {"obd_poll_order", scObdPollOrder, 0}, {"obd_poll_all", scObdPollAll, 0},
+    {"obd_resume_old_clock", scObdResumeOldClock, 0},
     {"metric_store_full", scMetricStoreFull, 0},
     {"drive_log_held_file", scDriveLogHeldFile, 0},
     {"service_due", scServiceDue, 0},

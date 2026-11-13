@@ -187,6 +187,8 @@ static IsoLink s_ssmLink = { SSM_REQUEST_ID, SSM_RESPONSE_ID, SSM_REQUEST_ID, 10
 static IsoLink *volatile s_link = &s_ssmLink;
 /** The reply ID ssm2FeedFrame() takes during an exchange (the RX task reads it). */
 static volatile uint32_t s_rxId = SSM_RESPONSE_ID;
+/** The exchange in progress asked every computer (0x7DF). */
+static volatile bool     s_toAll = false;
 
 /** @brief Why the exchange in progress failed, for whoever asked. */
 static void linkErr(const char *fmt, ...) {
@@ -255,7 +257,13 @@ void ssm2GetStatus(Ssm2Status &out) {
 bool ssm2FeedFrame(const twai_message_t &msg) {
     // Outside an exchange a 0x7E8 frame is an OBD-II reply, not ours.
     if (!s_inExchange || !s_rxQ || msg.extd) return false;
-    if (msg.identifier != s_rxId) return false;
+    if (msg.identifier != s_rxId) {
+        // A request to every computer (0x7DF): the others answer it as well.
+        // The exchange gets their frames too - a long answer opens with a
+        // first frame that waits for our flow control, and the bus is kept
+        // until it has passed (otherAnswer, othersFinish).
+        if (!s_toAll || msg.identifier < 0x7E8 || msg.identifier > 0x7EF) return false;
+    }
     xQueueSend(s_rxQ, &msg, 0);   // never stall the receive task
     return true;
 }
@@ -364,6 +372,61 @@ static bool isoSend(const uint8_t *p, size_t len) {
     return true;
 }
 
+/** Long answers of the other computers in progress, to a request sent to all
+ *  of them: who, and how many consecutive frames are still to come. */
+static struct { uint32_t id; uint16_t left; } s_others[3];
+/** The longest the bus is kept for them after such a request. */
+static constexpr uint32_t OTHERS_MAX_MS = 500;
+
+/**
+ * @brief Another computer's answer to a request sent to all of them (0x7DF).
+ *        A long one opens with a first frame that waits for flow control: it
+ *        gets it, to its own address, as every scan tool sends it - without
+ *        one that computer waits a second for it (N_Bs) with its answer half
+ *        sent. The answer itself is not ours to read.
+ * @return true if @p m came from another computer (it is not part of our reply).
+ */
+static bool otherAnswer(const twai_message_t &m) {
+    if (m.identifier == s_link->rxId) return false;
+    const uint8_t pci = m.data[0] & 0xF0;
+    if (pci == PCI_FF) {
+        const size_t total = ((size_t)(m.data[0] & 0x0F) << 8) | m.data[1];
+        const uint8_t fc[8] = { (uint8_t)(PCI_FC | 0x00), 0x00, 0x00, 0, 0, 0, 0, 0 };
+        if (tx8To(m.identifier - 8, fc))
+            for (auto &o : s_others)
+                if (!o.left || o.id == m.identifier) {
+                    o.id   = m.identifier;
+                    o.left = total > 6 ? (uint16_t)((total - 6 + 6) / 7) : 0;
+                    break;
+                }
+    } else if (pci == PCI_CF) {
+        for (auto &o : s_others)
+            if (o.left && o.id == m.identifier) { o.left--; break; }
+    }
+    return true;
+}
+
+/**
+ * @brief After a request to every computer: the bus stays ours until the
+ *        others have had P2CAN (obd_p2can) to start answering and every long
+ *        answer has passed - the next request, whoever sends it, must not
+ *        reach a computer in the middle of this one.
+ */
+static void othersFinish(uint32_t sentAtMs) {
+    twai_message_t m;
+    for (;;) {
+        bool busy = false;
+        for (const auto &o : s_others) busy |= o.left > 0;
+        const uint32_t waited = millis() - sentAtMs;
+        if (waited >= OTHERS_MAX_MS) return;
+        const uint32_t p2   = Cfg.obdP2CanMs;
+        const uint32_t wait = busy ? T_CF_MS : (waited < p2 ? p2 - waited : 0);
+        if (!wait) return;
+        if (!rxFrame(m, wait)) { if (busy) return; continue; }   // a long answer that stopped: left
+        otherAnswer(m);
+    }
+}
+
 /**
  * @brief Receive the reply to @p svc (or a negative response), ignoring
  *        anything else that turns up on 0x7E8 in the meantime.
@@ -375,6 +438,7 @@ static size_t isoRecv(uint8_t svc, uint8_t *out, size_t max) {
     for (;;) {
         const int32_t left = (int32_t)(deadline - millis());
         if (left <= 0 || !rxFrame(m, left)) { linkErr("no reply from ECU"); return 0; }
+        if (otherAnswer(m)) continue;
         const uint8_t pci = m.data[0] & 0xF0;
 
         if (pci == PCI_SF) {
@@ -412,6 +476,7 @@ static size_t isoRecv(uint8_t svc, uint8_t *out, size_t max) {
         uint8_t expect = 1;
         while (got < total) {
             if (!rxFrame(m, T_CF_MS)) { linkErr("reply cut short"); return 0; }
+            if (otherAnswer(m)) continue;
             if ((m.data[0] & 0xF0) != PCI_CF) { s_stray++; continue; }
             if ((m.data[0] & 0x0F) != (expect & 0x0F)) { linkErr("reply frames out of order"); return 0; }
             expect++;
@@ -467,11 +532,16 @@ IsoResult isoExchange(uint32_t txId, uint32_t rxId, uint32_t fcId,
     if (!diagBusLock(250)) { snprintf(L.err, L.errCap, "the bus is in use"); return ISO_BUSY; }
     s_link = &L;
     s_rxId = rxId;                     // before s_inExchange: the RX task reads both
+    s_toAll = txId == 0x7DF;
+    memset(s_others, 0, sizeof(s_others));
     s_inExchange = true;
     flushRx();
+    const uint32_t sentAt = millis();
     const bool sent = isoSend(req, len);
     if (sent) got = isoRecv((uint8_t)(req[0] + 0x40), rsp, max);
+    if (sent && s_toAll) othersFinish(sentAt);
     s_inExchange = false;
+    s_toAll = false;
     s_rxId = SSM_RESPONSE_ID;
     s_link = &s_ssmLink;
     diagBusUnlock();

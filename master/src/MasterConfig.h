@@ -326,6 +326,11 @@ public:
                                         natural rate slows learning under a
                                         flood of unknown frames.                */
     uint8_t  obdAddressing = 0;    /**< 0 auto, 1 engine ECU, 2 all ECUs.      */
+    uint8_t  obdOrder     = 0;     /**< Which due PID is asked first: 0 the one
+                                        most overdue for its own period (so a
+                                        50 ms PID keeps its share when there is
+                                        more to ask than time), 1 each in turn
+                                        (the order before this setting).       */
     uint16_t ssmTimeoutMs = 1000;  /**< SSM2 reply wait.                       */
     uint16_t coverMs      = 2500;  /**< A value this fresh from a better
                                         source is not requested again.         */

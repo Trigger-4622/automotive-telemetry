@@ -358,6 +358,7 @@ static bool masterFlagsActive() {
 int sim::activeFlagStarts = 0;
 uint64_t sim::resetModeEntries = 0;
 int sim::installsUnheld = 0;
+int sim::isoAbandoned = 0;
 static bool s_couldFlag = false;
 /** Count each time the controller becomes able to flag actively. Called
  *  wherever its state, counters or pad routing change. */
@@ -625,7 +626,8 @@ static const uint8_t TCM_PIDS[] = {0x01, 0x05, 0x0D, 0x20, 0x21};
 template <size_t N>
 static bool has(const uint8_t (&set)[N], uint8_t pid) {
     for (uint8_t p : set) if (p == pid) return true;
-    return false;
+    // (The engine ECU's list only: the TCM's stays as it is.)
+    return ecu.supportAllPids && N > 8 && pid >= 1 && pid <= 0xA6;
 }
 
 template <size_t N>
@@ -633,6 +635,11 @@ static void bitmap(const uint8_t (&set)[N], uint8_t base, uint8_t out[4]) {
     std::memset(out, 0, 4);
     for (uint8_t p : set)
         if (p > base && p <= base + 32) {
+            const int i = p - base - 1;
+            out[i / 8] |= (uint8_t)(0x80 >> (i % 8));
+        }
+    if (ecu.supportAllPids && N > 8)
+        for (int p = base + 1; p <= base + 32 && p <= 0xA6; p++) {
             const int i = p - base - 1;
             out[i / 8] |= (uint8_t)(0x80 >> (i % 8));
         }
@@ -672,7 +679,9 @@ static int obdData(uint8_t pid, uint8_t *d) {
         case 0x44: d[0] = 0x80; d[1] = 0x00; return 2;
         case 0x45: case 0x47: case 0x49: case 0x4A: case 0x4C: d[0] = pct(v.throttle); return 1;
         case 0x46: d[0] = 22 + 40; return 1;
-        default: return 0;
+        default:
+            if (ecu.supportAllPids) { std::memset(d, 0x40, 4); return 4; }
+            return 0;
     }
 }
 
@@ -700,7 +709,14 @@ static void obdRequest(uint32_t id, uint8_t pid) {
             if (pid == 0 || has(ECM_PIDS, pid)) { bitmap(ECM_PIDS, pid, d); obdReply(0x7E8, pid, d, 4, now + ecu.replyLatencyUs); }
         } else if (has(ECM_PIDS, pid)) {
             const int k = obdData(pid, d);
-            obdReply(0x7E8, pid, d, k, now + ecu.replyLatencyUs);
+            if (pid == 0x01 && ecu.ecmMilOn) d[0] = 0x81;          // lamp on, one code
+            uint64_t at = now + ecu.replyLatencyUs;
+            if (!functional && ecu.pendingPid && pid == ecu.pendingPid) {
+                // "Still working" first, the value later.
+                schedule(at, frame(0x7E8, {0x03, 0x7F, 0x01, 0x78, 0, 0, 0, 0}));
+                at += ecu.pendingUs;
+            }
+            obdReply(0x7E8, pid, d, k, at);
         } else if (!functional && ecu.obdNrcUnsupported) {
             schedule(now + ecu.replyLatencyUs, frame(0x7E8, {0x03, 0x7F, 0x01, 0x31, 0, 0, 0, 0}));
         }
@@ -709,10 +725,10 @@ static void obdRequest(uint32_t id, uint8_t pid) {
     if (functional && ecu.tcmEnabled) {
         uint8_t d[4];
         if ((pid & 0x1F) == 0 && pid <= 0xC0) {
-            if (pid == 0 || has(TCM_PIDS, pid)) { bitmap(TCM_PIDS, pid, d); obdReply(0x7E9, pid, d, 4, now + 1500); }
+            if (pid == 0 || has(TCM_PIDS, pid)) { bitmap(TCM_PIDS, pid, d); obdReply(0x7E9, pid, d, 4, now + ecu.tcmLatencyUs); }
         } else if (has(TCM_PIDS, pid)) {
             const int k = obdData(pid, d);
-            obdReply(0x7E9, pid, d, k, now + 1500);
+            obdReply(0x7E9, pid, d, k, now + ecu.tcmLatencyUs);
         }
     }
 }
@@ -766,6 +782,9 @@ static uint8_t ssmByte(uint32_t a) {
 }
 
 static void nodeSend(IsoNode &n, const std::vector<uint8_t> &msg, uint64_t at) {
+    // Still waiting for our flow control for its last long answer: that one
+    // was abandoned.
+    if (n.tx.waitingFc) { sim::isoAbandoned++; n.tx.waitingFc = false; }
     if (msg.size() <= 7) {
         twai_message_t m = frame(n.rspId, {});
         m.data[0] = (uint8_t)msg.size();
@@ -828,7 +847,7 @@ static std::vector<uint16_t> codesOf(bool tcm, uint8_t svc) {
 static void obdIsoHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functional) {
     const bool tcm = &n == &s_tcmNode;
     const uint8_t svc = req[0];
-    const uint64_t at = simrtos::nowUs() + (tcm ? 1500 : ecu.replyLatencyUs);
+    const uint64_t at = simrtos::nowUs() + (tcm ? ecu.tcmLatencyUs : ecu.replyLatencyUs);
     auto refuse = [&](uint8_t code) { if (!functional) nodeSend(n, {0x7F, svc, code}, at); };
     if (ecu.ignoreIso && ecu.ignoreIso(tcm, svc)) return;
     if (svc == 0x03 || svc == 0x07 || svc == 0x0A) {

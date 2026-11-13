@@ -35,6 +35,18 @@ struct EcuConfig {
     bool     permanentCodes  = false;  ///< Service 0A supported (a 2009 car: no).
     bool     clearNeedsEngineOff = false;  ///< Service 04 refused (0x22) while it runs.
     bool     vehicleInfo     = true;   ///< Service 09 answered (false: NRC 0x11, as some ECUs).
+    uint32_t tcmLatencyUs    = 1500;   ///< TCM reply delay (it is the quicker one by default).
+    /** The engine ECU supports every Service-01 PID up to 0xA6 (the real car's
+     *  list is longer than the simulator's 36), answering unknown ones with
+     *  four bytes of 0x40. */
+    bool     supportAllPids  = false;
+    /** The engine ECU's PID 01 says "lamp on, one code"; the TCM's own PID 01
+     *  always says "no lamp, no codes". */
+    bool     ecmMilOn        = false;
+    /** The engine ECU answers this PID with "still working" (7F 01 78) first
+     *  and the value this long after it (0 = answers normally). */
+    uint8_t  pendingPid      = 0;
+    uint32_t pendingUs       = 0;
     /** A request the computer lets go unanswered (a reply lost, a busy ECU):
      *  return true to send nothing. */
     std::function<bool(bool tcm, uint8_t svc)> ignoreIso;
@@ -203,6 +215,10 @@ extern uint64_t resetModeEntries;
 /** twai_driver_install() calls made with the TX pad not latched: the driver
  *  routes the pad to the controller before it resets the peripheral. */
 extern int installsUnheld;
+/** Long answers a computer started (first frame) and never got our flow
+ *  control for: it waits for it (N_Bs, a second), deaf to the next request
+ *  or dropping its answer - what a tester must not leave behind. */
+extern int isoAbandoned;
 extern int  radioQdbm;         ///< Last esp_wifi_set_max_tx_power() value (quarter dBm).
 extern std::string serialOut;  ///< Everything written with Serial.printf.
 /** The bit timing the last twai_driver_install() was given. */

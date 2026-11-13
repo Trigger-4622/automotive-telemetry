@@ -273,6 +273,11 @@ void WebPortal::setupRoutes() {
         o["physical"]  = st.obdPhysical;
         o["supported"] = st.obdSupported;
         o["rx"]        = st.obdRx;
+        // How long the ECU takes to answer [ms], and answers that came after
+        // the wait for them had ended (obd_to / obd_p2can shorter than the ECU).
+        o["lat"]       = st.obdLatUs / 1000.0f;
+        o["lat_max"]   = st.obdLatMaxUs / 1000.0f;
+        o["late"]      = st.obdLate;
 
         JsonObject so = doc["ssm"].to<JsonObject>();
         so["answers"]   = st.ssmAnswers;

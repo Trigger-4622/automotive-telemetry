@@ -7,6 +7,61 @@ installed, never before; the terminator on the transceiver module is removed;
 the codes come back sometimes at the start of a drive and sometimes after 30
 to 60 minutes of driving.
 
+## Update 2026-11-13: requests that landed inside an answer, and bus-off measured
+
+A review of everything the master sends to the car. Not flashed.
+
+**Requests no longer reach a computer that is still answering.** The wait for
+an OBD-II answer ended at `obd_to` - 25 ms on the car - and the bus was free
+again at that moment, for every requester. An ECU that takes 35 ms was counted
+as silent, and in Auto the SSM2 engine sent its request (15 frames) into the
+window the ECU was answering in; the P2CAN wait added in September held back
+the next *OBD-II* request only. Now the request that is waiting keeps the bus
+until it is answered, refused, or P2CAN (`obd_p2can`, 50 ms) has passed since
+it went out - for the OBD-II poller, SSM2 and the code reader alike. An ECU
+that answers at once is waited for exactly as long as before. In the
+simulator, with a 35 ms ECU and the car's settings: frames of ours inside the
+answer window went from 283-390 a minute to 0, and OBD-II answers from 209 to
+749 in 48 s (they had been written off as misses and backed off).
+`pacing_p2can`, `pacing_p2can_auto`.
+
+Also: "still working" (0x78) is waited on with the bus held (`obd_pending`);
+with 0x7DF every computer known to answer a PID is waited for, and the
+transmission computer's reading no longer overwrites the engine ECU's
+(`obd_two_ecus`); the code reader waits 150 ms a request instead of 500 and
+stops asking a transmission computer that never answers (`dtc_tcm_silent`);
+a code read through 0x7DF gives the engine ECU's long answer its flow control
+instead of leaving it waiting a second (`dtc_functional_fc`).
+
+**On the car:** the portal's Sources tab now says how long the ECU takes
+("answers in ... ms, slowest ... ms") and counts answers that came after
+their wait ("came late"). If that count is not 0, raise `obd_p2can`.
+
+**Bus-off with errors let pass, measured - nothing changed.** The 47 bus-offs
+in 155 s (2026-09-30) are the master's own frames failing: with TEC held at
+220, five failed frames in a row are bus-off. How often that happens depends
+on the share of our frames that fail, and on where TEC is held. Ten minutes in
+the simulator, requests as on the car:
+
+| Our frames that fail | TEC 220, topped up below 170 (now) | 200 / 170 | 184 / 168 | 176 / 160 |
+|---|---|---|---|---|
+| 5 % | 1 bus-off | 0 | 0 | 0 |
+| 10 % | 113 | 62 | 43 | 37 |
+| 20 % | 1132 | 1045 | 931 | 841 |
+
+The lowest TEC seen was 144-156 in every case: never error-active (below 128),
+so no error frame in any of them. A lower hold buys margin only against a
+moderate fault; at the car's rate (113 in ten minutes matches 47 in 155 s, so
+about one frame in ten was failing) it halves the bus-offs at best. The cure
+for that is the transmit path itself - see the open item in CLAUDE.md - and
+"What the errors are" on the Bus tab says which kind they are. Choices left to
+the owner: hold TEC at 184 / 168 instead of 220 / 170; and what a bus-off
+should do while errors are let pass. With `guard` off and `rx_guard` on it
+latches listen-only until "Resume" in the portal, and with sleep off the latch
+outlasts key-off - although an error-passive controller's bus-off has harmed
+nobody (its error flags were recessive). With both guards off, as on
+2026-09-30, the controller is restarted every time.
+
 ## Update 2026-09-27, later: where the errors come from - measure it on the next drive
 
 With errors let pass the master can no longer destroy anyone's frame, but it
@@ -330,7 +385,7 @@ prefer that.
 | Fix | Setting (default) | What it does | Scenario |
 |---|---|---|---|
 | Receive-error guard | `rx_guard` (on), `rx_guard_rec` (96), `rx_guard_errs` (60 in `guard_win`) | Switch to listen-only for the session when the controller is error-flagging other modules' frames: either its receive error counter reaches the error-warning level (a storm), or that many receive-side errors land in the guard window (a *moderate* marginal link, which never raises REC because a good frame winds it down faster than a flagged one winds it up). Also on bus-off while the transmit-side `guard` is off. Independent of `guard` (which stays off as you set it). Resume from the portal. | `tcm_p1718`, `tcm_p1718_optout`, `rx_guard_trickle`, `rx_guard_moderate`, `rx_guard_prompt`, `busoff_guard_off` |
-| P2CAN wait | `obd_p2can` (50 ms) | After a request that got no answer within `obd_to`, the next request waits until this long after the send. Delays, never drops. | `pacing_p2can` |
+| P2CAN wait | `obd_p2can` (50 ms) | A request that got no answer within `obd_to` keeps the bus until this long after the send (since 2026-11-13: for every requester, not just the next OBD-II request - see the top). Delays, never drops. | `pacing_p2can`, `pacing_p2can_auto` |
 | Request budget | `req_max_hz` (0 = off) | Ceiling on OBD-II requests per second; spreads them, never drops. Off by default so nothing is throttled that you did not choose; 40 is a sensible value for the car. | `budget` |
 | Settle wait | `start_delay_s` (10) | Already built; this branch puts it on the car. Listen-only for 10 s each time the bus comes up. Absent from the stored file, so it takes the default. | `settle*`, `crank_reset` |
 | Physical addressing latch | (none: behaviour) | Auto addressing gives physical several tries before ever using 0x7DF, and never goes back once physical has worked. | `no_functional` |
