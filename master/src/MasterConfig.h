@@ -111,6 +111,10 @@ struct RtSignal {
     uint8_t  nBits     = 0;
     uint8_t  bitList[MAX_SIG_BITS] = {};
     /** @} */
+    /** Not saved: the combination's own field as a mask over its code bits,
+     *  worked out by the receive task when it copies the table (leverOwnMask()
+     *  in main.cpp; 0 = read the whole combination). */
+    uint16_t ownMask   = 0;
 
     /** @return true when the signal publishes. */
     bool publishes() const { return mode == SIG_ON || mode == SIG_VERIFIED; }

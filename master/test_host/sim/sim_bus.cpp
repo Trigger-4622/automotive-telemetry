@@ -519,6 +519,28 @@ static void bodyFrame(uint64_t now) {
     if (tcmSee(m)) deliver(m);
 }
 
+sim::Gearbox sim::gearbox;
+/** What the gearbox is doing (see Gearbox): byte 6 of 0x253, and bit 54 of 0x252. */
+static uint8_t gearboxState() {
+    if (gearbox.lever == 'R') return 0x40;
+    if (gearbox.lever == 'D' && truth().speed > gearbox.lockKmh) return 0x40;
+    return 0x1B;
+}
+/** The gearbox frame (see Gearbox); due every 20 ms while enabled. */
+static void gearboxFrame(uint64_t now) {
+    static uint64_t due = 0;
+    if (!gearbox.enabled) { due = 0; return; }
+    if (due > now) return;
+    due = due && now - due < 20100 ? due + 20100 : now + 20100;
+    static uint8_t cnt = 0;
+    const char lv = gearbox.lever;
+    const uint8_t field = lv == 'P' ? 3 : lv == 'R' ? 2 : lv == 'N' ? 1 : 0;
+    const uint8_t b1 = (lv == 'P' || lv == 'N') ? 0x02 : 0x00;
+    const uint8_t torque = (uint8_t)(40 + truth().throttle * 0.25);
+    const twai_message_t m = frame(0x253, {cnt++, b1, torque, (uint8_t)(field << 4), 0, 0, gearboxState(), 0});
+    if (tcmSee(m)) deliver(m);
+}
+
 sim::Vdc sim::vdc;
 /** The stability control frame (see Vdc); due every 20 ms while enabled. */
 static void vdcFrame(uint64_t now) {
@@ -540,6 +562,7 @@ static void vdcFrame(uint64_t now) {
 /** @return When the next broadcast is due. */
 static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
     bodyFrame(now);
+    gearboxFrame(now);
     vdcFrame(now);
     const Truth v = truth();
     struct Def { uint32_t id; uint32_t periodUs; };
@@ -577,8 +600,9 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
                 break;
             case 0x252: {
                 const uint16_t s = (uint16_t)(v.speed / 0.05625);
+                const uint8_t b6 = gearbox.enabled ? (uint8_t)(0x81 | (gearboxState() & 0x40)) : 0x81;
                 m = frame(0x252, {0x80, 0x00, (uint8_t)(s >> 8), (uint8_t)s, 0x68,
-                                  (uint8_t)(rng() & 3), 0x81, (uint8_t)(s_cnt & 7)});
+                                  (uint8_t)(rng() & 3), b6, (uint8_t)(s_cnt & 7)});
                 break;
             }
             case 0x3B1:
@@ -601,6 +625,7 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
     for (const Def &d : DEFS) soonest = std::min(soonest, next[d.id]);
     if (body.enabled) soonest = std::min<uint64_t>(soonest, now + 50250);
     if (vdc.enabled) soonest = std::min<uint64_t>(soonest, now + 20100);
+    if (gearbox.enabled) soonest = std::min<uint64_t>(soonest, now + 20100);
     // Stress: many more identifiers than the census holds, each at 20 Hz,
     // spread over time as a real bus would carry them (not in one burst).
     static uint64_t extraLast = 0;

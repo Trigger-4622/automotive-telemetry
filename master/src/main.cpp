@@ -915,17 +915,67 @@ static float nearestCode(uint64_t raw, const RtSignal &s) {
 }
 
 /**
+ * @brief The lever's own field inside a saved bit combination: the shortest
+ *        run of neighbouring bits that tells every entry of the table apart
+ *        by itself - the rule the portal's teach page chooses by
+ *        (teachPositions).
+ *
+ * A combination taught before that rule holds every bit that changed with the
+ * lever on the day, and some of those are not the lever. The car's eight of
+ * 0x253 held five that say what the gearbox is doing: standing still they
+ * told R from the rest, and at speed in D they read as they do in reverse -
+ * one bit from the R entry, which nearestCode() takes for R
+ * (lever_own_field). Read from its own field alone, the other bits can do as
+ * they like. The saved table is not touched.
+ *
+ * @return The field as a mask over the combination's code bits; 0 when it has
+ *         no such field, or is one already.
+ */
+static uint16_t leverOwnMask(const RtSignal &s) {
+    if (s.nBits < 2 || s.nBits > MAX_SIG_BITS || s.nMap < 2) return 0;
+    uint8_t order[MAX_SIG_BITS];             // code bits, in payload order
+    for (uint8_t i = 0; i < s.nBits; i++) order[i] = i;
+    std::sort(order, order + s.nBits,
+              [&s](uint8_t a, uint8_t b) { return s.bitList[a] < s.bitList[b]; });
+    uint16_t pick = 0;
+    uint8_t  pickLen = s.nBits;              // only a run shorter than the whole list
+    for (uint8_t a = 0; a < s.nBits; a++) {
+        uint16_t mask = 0;
+        for (uint8_t b = a; b < s.nBits; b++) {
+            if (b > a && s.bitList[order[b]] != s.bitList[order[b - 1]] + 1) break;   // not neighbours
+            if (b - a + 1 >= pickLen) break;
+            mask |= (uint16_t)(1u << order[b]);
+            bool apart = true;
+            for (uint8_t i = 0; i < s.nMap && apart; i++)
+                for (uint8_t j = i + 1; j < s.nMap; j++)
+                    if ((s.mapRaw[i] & mask) == (s.mapRaw[j] & mask)) { apart = false; break; }
+            if (apart) { pick = mask; pickLen = (uint8_t)(b - a + 1); break; }
+        }
+    }
+    return pick;
+}
+
+/**
  * @brief Decode one CAN signal to its engineering value.
+ * @param exact Out, if given: false when a bit combination's reading is the
+ *              entry it is nearest to rather than one it matches.
  * @return `raw * scale + offset`, sign-extended first when `s.isSigned`; for a
  *         signal with a value table, the value its raw reading maps to, or NaN
  *         (publishes nothing) for a raw reading that is not in the table
  *         (a bit combination: nor plainly near one entry, nearestCode()).
  */
-static float decodeSignal(const uint8_t *d, uint8_t dlc, const RtSignal &s) {
+static float decodeSignal(const uint8_t *d, uint8_t dlc, const RtSignal &s, bool *exact = nullptr) {
     uint64_t raw = extractRaw(d, dlc, s);
+    if (exact) *exact = true;
     if (s.nMap) {
+        if (s.ownMask) {                     // its own field alone (leverOwnMask)
+            for (uint8_t k = 0; k < s.nMap; k++)
+                if ((raw & s.ownMask) == (uint64_t)(s.mapRaw[k] & s.ownMask)) return s.mapVal[k];
+            return NAN;                      // a position that was not taught
+        }
         for (uint8_t k = 0; k < s.nMap; k++)
             if (raw == s.mapRaw[k]) return s.mapVal[k];
+        if (exact) *exact = false;
         return nearestCode(raw, s);
     }
     int64_t  val = (int64_t)raw;
@@ -960,6 +1010,14 @@ static VerifyState s_verify[MAX_SIGNALS] = {};
 static std::vector<RtSignal> s_sigs;        /**< RX task's copy of the table. */
 static uint32_t s_sigGen = 0xFFFFFFFF;
 static volatile bool s_verifyClearReq = false;  /**< Portal: start over.      */
+/** @name The lever against a separate "reverse" bit (receive task only)
+ *  The last reading of a taught gear lever that matched an entry of its table.
+ *  @{ */
+static constexpr uint32_t LEVER_FRESH_MS = 1000;
+static uint32_t s_leverReadMs = 0;      /**< millis() of it; 0 = none yet.   */
+static char     s_leverRead   = 0;      /**< Its letter.                     */
+static bool     s_reverseTold = false;  /**< The disagreement, logged once.  */
+/** @} */
 
 static void verifyLimits(uint16_t metric, float &absTol, float &spread) {
     switch (metric) {
@@ -1010,6 +1068,21 @@ static void refreshSignals() {
     s_sigs   = Cfg.signals;
     Cfg.unlock();
     if (s_sigs.size() > MAX_SIGNALS) s_sigs.resize(MAX_SIGNALS);
+    for (auto &sg : s_sigs) {
+        sg.ownMask = leverOwnMask(sg);
+        if (!sg.ownMask) continue;
+        // Said once for each such signal, not at every change of the table.
+        static struct { uint32_t id; uint16_t metric, mask; } told[4];
+        static uint8_t nTold = 0;
+        bool known = false;
+        for (uint8_t t = 0; t < nTold; t++)
+            known |= told[t].id == sg.canId && told[t].metric == sg.metricId && told[t].mask == sg.ownMask;
+        if (known) continue;
+        told[nTold % 4] = { sg.canId, sg.metricId, sg.ownMask };
+        if (nTold < 4) nTold++;
+        log_i("signal '%s' (0x%03X): read from its own field, %u of its %u saved bits",
+              sg.name, sg.canId, (unsigned)__builtin_popcount(sg.ownMask), (unsigned)sg.nBits);
+    }
     memset(s_verify, 0, sizeof(s_verify));
     if (clear) return;
     for (size_t i = 0; i < s_sigs.size(); i++) {
@@ -2288,12 +2361,35 @@ static void twaiRxTask(void *) {
             if (rs.mode == SIG_OFF || rs.mode == SIG_REJECTED) continue;
             if (rs.canId != msg.identifier || rs.extended != (bool)msg.extd)
                 continue;
-            const float val = decodeSignal(msg.data, msg.data_length_code, rs);
+            bool exact = true;
+            float val = decodeSignal(msg.data, msg.data_length_code, rs, &exact);
             if (isnan(val)) continue;          // a table signal between positions
             s_verify[i].seen = true;
             s_verify[i].lastVal = val;
-            if (rs.publishes()) publishMetric(rs.metricId, val, SRC_RAW);
-            else                verifySample(i, val);
+            if (rs.publishes()) {
+                /*
+                 * The lever's own position outranks a separate "reverse" bit.
+                 * Such a bit was on in reverse the day it was mapped; it can
+                 * be on for other reasons (the car's is, at speed in D), and
+                 * the displays put Reverse before the lever's letter. While
+                 * the lever itself reads another position, Reverse is off.
+                 */
+                if (rs.metricId == METRIC_ID_GEAR_LEVER && exact) {
+                    s_leverRead   = (char)lroundf(val);
+                    s_leverReadMs = rxMs ? rxMs : 1;
+                } else if (rs.metricId == METRIC_ID_REVERSE && val >= 0.5f && s_leverReadMs &&
+                           rxMs - s_leverReadMs < LEVER_FRESH_MS && s_leverRead != 'R') {
+                    val = 0;
+                    if (!s_reverseTold) {
+                        s_reverseTold = true;
+                        log_w("signal '%s' (0x%03X bit %u) reads reverse while the gear lever reads %c - "
+                              "following the lever", rs.name, rs.canId, (unsigned)rs.startBit, s_leverRead);
+                    }
+                }
+                publishMetric(rs.metricId, val, SRC_RAW);
+            } else {
+                verifySample(i, val);
+            }
         }
     }
 }

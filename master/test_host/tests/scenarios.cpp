@@ -1014,18 +1014,23 @@ static void scDeviceConfig() {
                 (unsigned)stored["ssm"].size(), (unsigned)stored["pids"].size());
 
     // A minute of driving: the stored signals must all still be there, with
-    // their modes, whatever the learner does alongside them.
+    // their modes, whatever the learner does alongside them. A candidate
+    // still being confirmed (mode 2) is the one kind that may go: this car is
+    // not the one it was proposed in, and the verifier is there to judge it.
     runUntil(60);
     JsonDocument after;
     deserializeJson(after, simfs::files["/config.json"]);
-    size_t kept = 0;
-    for (JsonVariantConst s : stored["signals"].as<JsonArrayConst>())
+    size_t kept = 0, settled = 0;
+    for (JsonVariantConst s : stored["signals"].as<JsonArrayConst>()) {
+        if ((s["mode"] | 0) == SIG_AUTO) continue;
+        settled++;
         for (JsonVariantConst t : after["signals"].as<JsonArrayConst>())
             if ((t["can_id"] | -1) == (s["can_id"] | -2) && (t["start"] | -1) == (s["start"] | -2) &&
                 (t["len"] | -1) == (s["len"] | -2) && (t["metric"] | -1) == (s["metric"] | -2) &&
                 (t["mode"] | -1) == (s["mode"] | -2)) { kept++; break; }
-    check(kept == stored["signals"].size(), "every stored signal still saved after a minute",
-          fmt("%u of %u", (unsigned)kept, (unsigned)stored["signals"].size()));
+    }
+    check(kept == settled, "every stored signal still saved after a minute",
+          fmt("%u of %u", (unsigned)kept, (unsigned)settled));
     check(after["ssm"].size() == stored["ssm"].size() && after["pids"].size() == stored["pids"].size(),
           "SSM and PID tables intact after a minute");
 }
@@ -3323,6 +3328,87 @@ static void scLeverTolerant() {
     commonChecks();
 }
 
+/** The car's lever and its "Reverse" bit, exactly as its settings file holds
+ *  them (2026-11-14): eight bits of 0x253, and bit 54 of 0x252. */
+static const char *CAR_LEVER =
+    R"({"can_id":595,"ext":false,"start":9,"len":8,"be":false,"signed":false,"scale":1,"offset":0,)"
+    R"("metric":4111,"mode":1,"ref":0,"learned":false,"name":"Gear lever",)"
+    R"("bits":[9,28,29,48,49,51,52,54],"map":[[127,80],[132,82],[123,78],[120,68]]})";
+static const char *CAR_REVERSE =
+    R"({"can_id":594,"ext":false,"start":54,"len":1,"be":false,"signed":false,"scale":1,"offset":0,)"
+    R"("metric":4616,"mode":1,"ref":0,"learned":false,"name":"Reverse"})";
+static double s_roadKmh = 0;
+
+/** What the displays read for the lever and for Reverse over @p seconds:
+ *  how often the lever was @p want, anything else, or nothing; and how often
+ *  Reverse was on. */
+struct LeverReads { int right = 0, wrong = 0, none = 0, reverseOn = 0, n = 0; char last = '?'; };
+static LeverReads readLever(char want, double seconds) {
+    LeverReads r;
+    const double t0 = tNow();
+    for (double t = t0 + 0.5; t < t0 + seconds; t += 0.1) {
+        runUntil(t);
+        double v = -1;
+        r.n++;
+        if (!shownNow(METRIC_ID_GEAR_LEVER, v)) r.none++;
+        else if (v == want) r.right++;
+        else { r.wrong++; r.last = (char)v; }
+        if (shownNow(METRIC_ID_REVERSE, v) && v >= 0.5) r.reverseOn++;
+    }
+    return r;
+}
+
+/**
+ * "Above a certain speed it shows R instead of D." The car's lever was taught
+ * (2026-09-30) as every bit of 0x253 that changed with it that day: eight of
+ * them. Three are the lever - its own two-bit field and the park/neutral
+ * switch. The other five say what the gearbox is doing, and standing still in
+ * P, R, N and D they happened to tell R from the rest. At speed in D they
+ * read as they do in reverse, and the combination was then one bit away from
+ * the R entry - which a reading that tolerates a wrong bit takes for R. The
+ * car's separate "Reverse" bit is the same state bit seen in the engine's
+ * frame, and on the displays Reverse wins over the lever.
+ *
+ * A saved combination is now read from the lever's own field where it has
+ * one - the shortest run of neighbouring bits that tells every position apart,
+ * the rule the portal teaches by - and a lever read that way outranks a
+ * separate reverse bit. The saved table is not rewritten.
+ */
+static void scLeverOwnField() {
+    gearbox.enabled = true;
+    sim::speedOverride = [](double) { return s_roadKmh; };
+    simfs::files["/config.json"] = sigFile({CAR_LEVER, CAR_REVERSE});
+    boot();
+    runUntil(2);
+    const char *seq = "PRND";
+    for (int i = 0; seq[i]; i++) {
+        gearbox.lever = seq[i];
+        const LeverReads r = readLever(seq[i], 3);
+        check(r.right == r.n, fmt("standing still, %c reads %c", seq[i], seq[i]).c_str(),
+              fmt("%d of %d", r.right, r.n));
+        check((r.reverseOn == r.n) == (seq[i] == 'R') && (r.reverseOn == 0) == (seq[i] != 'R'),
+              fmt("...and Reverse is %s", seq[i] == 'R' ? "on" : "off").c_str(), fmt("%d of %d", r.reverseOn, r.n));
+    }
+    s_roadKmh = 60;                                   // in D, above the speed the converter locks at
+    const LeverReads d = readLever('D', 10);
+    check(d.wrong == 0, "at 60 km/h in D the displays never show another letter",
+          d.wrong ? fmt("%d of %d read %c", d.wrong, d.n, d.last) : "");
+    check(d.right == d.n, "...they show D throughout", fmt("%d of %d", d.right, d.n));
+    check(d.reverseOn == 0, "...and Reverse stays off", fmt("on in %d of %d", d.reverseOn, d.n));
+    s_roadKmh = 0;
+    gearbox.lever = 'R';
+    const LeverReads r = readLever('R', 3);
+    check(r.right == r.n && r.reverseOn == r.n, "reverse is still reverse", fmt("%d and %d of %d", r.right, r.reverseOn, r.n));
+    JsonDocument doc;
+    Cfg.toJson(doc);
+    std::string bits, map;
+    serializeJson(doc["signals"][0]["bits"], bits);
+    serializeJson(doc["signals"][0]["map"], map);
+    check(bits == "[9,28,29,48,49,51,52,54]" && map == "[[127,80],[132,82],[123,78],[120,68]]",
+          "the saved table is kept as it was taught", bits + " " + map);
+    commonChecks();
+}
+
 /**
  * A lever whose positions are separate bits, taught one by one as Reverse,
  * Lever in N and Lever in D: the master puts them together as the gear
@@ -3485,6 +3571,7 @@ static const Scenario SCENARIOS[] = {
     {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
     {"signal_bits", scSignalBits, 0}, {"lamp_radio_loss", scLampRadioLoss, 0},
     {"lever_tolerant", scLeverTolerant, 0},
+    {"lever_own_field", scLeverOwnField, 0},
     {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
     {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
     {"busoff_cycles", scBusOffCycles, 0},
