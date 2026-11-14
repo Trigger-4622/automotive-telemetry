@@ -269,7 +269,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 A11009, ROM 5B443C4107) and OBD-II on 0x7E0/0x7E8. About 25 broadcast IDs.
 The car's saved config (`master/test_host/fixtures/`: read back 2026-09-25
 with diag mode 2 = OBD-II only - the file the P1718 scenarios drive with - and
-2026-09-26 with diag mode 0 = Auto) holds 18 signals: learned RPM 0x231, pedal/throttle 0x232, coolant
+2026-09-26 with diag mode 0 = Auto; 2026-11-14 is the newest, 32 signals, its
+VIN's serial masked) holds 18 signals: learned RPM 0x231, pedal/throttle 0x232, coolant
 0x451, MAF and fuel level 0x705, intake temp 0x706; mapped by hand handbrake
 0x4B1, lights 0x351, seatbelt 0x432, steering 0x331, reverse 0x451, neutral
 0x252. Not yet taught: door, turn signals, high beam, cruise; oil pressure has
@@ -303,7 +304,15 @@ own field is preferred - the shortest run of neighbouring moving bits that
 tells every position apart - over the combination of every bit that moved,
 and a combination's code within a quarter of its width of exactly one entry
 reads as that entry (`nearestCode`, `lever_tolerant`); numeric tables still
-need an exact match. Using a taught signal replaces whatever fed that value
+need an exact match. A combination saved before that preference is read by
+the master from its own field too, where it has one (`leverOwnMask`, worked
+out when the receive task copies the table; the saved bits are not rewritten):
+the car's eight bits of 0x253 held five that say what the gearbox is doing,
+and at speed in D they read as in reverse - one bit from the R entry, which
+the tolerant reading took for R (`lever_own_field`). A lever read from a
+table entry it matches also outranks a separate "reverse" bit: while it reads
+another position, `METRIC_ID_REVERSE` is published as off (the displays put
+Reverse before the lever's letter). Using a taught signal replaces whatever fed that value
 before, once confirmed. The screens flash both arrows while `METRIC_ID_HAZARD`
 is on - following each side's own bit when it flashes, in step by themselves
 when it does not (`lamp_hazard_switch`).
@@ -373,8 +382,9 @@ when it does not (`lamp_hazard_switch`).
   the portal's time-limited requests and idle-connection fix, the indicators'
   teach run, the lever field and tolerant lever reading, lamp repeats). The
   car's lever is saved as 8 bits of 0x253 ([9,28,29,48,49,51,52,54], taught
-  that morning); its own field looks like bits 28-29 (P 3, R 2, N 1, D 0) -
-  re-teach it with the new page, which offers to replace the old one.
+  that morning); its own field is bits 28-29 (P 3, R 2, N 1, D 0). It showed
+  R instead of D above a certain speed (2026-11-14): the master now reads it
+  from those two bits by itself (`lever_own_field`), not yet flashed.
 - Round screen flashed 2026-09-30 evening from the same branch (lamps, dash,
   lever letters, hazard arrows): layout and file area byte-identical after,
   boot log clean. Its esptool needs `--before usb_reset` (native USB), and a

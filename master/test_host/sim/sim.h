@@ -271,6 +271,19 @@ Truth truth();
 struct Body { bool enabled = false; char lever = 'P'; bool turnLeft = false; uint8_t doors = 0; };
 extern Body body;
 /**
+ * The car's own gearbox frame, 0x253 at 50 Hz, as its saved lever table shows
+ * it (the settings file read off the car 2026-11-14), sent only while
+ * @ref enabled. Byte 3 bits 4-5 (bits 28-29): the lever itself - P 3, R 2,
+ * N 1, D 0. Byte 1 bit 1 (bit 9): the park/neutral switch, on in P and N.
+ * Byte 6: what the gearbox is doing, not where the lever is - 0x1B standing
+ * in P, N or D, 0x40 in reverse, and 0x40 again in D above @ref lockKmh (the
+ * converter locked). While enabled, the engine-side frame 0x252 carries the
+ * same state bit (bit 54), which the car's file has mapped as "Reverse".
+ * Byte 2: the engine torque the gearbox works with.
+ */
+struct Gearbox { bool enabled = false; char lever = 'P'; double lockKmh = 30; };
+extern Gearbox gearbox;
+/**
  * The stability control unit's frame, 0x0D4 at 50 Hz, sent only while
  * @ref enabled: yaw rate (bytes 0-1, int16 LE, 0.01 deg/s), lateral G (2-3,
  * int16 LE, 0.001 g) and longitudinal G (4-5, int16 LE, 0.001 g) - the car's
