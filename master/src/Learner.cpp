@@ -81,6 +81,12 @@ float needFor(uint16_t m, float ymin, float ymax) {
     return max(1.0f, 0.1f * max(fabsf(ymin), fabsf(ymax)));
 }
 
+/** @return true for a quantity with a figure of its own above. */
+bool needKnown(uint16_t m) {
+    for (const auto &n : NEEDS) if (n.metric == m) return true;
+    return false;
+}
+
 /** Values that make no sense to look for on the bus: counters that only
  *  climb, enumerations, our own housekeeping. */
 bool learnable(uint16_t m) {
@@ -141,9 +147,17 @@ struct Ref {
     float    bestFit;
     int16_t  best;
     uint16_t bestN;
+    float    quantum;               /**< Its smallest step seen (0 = none yet). */
 };
 
-struct Excl { uint32_t id; uint8_t start, len; bool be; uint16_t metric; };
+/**
+ * @brief A field that was tried for a value and rejected: its slope then, and
+ *        how often. Once, and the same field may be proposed again with a
+ *        different slope - the right field first fitted from too little
+ *        ("Listen now" takes ten samples) deserves the second look. Twice,
+ *        or put back to requests by the user, and it is not proposed again.
+ */
+struct Excl { uint32_t id; uint8_t start, len; bool be; uint16_t metric; float k; uint8_t strikes; };
 struct Dead { uint32_t id; uint8_t start, len; bool be; };
 struct Sample { uint16_t metric; float value; };
 /** @brief A value without a slot: just enough to tell whether it moves. */
@@ -272,10 +286,21 @@ bool watchMoving(uint16_t m, bool bit, float y) {
     return w->movedMs && now - w->movedMs < 60000;
 }
 
-/** @brief Never propose this field for this value again (a ring: the oldest
- *         exclusion goes when it is full). */
-void exclude(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric) {
-    s_ex[s_exHead] = { id, start, len, be, metric };
+/**
+ * @brief This field was rejected for this value with slope @p k (see Excl; a
+ *        ring: the oldest exclusion goes when it is full).
+ * @param forGood The user's own "Request instead": no second look.
+ */
+void exclude(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric, float k, bool forGood) {
+    for (size_t i = 0; i < s_nex; i++) {
+        Excl &e = s_ex[i];
+        if (e.id == id && e.start == start && e.len == len && e.be == be && e.metric == metric) {
+            e.k = k;
+            e.strikes = forGood ? 2 : (uint8_t)min(e.strikes + 1, 2);
+            return;
+        }
+    }
+    s_ex[s_exHead] = { id, start, len, be, metric, k, (uint8_t)(forGood ? 2 : 1) };
     s_exHead = (s_exHead + 1) % MAX_EX;
     if (s_nex < MAX_EX) s_nex++;
 }
@@ -287,11 +312,31 @@ const CensusView *lookup(const CensusView *cen, size_t n, uint32_t id, uint8_t &
     return nullptr;
 }
 
-bool excluded(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric) {
-    for (size_t i = 0; i < s_nex; i++)
-        if (s_ex[i].id == id && s_ex[i].start == start && s_ex[i].len == len &&
-            s_ex[i].be == be && s_ex[i].metric == metric) return true;
+/** @return true when this field must not be proposed for this value with
+ *          slope @p k: rejected twice, or once with this same slope (2 %). */
+bool excluded(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric, double k) {
+    for (size_t i = 0; i < s_nex; i++) {
+        const Excl &e = s_ex[i];
+        if (e.id != id || e.start != start || e.len != len || e.be != be || e.metric != metric) continue;
+        return e.strikes >= 2 || fabs(k - e.k) <= 0.02 * fabs(e.k);
+    }
     return false;
+}
+
+/**
+ * @brief A field too coarse to be this value: one step of it is worth more
+ *        than a quarter of the movement asked of the value AND more than
+ *        three of the value's own steps as the ECU reports it.
+ *
+ * A broadcast copy of a value is about as fine as the ECU's answer. What
+ * correlates in a few big steps is something else that moves with it: the
+ * car's "MAP" was a byte worth 10 kPa a step, its "timing advance" a gearbox
+ * byte worth 1.66 degrees - verified, and then logged in place of the ECU's
+ * own half degrees. A gear, whose own step is 1, is as fine as it gets.
+ */
+bool tooCoarse(double k, float need, const Ref &r) {
+    const double step = fabs(k);
+    return step > need * 0.25 && step > 3.0 * r.quantum;
 }
 
 bool isDead(uint32_t id, uint8_t start, uint8_t len, bool be) {
@@ -438,7 +483,9 @@ void sampleAnalog(size_t ai, float y, const CensusView *cen, size_t n) {
      * away from it (see Pend).
      */
     const float need = needFor(r.metric, r.ymin, r.ymax);
-    const bool steady = first || fabsf(y - r.prevY) <= need * Cfg.learnSteady;
+    const float step = first ? 0 : fabsf(y - r.prevY);
+    const bool steady = first || step <= need * Cfg.learnSteady;
+    if (step > 1e-6f && (r.quantum == 0 || step < r.quantum)) r.quantum = step;
     r.prevY = y;
     Pend &p = s_apend[ai];
     if (p.valid && steady) commitAnalog(ai);
@@ -530,8 +577,17 @@ float phi(const BitAcc &a) {
     return den > 0 ? (n11 * n - n1x * ny1) / den : 0.0f;
 }
 
+/**
+ * A value with no figure of its own in NEEDS must also have covered eight of
+ * its own steps: 10 % of a fuel trim that sits near zero is one step of it,
+ * and noise that size "swung" twice - the car's A/F learning was matched to a
+ * field of the steering frame that way.
+ */
 bool moved(const Ref &r) {
-    return r.metric && r.ymax - r.ymin >= needFor(r.metric, r.ymin, r.ymax) && r.swings >= 2;
+    if (!r.metric || r.swings < 2) return false;
+    const float range = r.ymax - r.ymin;
+    if (!needKnown(r.metric) && range < 8.0f * r.quantum) return false;
+    return range >= needFor(r.metric, r.ymin, r.ymax);
 }
 
 /** @brief Free the slots of candidates that had a fair chance and match
@@ -625,7 +681,7 @@ void syncWithSignals(uint16_t *pending, size_t &nPending) {
         if (s.publishes()) { if (nl < MAX_LEARNED) s_learned[nl++] = s.metricId; }
         else if (s.mode == SIG_AUTO && s.learned) { if (nPending < MAX_RT_SIGNALS) pending[nPending++] = s.metricId; }
         else if (s.mode == SIG_REJECTED && s.learned) {
-            exclude(s.canId, s.startBit, s.bitLength, s.bigEndian, s.metricId);
+            exclude(s.canId, s.startBit, s.bitLength, s.bigEndian, s.metricId, s.scale, false);
             log_w("learner: 0x%04X at 0x%03X was rejected by the verifier - searching again",
                   s.metricId, s.canId);
             Cfg.signals.erase(Cfg.signals.begin() + i);
@@ -665,18 +721,19 @@ void evaluate() {
         const float need = needFor(r.metric, r.ymin, r.ymax);
         for (size_t i = 0; i < s_nc; i++) {
             const Cand &c = s_c[i];
-            if (excluded(c.id, c.start, c.len, c.be, r.metric)) continue;
             const Acc &a = s_acc[i * NA_MAX + ai];
             double r2, k, cc;
             if (!fit(a, r2, k, cc)) continue;
+            if (excluded(c.id, c.start, c.len, c.be, r.metric, k)) continue;
             /*
-             * Two guards against a coincidence. The pair must have seen the
+             * Guards against a coincidence. The pair must have seen the
              * value at three levels at least - through two, any field that
-             * happened to change at the same moment fits perfectly. And one
-             * step of the field must be worth less than the movement asked of
-             * the value: a byte whose one step is 1600 rpm is not the RPM.
+             * happened to change at the same moment fits perfectly. One step
+             * of the field must be worth less than the movement asked of the
+             * value: a byte whose one step is 1600 rpm is not the RPM. And
+             * the field must be about as fine as the value (tooCoarse).
              */
-            if (__builtin_popcount(a.levels) < 3 || fabs(k) > need) continue;
+            if (__builtin_popcount(a.levels) < 3 || fabs(k) > need || tooCoarse(k, need, r)) continue;
             // A wider field wins only if it halves the residual: the high byte
             // of a 16-bit value also fits well, but coarsely.
             if (best < 0 || (1.0 - r2) < (1.0 - br2) * 0.5) { best = (int)i; br2 = r2; bk = k; bcc = cc; }
@@ -719,8 +776,8 @@ void evaluate() {
             // watched: one flip that a status bit happened to share is not a
             // match.
             if ((uint16_t)(r.toggles - a.tog0) < 3) continue;
-            if (excluded(s_b[i].id, s_b[i].bit, 1, false, r.metric)) continue;
             const float p = phi(a);
+            if (excluded(s_b[i].id, s_b[i].bit, 1, false, r.metric, p < 0 ? -1.0 : 1.0)) continue;
             if (fabsf(p) > bq) { bq = fabsf(p); best = (int)i; binv = p < 0; }
         }
         if (best >= 0) { r.best = best; r.bestFit = bq; r.bestN = s_bacc[best * NB_MAX + bi].n; }
@@ -784,19 +841,22 @@ void doAccept(uint16_t m) {
         return;
     }
     const Ref &r = s_ar[slot];
+    const float range = r.ymax - r.ymin, need = needFor(m, r.ymin, r.ymax);
     double bk = 0, bcc = 0, br2 = 0; int best = -1;
     for (size_t i = 0; i < s_nc; i++) {
         const Cand &c = s_c[i];
-        if (excluded(c.id, c.start, c.len, c.be, m)) continue;
         double r2, k, cc;
         if (!fit(s_acc[i * NA_MAX + slot], r2, k, cc, 10)) continue;   // the user decides: 10 is enough
+        if (excluded(c.id, c.start, c.len, c.be, m, k)) continue;
+        // ...but not on a field that cannot be the value, however well it
+        // follows it for now (see evaluate()).
+        if (fabs(k) > need || tooCoarse(k, need, r)) continue;
         if (best < 0 || (1.0 - r2) < (1.0 - br2) * 0.5) {
             best = (int)i; br2 = r2; bk = k; bcc = cc;
         }
     }
     if (best < 0) { log_w("learner: 0x%04X - no candidate field yet", m); return; }
     const Cand &c = s_c[best];
-    const float range = r.ymax - r.ymin, need = needFor(m, r.ymin, r.ymax);
     if (propose(m, c.id, c.start, c.len, c.be, (float)bk, (float)(r.y0 + bcc - bk * c.x0),
                 max(need * 0.2f, 0.03f * range), need, SIG_ON))
         log_i("learner: 0x%04X accepted by the user: 0x%03X start %u len %u (r2 %.3f)",
@@ -813,7 +873,7 @@ void doUnlearn(uint16_t m) {
     for (size_t i = 0; i < Cfg.signals.size();) {
         RtSignal &s = Cfg.signals[i];
         if (s.metricId == m && s.learned) {
-            exclude(s.canId, s.startBit, s.bitLength, s.bigEndian, m);
+            exclude(s.canId, s.startBit, s.bitLength, s.bigEndian, m, s.scale, true);
             Cfg.signals.erase(Cfg.signals.begin() + i);
             continue;
         }

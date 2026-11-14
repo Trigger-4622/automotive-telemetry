@@ -1138,6 +1138,19 @@ static bool metricRef(uint16_t id, float &value, uint32_t &stampMs, uint8_t &sou
     return ok;
 }
 
+/**
+ * How long a reading of the reference stands, waiting for the next one to
+ * settle it. This was 600 ms - less than the interval of every value asked
+ * for once a second or slower (coolant, intake air, oil temperature: 1 s;
+ * fuel level, barometer: 2 s). Their readings never met, not one comparison
+ * was made, and a correct candidate for any of them stayed "confirming" for
+ * ever: the only way to such a value was "Listen now", which takes the best
+ * match unchecked (verify_slow_value). Four seconds covers a 2 s value that
+ * the poller asks a second late. Nothing else depends on it: a pair is only
+ * compared if the value did not move between its two readings.
+ */
+static constexpr uint32_t REF_CHAIN_MS = 4000;
+
 /** @brief One decoded AUTO sample against its reference. */
 static void verifySample(size_t i, float val) {
     VerifyState &st = s_verify[i];
@@ -1145,7 +1158,7 @@ static void verifySample(size_t i, float val) {
     if (!s.refMetric) return;
 
     float ref; uint32_t stamp; uint8_t src;
-    if (!metricRef(s.refMetric, ref, stamp, src) || millis() - stamp > 600 || src == SRC_RAW) {
+    if (!metricRef(s.refMetric, ref, stamp, src) || millis() - stamp > REF_CHAIN_MS || src == SRC_RAW) {
         st.haveRef = false;
         st.held = false;                 // a gap breaks the chain of readings
         return;
@@ -1185,22 +1198,50 @@ static void verifySample(size_t i, float val) {
     st.refStamp = stamp;
     if (!held || fabsf(ref - heldRef) > absTol * 0.5f) return;   // it moved: not comparable
 
-    const float tol = max(absTol, 0.03f * fabsf(heldRef));
+    /*
+     * 3 % of the value's size as well, for the built-in figures: 75 rpm is
+     * fair at idle and mean at 6000. Not on top of a learned signal's own
+     * tolerance, which is sized to the range the value moved over: for a
+     * battery voltage 3 % is 0.42 V - more than it ever moves - and nothing
+     * that sat near 14 V could be told from it, or rejected
+     * (candidate_judged).
+     */
+    const float tol = s.vtol > 0 ? absTol : max(absTol, 0.03f * fabsf(heldRef));
     const bool agree = fabsf(heldVal - heldRef) <= tol;
     val = heldVal;                       // the value that was compared
     ref = heldRef;
 
-    if (st.agree == 0 && st.disagree == 0) { st.minVal = st.maxVal = val; }
-    else { st.minVal = min(st.minVal, val); st.maxVal = max(st.maxVal, val); }
-    if (agree) { if (st.agree < 0xFFFF) st.agree++; }
-    else       { if (st.disagree < 0xFFFF) st.disagree++; }
+    /*
+     * The range is the range it AGREED over. Counted over every comparison,
+     * a candidate right at one level only was verified by its first
+     * disagreement: a hundred agreeing samples at idle, then one sample
+     * somewhere else - wrong, but it supplied the "spread", and one wrong in
+     * a hundred is within the allowance. Engine speed with a scale 8 % out
+     * was promoted that way (candidate_second_look).
+     */
+    if (agree) {
+        if (st.agree == 0) st.minVal = st.maxVal = val;
+        else { st.minVal = min(st.minVal, val); st.maxVal = max(st.maxVal, val); }
+        if (st.agree < 0xFFFF) st.agree++;
+    } else {
+        if (st.disagree < 0xFFFF) st.disagree++;
+    }
 
     if (st.agree >= Cfg.verifyN && st.disagree * 10 <= st.agree &&
         (st.maxVal - st.minVal) >= spread) {
         log_i("signal '%s' (0x%03X) VERIFIED: %u agree, %u disagree, range %.1f..%.1f",
               s.name, s.canId, st.agree, st.disagree, st.minVal, st.maxVal);
         setSignalMode(i, SIG_VERIFIED, true);
-    } else if (st.disagree >= Cfg.verifyN && st.disagree > st.agree * 2) {
+    } else if ((st.disagree >= Cfg.verifyN && st.disagree > st.agree * 2) ||
+               ((uint32_t)st.agree + st.disagree >= 6u * Cfg.verifyN && st.disagree * 10 > st.agree)) {
+        /*
+         * Mostly wrong, or - given six times the comparisons a good signal
+         * needs - wrong too often ever to be verified (more than one in
+         * eleven). Without the second, a candidate right at idle and wrong
+         * above it was neither: "confirming" for ever, its value requested
+         * for ever, and the learner, which waits for the verdict, never
+         * looking at another field for it.
+         */
         log_w("signal '%s' (0x%03X) REJECTED: %u agree, %u disagree (last %.1f vs ECU %.1f)",
               s.name, s.canId, st.agree, st.disagree, val, ref);
         setSignalMode(i, SIG_REJECTED, false);
