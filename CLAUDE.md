@@ -145,6 +145,29 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   never zero a timestamp or compare a signed distance to a deadline: powered
   for 24.8 days, the old poller's zeroed deadlines read as in the future and
   not one PID was asked after the next key-on (`obd_resume_old_clock`).
+- **Learned signals: proposing and confirming** (`verify_slow_value`,
+  `candidate_judged`, `candidate_second_look`, `learn_not_coarse`,
+  `learn_needs_steps`). The learner (Learner.cpp) proposes a field as
+  `SIG_AUTO`; the verifier (`verifySample` in main.cpp) compares it with the
+  ECU's figure - one comparison per reading, settled by the next - and
+  promotes or rejects it. The car's settings of 2026-11-14 held an intake
+  temperature read from the coolant byte, a MAP in 10 kPa steps, a timing
+  advance from a gearbox byte in 1.66 degree steps and two candidates
+  "confirming" for ever. What let them in, and the rules now: a reading stands
+  for `REF_CHAIN_MS` (4 s, was 600 ms - nothing asked for once a second or
+  slower was ever compared, so slow values could only be had with "Listen
+  now", which takes the best match unchecked); the range that verifies is the
+  range the candidate AGREED over (one disagreeing sample elsewhere used to
+  supply it); a learned signal's own tolerance (`vtol`) is not widened to 3 %
+  of the value's size (0.42 V for a battery); six times `verify_n` comparisons
+  with more than one disagreement in eleven is a rejection; a field worth more
+  a step than a quarter of the movement asked and three of the value's own
+  steps is not proposed, nor taken by "Listen now" (`tooCoarse`); a value with
+  no figure of its own in `NEEDS` must cover eight of its own steps; and a
+  rejected field may be proposed once more with a different scale
+  (`Excl::strikes`) - "Request instead" still excludes it for good. Not built:
+  a signal already in use is never compared with the ECU again (its PID is no
+  longer asked), and rejections are forgotten at a restart.
 - **Listen-only is NOT silent on this chip by itself.** Espressif erratum
   (ESP32/S2/S3/C3): a listen-only TWAI controller still sends ACTIVE error
   flags, and listen-only freezes its error counters, so one started with REC 0
@@ -402,6 +425,13 @@ when it does not (`lamp_hazard_switch`).
   road speed above all, and the timers and G-meter that use it - are livelier
   (`obd_order` 1 puts the old order back); and what the code reader says about
   the transmission computer.
+- Settings review (2026-11-14, the newest fixture): the owner has a corrected
+  file (lever as bits 28-29, the wrong learned matches rejected, the values
+  they stood for read with the SSM2 request, the two logged SSM2 values this
+  ECU does not offer - Front O2 #1, Knock correction - replaced by A/F 1
+  lambda and Knock corr fine). Left for the owner: both front doors on one bit
+  (0x431 bit 40), "Brake" overlapping the speed's high byte (0x333), SSM2 at
+  5 Hz against a 10 Hz log. The learner rules above are harness only.
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
   service 03 at all; that the SSM2 odometer matches the cluster; which frame

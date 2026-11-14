@@ -3328,6 +3328,179 @@ static void scLeverTolerant() {
     commonChecks();
 }
 
+/** The learner's state for one value (LS_*), or -1 while it has no slot. */
+static int learnState(uint16_t metric) {
+    std::vector<LearnView> lv(128);
+    const size_t n = learnerStatus(lv.data(), 128);
+    for (size_t i = 0; i < n; i++) if (lv[i].metric == metric) return lv[i].state;
+    return -1;
+}
+/** The signal that feeds @p metric, whatever its mode. */
+static SigInfo signalFor(uint16_t metric, uint32_t canId = 0) {
+    Cfg.lock();
+    SigInfo r = {false, {}};
+    for (const auto &s : Cfg.signals)
+        if (s.metricId == metric && (!canId || s.canId == canId)) { r = {true, s}; break; }
+    Cfg.unlock();
+    return r;
+}
+
+/**
+ * A candidate that is right some of the time. The verifier promotes one that
+ * disagrees no more than one time in eleven, and rejected one that disagreed
+ * two times in three - and in between did neither, for ever: the value stayed
+ * "confirming", was requested for ever, and the learner, which waits for the
+ * verdict, never looked at another field for it. Two such candidates sat in
+ * the car's settings on 2026-11-14; this is one of them, the battery voltage
+ * proposed from a byte that hardly moves: within its 0.12 V of the ECU's
+ * figure four times in ten. Given six times the comparisons a good signal
+ * needs, more than one disagreement in eleven is now a rejection.
+ */
+static void scCandidateJudged() {
+    // (The voltage is the only PID here, asked for every 200 ms: its readings
+    // then follow each other closely enough to be compared on any firmware.)
+    simfs::files["/config.json"] =                  // (not fmt: its buffer is 256 bytes)
+        "{\"cfg_ver\":" + std::to_string((int)MasterConfig::CFG_VERSION) +
+        R"(,"diag_mode":2,"pids":[{"pid":66,"enabled":true,"period":200}],"signals":[{"can_id":561,"ext":false,)"
+        R"("start":40,"len":8,"be":false,"signed":false,"scale":0.04235,"offset":11.00845,"metric":322,"mode":2,)"
+        R"("ref":322,"learned":true,"vtol":0.12,"vsp":0.6,"name":"learned 0142"}]})";
+    boot();
+    runUntil(300);
+    const SigInfo bv = signalFor(METRIC_ID_BATT_VOLTAGE);
+    check(!bv.found, "the candidate is judged, not left confirming for ever",
+          bv.found ? fmt("still there, mode %u", bv.s.mode) : "");
+    bool rejected = false;
+    for (const auto &l : sim::logLines) rejected |= l.find("'learned 0142' (0x231) REJECTED") != std::string::npos;
+    check(rejected, "rejected: it disagreed too often ever to be verified");
+    double v = 0;
+    const bool shown = shownNow(METRIC_ID_BATT_VOLTAGE, v);
+    check(shown && std::fabs(v - (14.1 + 0.2 * std::sin(tNow()))) < 0.15 && sourceOf(METRIC_ID_BATT_VOLTAGE) == SRC_OBD,
+          "the voltage on the displays is the ECU's", fmt("%.2f V, source %d", v, sourceOf(METRIC_ID_BATT_VOLTAGE)));
+    commonChecks("REJECTED");
+}
+
+/**
+ * A value asked for once a second. The verifier compares each reading of the
+ * ECU's figure with the frame, once the next reading has shown the value held
+ * still - and gave up on a reading after 600 ms. Coolant, intake air and oil
+ * temperature are asked for every second, fuel level every two: their
+ * readings never met, no comparison was ever made, and a correct candidate
+ * for any of them stayed "confirming" for ever. The only way to such a value
+ * was "Listen now" - which takes the best match unchecked, and is how the
+ * car came by an intake temperature read from the coolant byte. Here the
+ * coolant is proposed from the right byte with the right scale.
+ */
+static void scVerifySlowValue() {
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"diag_mode":2,"signals":[{"can_id":864,"ext":false,)"
+        R"("start":24,"len":8,"be":false,"signed":false,"scale":1,"offset":-40,"metric":261,"mode":2,)"
+        R"("ref":261,"learned":true,"name":"learned 0105"}]})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(120);
+    const AskGaps g = askGaps(0x05, 5, 60);
+    check(g.meanMs > 700, "the coolant is asked for about once a second", fmt("every %.0f ms", g.meanMs));
+    const SigInfo c = signalFor(METRIC_ID_COOLANT_TEMP);
+    check(c.found && c.s.mode == SIG_VERIFIED, "a correct candidate for it is verified", c.found ? sigStr(c) : "gone");
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 1.5, info) && sourceOf(METRIC_ID_COOLANT_TEMP) == SRC_RAW,
+          "and the displays read it from the bus", info);
+    check(txCount([](const twai_message_t &m) { return isObd(m, 0x05); }, 100, 120) == 0, "no longer requested");
+    commonChecks();
+}
+
+/**
+ * The right field, first fitted wrongly. "Listen now" takes the best match
+ * after ten samples, and a scale fitted from ten samples can be well out. A
+ * rejected field used never to be proposed for that value again, whatever a
+ * later fit said - so the value was requested for ever, although the car
+ * broadcasts it. Rejected once, a field may now be proposed again with a
+ * different scale; twice, or put back to requests by the user, and it is left
+ * alone. Here engine speed sits in the settings with a scale 8 % out.
+ */
+static void scCandidateSecondLook() {
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"diag_mode":2,"signals":[{"can_id":561,"ext":false,)"
+        R"("start":16,"len":16,"be":false,"signed":false,"scale":0.27,"offset":0,"metric":268,"mode":2,)"
+        R"("ref":268,"learned":true,"name":"learned 010C"}]})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(200);
+    bool rejected = false;
+    for (const auto &l : sim::logLines) rejected |= l.find("'learned 010C' (0x231) REJECTED") != std::string::npos;
+    check(rejected, "the wrong scale is rejected");
+    const SigInfo rpm = signalFor(METRIC_ID_RPM);
+    check(rpm.found && rpm.s.mode == SIG_VERIFIED && rpm.s.canId == 0x231 && rpm.s.startBit == 16 &&
+          rpm.s.bitLength == 16 && std::fabs(rpm.s.scale - 0.25) < 0.004,
+          "and the same field is learned again with the right one", rpm.found ? sigStr(rpm) : "not learned");
+    std::string info;
+    check(freshNear(METRIC_ID_RPM, truth().rpm, 60, info), "engine speed on the displays is right", info);
+    const uint64_t asked = txCount([](const twai_message_t &m) { return isObd(m, 0x0C); }, 180, 200);
+    check(asked == 0, "and no longer requested", fmt("%llu requests in 20 s", (unsigned long long)asked));
+    // Put back to requests by the user: that is for good, whatever a later fit says.
+    learnerUnlearn(METRIC_ID_RPM);
+    runUntil(320);
+    const SigInfo again = signalFor(METRIC_ID_RPM);
+    check(!(again.found && again.s.canId == 0x231 && again.s.startBit == 16 && again.s.bitLength == 16 && !again.s.bigEndian),
+          "\"Request instead\" still means it: that field is not proposed again", again.found ? sigStr(again) : "none");
+    commonChecks("REJECTED");
+}
+
+/**
+ * A field that follows a value in a few big steps is not that value. The
+ * car's timing advance was "learned" from a byte of the gearbox frame worth
+ * 1.66 degrees a step (verified, too: it does follow the timing), and from
+ * then on the displays and the drive log had that in place of the ECU's own
+ * half degrees; its MAP came from a byte worth 10 kPa a step. A broadcast
+ * copy of a value is about as fine as the ECU's answer: a field whose one
+ * step is worth more than a quarter of the movement asked of the value, and
+ * more than three of the value's own steps, is no longer proposed.
+ */
+static void scLearnNotCoarse() {
+    gearbox.enabled = true;
+    gearbox.lever = 'D';
+    ecu.ownTiming = true;
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"diag_mode":2})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(240);
+    const SigInfo t = signalFor(METRIC_ID_TIMING_ADV);
+    check(!t.found, "timing advance is not taken from the gearbox byte that follows it in 1.66 degree steps",
+          t.found ? sigStr(t) : "");
+    double v = 0;
+    const bool shown = shownNow(METRIC_ID_TIMING_ADV, v);
+    check(shown && std::fabs(v - sim::timingNow()) <= 0.51, "the displays have the ECU's own figure, to half a degree",
+          fmt("shown %.2f, the ECU's %.2f", v, sim::timingNow()));
+    check(sourceOf(METRIC_ID_TIMING_ADV) == SRC_OBD, "...from OBD-II", fmt("source %d", sourceOf(METRIC_ID_TIMING_ADV)));
+    const SigInfo rpm = learnedFor(METRIC_ID_RPM);
+    check(rpm.found && rpm.s.mode == SIG_VERIFIED && rpm.s.canId == 0x231, "what is on the bus is still learned (engine speed)",
+          sigStr(rpm));
+    const SigInfo thr = learnedFor(METRIC_ID_THROTTLE);
+    check(thr.found && thr.s.bitLength == 8 && std::fabs(thr.s.scale - 0.392) < 0.02,
+          "...a single byte included, where it is as fine as the value (throttle)", sigStr(thr));
+    commonChecks();
+}
+
+/**
+ * A value that has only dithered by a step is not searched for. Ten per cent
+ * of a fuel trim that sits near zero is one step of it; noise that size
+ * "swung" twice, and from then on any field that drifted the same way for a
+ * while was a match - the car's A/F learning was proposed from a field of
+ * the steering frame. A value with no figure of its own for the movement it
+ * needs must now also cover eight of its own steps.
+ */
+static void scLearnNeedsSteps() {
+    ecu.trimDither = true;
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"diag_mode":1})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(120);
+    double v = 99;
+    const bool read = shownNow(METRIC_ID_SSM_AF_LEARN, v);
+    check(read && std::fabs(v) < 1.0, "the trim is read (and is doing nothing)", fmt("%.2f %%", v));
+    const int st = learnState(METRIC_ID_SSM_AF_LEARN);
+    check(st == LS_NEED_MOVE, "a trim dithering one step either side of zero still \"needs movement\"",
+          fmt("state %d", st));
+    check(!signalFor(METRIC_ID_SSM_AF_LEARN).found, "and nothing is proposed for it");
+    const SigInfo rpm = learnedFor(METRIC_ID_RPM);
+    check(rpm.found && rpm.s.mode == SIG_VERIFIED, "values that do move are learned as before (engine speed)", sigStr(rpm));
+    commonChecks();
+}
+
 /** The car's lever and its "Reverse" bit, exactly as its settings file holds
  *  them (2026-11-14): eight bits of 0x253, and bit 54 of 0x252. */
 static const char *CAR_LEVER =
@@ -3572,6 +3745,10 @@ static const Scenario SCENARIOS[] = {
     {"signal_bits", scSignalBits, 0}, {"lamp_radio_loss", scLampRadioLoss, 0},
     {"lever_tolerant", scLeverTolerant, 0},
     {"lever_own_field", scLeverOwnField, 0},
+    {"candidate_judged", scCandidateJudged, 0}, {"candidate_second_look", scCandidateSecondLook, 0},
+    {"learn_not_coarse", scLearnNotCoarse, 0},
+    {"learn_needs_steps", scLearnNeedsSteps, 0},
+    {"verify_slow_value", scVerifySlowValue, 0},
     {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
     {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
     {"busoff_cycles", scBusOffCycles, 0},

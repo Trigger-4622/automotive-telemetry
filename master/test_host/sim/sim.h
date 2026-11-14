@@ -47,6 +47,18 @@ struct EcuConfig {
      *  and the value this long after it (0 = answers normally). */
     uint8_t  pendingPid      = 0;
     uint32_t pendingUs       = 0;
+    /** Ignition timing has a life of its own (not, as otherwise here, a
+     *  function of engine speed): 10 to 36 degrees in steps held 3.1 s. The
+     *  gearbox frame (Gearbox) then carries what the car's does in byte 2 - a
+     *  value that follows the timing in steps of 1.66 degrees. */
+    bool     ownTiming       = false;
+    /** Intake air temperature as on a cold start: it rises with the coolant
+     *  (0.4 x coolant + 7) until this many seconds after boot, then falls to
+     *  25 C over half a minute as the car gets moving (0 = a steady 25 C). */
+    double   iatWithCoolantS = 0;
+    /** The A/F learning value (SSM2 0x0A, 0.78 % a step) dithers a step either
+     *  side of zero, as a trim that is doing nothing does. */
+    bool     trimDither      = false;
     /** A request the computer lets go unanswered (a reply lost, a busy ECU):
      *  return true to send nothing. */
     std::function<bool(bool tcm, uint8_t svc)> ignoreIso;
@@ -257,6 +269,10 @@ double elapsedS();
 /** The car's true values right now (what the gauges should show). */
 struct Truth { double rpm, speed, throttle, coolant, gear; bool brake, lights; };
 Truth truth();
+/** Ignition timing [deg] and intake air temperature [C] as the ECU reports
+ *  them (see EcuConfig::ownTiming, iatWithCoolantS). */
+double timingNow();
+double iatNow();
 
 /**
  * A body/transmission frame, 0x3D1 at 20 Hz, sent only while @ref enabled

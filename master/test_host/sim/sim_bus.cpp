@@ -486,6 +486,19 @@ Truth sim::truth() {
     return r;
 }
 
+double sim::timingNow() {
+    const Truth v = truth();
+    if (!ecu.ownTiming) return 10 + v.rpm / 200;
+    static const double L[] = {10, 24, 16, 32, 12, 28, 20, 36};
+    return elapsedS() < 8 ? 10 : profile(L, 8, 3.1, elapsedS());
+}
+double sim::iatNow() {
+    if (ecu.iatWithCoolantS <= 0) return 25;
+    const double t = elapsedS(), warm = 0.4 * truth().coolant + 7;
+    if (t < ecu.iatWithCoolantS) return warm;
+    return std::max(25.0, warm - (warm - 25) * std::min(1.0, (t - ecu.iatWithCoolantS) / 30));
+}
+
 static uint8_t s_cnt = 0;
 
 sim::Body sim::body;
@@ -536,7 +549,10 @@ static void gearboxFrame(uint64_t now) {
     const char lv = gearbox.lever;
     const uint8_t field = lv == 'P' ? 3 : lv == 'R' ? 2 : lv == 'N' ? 1 : 0;
     const uint8_t b1 = (lv == 'P' || lv == 'N') ? 0x02 : 0x00;
-    const uint8_t torque = (uint8_t)(40 + truth().throttle * 0.25);
+    // Byte 2: the engine torque the gearbox works with - or, as on the car,
+    // something that follows the ignition timing in steps of 1.66 degrees.
+    const uint8_t torque = ecu.ownTiming ? (uint8_t)std::lround((timingNow() + 65.66) / 1.66)
+                                         : (uint8_t)(40 + truth().throttle * 0.25);
     const twai_message_t m = frame(0x253, {cnt++, b1, torque, (uint8_t)(field << 4), 0, 0, gearboxState(), 0});
     if (tcmSee(m)) deliver(m);
 }
@@ -684,8 +700,10 @@ static int obdData(uint8_t pid, uint8_t *d) {
         case 0x0B: d[0] = (uint8_t)(30 + v.throttle * 0.8); return 1;
         case 0x0C: { const uint16_t r = (uint16_t)(v.rpm * 4); d[0] = r >> 8; d[1] = r & 0xFF; return 2; }
         case 0x0D: d[0] = (uint8_t)std::lround(v.speed); return 1;
-        case 0x0E: d[0] = (uint8_t)((10 + v.rpm / 200 + 64) * 2); return 1;
-        case 0x0F: d[0] = 25 + 40; return 1;
+        case 0x0E: d[0] = ecu.ownTiming ? (uint8_t)std::lround((timingNow() + 64) * 2)
+                                        : (uint8_t)((10 + v.rpm / 200 + 64) * 2);
+                   return 1;
+        case 0x0F: d[0] = (uint8_t)std::lround(iatNow() + 40); return 1;
         case 0x10: { const uint16_t m = (uint16_t)(v.rpm * v.throttle / 10); d[0] = m >> 8; d[1] = m & 0xFF; return 2; }
         case 0x11: d[0] = pct(v.throttle); return 1;
         case 0x13: d[0] = 0x03; return 1;
@@ -781,13 +799,20 @@ static uint8_t ssmByte(uint32_t a) {
     switch (a) {
         case 0x07: return (uint8_t)std::lround((v.throttle * 0.8 + 15) * 2.55);
         case 0x08: return (uint8_t)(v.coolant + 40);
-        case 0x09: case 0x0A: case 0x0B: case 0x0C: return 128;
+        case 0x0A:
+            if (ecu.trimDither) {       // a step either side of zero, changing every 0.7 s
+                static const int8_t D[] = {0, 1, 0, -1, 0, 0, 1, -1, 0, 1, 0, -1, -1, 0, 1, 0};
+                return (uint8_t)(128 + D[(int)(elapsedS() / 0.7) & 15]);
+            }
+            return 128;
+        case 0x09: case 0x0B: case 0x0C: return 128;
         case 0x0D: return (uint8_t)(30 + v.throttle * 0.8);
         case 0x0E: return rpm4 >> 8;
         case 0x0F: return rpm4 & 0xFF;
         case 0x10: return (uint8_t)std::lround(v.speed);
-        case 0x11: return (uint8_t)((10 + v.rpm / 200) * 2 + 128);
-        case 0x12: return 25 + 40;
+        case 0x11: return ecu.ownTiming ? (uint8_t)std::lround(timingNow() * 2 + 128)
+                                        : (uint8_t)((10 + v.rpm / 200) * 2 + 128);
+        case 0x12: return (uint8_t)std::lround(iatNow() + 40);
         case 0x15: return (uint8_t)std::lround(v.throttle * 2.55);
         case 0x1C: return (uint8_t)(14.1 / 0.08);
         case 0x20: return 20;
@@ -935,7 +960,11 @@ static void nodeFrame(IsoNode &n, const twai_message_t &m, bool functional) {
         uint64_t t = now + 500;
         static int replies = 0;
         size_t end = n.tx.msg.size();
-        if (&n == &s_ecmNode && ecu.ssmCutEveryN && ++replies % ecu.ssmCutEveryN == 0) end = 6 + 7;
+        // Cut: after its first consecutive frame - or, for a reply that would
+        // be complete with that one, before it. (The fixed "6 + 7" read past a
+        // reply of 12 bytes or fewer, and never ended.)
+        if (&n == &s_ecmNode && ecu.ssmCutEveryN && ++replies % ecu.ssmCutEveryN == 0)
+            end = n.tx.msg.size() > 6 + 7 ? 6 + 7 : std::min<size_t>(end, 6);
         while (n.tx.off < end) {
             twai_message_t cf = frame(n.rspId, {});
             cf.data[0] = (uint8_t)(0x20 | (n.tx.sn++ & 0x0F));
