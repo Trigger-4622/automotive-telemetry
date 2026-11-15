@@ -139,6 +139,9 @@ static uint8_t  s_okStreak = 0, s_failStreak = 0;
 /** Local copy of the parameter table plus scheduling state. */
 static std::vector<RtSsm>    s_table;
 static std::vector<uint32_t> s_lastPoll;
+static std::vector<uint32_t> s_lastAnswer;  /**< Last answered: a covered value is
+                                                 asked again after learn_recheck_s
+                                                 (masterRecheckWanted). */
 static std::vector<uint8_t>  s_refused;   /**< ECU rejected this address.    */
 static uint32_t              s_tableGen = 0xFFFFFFFF;
 static size_t                s_cursor = 0;
@@ -615,15 +618,18 @@ static void refreshTable() {
     Cfg.lock();                          // ssm2GetStatus reads these too
     const std::vector<RtSsm>    oldTable = s_table;
     const std::vector<uint32_t> oldPoll  = s_lastPoll;
+    const std::vector<uint32_t> oldAns   = s_lastAnswer;
     const std::vector<uint8_t>  oldRef   = s_refused;
     s_tableGen = Cfg.generation;
     s_table    = Cfg.ssm;
     s_lastPoll.assign(s_table.size(), 0);
+    s_lastAnswer.assign(s_table.size(), 0);
     s_refused.assign(s_table.size(), 0);
     for (size_t i = 0; i < s_table.size(); i++)
         for (size_t j = 0; j < oldTable.size(); j++) {
             if (oldTable[j].address != s_table[i].address) continue;
             if (j < oldPoll.size()) s_lastPoll[i] = oldPoll[j];
+            if (j < oldAns.size())  s_lastAnswer[i] = oldAns[j];
             if (j < oldRef.size())  s_refused[i]  = oldRef[j];
             break;
         }
@@ -650,7 +656,7 @@ enum PollResult : uint8_t { P_IDLE, P_OK, P_FAIL, P_NRC, P_BUSY, P_REFUSED };
 static void publishReply(const Slot *slots, size_t nSlot, const uint8_t *rsp, uint32_t now) {
     for (size_t i = 0; i < nSlot; i++) {
         const Slot &s = slots[i];
-        if (s.tableIdx >= 0) s_lastPoll[s.tableIdx] = now;
+        if (s.tableIdx >= 0) s_lastPoll[s.tableIdx] = s_lastAnswer[s.tableIdx] = now;
         if (s.metricId == 0) {                       // a switch byte
             const int bi = swByteIndex(s.addr);
             if (bi >= 0) s_swPoll[bi] = now;
@@ -769,7 +775,11 @@ static PollResult ssm2PollOnce() {
             if (ssm2Supported(e) == 0) continue;
             const int32_t late = lateness(now, s_lastPoll[i], e.periodMs);
             if (e.periodMs && late < 0) continue;          // not due yet
-            if (metricCoveredAbove(e.metricId, SRC_SSM, Cfg.coverMs)) continue;
+            // Covered by a better source: not asked - except, for a learned
+            // signal, once every learn_recheck_s to check it against the ECU.
+            if (metricCoveredAbove(e.metricId, SRC_SSM, Cfg.coverMs) &&
+                !(Cfg.learnRecheckS && now - s_lastAnswer[i] >= Cfg.learnRecheckS * 1000UL &&
+                  masterRecheckWanted(e.metricId))) continue;
             due.push_back({ (int16_t)i, late });
         }
         if (total) s_cursor = (s_cursor + 1) % total;

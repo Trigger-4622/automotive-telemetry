@@ -480,6 +480,7 @@ Truth sim::truth() {
     r.speed = speedOverride ? speedOverride(t) : t < 8 ? 0 : profile(SPD, 8, 3.0, t);
     r.throttle = t < 8 ? 0 : profile(THR, 8, 2.2, t);
     r.coolant = 20 + std::min(70.0, t * 0.5);
+    if (ecu.coolantCycle) r.coolant = t < 130 ? 20 + t * 0.5 : 85 + 4 * std::sin((t - 130) * 2 * M_PI / 50);
     r.gear = r.speed < 15 ? 1 : r.speed < 30 ? 2 : r.speed < 50 ? 3 : r.speed < 70 ? 4 : 5;
     r.brake = std::fmod(t, 7.0) < 1.2;
     r.lights = t >= 60 && t < 120;
@@ -633,6 +634,14 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
                 break;
             case 0x331: m = frame(0x331, {(uint8_t)(t * 2.5), 0, 0, 0, 0, 0, 0, 0}); break;
             case 0x332: m = frame(0x332, {s_cnt, (uint8_t)(s_cnt * 7), 0, 0, 0, 0, 0, 0}); break;
+            case 0x705:
+                if (ecu.maf705) {
+                    const uint16_t q = (uint16_t)std::lround(v.rpm * v.throttle / 1000.0 / 0.005);
+                    m = frame(0x705, {0x11, 0x60, 0x33, (uint8_t)q, (uint8_t)(q >> 8), 0x66, 0x77, 0x88});
+                } else {
+                    m = frame(d.id, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88});
+                }
+                break;
             default:    m = frame(d.id, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}); break;
         }
         if (tcmSee(m)) deliver(m);      // the TCM watches the ECM's broadcasts

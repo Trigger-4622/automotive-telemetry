@@ -165,9 +165,24 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   steps is not proposed, nor taken by "Listen now" (`tooCoarse`); a value with
   no figure of its own in `NEEDS` must cover eight of its own steps; and a
   rejected field may be proposed once more with a different scale
-  (`Excl::strikes`) - "Request instead" still excludes it for good. Not built:
-  a signal already in use is never compared with the ECU again (its PID is no
-  longer asked), and rejections are forgotten at a restart.
+  (`Excl::strikes`) - "Request instead" still excludes it for good, and so do
+  two rejections and a learned row switched off by hand, for every field that
+  shares a bit with it (`fieldMask`; the top byte of a 16-bit field turned down
+  was learned in its place - `learn_off_respected`). Rejections are saved
+  (`learn_excl`, at most 32, written by the learner only; "Restart learning"
+  keeps them, "Forget learned values" clears them - `learn_excl_kept`). A
+  learned signal in use is checked against the ECU every `learn_recheck_s`
+  (30 s; 0 = off, at most 3600; portal Advanced, Learning, applied without a
+  restart - `learn_recheck_setting`): the pollers ask its covered value once
+  (`masterRecheckWanted`), the answer is kept beside the metric whatever the
+  source priority (`MasterMetric::reqValue`, also what candidates are verified
+  against), and it is compared with the frame only after the frame held still
+  300 ms before the answer; four disagreements in a row reject it
+  (`recheckSample`, `learn_recheck`: the car's intake temperature on the
+  coolant byte). Hand-made signals are never re-checked. A reading is paired
+  only with a frame that arrived after the value settled at its level - a
+  once-a-second frame (the car's 0x705) was paired with readings up to a second
+  newer and the MAF never fitted there (`learn_slow_frame`).
 - **Listen-only is NOT silent on this chip by itself.** Espressif erratum
   (ESP32/S2/S3/C3): a listen-only TWAI controller still sends ACTIVE error
   flags, and listen-only freezes its error counters, so one started with REC 0
@@ -431,7 +446,9 @@ when it does not (`lamp_hazard_switch`).
   ECU does not offer - Front O2 #1, Knock correction - replaced by A/F 1
   lambda and Knock corr fine). Left for the owner: both front doors on one bit
   (0x431 bit 40), "Brake" overlapping the speed's high byte (0x333), SSM2 at
-  5 Hz against a 10 Hz log. The learner rules above are harness only.
+  5 Hz against a 10 Hz log. The learner rules above are harness only; on the
+  car, the serial log's "no longer agrees with the ECU" lines say what a
+  re-check turned down.
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
   service 03 at all; that the SSM2 odometer matches the cluster; which frame

@@ -297,6 +297,12 @@ uint64_t masterExtract(const uint8_t *d, uint8_t dlc, uint8_t start, uint8_t len
 
 /** @brief OBD-II has finished one full pass, so what it covers is known. */
 bool diagObdSettled();
+/**
+ * @brief Is @p metric read from the bus through a learned signal that is to be
+ *        checked against the ECU now and then (learn_recheck_s)? The pollers
+ *        then ask for it every learn_recheck_s even though it is covered.
+ */
+bool masterRecheckWanted(uint16_t metric);
 
 /**
  * @brief Recompute the channels that are derived rather than read — boost,

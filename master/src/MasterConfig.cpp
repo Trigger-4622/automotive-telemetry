@@ -215,6 +215,8 @@ void MasterConfig::loadDefaults() {
     ssmSwitches = true;
     learnEnabled = true;
     learnR2 = 0.985f; learnMinN = 40; learnSteady = 0.10f; learnPhi = 0.95f; verifyN = 30;
+    learnRecheckS = 30;
+    learnExcl.clear();
     obdGapMs = 8; obdTimeoutMs = 80; reqMaxHz = 0; obdAddressing = 0; obdOrder = 0;
     ssmTimeoutMs = 1000; coverMs = 2500;
     keepaliveMs = 300; sourceHoldMs = 500; ldrDark = NIGHT_LDR_DARK_ADC; ldrLight = NIGHT_LDR_LIGHT_ADC;
@@ -544,6 +546,7 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["learn_steady"] = learnSteady;
     doc["learn_phi"]    = learnPhi;
     doc["verify_n"]     = verifyN;
+    doc["learn_recheck_s"] = learnRecheckS;
     doc["obd_gap"]      = obdGapMs;
     doc["obd_to"]       = obdTimeoutMs;
     doc["obd_p2can"]    = obdP2CanMs;
@@ -573,6 +576,12 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     for (uint16_t id : logIds) li.add(id);
     JsonArray rm = doc["ssm_removed"].to<JsonArray>();
     for (uint32_t a : ssmRemoved) rm.add(a);
+    JsonArray lx = doc["learn_excl"].to<JsonArray>();
+    for (const auto &e : learnExcl) {
+        JsonArray r = lx.add<JsonArray>();
+        r.add(e.canId); r.add(e.start); r.add(e.len); r.add(e.be ? 1 : 0);
+        r.add(e.metric); r.add(e.k); r.add(e.strikes);
+    }
 
     JsonArray ma = doc["ssm"].to<JsonArray>();
     for (const auto &e : ssm) {
@@ -692,6 +701,7 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     learnSteady  = v["learn_steady"] | learnSteady;
     learnPhi     = v["learn_phi"]    | learnPhi;
     verifyN      = v["verify_n"]     | verifyN;
+    learnRecheckS = (uint16_t)jint(v["learn_recheck_s"], learnRecheckS, 0, 3600);
     obdGapMs     = v["obd_gap"]      | obdGapMs;
     obdTimeoutMs = v["obd_to"]       | obdTimeoutMs;
     obdP2CanMs   = (uint16_t)jint(v["obd_p2can"], obdP2CanMs, 0, 2000);
@@ -775,6 +785,21 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
         }
     }
 
+    if (v["learn_excl"].is<JsonArrayConst>()) {
+        learnExcl.clear();
+        for (JsonVariantConst r : v["learn_excl"].as<JsonArrayConst>()) {
+            if (!r.is<JsonArrayConst>() || r.size() < 7 || learnExcl.size() >= MAX_LEARN_EXCL) continue;
+            LearnExcl e;
+            e.canId   = r[0] | 0u;
+            e.start   = (uint8_t)jint(r[1], 0, 0, 63);
+            e.len     = (uint8_t)jint(r[2], 1, 1, 64);
+            e.be      = (r[3] | 0) != 0;
+            e.metric  = (uint16_t)jint(r[4], 0, 0, 0xFFFF);
+            e.k       = r[5] | 0.0f;
+            e.strikes = (uint8_t)jint(r[6], 1, 1, 2);
+            if (e.canId && e.metric) learnExcl.push_back(e);
+        }
+    }
     if (v["ssm_removed"].is<JsonArrayConst>()) {
         ssmRemoved.clear();
         for (JsonVariantConst a : v["ssm_removed"].as<JsonArrayConst>())

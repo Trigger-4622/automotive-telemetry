@@ -42,7 +42,7 @@ namespace {
 
 constexpr size_t NA_MAX      = 20;    /**< Analog values learned at once.  */
 constexpr size_t NB_MAX      = 12;    /**< Switches learned at once.       */
-constexpr size_t MAX_EX      = 48;    /**< Rejected (field, value) pairs.  */
+constexpr size_t MAX_EX      = MasterConfig::MAX_LEARN_EXCL;  /**< Rejected (field, value) pairs, saved. */
 constexpr size_t MAX_DEAD    = 512;   /**< Evicted candidates remembered.  */
 constexpr size_t MAX_LEARNED = MAX_RT_SIGNALS;  /**< Metrics on the bus.   */
 constexpr size_t MAX_WATCH   = 160;   /**< Values waiting for a slot.      */
@@ -148,6 +148,8 @@ struct Ref {
     int16_t  best;
     uint16_t bestN;
     float    quantum;               /**< Its smallest step seen (0 = none yet). */
+    float    levelY;                /**< The level it last settled at...         */
+    uint32_t levelSince;            /**< ...and since when (millis).             */
 };
 
 /**
@@ -172,6 +174,11 @@ Cand    *s_c = nullptr;  Acc    *s_acc  = nullptr;  size_t s_nc = 0;
 BitCand *s_b = nullptr;  BitAcc *s_bacc = nullptr;  size_t s_nb = 0;
 Ref      s_ar[NA_MAX] = {}, s_br[NB_MAX] = {};
 Excl     s_ex[MAX_EX];       size_t s_nex = 0, s_exHead = 0;
+bool     s_exDirty = false;  /**< Changed since last written to the settings. */
+/** Learned rows switched off by hand (rebuilt from the table at every
+ *  evaluation): their field is not proposed for their value again. */
+constexpr size_t MAX_OFF = 16;
+Dead     s_off[MAX_OFF]; uint16_t s_offMetric[MAX_OFF]; size_t s_noff = 0;
 Dead     s_dead[MAX_DEAD];   size_t s_ndead = 0, s_deadHead = 0;
 Watch    s_watch[MAX_WATCH]; size_t s_nWatch = 0;
 uint16_t s_learned[MAX_LEARNED]; volatile size_t s_nLearned = 0;
@@ -292,6 +299,7 @@ bool watchMoving(uint16_t m, bool bit, float y) {
  * @param forGood The user's own "Request instead": no second look.
  */
 void exclude(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric, float k, bool forGood) {
+    s_exDirty = true;
     for (size_t i = 0; i < s_nex; i++) {
         Excl &e = s_ex[i];
         if (e.id == id && e.start == start && e.len == len && e.be == be && e.metric == metric) {
@@ -305,6 +313,39 @@ void exclude(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric, 
     if (s_nex < MAX_EX) s_nex++;
 }
 
+/**
+ * @brief The exclusions into the settings, oldest first, so that they outlast
+ *        a restart. They used to live in memory only, and a rejected learned
+ *        row is dropped from the table as soon as it is read: after the next
+ *        power cycle the same field could be proposed again, and confirmed
+ *        again by the same coincidence (learn_excl_kept).
+ */
+void saveExclusions() {
+    if (s_resetReq) return;         // a reset (Forget) is on its way: it reloads them
+    Cfg.lock();
+    Cfg.learnExcl.clear();
+    for (size_t k = 0; k < s_nex; k++) {
+        const Excl &e = s_ex[s_nex < MAX_EX ? k : (s_exHead + k) % MAX_EX];
+        Cfg.learnExcl.push_back({ e.id, e.start, e.len, e.be, e.metric, e.k, e.strikes });
+    }
+    Cfg.requestSave();
+    Cfg.unlock();
+    s_exDirty = false;
+}
+
+/** @brief The saved exclusions back into memory (at start, and after Restart). */
+void loadExclusions() {
+    Cfg.lock();
+    s_nex = s_exHead = 0;
+    for (const auto &e : Cfg.learnExcl) {
+        if (s_nex >= MAX_EX) break;
+        s_ex[s_nex++] = { e.canId, e.start, e.len, e.be, e.metric, e.k, e.strikes };
+    }
+    s_exHead = s_nex % MAX_EX;
+    Cfg.unlock();
+    s_exDirty = false;
+}
+
 const CensusView *lookup(const CensusView *cen, size_t n, uint32_t id, uint8_t &ci) {
     if (ci < n && cen[ci].id == id && !cen[ci].extd) return &cen[ci];
     for (size_t i = 0; i < n; i++)
@@ -314,11 +355,42 @@ const CensusView *lookup(const CensusView *cen, size_t n, uint32_t id, uint8_t &
 
 /** @return true when this field must not be proposed for this value with
  *          slope @p k: rejected twice, or once with this same slope (2 %). */
+/** @brief The payload bits a field covers (bit 8 x byte + bit, as the census
+ *         numbers them), Intel or Motorola as masterExtract reads them. */
+uint64_t fieldMask(uint8_t start, uint8_t len, bool be) {
+    uint64_t m = 0;
+    if (!be) {
+        for (uint8_t i = 0; i < len && start + i < 64; i++) m |= 1ULL << (start + i);
+    } else {
+        const unsigned msb = (start / 8) * 8 + (7 - start % 8);   // offset from the word's MSB
+        for (unsigned i = 0; i < len && msb + i < 64; i++) {
+            const unsigned o = msb + i;
+            m |= 1ULL << ((o / 8) * 8 + 7 - o % 8);
+        }
+    }
+    return m;
+}
+
+/**
+ * @return true when this field must not be proposed for this value with
+ *         slope @p k. Rejected once: not with this same slope (2 %). For good
+ *         - rejected twice, put back to requests by the user, or a learned row
+ *         the user switched off - not this field, nor any field sharing a bit
+ *         with it: the top byte of a 16-bit field turned down is the same
+ *         signal, coarser, and it was learned in its place
+ *         (learn_off_respected).
+ */
 bool excluded(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric, double k) {
+    const uint64_t mine = fieldMask(start, len, be);
+    for (size_t i = 0; i < s_noff; i++)
+        if (s_off[i].id == id && s_offMetric[i] == metric &&
+            (fieldMask(s_off[i].start, s_off[i].len, s_off[i].be) & mine)) return true;
     for (size_t i = 0; i < s_nex; i++) {
         const Excl &e = s_ex[i];
-        if (e.id != id || e.start != start || e.len != len || e.be != be || e.metric != metric) continue;
-        return e.strikes >= 2 || fabs(k - e.k) <= 0.02 * fabs(e.k);
+        if (e.id != id || e.metric != metric) continue;
+        const bool same = e.start == start && e.len == len && e.be == be;
+        if (e.strikes >= 2 && (fieldMask(e.start, e.len, e.be) & mine)) return true;
+        if (same) return e.strikes >= 2 || fabs(k - e.k) <= 0.02 * fabs(e.k);
     }
     return false;
 }
@@ -360,6 +432,7 @@ void resetAll() {
     memset(s_bpend, 0, sizeof(s_bpend));
     s_nex = s_exHead = s_ndead = s_deadHead = s_nWatch = 0;
     s_fullLogged = s_tableFullLogged = false;
+    loadExclusions();       // rejections are not progress: they outlast a restart of learning
 }
 
 /* ─────────────────────────── candidate discovery ───────────────────────── */
@@ -487,6 +560,8 @@ void sampleAnalog(size_t ai, float y, const CensusView *cen, size_t n) {
     const bool steady = first || step <= need * Cfg.learnSteady;
     if (step > 1e-6f && (r.quantum == 0 || step < r.quantum)) r.quantum = step;
     r.prevY = y;
+    const uint32_t now = millis();
+    if (first || fabsf(y - r.levelY) > need * Cfg.learnSteady) { r.levelY = y; r.levelSince = now; }
     Pend &p = s_apend[ai];
     if (p.valid && steady) commitAnalog(ai);
     p.valid = false;
@@ -496,10 +571,19 @@ void sampleAnalog(size_t ai, float y, const CensusView *cen, size_t n) {
     p.valid = true;
     p.yc    = y - r.y0;
     p.band  = 1u << ((uint32_t)(int32_t)floorf(p.yc / (need * 0.5f)) & 31);
+    /*
+     * Only a frame that arrived after the value settled at this level: one
+     * from before may show the level it left. A frame sent ten times a second
+     * always is; one sent once a second (the car's 0x705: MAF, fuel level)
+     * was paired with readings up to a second newer, every change of the
+     * value scattered the fit, and the MAF was never found there
+     * (learn_slow_frame).
+     */
+    const uint32_t settled = now - r.levelSince;
     for (size_t i = 0; i < s_nc; i++) {
         Cand &c = s_c[i];
         const CensusView *e = lookup(cen, n, c.id, c.ci);
-        s_px[i * NA_MAX + ai] = (!e || e->ageMs > 5000)      // frame gone; held otherwise
+        s_px[i * NA_MAX + ai] = (!e || e->ageMs > 5000 || e->ageMs > settled)
             ? NAN : (float)masterExtract(e->data, e->dlc, c.start, c.len, c.be) - c.x0;
     }
 }
@@ -544,10 +628,11 @@ void sampleBit(size_t bi, float y, const CensusView *cen, size_t n) {
     p.yb      = yb;
     p.settled = same;
     uint8_t *vx = &s_pbx[bi * s_bBytes], *vv = &s_pbv[bi * s_bBytes];
-    for (size_t i = 0; i < s_nb; i++) {
+    const uint32_t sinceFlip = millis() - r.lastMoveMs;      // as for values: a frame from
+    for (size_t i = 0; i < s_nb; i++) {                      // after the switch last flipped
         BitCand &b = s_b[i];
         const CensusView *e = lookup(cen, n, b.id, b.ci);
-        const bool ok = e && e->ageMs <= 5000 && b.bit / 8 < e->dlc;
+        const bool ok = e && e->ageMs <= 5000 && e->ageMs <= sinceFlip && b.bit / 8 < e->dlc;
         putBit(vv, i, ok);
         putBit(vx, i, ok && ((e->data[b.bit / 8] >> (b.bit % 8)) & 1));
     }
@@ -676,8 +761,19 @@ void syncWithSignals(uint16_t *pending, size_t &nPending) {
     size_t nl = 0;
     Cfg.lock();
     bool changed = false;
+    s_noff = 0;
     for (size_t i = 0; i < Cfg.signals.size();) {
         const RtSignal &s = Cfg.signals[i];
+        /*
+         * A learned row switched off by hand: the owner does not want that
+         * field for that value. It used to be invisible here, and the same
+         * field was learned again - a second row, in use, undoing the choice
+         * (learn_off_respected). The row stays, to be switched on again.
+         */
+        if (s.mode == SIG_OFF && s.learned && s_noff < MAX_OFF) {
+            s_off[s_noff] = { s.canId, s.startBit, s.bitLength, s.bigEndian };
+            s_offMetric[s_noff++] = s.metricId;
+        }
         if (s.publishes()) { if (nl < MAX_LEARNED) s_learned[nl++] = s.metricId; }
         else if (s.mode == SIG_AUTO && s.learned) { if (nPending < MAX_RT_SIGNALS) pending[nPending++] = s.metricId; }
         else if (s.mode == SIG_REJECTED && s.learned) {
@@ -831,6 +927,8 @@ void doAccept(uint16_t m) {
             const BitAcc &a = s_bacc[i * NB_MAX + slot];
             if (a.n < 10 || !a.ones || a.ones == a.n) continue;
             const float p = phi(a);
+            // Not a bit the user or the verifier has turned down for this switch.
+            if (excluded(s_b[i].id, s_b[i].bit, 1, false, m, p < 0 ? -1.0 : 1.0)) continue;
             if (fabsf(p) > bq) { bq = fabsf(p); best = (int)i; inv = p < 0; }
         }
         if (best < 0) { log_w("learner: 0x%04X - no candidate bit yet", m); return; }
@@ -907,6 +1005,7 @@ void task(void *) {
             if (cmd.op == CMD_ACCEPT) doAccept(cmd.metric);
             else                      doUnlearn(cmd.metric);
         }
+        if (s_exDirty) saveExclusions();
         if (!Cfg.learnEnabled) continue;
 
         const uint32_t now = millis();
@@ -923,6 +1022,7 @@ void task(void *) {
             else     sampleAnalog(slot, buf[i].value, cen, nc);
         }
         if (now - lastEval >= 2000) { lastEval = now; evaluate(); }
+        if (s_exDirty) saveExclusions();
     }
 }
 
@@ -1042,6 +1142,7 @@ void learnerForget() {
     for (size_t i = 0; i < Cfg.signals.size();)
         if (Cfg.signals[i].learned) Cfg.signals.erase(Cfg.signals.begin() + i);
         else i++;
+    Cfg.learnExcl.clear();          // everything starts over, rejections included
     Cfg.generation++;
     Cfg.requestSave();
     Cfg.unlock();

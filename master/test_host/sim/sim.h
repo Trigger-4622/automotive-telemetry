@@ -59,6 +59,12 @@ struct EcuConfig {
     /** The A/F learning value (SSM2 0x0A, 0.78 % a step) dithers a step either
      *  side of zero, as a trim that is doing nothing does. */
     bool     trimDither      = false;
+    /** Once warm (85 C, 130 s after boot), the coolant cycles with the
+     *  thermostat: 85 +- 4 C over 50 s, instead of sitting at 90 C. */
+    bool     coolantCycle    = false;
+    /** 0x705 (once a second) carries the MAF as the car's does: bytes 3-4,
+     *  0.005 g/s a count - the value the ECU answers for PID 0x10. */
+    bool     maf705          = false;
     /** A request the computer lets go unanswered (a reply lost, a busy ECU):
      *  return true to send nothing. */
     std::function<bool(bool tcm, uint8_t svc)> ignoreIso;
