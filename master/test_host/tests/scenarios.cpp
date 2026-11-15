@@ -3450,6 +3450,37 @@ static void scLearnRecheck() {
 }
 
 /**
+ * The re-check is the owner's to set: learn_recheck_s in the portal (Advanced,
+ * Learning) - 0 switches it off, any interval up to an hour applies at once,
+ * without a restart, and is saved. With it off, nothing covered is asked for
+ * again, as before the re-check existed.
+ */
+static void scLearnRecheckSetting() {
+    simfs::files["/config.json"] = "{\"cfg_ver\":" + std::to_string((int)MasterConfig::CFG_VERSION) +
+        R"(,"diag_mode":2,"learn_recheck_s":0,"signals":[)"
+        R"({"can_id":864,"ext":false,"start":24,"len":8,"be":false,"signed":false,"scale":1,"offset":-40,)"
+        R"("metric":261,"mode":3,"ref":261,"learned":true,"vtol":1.02,"vsp":5,"name":"learned 0105"}]})";
+    boot();
+    auto asks = [](double a, double b) { return txCount([](const twai_message_t &m) { return isObd(m, 0x05); }, a, b); };
+    runUntil(200);
+    check(Cfg.learnRecheckS == 0, "0 is kept as off", fmt("%u", Cfg.learnRecheckS));
+    check(asks(20, 200) == 0, "off: the coolant, read from the bus, is never asked for",
+          fmt("%llu requests in 180 s", (unsigned long long)asks(20, 200)));
+    portalPost(R"({"learn_recheck_s":60})");             // changed in the portal, no restart
+    runUntil(445);
+    const uint64_t n = asks(205, 445);
+    check(n >= 3 && n <= 5, "60 s: asked about once a minute, at once", fmt("%llu requests in 240 s", (unsigned long long)n));
+    JsonDocument saved;
+    deserializeJson(saved, simfs::files["/config.json"]);
+    check((saved["learn_recheck_s"] | -1) == 60, "and saved", fmt("%d", saved["learn_recheck_s"] | -1));
+    portalPost(R"({"learn_recheck_s":99999})");
+    check(Cfg.learnRecheckS == 3600, "an interval past an hour is held to an hour", fmt("%u", Cfg.learnRecheckS));
+    const SigInfo c = signalFor(METRIC_ID_COOLANT_TEMP, 0x360);
+    check(c.found && c.s.mode == SIG_VERIFIED, "the coolant, right, stays read from the bus", c.found ? sigStr(c) : "gone");
+    commonChecks();
+}
+
+/**
  * A field rejected for a value is remembered across a restart. The learner
  * kept its rejections in memory only, and the rejected row was dropped from
  * the settings the moment it was read: after the next power cycle the same
@@ -3885,7 +3916,8 @@ static const Scenario SCENARIOS[] = {
     {"learn_not_coarse", scLearnNotCoarse, 0},
     {"learn_needs_steps", scLearnNeedsSteps, 0},
     {"verify_slow_value", scVerifySlowValue, 0},
-    {"learn_recheck", scLearnRecheck, 0}, {"learn_excl_kept", scLearnExclKept, 0},
+    {"learn_recheck", scLearnRecheck, 0}, {"learn_recheck_setting", scLearnRecheckSetting, 0},
+    {"learn_excl_kept", scLearnExclKept, 0},
     {"learn_off_respected", scLearnOffRespected, 0},
     {"learn_slow_frame", scLearnSlowFrame, 0},
     {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},

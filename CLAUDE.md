@@ -172,7 +172,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   (`learn_excl`, at most 32, written by the learner only; "Restart learning"
   keeps them, "Forget learned values" clears them - `learn_excl_kept`). A
   learned signal in use is checked against the ECU every `learn_recheck_s`
-  (30 s; 0 = never): the pollers ask its covered value once
+  (30 s; 0 = off, at most 3600; portal Advanced, Learning, applied without a
+  restart - `learn_recheck_setting`): the pollers ask its covered value once
   (`masterRecheckWanted`), the answer is kept beside the metric whatever the
   source priority (`MasterMetric::reqValue`, also what candidates are verified
   against), and it is compared with the frame only after the frame held still
