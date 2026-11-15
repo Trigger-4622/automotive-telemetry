@@ -474,7 +474,8 @@ const ADV=[
   ['learn_min_n','Samples needed','num','',10,5000],
   ['learn_steady','Steady-sample tolerance','num','× the movement needed',0.01,10,0.01],
   ['learn_phi','Switch correlation needed','num','0.5–1',0.5,1,0.01],
-  ['verify_n','Confirmations before trusting a match','num','samples',5,250]]],
+  ['verify_n','Confirmations before trusting a match','num','samples',5,250],
+  ['learn_recheck_s','Check what is read from the bus against the ECU every','num','s per value · 0 = never',0,3600]]],
  ['Bus guard',[
   ['guard','Bus guard on','bool'],
   ['guard_errs','Errors after our frames that trip it','num','',1,100],

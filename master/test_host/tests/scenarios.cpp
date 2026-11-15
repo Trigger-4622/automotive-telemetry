@@ -227,8 +227,9 @@ static void scAuto() {
     check(sourceOf(METRIC_ID_RPM) == SRC_RAW, "RPM now read from the bus", fmt("source %d", sourceOf(METRIC_ID_RPM)));
 
     runUntil(200);
-    check(txCount([](const twai_message_t &m) { return isObd(m, 0x0C); }, 185, 200) == 0,
-          "RPM no longer requested over OBD-II once learned");
+    // (Asked once every learn_recheck_s, 30 s, to check the learned signal.)
+    check(txCount([](const twai_message_t &m) { return isObd(m, 0x0C); }, 185, 200) <= 1,
+          "RPM no longer requested over OBD-II once learned (a re-check at most)");
     check(freshNear(METRIC_ID_RPM, truth().rpm, 250, info), "RPM from the bus tracks the engine", info);
     // Requests stay within their design pacing: SSM2 at most one exchange per
     // 100 ms, and OBD-II only the PIDs nothing better covers.
@@ -238,8 +239,8 @@ static void scAuto() {
     const double obdR = txCount([](const twai_message_t &m) { return isObd(m); }, 190, 200) / 10.0;
     check(obdR < 60, "OBD-II request rate bounded", fmt("%.1f/s", obdR));
     for (int pid : {0x0C, 0x0D, 0x11, 0x43, 0x45, 0x47, 0x4A, 0x4C})
-        check(txCount([pid](const twai_message_t &m) { return isObd(m, pid); }, 185, 200) == 0,
-              fmt("PID %02X not requested once learned from the bus", pid).c_str());
+        check(txCount([pid](const twai_message_t &m) { return isObd(m, pid); }, 185, 200) <= 1,
+              fmt("PID %02X not requested once learned from the bus (a re-check at most)", pid).c_str());
     masterGetStats(st);
     check(st.guardTrips == 0, "bus guard never tripped on a clean bus");
     check(st.errWhileTx == 0 && st.errIdle == 0, "no bus errors counted");
@@ -3403,7 +3404,138 @@ static void scVerifySlowValue() {
     std::string info;
     check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 1.5, info) && sourceOf(METRIC_ID_COOLANT_TEMP) == SRC_RAW,
           "and the displays read it from the bus", info);
-    check(txCount([](const twai_message_t &m) { return isObd(m, 0x05); }, 100, 120) == 0, "no longer requested");
+    check(txCount([](const twai_message_t &m) { return isObd(m, 0x05); }, 100, 120) <= 1,
+          "no longer requested (a re-check at most)");
+    commonChecks();
+}
+
+/**
+ * A learned signal that was right when it was confirmed and is wrong now. The
+ * car's intake temperature was matched to the coolant byte: during a warm-up
+ * the two rise together, and the match was confirmed - then the car got
+ * moving, the intake air cooled, and the displays and the drive log went on
+ * showing a figure that followed the coolant. Once a value is read from the
+ * bus its requests stop, and nothing ever compared it with the ECU again.
+ * Now each learned signal in use is checked against the ECU every
+ * learn_recheck_s (30 s) - one request - and four disagreements in a row put
+ * the value back on requests and the field out of the running for it.
+ */
+static void scLearnRecheck() {
+    ecu.coolantCycle = true;
+    ecu.iatWithCoolantS = 60;            // follows the coolant for a minute, then falls to 25 C
+    simfs::files["/config.json"] = "{\"cfg_ver\":" + std::to_string((int)MasterConfig::CFG_VERSION) +
+        R"(,"diag_mode":2,"signals":[)"
+        R"({"can_id":864,"ext":false,"start":24,"len":8,"be":false,"signed":false,"scale":1,"offset":-40,)"
+        R"("metric":261,"mode":3,"ref":261,"learned":true,"vtol":1.02,"vsp":5,"name":"learned 0105"},)"
+        R"({"can_id":864,"ext":false,"start":24,"len":8,"be":false,"signed":false,"scale":0.4,"offset":-9,)"
+        R"("metric":271,"mode":3,"ref":271,"learned":true,"vtol":0.8,"vsp":4,"name":"learned 010F"}]})";
+    boot();
+    runUntil(420);
+    double v = 0;
+    const bool shown = shownNow(METRIC_ID_IAT, v);
+    check(shown && std::fabs(v - sim::iatNow()) <= 1.5, "the intake temperature on the displays is the ECU's again",
+          fmt("shown %.1f, the ECU's %.1f", v, sim::iatNow()));
+    check(sourceOf(METRIC_ID_IAT) == SRC_OBD, "...requested again", fmt("source %d", sourceOf(METRIC_ID_IAT)));
+    const SigInfo iat = signalFor(METRIC_ID_IAT, 0x360);
+    check(!iat.found, "the field that followed the coolant no longer stands for it", iat.found ? sigStr(iat) : "");
+    bool told = false;
+    for (const auto &l : sim::logLines) told |= l.find("'learned 010F' (0x360) no longer agrees with the ECU") != std::string::npos;
+    check(told, "and the log says why");
+    const SigInfo clt = signalFor(METRIC_ID_COOLANT_TEMP, 0x360);
+    check(clt.found && clt.s.mode == SIG_VERIFIED, "the coolant, right all along, stays read from the bus", clt.found ? sigStr(clt) : "gone");
+    const uint64_t asked = txCount([](const twai_message_t &m) { return isObd(m, 0x05); }, 100, 420);
+    check(asked >= 6 && asked <= 14, "checked against the ECU about every 30 s - one request each time",
+          fmt("%llu requests for it in 320 s", (unsigned long long)asked));
+    commonChecks();
+}
+
+/**
+ * A field rejected for a value is remembered across a restart. The learner
+ * kept its rejections in memory only, and the rejected row was dropped from
+ * the settings the moment it was read: after the next power cycle the same
+ * field could be proposed again, and confirmed again by the same coincidence.
+ * The rejections are saved now (learn_excl). Here the owner has rejected the
+ * coolant byte for the coolant; "Restart learning" clears the learner's
+ * memory as a power cycle does.
+ */
+static void scLearnExclKept() {
+    ecu.coolantCycle = true;
+    simfs::files["/config.json"] = "{\"cfg_ver\":" + std::to_string((int)MasterConfig::CFG_VERSION) +
+        R"(,"diag_mode":2,"signals":[)"
+        R"({"can_id":864,"ext":false,"start":24,"len":8,"be":false,"signed":false,"scale":1,"offset":-40,)"
+        R"("metric":261,"mode":4,"ref":261,"learned":true,"vtol":1.02,"vsp":5,"name":"learned 0105"}]})";
+    boot();
+    runUntil(30);
+    JsonDocument saved;
+    deserializeJson(saved, simfs::files["/config.json"]);
+    bool kept = false;
+    for (JsonVariantConst e : saved["learn_excl"].as<JsonArrayConst>())
+        kept |= (e[0] | 0) == 0x360 && (e[1] | -1) == 24 && (e[2] | 0) == 8 && (e[4] | 0) == METRIC_ID_COOLANT_TEMP;
+    check(kept, "the rejection is saved with the settings");
+    learnerReset();                      // the learner's memory gone, as after a power cycle
+    runUntil(500);
+    const SigInfo c = signalFor(METRIC_ID_COOLANT_TEMP, 0x360);
+    check(!c.found, "the rejected field is not proposed again", c.found ? sigStr(c) : "");
+    std::string info;
+    check(freshNear(METRIC_ID_COOLANT_TEMP, truth().coolant, 1.5, info) && sourceOf(METRIC_ID_COOLANT_TEMP) == SRC_OBD,
+          "the coolant is requested instead", info);
+    learnerForget();                     // "Forget learned values" starts everything over
+    runUntil(520);
+    JsonDocument after;
+    deserializeJson(after, simfs::files["/config.json"]);
+    check(after["learn_excl"].size() == 0, "and \"Forget learned values\" forgets the rejections too",
+          fmt("%u left", (unsigned)after["learn_excl"].size()));
+    commonChecks();
+}
+
+/**
+ * A learned signal switched off by hand. The learner took only signals in
+ * use, being confirmed or rejected into account: one switched off in the
+ * portal was invisible to it, and it learned the same field again - a second
+ * row, confirmed and in use, undoing the owner's choice. A learned row that
+ * is switched off now keeps the learner off that field for that value; the
+ * row stays as it is, to be switched on again.
+ */
+static void scLearnOffRespected() {
+    simfs::files["/config.json"] = "{\"cfg_ver\":" + std::to_string((int)MasterConfig::CFG_VERSION) +
+        R"(,"diag_mode":2,"signals":[{"can_id":561,"ext":false,"start":16,"len":16,"be":false,"signed":false,)"
+        R"("scale":0.25,"offset":0,"metric":268,"mode":0,"ref":268,"learned":true,"vtol":100,"vsp":500,"name":"learned 010C"}]})";
+    boot();
+    runUntil(150);
+    size_t rows = 0, inUse = 0;
+    Cfg.lock();
+    for (const auto &sg : Cfg.signals)
+        if (sg.metricId == METRIC_ID_RPM) { rows++; inUse += sg.publishes() || sg.mode == SIG_AUTO; }
+    Cfg.unlock();
+    check(rows == 1 && inUse == 0, "engine speed is not learned again on the field switched off",
+          fmt("%zu rows, %zu in use or being confirmed", rows, inUse));
+    check(sourceOf(METRIC_ID_RPM) == SRC_OBD, "it is requested, as chosen", fmt("source %d", sourceOf(METRIC_ID_RPM)));
+    const SigInfo spd = learnedFor(METRIC_ID_SPEED);
+    check(spd.found && spd.s.mode == SIG_VERIFIED, "other values are learned as before (road speed)", sigStr(spd));
+    commonChecks();
+}
+
+/**
+ * A value carried in a frame sent once a second - the car's MAF and fuel
+ * level are in 0x705. The learner pairs each reading of the ECU's figure with
+ * the frame as last received, and that could be a second older than the
+ * reading: every change of the value scattered the fit, the right field
+ * reached 87-91 % at best, and it was thrown out with the fields that match
+ * nothing - the MAF was "not found" there (the car got it with "Listen now",
+ * unchecked). A reading is now paired only with a frame that arrived after
+ * the value settled at that level.
+ */
+static void scLearnSlowFrame() {
+    ecu.maf705 = true;
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"diag_mode":2})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(240);
+    const SigInfo c = signalFor(METRIC_ID_MAF);
+    check(c.found && c.s.canId == 0x705 && c.s.startBit == 24 && c.s.bitLength == 16 && !c.s.bigEndian &&
+          std::fabs(c.s.scale - 0.005) < 0.0001, "the MAF is found in the once-a-second frame", c.found ? sigStr(c) : "not found");
+    check(c.found && c.s.mode == SIG_VERIFIED, "...and confirmed", c.found ? fmt("mode %u", c.s.mode) : "");
+    const SigInfo rpm = learnedFor(METRIC_ID_RPM);
+    check(rpm.found && rpm.s.mode == SIG_VERIFIED && rpm.s.canId == 0x231, "values in fast frames are learned as before", sigStr(rpm));
     commonChecks();
 }
 
@@ -3432,7 +3564,7 @@ static void scCandidateSecondLook() {
     std::string info;
     check(freshNear(METRIC_ID_RPM, truth().rpm, 60, info), "engine speed on the displays is right", info);
     const uint64_t asked = txCount([](const twai_message_t &m) { return isObd(m, 0x0C); }, 180, 200);
-    check(asked == 0, "and no longer requested", fmt("%llu requests in 20 s", (unsigned long long)asked));
+    check(asked <= 1, "and no longer requested (a re-check at most)", fmt("%llu requests in 20 s", (unsigned long long)asked));
     // Put back to requests by the user: that is for good, whatever a later fit says.
     learnerUnlearn(METRIC_ID_RPM);
     runUntil(320);
@@ -3462,6 +3594,10 @@ static void scLearnNotCoarse() {
     const SigInfo t = signalFor(METRIC_ID_TIMING_ADV);
     check(!t.found, "timing advance is not taken from the gearbox byte that follows it in 1.66 degree steps",
           t.found ? sigStr(t) : "");
+    // Read in the middle of one of the timing's steady spells (3.1 s held,
+    // 0.6 s moving), not while it moves between two.
+    const double ph = std::fmod(tNow(), 3.7);
+    runUntil(tNow() + (ph < 1.5 ? 1.5 - ph : 3.7 - ph + 1.5));
     double v = 0;
     const bool shown = shownNow(METRIC_ID_TIMING_ADV, v);
     check(shown && std::fabs(v - sim::timingNow()) <= 0.51, "the displays have the ECU's own figure, to half a degree",
@@ -3749,6 +3885,9 @@ static const Scenario SCENARIOS[] = {
     {"learn_not_coarse", scLearnNotCoarse, 0},
     {"learn_needs_steps", scLearnNeedsSteps, 0},
     {"verify_slow_value", scVerifySlowValue, 0},
+    {"learn_recheck", scLearnRecheck, 0}, {"learn_excl_kept", scLearnExclKept, 0},
+    {"learn_off_respected", scLearnOffRespected, 0},
+    {"learn_slow_frame", scLearnSlowFrame, 0},
     {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
     {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
     {"busoff_cycles", scBusOffCycles, 0},

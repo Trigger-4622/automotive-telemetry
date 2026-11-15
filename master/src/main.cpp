@@ -90,6 +90,11 @@ struct MasterMetric {
     uint32_t sentMs;        /**< millis() of the last broadcast.        */
     bool     everSent;      /**< At least one broadcast has carried it. */
     uint8_t  repeats;       /**< Bursts still to carry its last change. */
+    /** The ECU's latest answer for it (OBD-II or SSM2), kept whatever the
+     *  source priority let through: the reference learned signals are
+     *  checked against, even while one of them is what gets published. */
+    float    reqValue;
+    uint32_t reqMs;         /**< millis() of that answer; 0 = none yet.  */
 };
 
 /** @brief The metric store, shared between the CAN and broadcast tasks. */
@@ -286,7 +291,12 @@ void publishMetric(uint16_t id, float value, uint8_t source) {
     if (!slot)
         for (auto &m : s_metrics)
             if (!m.used) { slot = &m; slot->used = true; slot->id = id;
-                           slot->everSent = false; slot->repeats = 0; slot->source = SRC_NONE; break; }
+                           slot->everSent = false; slot->repeats = 0; slot->source = SRC_NONE;
+                           slot->reqMs = 0; break; }
+    if (slot && (source == SRC_OBD || source == SRC_SSM)) {
+        slot->reqValue = value;
+        slot->reqMs    = now ? now : 1;
+    }
     if (slot) {
         /*
          * Source priority. A raw broadcast frame at 50 Hz must not be
@@ -1003,8 +1013,15 @@ struct VerifyState {
     float    lastVal, lastRef, minVal, maxVal;
     bool     seen, haveRef;
     bool     held;           /**< A comparison waits for the next reference. */
+    uint8_t  rcBad;          /**< Re-checks in a row that disagreed.        */
     float    heldRef, heldVal;
     uint32_t refStamp;       /**< When the reference in hand was written.   */
+    /** @name Re-check of a learned signal in use (recheckSample)
+     *  @{ */
+    float    rcVal;          /**< Its value since it last moved...          */
+    uint32_t rcSince;        /**< ...and since when (0 = not yet seen).     */
+    uint32_t rcStamp;        /**< The ECU answer last compared.             */
+    /** @} */
 };
 static VerifyState s_verify[MAX_SIGNALS] = {};
 static std::vector<RtSignal> s_sigs;        /**< RX task's copy of the table. */
@@ -1086,9 +1103,11 @@ static void refreshSignals() {
     memset(s_verify, 0, sizeof(s_verify));
     if (clear) return;
     for (size_t i = 0; i < s_sigs.size(); i++) {
-        if (s_sigs[i].mode != SIG_AUTO) continue;
+        // A candidate's progress, and a learned signal's re-checks.
+        const bool rechecked = s_sigs[i].learned && s_sigs[i].publishes();
+        if (s_sigs[i].mode != SIG_AUTO && !rechecked) continue;
         for (size_t j = 0; j < prev.size() && j < MAX_SIGNALS; j++)
-            if (prev[j].mode == SIG_AUTO && sameSignal(prev[j], s_sigs[i])) {
+            if (prev[j].mode == s_sigs[i].mode && sameSignal(prev[j], s_sigs[i])) {
                 s_verify[i] = prevV[j];
                 break;
             }
@@ -1138,6 +1157,17 @@ static bool metricRef(uint16_t id, float &value, uint32_t &stampMs, uint8_t &sou
     return ok;
 }
 
+/** @brief The ECU's latest answer for @p id and when it came (MasterMetric::
+ *         reqValue) - whatever is being published for it. */
+static bool metricRequested(uint16_t id, float &value, uint32_t &stampMs) {
+    bool ok = false;
+    portENTER_CRITICAL(&s_metricMux);
+    const MasterMetric *m = findSlot(id);
+    if (m && m->reqMs) { value = m->reqValue; stampMs = m->reqMs; ok = true; }
+    portEXIT_CRITICAL(&s_metricMux);
+    return ok;
+}
+
 /**
  * How long a reading of the reference stands, waiting for the next one to
  * settle it. This was 600 ms - less than the interval of every value asked
@@ -1157,8 +1187,8 @@ static void verifySample(size_t i, float val) {
     const RtSignal &s = s_sigs[i];
     if (!s.refMetric) return;
 
-    float ref; uint32_t stamp; uint8_t src;
-    if (!metricRef(s.refMetric, ref, stamp, src) || millis() - stamp > REF_CHAIN_MS || src == SRC_RAW) {
+    float ref; uint32_t stamp;
+    if (!metricRequested(s.refMetric, ref, stamp) || millis() - stamp > REF_CHAIN_MS) {
         st.haveRef = false;
         st.held = false;                 // a gap breaks the chain of readings
         return;
@@ -1247,6 +1277,64 @@ static void verifySample(size_t i, float val) {
         setSignalMode(i, SIG_REJECTED, false);
     }
 }
+
+/**
+ * @name Re-checking learned signals in use
+ *
+ * Once a learned signal is published its value is no longer requested, and it
+ * was never compared with the ECU again. A match confirmed by a coincidence
+ * stayed for good: the car's intake temperature was confirmed on the coolant
+ * byte during a warm-up, when the two rise together, and the displays and the
+ * drive log went on showing a figure that followed the coolant
+ * (learn_recheck). So every learn_recheck_s the value is asked for once more
+ * (masterRecheckWanted(): the OBD-II poller and SSM2 ask a covered value
+ * anyway), and the answer is compared with the frame - only when the frame
+ * held still for RECHECK_STEADY_MS before the answer came, so that the two
+ * describe the same moment. RECHECK_BAD disagreements in a row and the signal
+ * is rejected: the value is requested again, and the learner leaves that field
+ * alone for it (learn_excl). A hand-made signal is never touched.
+ * @{
+ */
+static constexpr uint32_t RECHECK_STEADY_MS = 300;
+static constexpr uint8_t  RECHECK_BAD       = 4;
+
+bool masterRecheckWanted(uint16_t metric) {
+    if (!Cfg.learnRecheckS) return false;
+    bool want = false;
+    Cfg.lock();
+    for (const auto &s : Cfg.signals)
+        if (s.learned && s.publishes() && s.refMetric == metric && !s.nMap) { want = true; break; }
+    Cfg.unlock();
+    return want;
+}
+
+/** @brief One decoded sample of a learned signal in use, against the ECU's
+ *         latest answer for its value. */
+static void recheckSample(size_t i, float val) {
+    const RtSignal &s = s_sigs[i];
+    if (!Cfg.learnRecheckS || !s.learned || !s.refMetric || s.nMap) return;
+    VerifyState &st = s_verify[i];
+    float absTol, spread;
+    verifyLimits(s.refMetric, absTol, spread);
+    if (s.vtol > 0) absTol = s.vtol;
+    const uint32_t now = millis();
+    if (!st.rcSince || fabsf(val - st.rcVal) > absTol * 0.5f) { st.rcVal = val; st.rcSince = now ? now : 1; }
+
+    float ref; uint32_t stamp;
+    if (!metricRequested(s.refMetric, ref, stamp) || stamp == st.rcStamp) return;
+    st.rcStamp = stamp;
+    const uint32_t age = now - stamp;
+    if (age > 500) return;                                      // not this answer's moment
+    if (now - st.rcSince < age + RECHECK_STEADY_MS) return;     // the frame moved around it
+
+    const float tol = s.vtol > 0 ? absTol : max(absTol, 0.03f * fabsf(ref));
+    if (fabsf(val - ref) <= tol) { st.rcBad = 0; return; }
+    if (++st.rcBad < RECHECK_BAD) return;
+    log_w("signal '%s' (0x%03X) no longer agrees with the ECU: %u checks in a row off (%.1f against the "
+          "ECU's %.1f) - requesting the value again", s.name, s.canId, (unsigned)st.rcBad, val, ref);
+    setSignalMode(i, SIG_REJECTED, false);
+}
+/** @} */
 
 /* ═══════════════════════════ OBD-II engine ═══════════════════════════════ */
 
@@ -1634,7 +1722,20 @@ static struct {
                                 or the back-off of one that does not answer.  */
     uint8_t  misses[256];  /**< Requests in a row it did not answer.          */
     uint8_t  seen[32];     /**< Bit per PID: scheduled since the poll began.  */
+    uint16_t recheckAt[256]; /**< Seconds (millis / 1000, wrapping) of its last
+                                  re-check (masterRecheckWanted).             */
 } s_poll;
+
+/** @brief A covered PID due to be asked anyway, so that the learned signal
+ *         standing in for it is checked against the ECU (recheckSample). */
+static bool obdRecheckDue(uint8_t pid) {
+    // Elapsed seconds in 16 bits: right for any interval under 18 hours.
+    const uint16_t since = (uint16_t)(millis() / 1000) - s_poll.recheckAt[pid];
+    if (!Cfg.learnRecheckS || since < Cfg.learnRecheckS) return false;
+    for (const auto &def : OBD_POLL_TABLE)
+        if (def.pid == pid && masterRecheckWanted(def.metric_id)) return true;
+    return false;
+}
 
 static bool pollSeen(uint8_t pid) { return (s_poll.seen[pid >> 3] >> (pid & 7)) & 1; }
 
@@ -1788,11 +1889,13 @@ static void obdPollTask(void *) {
         // The PID to ask. One a better source already delivers is not asked:
         // it is looked at again in a second, and the next one chosen.
         int idx; bool allSeen; uint32_t idleMs;
+        bool recheck = false;
         for (;;) {
             idx = obdPickNext(pids, last, allSeen, idleMs);
             if (idx < 0) break;
             last = idx;
             if (!obdPidCovered(pids[idx].pid)) break;
+            if ((recheck = obdRecheckDue(pids[idx].pid))) break;   // asked anyway, once
             pollSchedule(pids[idx].pid, 1000);
         }
         if (allSeen) s_obdSettled = true;    // every PID has had a turn: coverage is known
@@ -1807,6 +1910,7 @@ static void obdPollTask(void *) {
             if (since < minGap) vTaskDelay(pdMS_TO_TICKS(minGap - since));
         }
         const AskResult r = obdAsk(p.pid, Cfg.obdTimeoutMs);
+        if (recheck && r != ASK_BUSY) s_poll.recheckAt[p.pid] = (uint16_t)(millis() / 1000);
         // The budget counts from when the request really went out (see
         // s_obdSentAtMs); a request that never went out does not count.
         if (r != ASK_BUSY) s_reqLastSendMs = s_obdSentAtMs;
@@ -2428,6 +2532,7 @@ static void twaiRxTask(void *) {
                     }
                 }
                 publishMetric(rs.metricId, val, SRC_RAW);
+                recheckSample(i, val);
             } else {
                 verifySample(i, val);
             }

@@ -259,6 +259,16 @@ public:
     std::vector<RtSignal> signals;              /**< Raw decode table.     */
     std::vector<RtPid>    pids;                 /**< PID overrides.        */
     std::vector<RtSsm>    ssm;                  /**< Subaru SSM2 table.    */
+    /**
+     * Fields the learner must not propose for a value again, kept across
+     * restarts ("learn_excl"): rejected by the verifier or a re-check, or put
+     * back to requests by the user. @c k is the scale the field had then;
+     * one strike and it may be proposed once more with a different scale,
+     * two and never (Learner.cpp, Excl). Written by the learner only.
+     */
+    struct LearnExcl { uint32_t canId; uint8_t start, len; bool be; uint16_t metric; float k; uint8_t strikes; };
+    static constexpr size_t MAX_LEARN_EXCL = 32;
+    std::vector<LearnExcl> learnExcl;
     std::vector<uint32_t> ssmRemoved;           /**< Seeded SSM2 addresses
                                                      the user deleted.     */
     uint16_t ssmGapMs    = 100;    /**< Minimum gap between SSM2 requests. */
@@ -317,6 +327,9 @@ public:
     float    learnSteady  = 0.10f; /**< Steady = moved < this x the need.      */
     float    learnPhi     = 0.95f; /**< Bit correlation that counts as a match.*/
     uint8_t  verifyN      = 30;    /**< Agreeing samples before trusting one.  */
+    uint16_t learnRecheckS = 30;   /**< A learned signal in use is checked
+                                        against the ECU this often (one request
+                                        for its value; 0 = never).              */
     uint8_t  obdGapMs     = 8;     /**< Pause between OBD-II requests.         */
     uint16_t obdTimeoutMs = 80;    /**< OBD-II reply wait.                     */
     uint16_t obdP2CanMs   = 50;    /**< ISO 15765-4 P2CAN: after a request that
