@@ -179,6 +179,7 @@ static bool colsChanged() {
 }
 
 static void logTask(void *) {
+    masterWatchStack("drivelog");
     uint32_t session = 0;
     bool wasAlive = false;
     for (;;) {

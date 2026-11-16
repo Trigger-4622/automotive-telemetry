@@ -246,6 +246,22 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   block: serial `[stats]` and `/api/live` (`heap`, `heap_min`, `heap_block`);
   the loop task's stack is in the `[ctrl ]` headroom figure. The sim's heap is
   a constant 180 KB, so it cannot show exhaustion itself.
+- **Static RAM is the learner's heap too** (2026-11-16: data + bss 84 KB, was
+  123 KB; `pio run` prints it - check it after adding a table). Never keep a
+  `static` copy of a table for a portal page or a task: read it a row at a
+  time (`masterCensusRow` / `masterCensusOrder`, `masterMetricAt`,
+  `learnerStatusRow`; the learner's `Census` holds one row), or take it from
+  the heap for the length of the request (`/api/logs`). The census is 48 rows
+  that are always there and blocks of 16 the receive task takes when a bus
+  has more identifiers (128 at most, as before; 2 KB a block out of the
+  reserve, never given back - none on this car, `census_rows`). The verifier's
+  counters follow their signals in place when the table changes
+  (`verifyCarry`, `verify_carry`: no second copy of the table). Stacks are
+  61 KB of the heap and nothing here can measure them: each task's least
+  headroom is in the serial log (`[stack]`, once a minute) and `/api/live`
+  (`stacks`: [least left, size]) - a task started outside main.cpp reports in
+  with `masterWatchStack()` (`stack_watch`). Cut a stack only from the car's
+  figures.
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only
@@ -449,6 +465,14 @@ when it does not (`lamp_hazard_switch`).
   5 Hz against a 10 Hz log. The learner rules above are harness only; on the
   car, the serial log's "no longer agrees with the ECU" lines say what a
   re-check turned down.
+- RAM (2026-11-16): harness and build only. On the car: the boot line
+  `learner started: N fields x 20 values ... (X KB, Y KB left)` (N should be
+  higher than before), `/api/live` `heap_min` after a drive with the portal
+  used and settings saved (how much of the 95 KB reserve is never touched),
+  and `stacks` - the figures a smaller `HEAP_RESERVE` or smaller stacks would
+  have to rest on. Not done, for want of those: the stacks, the reserve, the
+  live page's JSON document (about 25 KB for a second, every second the portal
+  is open).
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
   service 03 at all; that the SSM2 odometer matches the cluster; which frame

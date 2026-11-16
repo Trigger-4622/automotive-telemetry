@@ -1534,6 +1534,17 @@ void WebPortal::setupRoutes() {
         // panic, and a panic restarts the master mid-drive.
         doc["stack"]      = st.stackMinFree;
         doc["stack_task"] = st.stackMinTask;
+        {
+            // Every task: [least left, size] - what its stack could be cut to.
+            StackView sv[12];
+            const size_t ns = masterStacks(sv, 12);
+            JsonObject so = doc["stacks"].to<JsonObject>();
+            for (size_t i = 0; i < ns; i++) {
+                JsonArray a = so[sv[i].name].to<JsonArray>();
+                a.add(sv[i].minFree);
+                a.add(sv[i].size);
+            }
+        }
         // The MAC the displays see is the one the broadcast leaves from, and
         // with the portal up that is the AP interface, not the station's.
         doc["mac"]    = Portal.running() ? WiFi.softAPmacAddress() : WiFi.macAddress();
@@ -1600,10 +1611,7 @@ void WebPortal::setupRoutes() {
         g["pause"]  = st.guardPauseMs;
         g["silent"] = st.guardSilent;
         g["rx_silent"] = st.rxGuardSilent;
-        {
-            static CensusView cen[128];
-            b["ids"] = masterCensusRaw(cen, 128);
-        }
+        b["ids"] = masterCensusCount();
 
         JsonObject o = doc["obd"].to<JsonObject>();
         o["answers"]   = st.obdAnswers;
@@ -1650,21 +1658,23 @@ void WebPortal::setupRoutes() {
             e["fail"] = st.espFail;
         }
 
-        // Every slot, plus every value already read from the bus.
-        static LearnView lv[32 + MAX_RT_SIGNALS];
-        const size_t nl = learnerStatus(lv, sizeof(lv) / sizeof(lv[0]));
+        // Every slot, plus every value already read from the bus - a row at
+        // a time: the list of them all was 3 KB kept for this page alone.
         JsonArray la = doc["learn"].to<JsonArray>();
+        const size_t nl = learnerStatusRows();
         for (size_t i = 0; i < nl; i++) {
+            LearnView lv;
+            if (!learnerStatusRow(i, lv)) continue;
             JsonObject x = la.add<JsonObject>();
-            x["m"]   = lv[i].metric;
-            x["st"]  = lv[i].state;
-            x["p"]   = lv[i].progress;
-            x["fit"] = lv[i].fit;
-            x["n"]   = lv[i].samples;
-            x["id"]  = lv[i].canId;
-            x["s"]   = lv[i].start;
-            x["l"]   = lv[i].len;
-            x["be"]  = lv[i].be;
+            x["m"]   = lv.metric;
+            x["st"]  = lv.state;
+            x["p"]   = lv.progress;
+            x["fit"] = lv.fit;
+            x["n"]   = lv.samples;
+            x["id"]  = lv.canId;
+            x["s"]   = lv.start;
+            x["l"]   = lv.len;
+            x["be"]  = lv.be;
         }
         uint16_t lf = 0, lb = 0;
         learnerCounts(lf, lb);
@@ -1681,15 +1691,16 @@ void WebPortal::setupRoutes() {
                 if (masterPidSupported((uint8_t)p)) ps.add(p);
         }
 
-        static MetricViewM mv[192];
-        const size_t nm = masterGetMetrics(mv, 192);
         JsonArray ma = doc["metrics"].to<JsonArray>();
+        const size_t nm = masterMetricSlots();
         for (size_t i = 0; i < nm; i++) {
+            MetricViewM mv;                     // slot by slot, not a copy of the store
+            if (!masterMetricAt(i, mv)) continue;
             JsonObject m = ma.add<JsonObject>();
-            m["id"]  = mv[i].id;
-            m["v"]   = mv[i].value;
-            m["age"] = mv[i].ageMs;
-            m["src"] = mv[i].source;
+            m["id"]  = mv.id;
+            m["v"]   = mv.value;
+            m["age"] = mv.ageMs;
+            m["src"] = mv.source;
         }
         sendJson(doc);
     });
@@ -1697,8 +1708,9 @@ void WebPortal::setupRoutes() {
     /* The Bus tab's frame list, polled only while that tab is open. */
     s_server.on("/api/bus", HTTP_GET, []() {
         JsonDocument doc;
-        static CensusView cen[128];
-        const size_t nc = masterGetCensus(cen, 128);
+        // In identifier order, a row at a time (not a 4 KB copy of them all).
+        uint8_t order[128];
+        const size_t nc = masterCensusOrder(order, sizeof order);
         JsonArray ca = doc["census"].to<JsonArray>();
         char hx[17], chx[17];
         // ?e=1 (teach by doing): each bit's flip counter as well, 128 hex digits.
@@ -1724,19 +1736,22 @@ void WebPortal::setupRoutes() {
         char ehx[129];
         uint8_t ed[64];
         for (size_t i = 0; i < nc; i++) {
+            CensusView cen;
+            if (!masterCensusRow(order[i], cen, edges ? ed : nullptr)) continue;   // reset meanwhile
+            const uint8_t dlc = cen.dlc > 8 ? 8 : cen.dlc;
             JsonObject o = ca.add<JsonObject>();
-            o["id"]    = cen[i].id;
-            o["count"] = cen[i].count;
-            o["ext"]   = cen[i].extd;
-            o["age"]   = cen[i].ageMs;
-            for (uint8_t k = 0; k < cen[i].dlc; k++) {
-                snprintf(hx + 2 * k, 3, "%02X", cen[i].data[k]);
-                snprintf(chx + 2 * k, 3, "%02X", cen[i].changed[k]);
+            o["id"]    = cen.id;
+            o["count"] = cen.count;
+            o["ext"]   = cen.extd;
+            o["age"]   = cen.ageMs;
+            for (uint8_t k = 0; k < dlc; k++) {
+                snprintf(hx + 2 * k, 3, "%02X", cen.data[k]);
+                snprintf(chx + 2 * k, 3, "%02X", cen.changed[k]);
             }
-            hx[2 * cen[i].dlc] = chx[2 * cen[i].dlc] = '\0';
+            hx[2 * dlc] = chx[2 * dlc] = '\0';
             o["d"] = hx;
             o["c"] = chx;
-            if (edges && masterCensusEdges(cen[i].id, cen[i].extd, ed)) {
+            if (edges) {
                 for (uint8_t k = 0; k < 64; k++) snprintf(ehx + 2 * k, 3, "%02X", ed[k]);
                 o["e"] = ehx;
             }
@@ -1833,8 +1848,11 @@ void WebPortal::setupRoutes() {
     s_server.on("/api/logs", HTTP_GET, []() {
         DriveLogStatus st;
         driveLogStatus(st);
-        static LogFileInfo li[64];
-        const size_t n = driveLogList(li, 64);
+        // The list is wanted only while this page is built: from the heap for
+        // that long, not 2 KB set aside for good.
+        static constexpr size_t MAX_LIST = 64;
+        LogFileInfo *li = (LogFileInfo *)malloc(MAX_LIST * sizeof(LogFileInfo));
+        const size_t n = li ? driveLogList(li, MAX_LIST) : 0;
         JsonDocument doc;
         doc["on"]      = st.on;
         doc["rec"]     = st.recording;
@@ -1856,6 +1874,7 @@ void WebPortal::setupRoutes() {
             o["rec"]  = li[i].recording;
         }
         sendJson(doc);
+        free(li);
     });
     // The file as recorded; the page turns it into CSV with the metrics' names.
     s_server.on("/api/log", HTTP_GET, []() {

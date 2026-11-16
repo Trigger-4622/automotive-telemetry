@@ -113,7 +113,7 @@ struct MasterStats {
     uint32_t busBitsRx;  /**< Estimated bits received since boot.      */
     uint32_t canTx;      /**< Frames this node transmitted.            */
     uint16_t bitrate;    /**< kbit/s, for turning bits into a load %.  */
-    uint32_t stackMinFree;     /**< Least stack any CAN-side task has had left [B]. */
+    uint32_t stackMinFree;     /**< Least stack any task has had left [B].          */
     const char *stackMinTask;  /**< ...and which task that was.                     */
     uint32_t tec;        /**< Transmit error counter (ours).           */
     uint32_t rec;        /**< Receive error counter.                   */
@@ -185,6 +185,15 @@ struct EvView {
  */
 size_t masterEventLog(EvView *out, size_t max);
 
+/**
+ * @brief For the test harness (the firmware never calls it, so it is not
+ *        linked in): the verifier's in-place move of its counters when the
+ *        signal table changes. Row i is marked @p marks[i] going in; coming
+ *        out it must hold the mark of row from[i], or 0 where from[i] is 0xFF
+ *        (0xFFFF = a row that came out torn).
+ */
+void masterVerifyCarryTest(uint16_t *marks, const uint8_t *from, size_t n, size_t cap);
+
 /** @brief Plain-word name of an evidence-log event type. */
 const char *masterEventName(uint8_t type);
 
@@ -210,6 +219,20 @@ struct MetricViewM {
     uint8_t  source;  /**< @ref MetricSource.               */
 };
 
+/** @brief One task's stack: its size and the least of it ever left free. */
+struct StackView {
+    const char *name;
+    uint32_t    size;     /**< As created [B].                       */
+    uint32_t    minFree;  /**< Least left since boot [B].            */
+};
+/** @brief Every watched task's stack headroom. */
+size_t masterStacks(StackView *out, size_t max);
+/**
+ * @brief Called by a task started outside main.cpp, as its first act: adds
+ *        it to the stack watch under @p name (ssm2, codes, learner, drivelog).
+ */
+void masterWatchStack(const char *name);
+
 /**
  * @brief Copy the current counters.
  * @param[out] out Destination.
@@ -217,12 +240,27 @@ struct MetricViewM {
 void masterGetStats(MasterStats &out);
 
 /**
- * @brief Copy the identifier census.
- * @param[out] out Destination array.
- * @param max      Capacity of @p out.
- * @return Rows written.
+ * @name The identifier census, a row at a time
+ * Nobody needs all of it at once, and a copy of all of it is 4 KB: the portal
+ * and the learner each used to keep one.
+ * @{
  */
-size_t masterGetCensus(CensusView *out, size_t max);
+/** @brief Identifiers in the census. */
+size_t masterCensusCount();
+/**
+ * @brief One row, by its index (arrival order; stable until the census is
+ *        reset).
+ * @param[out] edges When given: its 64 per-bit flip counters as well (see
+ *        masterCensusEdges()).
+ * @return false when there is no such row (any more).
+ */
+bool masterCensusRow(size_t index, CensusView &out, uint8_t *edges = nullptr);
+/**
+ * @brief The rows' indices ordered by identifier, for a list that stays put.
+ * @return Indices written.
+ */
+size_t masterCensusOrder(uint8_t *order, size_t max);
+/** @} */
 
 /**
  * @brief How often each bit of one identifier has flipped since the census
@@ -238,6 +276,14 @@ bool masterCensusEdges(uint32_t id, bool extd, uint8_t out[64]);
  * @return Rows written.
  */
 size_t masterGetMetrics(MetricViewM *out, size_t max);
+
+/**
+ * @brief One slot of the metric store, without copying the store.
+ * @return false when the slot is empty; slots run 0..masterMetricSlots()-1.
+ */
+bool masterMetricAt(size_t slot, MetricViewM &out);
+/** @brief Slots in the metric store (filled or not). */
+size_t masterMetricSlots();
 
 /** @brief Forget every identifier seen so far, for a clean capture. */
 void masterResetCensus();
@@ -268,9 +314,6 @@ void masterCountTx();
  * @param waitMs How long to wait for the lock and for room in the queue.
  */
 bool masterTransmit(const twai_message_t &msg, uint32_t waitMs);
-
-/** @brief Census snapshot in arrival order (no sorting), for the learner. */
-size_t masterCensusRaw(CensusView *out, size_t max);
 
 /**
  * @brief One kind of bus error the controller reported, from its error-code

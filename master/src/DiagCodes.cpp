@@ -330,6 +330,7 @@ static void publish() {
 }
 
 static void codesTask(void *) {
+    masterWatchStack("codes");
     bool     wasAlive = false;
     uint32_t nextRead = 0, lastPub = 0;
     float    lastMil = -1, lastCount = -1;

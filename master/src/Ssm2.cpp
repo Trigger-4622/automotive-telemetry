@@ -881,6 +881,7 @@ static PollResult ssm2PollOnce() {
 /* ─────────────────────────────────── task ────────────────────────────────── */
 
 static void ssm2Task(void *) {
+    masterWatchStack("ssm2");
     uint32_t rateWindowMs = millis(), rateCount = 0;
 
     for (;;) {
