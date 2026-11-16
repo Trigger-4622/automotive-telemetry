@@ -365,23 +365,26 @@ void loadExclusions() {
  */
 class Census {
 public:
-    Census() : _n(masterCensusCount()) {}
+    Census() : _n(masterCensusCount()) { s_at = -1; }
     size_t size() const { return _n; }
     /** Row @p i, or nullptr. Good until the next call. */
     const CensusView *row(size_t i) {
         if (i >= _n) return nullptr;
-        if (_at != (int)i) {
-            _at = -1;
-            if (!masterCensusRow(i, _row)) return nullptr;   // reset under us
-            _at = (int)i;
+        if (s_at != (int)i) {
+            s_at = -1;
+            if (!masterCensusRow(i, s_row)) return nullptr;   // reset under us
+            s_at = (int)i;
         }
-        return &_row;
+        return &s_row;
     }
 private:
-    size_t     _n;
-    int        _at = -1;
-    CensusView _row;
+    size_t _n;
+    // The row held: the learner task's alone, and not on its stack.
+    static CensusView s_row;
+    static int        s_at;
 };
+CensusView Census::s_row;
+int        Census::s_at = -1;
 
 const CensusView *lookup(Census &cen, uint32_t id, uint8_t &ci) {
     const CensusView *e = cen.row(ci);

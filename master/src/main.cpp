@@ -1126,9 +1126,12 @@ static constexpr uint8_t CARRY_NONE = 0xFF;
  * written only once nothing still waits to read what it held, and rows that
  * wait on each other in a ring go round through one spare row.
  *
+ * Never inlined: its spare row is on the receive task's stack only while it
+ * runs, not under the log lines of the refresh that calls it.
+ *
  * @param n Rows in the new table; the rows after them are emptied.
  */
-static void verifyCarry(VerifyState *v, const uint8_t *from, size_t n, size_t cap) {
+static void __attribute__((noinline)) verifyCarry(VerifyState *v, const uint8_t *from, size_t n, size_t cap) {
     static constexpr uint8_t DONE = 0xFE;
     static uint8_t src[MAX_SIGNALS];        // receive task only; not on its stack
     if (cap > MAX_SIGNALS) cap = MAX_SIGNALS;
@@ -3825,6 +3828,24 @@ static void portalRescueCheck() {
  * Worth watching during bring-up: `CAN rx` climbing proves the wiring and
  * bitrate are right, and `SSM`/`OBD` climbing proves the ECU is answering.
  */
+/**
+ * @brief Each task's least stack left, once a minute: what a stack could be
+ *        cut to is read off the car, not guessed.
+ *
+ * A function of its own, never inlined: loop()'s frame lies under every
+ * portal page and every save, and must not grow by this list.
+ */
+static void __attribute__((noinline)) stackHeartbeat() {
+    static uint8_t beat = 11;
+    if (++beat < 12) return;
+    beat = 0;
+    Serial.printf("[stack] least left of size:");
+    for (const auto &t : s_tasks)
+        if (t.h)
+            Serial.printf(" %s %u/%u", t.name, (unsigned)uxTaskGetStackHighWaterMark(t.h), (unsigned)t.size);
+    Serial.printf("\n");
+}
+
 void loop() {
     static uint32_t last = 0;
     if (millis() - last >= 5000) {
@@ -3883,20 +3904,7 @@ void loop() {
                           (unsigned)ls.errIdle, (unsigned)ls.txFailed, (unsigned)ls.arbLost,
                           (unsigned)ls.lomTecRead, (unsigned)ls.lomRepins,
                           (unsigned)ls.stackMinFree, ls.stackMinTask);
-            {
-                // Each task's least stack left, once a minute: what a stack
-                // could be cut to is read off the car, not guessed.
-                static uint8_t beat = 11;
-                if (++beat >= 12) {
-                    beat = 0;
-                    StackView sv[12];
-                    const size_t ns = masterStacks(sv, 12);
-                    Serial.printf("[stack] least left of size:");
-                    for (size_t i = 0; i < ns; i++)
-                        Serial.printf(" %s %u/%u", sv[i].name, (unsigned)sv[i].minFree, (unsigned)sv[i].size);
-                    Serial.printf("\n");
-                }
-            }
+            stackHeartbeat();
             static bool stackWarned = false;
             if (!stackWarned && ls.stackMinTask[0] && ls.stackMinFree < 512) {
                 stackWarned = true;

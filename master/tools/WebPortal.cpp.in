@@ -145,6 +145,86 @@ static void sendJson(JsonDocument &doc) {
 
 static void sendOk() { s_server.send(200, "application/json", "{\"ok\":true}"); }
 
+/*
+ * The lists below are read a row at a time (a copy of each was kept in RAM
+ * for these pages alone: 13 KB), in functions of their own that are never
+ * inlined: their buffers are on the stack only while the rows are added, not
+ * under the sending of the answer, which is the deep part.
+ */
+
+/** Every task's stack: {"name":[least left, size]}. */
+static void __attribute__((noinline)) addStacks(JsonObject so) {
+    StackView sv[12];
+    const size_t ns = masterStacks(sv, 12);
+    for (size_t i = 0; i < ns; i++) {
+        JsonArray a = so[sv[i].name].to<JsonArray>();
+        a.add(sv[i].minFree);
+        a.add(sv[i].size);
+    }
+}
+
+/** Every learner slot, plus every value already read from the bus. */
+static void __attribute__((noinline)) addLearnRows(JsonArray la) {
+    const size_t nl = learnerStatusRows();
+    for (size_t i = 0; i < nl; i++) {
+        LearnView lv;
+        if (!learnerStatusRow(i, lv)) continue;
+        JsonObject x = la.add<JsonObject>();
+        x["m"]   = lv.metric;
+        x["st"]  = lv.state;
+        x["p"]   = lv.progress;
+        x["fit"] = lv.fit;
+        x["n"]   = lv.samples;
+        x["id"]  = lv.canId;
+        x["s"]   = lv.start;
+        x["l"]   = lv.len;
+        x["be"]  = lv.be;
+    }
+}
+
+/** The metric store, slot by slot. */
+static void __attribute__((noinline)) addMetricRows(JsonArray ma) {
+    const size_t nm = masterMetricSlots();
+    for (size_t i = 0; i < nm; i++) {
+        MetricViewM mv;
+        if (!masterMetricAt(i, mv)) continue;
+        JsonObject m = ma.add<JsonObject>();
+        m["id"]  = mv.id;
+        m["v"]   = mv.value;
+        m["age"] = mv.ageMs;
+        m["src"] = mv.source;
+    }
+}
+
+/** The census in identifier order; @p edges: each bit's flip counter as well. */
+static void __attribute__((noinline)) addCensusRows(JsonArray ca, bool edges) {
+    uint8_t order[128];
+    const size_t nc = masterCensusOrder(order, sizeof order);
+    char hx[17], chx[17], ehx[129];
+    uint8_t ed[64];
+    for (size_t i = 0; i < nc; i++) {
+        CensusView cen;
+        if (!masterCensusRow(order[i], cen, edges ? ed : nullptr)) continue;   // reset meanwhile
+        const uint8_t dlc = cen.dlc > 8 ? 8 : cen.dlc;
+        JsonObject o = ca.add<JsonObject>();
+        o["id"]    = cen.id;
+        o["count"] = cen.count;
+        o["ext"]   = cen.extd;
+        o["age"]   = cen.ageMs;
+        for (uint8_t k = 0; k < dlc; k++) {
+            snprintf(hx + 2 * k, 3, "%02X", cen.data[k]);
+            snprintf(chx + 2 * k, 3, "%02X", cen.changed[k]);
+        }
+        hx[2 * dlc] = chx[2 * dlc] = '\0';
+        o["d"] = hx;
+        o["c"] = chx;
+        if (edges) {
+            for (uint8_t k = 0; k < 64; k++) snprintf(ehx + 2 * k, 3, "%02X", ed[k]);
+            o["e"] = ehx;
+        }
+    }
+}
+
 void WebPortal::setupRoutes() {
     s_server.on("/", HTTP_GET, []() {
         s_server.send_P(200, "text/html", PORTAL_HTML);
@@ -196,17 +276,7 @@ void WebPortal::setupRoutes() {
         // panic, and a panic restarts the master mid-drive.
         doc["stack"]      = st.stackMinFree;
         doc["stack_task"] = st.stackMinTask;
-        {
-            // Every task: [least left, size] - what its stack could be cut to.
-            StackView sv[12];
-            const size_t ns = masterStacks(sv, 12);
-            JsonObject so = doc["stacks"].to<JsonObject>();
-            for (size_t i = 0; i < ns; i++) {
-                JsonArray a = so[sv[i].name].to<JsonArray>();
-                a.add(sv[i].minFree);
-                a.add(sv[i].size);
-            }
-        }
+        addStacks(doc["stacks"].to<JsonObject>());
         // The MAC the displays see is the one the broadcast leaves from, and
         // with the portal up that is the AP interface, not the station's.
         doc["mac"]    = Portal.running() ? WiFi.softAPmacAddress() : WiFi.macAddress();
@@ -320,24 +390,7 @@ void WebPortal::setupRoutes() {
             e["fail"] = st.espFail;
         }
 
-        // Every slot, plus every value already read from the bus - a row at
-        // a time: the list of them all was 3 KB kept for this page alone.
-        JsonArray la = doc["learn"].to<JsonArray>();
-        const size_t nl = learnerStatusRows();
-        for (size_t i = 0; i < nl; i++) {
-            LearnView lv;
-            if (!learnerStatusRow(i, lv)) continue;
-            JsonObject x = la.add<JsonObject>();
-            x["m"]   = lv.metric;
-            x["st"]  = lv.state;
-            x["p"]   = lv.progress;
-            x["fit"] = lv.fit;
-            x["n"]   = lv.samples;
-            x["id"]  = lv.canId;
-            x["s"]   = lv.start;
-            x["l"]   = lv.len;
-            x["be"]  = lv.be;
-        }
+        addLearnRows(doc["learn"].to<JsonArray>());
         uint16_t lf = 0, lb = 0;
         learnerCounts(lf, lb);
         doc["learn_f"] = lf;
@@ -353,28 +406,14 @@ void WebPortal::setupRoutes() {
                 if (masterPidSupported((uint8_t)p)) ps.add(p);
         }
 
-        JsonArray ma = doc["metrics"].to<JsonArray>();
-        const size_t nm = masterMetricSlots();
-        for (size_t i = 0; i < nm; i++) {
-            MetricViewM mv;                     // slot by slot, not a copy of the store
-            if (!masterMetricAt(i, mv)) continue;
-            JsonObject m = ma.add<JsonObject>();
-            m["id"]  = mv.id;
-            m["v"]   = mv.value;
-            m["age"] = mv.ageMs;
-            m["src"] = mv.source;
-        }
+        addMetricRows(doc["metrics"].to<JsonArray>());
         sendJson(doc);
     });
 
     /* The Bus tab's frame list, polled only while that tab is open. */
     s_server.on("/api/bus", HTTP_GET, []() {
         JsonDocument doc;
-        // In identifier order, a row at a time (not a 4 KB copy of them all).
-        uint8_t order[128];
-        const size_t nc = masterCensusOrder(order, sizeof order);
         JsonArray ca = doc["census"].to<JsonArray>();
-        char hx[17], chx[17];
         // ?e=1 (teach by doing): each bit's flip counter as well, 128 hex digits.
         const bool edges = s_server.arg("e") == "1";
         // ?m=269,4102 (teach a G or yaw field): those values with their age,
@@ -395,29 +434,7 @@ void WebPortal::setupRoutes() {
                 }
             }
         }
-        char ehx[129];
-        uint8_t ed[64];
-        for (size_t i = 0; i < nc; i++) {
-            CensusView cen;
-            if (!masterCensusRow(order[i], cen, edges ? ed : nullptr)) continue;   // reset meanwhile
-            const uint8_t dlc = cen.dlc > 8 ? 8 : cen.dlc;
-            JsonObject o = ca.add<JsonObject>();
-            o["id"]    = cen.id;
-            o["count"] = cen.count;
-            o["ext"]   = cen.extd;
-            o["age"]   = cen.ageMs;
-            for (uint8_t k = 0; k < dlc; k++) {
-                snprintf(hx + 2 * k, 3, "%02X", cen.data[k]);
-                snprintf(chx + 2 * k, 3, "%02X", cen.changed[k]);
-            }
-            hx[2 * dlc] = chx[2 * dlc] = '\0';
-            o["d"] = hx;
-            o["c"] = chx;
-            if (edges) {
-                for (uint8_t k = 0; k < 64; k++) snprintf(ehx + 2 * k, 3, "%02X", ed[k]);
-                o["e"] = ehx;
-            }
-        }
+        addCensusRows(ca, edges);
         sendJson(doc);
     });
 
