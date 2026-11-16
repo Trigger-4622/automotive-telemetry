@@ -471,8 +471,8 @@ when it does not (`lamp_hazard_switch`).
   used and settings saved (how much of the 95 KB reserve is never touched),
   and `stacks` - the figures a smaller `HEAP_RESERVE` or smaller stacks would
   have to rest on. Not done, for want of those: the stacks, the reserve, the
-  live page's JSON document (about 25 KB for a second, every second the portal
-  is open).
+  live page's JSON document (estimated at 20-30 KB for a moment, every second
+  the portal is open - not measured).
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
   service 03 at all; that the SSM2 odometer matches the cluster; which frame
