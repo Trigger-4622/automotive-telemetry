@@ -18,11 +18,16 @@ python master/test_host/run.py [scenario] [-v]                 # master in a sim
 python master/test_host/run.py portal_teach                    # the portal's teach-by-doing analysis, in Node
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
+python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # the real master firmware in Espressif's QEMU (needs $QEMU_ESP32S3; not in test_all)
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
 
-The harnesses are the only way to exercise the firmware without hardware.
+The harnesses are the only way to exercise the firmware's logic without
+hardware. `master/test_qemu` (its README) runs the real compiled master on an
+emulated ESP32-S3 - real stacks, heap and both cores, which the harness cannot
+show - against a simulated car; it has no radio, no CAN error counters and no
+working settings file, and is a test build that must never be flashed.
 In a cloud session `scripts/cloud-setup.sh` (session-start hook) has installed
 what they need; if it printed "NOT set up", say so rather than skipping the
 tests. Firmware builds need `*.platformio.org` on the environment's network
@@ -465,7 +470,9 @@ when it does not (`lamp_hazard_switch`).
   5 Hz against a 10 Hz log. The learner rules above are harness only; on the
   car, the serial log's "no longer agrees with the ECU" lines say what a
   re-check turned down.
-- RAM (2026-11-16): harness and build only. On the car: the boot line
+- RAM (2026-11-16): harness, build and QEMU (`master/test_qemu/README.md`:
+  before and after side by side, a 70-identifier bus, a 10 minute soak, the
+  tables read from the other core - no crash, no inconsistency). On the car: the boot line
   `learner started: N fields x 20 values ... (X KB, Y KB left)` (N should be
   higher than before), `/api/live` `heap_min` after a drive with the portal
   used and settings saved (how much of the 95 KB reserve is never touched),
