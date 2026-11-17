@@ -249,6 +249,8 @@ static void applySettings() {
 #endif
 
 #include "DriveLog.h"
+#include "MasterPacket.h"
+#include "MasterTelemetry.h"
 #include "MasterConfig.h"
 extern "C" void __real__ZN12MasterConfig5beginEv(MasterConfig *);
 extern "C" void __wrap__ZN12MasterConfig5beginEv(MasterConfig *self) {
@@ -657,6 +659,27 @@ void __wrap__ZN9WebPortal4loopEv(void *) {
 #if QEMU_OTA
     otaStep();
 #endif
+    // The indicators as the screens see them: count every change of each.
+    static float lastTurn[2] = {NAN, NAN};
+    static uint32_t turnFlips[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        float v; uint32_t age; uint8_t src;
+        if (metricLookup(k ? METRIC_ID_TURN_RIGHT : METRIC_ID_TURN_LEFT, v, age, src) && age < 1500) {
+            if (!isnan(lastTurn[k]) && v != lastTurn[k]) turnFlips[k]++;
+            lastTurn[k] = v;
+        }
+    }
+    // Every value in the metric store that is fresh, once a minute.
+    static uint32_t lastMets = 0;
+    if (millis() - lastMets >= 60000) {
+        lastMets = millis();
+        Serial.printf("[mets ] turn L %u changes, turn R %u |", (unsigned)turnFlips[0], (unsigned)turnFlips[1]);
+        for (size_t i = 0; i < masterMetricSlots(); i++) {
+            MetricViewM m;
+            if (masterMetricAt(i, m) && m.ageMs < 2000) Serial.printf(" %04X=%.3g", m.id, m.value);
+        }
+        Serial.println();
+    }
     // The drive log as the portal's Logs card shows it, once a minute.
     static uint32_t lastLog = 0;
     if (millis() - lastLog >= 60000) {
