@@ -203,7 +203,16 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   coolant byte). Hand-made signals are never re-checked. A reading is paired
   only with a frame that arrived after the value settled at its level - a
   once-a-second frame (the car's 0x705) was paired with readings up to a second
-  newer and the MAF never fitted there (`learn_slow_frame`).
+  newer and the MAF never fitted there (`learn_slow_frame`). The field table
+  fills in the first seconds from the bytes that have changed by then, and a
+  16-bit field needs both its bytes to have changed: on a real 2012 Impreza's
+  drive (QEMU) speed's high byte moved at 14.4 km/h, 23.7 s in, the table was
+  full at 10.2 s, and speed was never learned in 40 minutes. Fields that find
+  the table full now take turns (`swapIn`, `learn_late_field`) with
+  candidates that have been in it 20 s, have 150 samples against every value
+  that moved, match none and are no value's best field - swapped out, not
+  marked dead, so they come back later; discovery starts a row further on
+  each pass so no frame is always last in line.
 - **Listen-only is NOT silent on this chip by itself.** Espressif erratum
   (ESP32/S2/S3/C3): a listen-only TWAI controller still sends ACTIVE error
   flags, and listen-only freezes its error counters, so one started with REC 0
@@ -544,8 +553,9 @@ when it does not (`lamp_hazard_switch`).
   (2026-11-17, `master/test_qemu/README.md`), not fixed: engine speed learned
   as 12 bits of a 14-bit field because the drive stayed under 4,096 rpm (the
   two fields read the same until then; above it the 12-bit one wraps, and only
-  the re-check would catch it); the field table is full within two seconds on
-  a 54-identifier bus; road speed taken from one wheel. This car's engine
+  the re-check would catch it); road speed taken from one wheel. (The field
+  table filling within seconds, which kept late-moving fields out for good, is
+  fixed: `learn_late_field` above.) This car's engine
   speed is 16 bits wide and is not affected.
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under

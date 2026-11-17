@@ -659,8 +659,15 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
         const uint64_t dt = extraLast ? now - extraLast : 0;
         extraLast = now;
         const int n = (int)std::min<uint64_t>(faults.extraIds, dt * faults.extraIds / 50000 + 1);
-        for (int k = 0; k < n; k++, extraNext = (extraNext + 1) % faults.extraIds)
-            deliver(frame(0x500 + extraNext, {(uint8_t)extraNext, s_cnt, 0, 0, 0, 0, 0, 0}));
+        for (int k = 0; k < n; k++, extraNext = (extraNext + 1) % faults.extraIds) {
+            uint16_t e = 0;
+            if (faults.extraEngine) {
+                const double t = elapsedS();
+                e = (uint16_t)std::max(0.0, truth().rpm * (1.0 + 0.002 * extraNext) +
+                                            600.0 * std::sin(t / (2.0 + 0.37 * extraNext)));
+            }
+            deliver(frame(0x500 + extraNext, {(uint8_t)extraNext, s_cnt, (uint8_t)e, (uint8_t)(e >> 8), 0, 0, 0, 0}));
+        }
     }
     return soonest;
 }

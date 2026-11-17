@@ -19,8 +19,11 @@
  *
  * The candidate tables are sized at boot from the heap that is actually
  * free, keeping a reserve for Wi-Fi and the portal. Candidates that have had
- * a fair chance and match nothing are evicted, so bytes that only start
- * moving later (speed, gear) always find room.
+ * a fair chance and follow nothing are evicted for good. With the table full,
+ * fields that only start moving later (speed's high byte once the car passes
+ * 14.4 km/h) take turns with candidates that have been judged against every
+ * value that moved and match none (swapIn), and discovery starts one census
+ * row further on each pass, so no frame is always last in line.
  *
  * ## Event-driven frames
  *
@@ -48,6 +51,9 @@ constexpr size_t MAX_LEARNED = MAX_RT_SIGNALS;  /**< Metrics on the bus.   */
 constexpr size_t MAX_WATCH   = 160;   /**< Values waiting for a slot.      */
 constexpr uint32_t STILL_MS  = 30000; /**< Unmoving this long: slot freed. */
 constexpr size_t HEAP_RESERVE = 95 * 1024;   /**< Left for Wi-Fi + portal. */
+constexpr size_t SWAP_MAX    = 8;     /**< Waiting fields swapped in per pass. */
+constexpr uint32_t SWAP_MIN_MS = 20000; /**< In the table this long first.  */
+constexpr float  SWAP_MIN_N  = 150;   /**< ...and judged on this many samples. */
 
 /* ─────────────────────────── what to require ─────────────────────────────
  *
@@ -108,7 +114,7 @@ bool isBitMetric(uint16_t m) { return (m & 0xFF00) == 0x2100 || m == METRIC_ID_M
 
 /** @brief A field of a frame being tried, and its value when first seen
  *         (sums are centred on it for float precision). */
-struct Cand    { uint32_t id; uint8_t start, len; bool be; float x0; uint8_t ci; };
+struct Cand    { uint32_t id; uint8_t start, len; bool be; float x0; uint8_t ci; uint32_t bornMs; };
 struct BitCand { uint32_t id; uint8_t bit; uint8_t ci; };
 
 /**
@@ -193,6 +199,11 @@ Watch    s_watch[MAX_WATCH]; size_t s_nWatch = 0;
 uint16_t s_learned[MAX_LEARNED]; volatile size_t s_nLearned = 0;
 volatile bool s_resetReq = false;
 bool s_fullLogged = false, s_tableFullLogged = false;
+/** Fields that found the table full on this discovery pass (see swapIn()). */
+struct Want { uint32_t id; uint8_t start, len; bool be; uint8_t ci; };
+Want     s_want[SWAP_MAX]; size_t s_nWant = 0;
+size_t   s_discStart = 0;     /**< Census row the next discovery pass starts at. */
+uint32_t s_swapped = 0;       /**< Fields swapped in so far (the portal's log). */
 
 /*
  * One-sample look-ahead.
@@ -486,9 +497,13 @@ void addCand(const CensusView &e, uint8_t ci, uint8_t start, uint8_t len, bool b
             return;
     if (s_nc >= s_maxC) {
         if (!s_fullLogged) { s_fullLogged = true; log_i("learner: field table full, evicting as it goes"); }
+        bool wanted = false;
+        for (size_t i = 0; i < s_nWant; i++)
+            wanted |= s_want[i].id == e.id && s_want[i].start == start && s_want[i].len == len && s_want[i].be == be;
+        if (!wanted && s_nWant < SWAP_MAX) s_want[s_nWant++] = { e.id, start, len, be, ci };
         return;
     }
-    s_c[s_nc] = { e.id, start, len, be, (float)masterExtract(e.data, e.dlc, start, len, be), ci };
+    s_c[s_nc] = { e.id, start, len, be, (float)masterExtract(e.data, e.dlc, start, len, be), ci, millis() };
     memset(&s_acc[s_nc * NA_MAX], 0, sizeof(Acc) * NA_MAX);
     for (size_t ai = 0; ai < NA_MAX; ai++) s_px[s_nc * NA_MAX + ai] = NAN;  // nothing held yet
     s_nc++;
@@ -514,7 +529,13 @@ void addBit(const CensusView &e, uint8_t ci, uint8_t bit) {
  * the top of a byte.
  */
 void discover(Census &cen) {
-    for (size_t i = 0; i < cen.size(); i++) {
+    // Each pass starts one row further on: when places are scarce, the frames
+    // at the end of the census would otherwise always be last in line.
+    const size_t rows = cen.size();
+    if (rows) s_discStart = (s_discStart + 1) % rows;
+    s_nWant = 0;
+    for (size_t j = 0; j < rows; j++) {
+        const size_t i = (s_discStart + j) % rows;
         const CensusView *row = cen.row(i);
         if (!row) continue;
         const CensusView &e = *row;
@@ -769,6 +790,60 @@ void evict() {
         }
         i++;
     }
+}
+
+/**
+ * @brief Fields waiting for a place take turns with candidates that have had
+ *        their chance and matched nothing.
+ *
+ * The table is filled in the first seconds from the bytes that have changed by
+ * then, and a 16-bit field needs both of its bytes to have changed: the
+ * Impreza's speed moved its high byte only at 14.4 km/h, 23.7 s in, the table
+ * was full at 10.2 s, and evict() frees a place only for a field that follows
+ * no value at all - so speed's fields never got one in a 40-minute drive
+ * (learn_late_field). A candidate gives its place to a waiting field when it
+ * has been in the table SWAP_MIN_MS, has SWAP_MIN_N samples against every value
+ * that has moved and matches none of them, and is no value's best field; the
+ * weakest goes first. It is not marked dead: it comes back on a later pass,
+ * so a field judged before its own value moved gets its chance after all.
+ */
+void swapIn(Census &cen) {
+    if (!s_nWant) return;
+    const uint32_t now = millis();
+    for (size_t w = 0; w < s_nWant; w++) {
+        int victim = -1;
+        double weakest = 2.0;
+        for (size_t i = 0; i < s_nc; i++) {
+            if (now - s_c[i].bornMs < SWAP_MIN_MS) continue;
+            bool judged = false, keep = false;
+            double best = 0;
+            for (size_t ai = 0; ai < NA_MAX && !keep; ai++) {
+                const Ref &r = s_ar[ai];
+                if (!r.metric) continue;
+                if (r.best == (int16_t)i) { keep = true; break; }   // a value's best field
+                if (!moved(r)) continue;
+                const Acc &a = s_acc[i * NA_MAX + ai];
+                if (a.n < SWAP_MIN_N) { keep = true; break; }        // not judged on it yet
+                judged = true;
+                double r2, k, cc;
+                if (fit(a, r2, k, cc)) best = max(best, r2);
+            }
+            if (keep || !judged || best >= Cfg.learnR2) continue;
+            if (best < weakest) { weakest = best; victim = (int)i; }
+        }
+        if (victim < 0) break;                     // nothing has had its chance yet
+        const Want &f = s_want[w];
+        const CensusView *e = lookup(cen, f.id, s_want[w].ci);
+        if (!e) continue;
+        if (!s_swapped)
+            log_i("learner: fields that started moving late take turns with ones that match nothing");
+        s_c[victim] = { f.id, f.start, f.len, f.be,
+                        (float)masterExtract(e->data, e->dlc, f.start, f.len, f.be), s_want[w].ci, now };
+        memset(&s_acc[victim * NA_MAX], 0, sizeof(Acc) * NA_MAX);
+        for (size_t ai = 0; ai < NA_MAX; ai++) s_px[victim * NA_MAX + ai] = NAN;
+        s_swapped++;
+    }
+    s_nWant = 0;
 }
 
 /** @return false when the signal table is full (said once in the log). */
@@ -1054,7 +1129,7 @@ void task(void *) {
 
         const uint32_t now = millis();
         Census cen;
-        if (now - lastDisc >= 2000) { lastDisc = now; discover(cen); }
+        if (now - lastDisc >= 2000) { lastDisc = now; discover(cen); swapIn(cen); }
 
         for (size_t i = 0; i < n; i++) {
             const uint16_t m = buf[i].metric;

@@ -78,6 +78,11 @@ struct BusFaults {
     bool     busOffNow = false;        ///< Force the controller bus-off.
     bool     silenceBus = false;       ///< Car asleep: nothing is broadcast.
     int      extraIds = 0;             ///< More distinct IDs, 20 Hz each.
+    /** The extra IDs carry, in bytes 2-3, a figure that follows the engine
+     *  loosely (engine speed with a slow wobble of its own): related enough
+     *  that the learner never drops them as useless, never close enough to be
+     *  a match - a bus full of such frames fills the learner's field table. */
+    bool     extraEngine = false;
     int      burstFramesPerMs = 0;     ///< Flood: this many extra frames every ms.
     /**
      * A marginal link: the master's controller misreads this fraction of the

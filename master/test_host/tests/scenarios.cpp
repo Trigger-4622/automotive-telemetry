@@ -4183,6 +4183,43 @@ static void scLearnNotCoarse() {
 }
 
 /**
+ * A value whose top byte only starts to move once the learner's field table is
+ * full. The table is filled from the bytes that have changed so far, in the
+ * first seconds; a 16-bit field needs both of its bytes to have changed. On the
+ * Impreza's 40-minute drive (QEMU, 2026-11-17) speed's low byte moved 8 s in,
+ * its high byte at 23.7 s (14.4 km/h) - and the table was full at 10.2 s, so
+ * speed was never learned in the whole drive: none of its 16-bit fields ever
+ * got a place. Here the car creeps at 1-11 km/h for 90 s (only the low byte
+ * moves) while 40 frames whose bytes follow the engine loosely - never dropped
+ * as useless, never a match - fill the table; then it drives.
+ */
+static void scLearnLateField() {
+    faults.extraIds = 40;
+    faults.extraEngine = true;
+    sim::speedOverride = [](double t) {
+        return t < 90 ? 6 + 5 * std::sin(t / 4.0) : 50 + 40 * std::sin((t - 90) / 12.0);
+    };
+    simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"diag_mode":2})", (int)MasterConfig::CFG_VERSION);
+    boot();
+    runUntil(80);
+    check(logHas("field table full"), "the field table is full while only speed's low byte moves");
+    runUntil(420);
+    const SigInfo spd = learnedFor(METRIC_ID_SPEED);
+    check(spd.found && spd.s.canId == 0x252 && spd.s.bitLength >= 16 && spd.s.mode == SIG_VERIFIED,
+          "speed is learned from its 16-bit field once its high byte moves", spd.found ? sigStr(spd) : "not learned");
+    const SigInfo rpm = learnedFor(METRIC_ID_RPM);
+    check(rpm.found && rpm.s.canId == 0x231 && rpm.s.mode == SIG_VERIFIED,
+          "engine speed is still learned from its own frame, not the look-alikes", sigStr(rpm));
+    bool lookAlike = false;
+    Cfg.lock();
+    for (const auto &sg : Cfg.signals) lookAlike |= sg.learned && sg.canId >= 0x500 && sg.canId < 0x528;
+    Cfg.unlock();
+    check(!lookAlike, "nothing learned from the frames that only follow the engine");
+    sim::speedOverride = nullptr;
+    commonChecks();
+}
+
+/**
  * A value that has only dithered by a step is not searched for. Ten per cent
  * of a fuel trim that sits near zero is one step of it; noise that size
  * "swung" twice, and from then on any field that drifted the same way for a
@@ -4460,6 +4497,7 @@ static const Scenario SCENARIOS[] = {
     {"learn_excl_kept", scLearnExclKept, 0},
     {"learn_off_respected", scLearnOffRespected, 0},
     {"learn_slow_frame", scLearnSlowFrame, 0},
+    {"learn_late_field", scLearnLateField, 0},
     {"car_off_tx", scCarOffTx, 0}, {"car_off_tx_nosettle", scCarOffTxNoSettle, 0},
     {"ecu_gone_quiet", scEcuGoneQuiet, 0}, {"restart_off_bus", scRestartOffBus, 0},
     {"busoff_cycles", scBusOffCycles, 0},
