@@ -35,6 +35,7 @@ static uint64_t            s_now = 0;
 static uint64_t            s_seq = 0;
 static std::atomic<uint64_t> s_nowAtomic{0};
 int g_criticalDepth = 0;
+void (*g_afterMillis)() = nullptr;
 
 uint64_t nowUs() { return s_nowAtomic.load(); }
 const char *currentName() { return s_cur ? s_cur->name.c_str() : "?"; }

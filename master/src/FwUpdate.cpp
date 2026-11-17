@@ -22,6 +22,7 @@ static constexpr size_t MARK_LEN = sizeof(FW_MARK) - 1;
 
 static bool     s_busy = false;
 static uint32_t s_got = 0, s_t0 = 0, s_lastWrite = 0;
+static uint32_t s_bootMs = 0;      /**< millis() at fwBootReport(): the trial is timed from it. */
 static bool     s_markSeen = false;
 static uint8_t  s_tail[MARK_LEN];   /**< The end of the last piece: the mark can straddle two. */
 static size_t   s_tailLen = 0;
@@ -167,7 +168,7 @@ void fwUpdateTick(bool portalUp, bool beforeSleep) {
     static bool checked = false, pending = false;
     if (!checked) { checked = true; pending = onTrial(); }
     if (!pending || !portalUp) return;       // a firmware whose portal is down is never kept
-    if (!beforeSleep && millis() < FW_CONFIRM_MS) return;
+    if (!beforeSleep && millis() - s_bootMs < FW_CONFIRM_MS) return;
     if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
         pending = false;
         log_i("update: the new firmware has run properly - kept");
@@ -175,6 +176,7 @@ void fwUpdateTick(bool portalUp, bool beforeSleep) {
 }
 
 void fwBootReport() {
+    s_bootMs = millis();                     // the trial runs from here, whatever the clock read
     FwStatus s;
     fwStatus(s);
     log_i("firmware %s, build %s, slot %s%s", s.version, s.build, s.slot,

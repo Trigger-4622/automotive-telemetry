@@ -24,7 +24,11 @@ using std::min;
 #define DRAM_ATTR
 #define SET_LOOP_TASK_STACK_SIZE(sz)
 
-inline uint32_t millis() { return (uint32_t)(simrtos::nowUs() / 1000u); }
+inline uint32_t millis() {
+    const uint32_t t = (uint32_t)(simrtos::nowUs() / 1000u);
+    if (simrtos::g_afterMillis) simrtos::g_afterMillis();   // a test's preemption point
+    return t;
+}
 inline uint32_t micros() { return (uint32_t)simrtos::nowUs(); }
 inline void delay(uint32_t ms) { vTaskDelay(ms); }
 inline void delayMicroseconds(uint32_t us) { simrtos::sleepUs(us); }

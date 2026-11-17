@@ -19,7 +19,8 @@ python master/test_host/run.py portal_teach                    # the portal's te
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
 python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # the real master firmware in Espressif's QEMU (needs $QEMU_ESP32S3; not in test_all)
-python master/test_qemu/run.py --replay drive.log   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
+python master/test_qemu/run.py --replay drive.log [--settings cfg.json]   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
+python master/test_qemu/run.py --ota                # ...a Wi-Fi firmware update, kept, a second one crashing, rolled back
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
@@ -27,8 +28,10 @@ python master/tools/known_catalogue.py        # after adding metric IDs to Maste
 The harnesses are the only way to exercise the firmware's logic without
 hardware. `master/test_qemu` (its README) runs the real compiled master on an
 emulated ESP32-S3 - real stacks, heap and both cores, which the harness cannot
-show - against a simulated car; it has no radio, no CAN error counters and no
-working settings file, and is a test build that must never be flashed.
+show - against a simulated car; it has no radio and no CAN error counters (the
+settings file and the drive log work: its flash is read in DIO mode, QEMU
+misreads QIO), and is a test build that must never be flashed. QEMU itself now
+and then segfaults in a boot that writes the flash; run.py runs it again once.
 In a cloud session `scripts/cloud-setup.sh` (session-start hook) has installed
 what they need; if it printed "NOT set up", say so rather than skipping the
 tests. Firmware builds need `*.platformio.org` on the environment's network
@@ -122,6 +125,14 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   asking every PID while the ECU is off. `masterBeforeRestart()` takes the
   controller off the bus and latches the TX pad recessive (RTC hold) across
   every portal restart; `txRecessiveBoot()` drives the pin before releasing it.
+- **A stamp written by another task: read it, then the clock**
+  (`sleep_busy_bus_race`). `s_lastCanMs` is written by the receive task on
+  core 1; `millis() - s_lastCanMs` evaluated the other way round wraps to 49
+  days when a frame is stamped in between, and the sleep check put the master
+  to sleep on a busy bus (QEMU, a real 40-minute drive, 2026-11-17).
+  `settleLeft()`, `heardWithin()` and `diagBusAlive()` already read it first.
+  The harness shows such races only through `simrtos::g_afterMillis` (other
+  tasks run right after a clock reading, as a preemption or the other core).
 - **Asking the car** (`pacing_p2can*`, `obd_two_ecus`, `obd_pending`,
   `dtc_functional_fc`, `dtc_tcm_silent`): one request on the bus at a time,
   whoever sends it - the OBD-II poller, SSM2 and the code reader all take
@@ -417,7 +428,7 @@ when it does not (`lamp_hazard_switch`).
   settings saves (`log_old_table`, `drive_log_full`). Oldest deleted first
   (one open for a download will not delete and is passed over), 4 KB writes
   announced with `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
-  The QEMU test has no `logs` partition (its flash refuses LittleFS anyway).
+  The QEMU test has a 1.9 MB `logs` partition (8 MB with `--ota`).
 - **Firmware update over Wi-Fi** (master only, `master/src/FwUpdate.*`;
   portal Settings > Firmware, `/api/update`): the upload goes into the spare
   app slot (app0/app1; a USB upload always writes app0 and resets otadata to

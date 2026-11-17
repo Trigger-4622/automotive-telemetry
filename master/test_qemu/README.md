@@ -13,14 +13,27 @@ two tasks on two cores sharing a table.
 
 | Real | Stood in for (`shim/qemu_shim.cpp`, put in by the linker) | Not there at all |
 |---|---|---|
-| Every source file in `../src`, same compiler flags | The frames the CAN controller would receive: a car of 25 identifiers (more with `--extra-ids`), four of them carrying values that step between levels | The controller's error counters (its registers read 0: the listen-only pin and "errors let pass" report that they did not take) |
+| Every source file in `../src`, same compiler flags | The frames the CAN controller would receive: a car of 25 identifiers (more with `--extra-ids`), four of them carrying values that step between levels, or a recorded drive (`--replay`) | The controller's error counters (its registers read 0: the listen-only pin and "errors let pass" report that they did not take) |
 | All ten tasks, their stacks, the heap | An engine computer answering OBD-II service 01 for five PIDs with the same values | Wi-Fi, ESP-NOW on the air, the portal (QEMU has no radio; the portal's page handlers are not even linked) |
-| The learner, the verifier, the census, the broadcaster's packing | ESP-NOW: a packet is counted and reported as sent | The settings file: QEMU's flash refuses LittleFS with this ESP-IDF (4.4.7), so the master runs on defaults and every save fails after building its document |
+| The learner, the verifier, the census, the broadcaster's packing | ESP-NOW: a packet is counted and reported as sent | The radio's share of the heap, flash timing (QEMU's flash writes take no time) |
+| The flash: LittleFS on the settings and logs partitions, every save, the drive log; with `--ota` the board's own partition table, the bootloader, otadata and its rollback | The clock: each boot's starts at 0, as the board's does (QEMU's runs on through a restart) | |
 
 So the heap figures are **without Wi-Fi's share** (some 50-60 KB on the board,
-plus 20 KB of its static RAM), and nothing about the bus's electrics, the
-radio, the portal or the settings file is shown. `device_config` and the rest
-of the host harness cover the settings; the car covers the rest.
+plus 20 KB of its static RAM), and nothing about the bus's electrics or the
+radio is shown.
+
+Two things about QEMU (Espressif's 9.2.2) itself, found on 2026-11-17:
+
+- **It reads flash two bytes off in quad (QIO) mode** - the firmware's own
+  reads, not the boot loader's - so no file system could ever be read and
+  every save failed. Dual (DIO) reads are right: the test build uses
+  `board_build.flash_mode = dio` (the master's own build stays QIO).
+- **Now and then QEMU itself dies of a segmentation fault**, early in a boot
+  that formats or writes the flash: inside its generated code, on one of the
+  two cores' threads (gdb), not in the firmware. `run.py` runs it again once
+  and says so. With both cores on one thread (`-accel tcg,thread=single`) it
+  does not happen, but the second core never comes back after a software
+  restart and the firmware waits for it for ever - so `--ota` cannot use it.
 
 ## Running it
 
@@ -37,6 +50,7 @@ python master/test_qemu/run.py --seconds 600         # a soak
 python master/test_qemu/run.py --readers             # + a task on the other core reading every table
                                                      #   as the portal's pages do, 50 times a second
 python master/test_qemu/run.py --src ../other-checkout/master   # the same test on another version
+python master/test_qemu/run.py --ota                 # the firmware update over Wi-Fi, twice, and a rollback
 ```
 
 It builds (`platformio.ini` here: the sources of `../src`, the shim beside
@@ -50,13 +64,18 @@ Not part of `scripts/test_all.py` or CI: it needs the QEMU download.
 ### A recorded car instead of the made-up one
 
 ```bash
-python master/test_qemu/run.py --replay /path/to/candump.log [--readers] [--seconds 450]
+python master/test_qemu/run.py --replay /path/to/candump.log [--settings settings.json] [--readers] [--seconds 450]
 ```
 
 `--replay` takes a candump log (`(1672868911.675546) can0 140#04042803000411A0`),
-puts it in the firmware image (`shim/replay.bin`, not committed; the test
-build has a 12 MB app partition for it) and plays it at its own pace, again
-from the top at its end. The simulated ECU answers coolant, engine speed,
+puts it in the firmware image (`shim/replay.bin`, not committed: about 4 bytes
+a frame - only the bytes that changed since that identifier's last frame - so
+a 40-minute drive is 11.4 MB; the test build has a 12.5 MB app partition for
+it) and plays it at its own pace, again from the top at its end.
+
+`--settings` puts a settings file in the image (`shim/settings.json`, not
+committed) and applies it right after the master has loaded its own, as the
+portal's "Everything, as JSON" upload does: `fromJson(.., true)` and a save. The simulated ECU answers coolant, engine speed,
 road speed and the accelerator pedal **from the frames just played**, read with
 the layout of Subaru's 2005-2019 cars (engine speed and pedal in 0x140, road
 speed in 0x0D1, coolant in 0x360), so the learner has to find real fields in
@@ -65,7 +84,24 @@ real traffic. A log of another make plays too, but its ECU answers nothing true.
 Recordings used (not in this repository): Brooke Lampe and Weizhi Meng's
 *can-log* / *can-train-and-test* dataset, CC BY 4.0, 2017 Subaru Forester,
 `attack-free-1..4.log` - bitbucket.org/brooke-lampe/can-log, also at
-data.dtu.dk (articles 24805509 and 24805533).
+data.dtu.dk (articles 24805509 and 24805533). And *CANdid* (University of
+Adelaide, CC BY 4.0, doi.org/10.25909/29068553): vehicle 6, a 2012 Subaru
+Impreza (automatic), `6_driving_CAN.log` - 40 minutes (2,374 s, 2,695,619
+frames, 26 identifiers), town first and then a faster road up to 91 km/h.
+
+### The firmware update over Wi-Fi
+
+`--ota` builds the test firmware with the board's own partition table
+(`../partitions_16mb.csv`: app0, app1, the settings where they are on the
+board, 8 MB of drive logs) and, from the loop task where the portal's upload
+handler runs, hands this firmware's own image to `fwUpdateBegin / Write / End`
+in the 1436-byte pieces Arduino's WebServer delivers, then restarts as
+`/api/update` does. The rest is the real bootloader's: it boots the update on
+trial; the update is kept after 30 s; a second update is made and crashes on
+purpose 15 s in, before it is kept; the bootloader goes back to the kept one,
+which reports the rollback. The settings and learned values must load the
+same at every boot. The portal is not started (no radio) but marked as up, so
+a firmware on trial can be kept.
 
 ## 2026-11-16: the RAM change (PR #11), before and after
 

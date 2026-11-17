@@ -11,7 +11,8 @@
  * the same result - a failure can be replayed and debugged.
  *
  * What it cannot show: preemption in the middle of code that never blocks.
- * Races of that kind need the real chip.
+ * Races of that kind need the real chip (or QEMU, master/test_qemu) - except
+ * one between a clock reading and its use: see g_afterMillis.
  */
 #pragma once
 #include <cstdint>
@@ -63,6 +64,11 @@ void jumpUs(uint64_t us);
 
 /** Critical-section bookkeeping: blocking inside one is a firmware bug. */
 extern int g_criticalDepth;
+
+/** A test may set this: called by millis() right after it has read the clock,
+ *  where a task on the chip can be preempted - or the other core can run -
+ *  before it uses the value. Lets one test show a race of that kind. */
+extern void (*g_afterMillis)();
 
 /** Reports "virtual time stopped moving" (a task spinning without ever
  *  blocking) and aborts, after @p realSeconds of wall time. */

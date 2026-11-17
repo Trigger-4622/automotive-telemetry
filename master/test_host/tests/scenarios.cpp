@@ -3598,6 +3598,26 @@ static void scFwTrial() {
     commonChecks();
 }
 
+/** The trial is timed from the boot, not from the clock's zero: here the clock
+ *  already reads 200 s when the firmware starts (QEMU's system timer runs on
+ *  through a software restart; the board's restarts from 0 - this holds either
+ *  way). It used to be kept at its first look. */
+static void scFwTrialLateClock() {
+    // Sleep off: its "quiet since" also counts from the clock's zero (right on
+    // the board, where every reset restarts the clock), and it would sleep at once.
+    storedConfig(R"({"sleep_enabled":false})");
+    sim::otaState = ESP_OTA_IMG_PENDING_VERIFY;
+    simrtos::sleepUs(200ULL * 1000 * 1000);
+    boot();
+    runUntil(20);
+    FwStatus fs; fwStatus(fs);
+    check(fs.trial && !sim::otaMarkedValid, "still on trial 20 s after the boot, the clock at 220 s");
+    runUntil(40);
+    fwStatus(fs);
+    check(sim::otaMarkedValid && !fs.trial, "kept once it has run 30 s");
+    commonChecks();
+}
+
 /** On trial and the car goes off: confirmed before deep sleep (a wake is a
  *  reset, which would go back to the previous firmware). */
 static void scFwTrialSleep() {
@@ -3620,6 +3640,32 @@ static void scFwRolledBack() {
     check(fs.rolledBack && logHas("did not run properly"), "the rollback is reported");
     check(!sim::otaMarkedValid, "nothing on trial, nothing confirmed");
     commonChecks();
+}
+
+/** The sleep check read the clock, then the time of the last frame. A frame
+ *  stamped in between - the receive task runs on the other core, or the check
+ *  is preempted - is newer than "now", the difference wraps to 49 days, and the
+ *  master slept on a busy bus (QEMU, a real 40-minute Subaru drive, 2026-11-17:
+ *  "bus quiet for 90 s - sleeping" at 1,100 frames a second). Here every clock
+ *  reading of the housekeeping task is followed by 2 ms of the other tasks. */
+static void scSleepBusyBusRace() {
+    boot();
+    simrtos::g_afterMillis = [] {
+        static bool inside = false;
+        if (inside || simrtos::g_criticalDepth || std::strcmp(simrtos::currentName(), "housekeep")) return;
+        inside = true;
+        simrtos::sleepUs(2000);
+        inside = false;
+    };
+    runUntil(150);
+    const bool slept = sim::sleepEntered;
+    simrtos::g_afterMillis = nullptr;
+    check(!slept, "no sleep while the car is on", slept ? fmt("slept at %.1f s", tNow()) : "");
+    carOff();
+    const double off = tNow();
+    runUntil(off + 120);
+    check(sim::sleepEntered && tNow() >= off + 89, "asleep 90 s after the car went off",
+          fmt("%.1f s after", tNow() - off));
 }
 
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
@@ -4441,7 +4487,9 @@ static const Scenario SCENARIOS[] = {
     {"log_move_cut", scLogMoveCut, 0}, {"log_move_fails", scLogMoveFails, 0},
     {"fw_update", scFwUpdate, 0}, {"fw_update_moving", scFwUpdateMoving, 0},
     {"fw_update_wrong_image", scFwUpdateWrongImage, 0}, {"fw_update_cut", scFwUpdateCut, 0},
-    {"fw_trial", scFwTrial, 0}, {"fw_trial_sleep", scFwTrialSleep, 0}, {"fw_rolled_back", scFwRolledBack, 0},
+    {"fw_trial", scFwTrial, 0}, {"fw_trial_late_clock", scFwTrialLateClock, 0},
+    {"fw_trial_sleep", scFwTrialSleep, 0}, {"fw_rolled_back", scFwRolledBack, 0},
+    {"sleep_busy_bus_race", scSleepBusyBusRace, 0},
 };
 
 static const Scenario *s_sc = nullptr;

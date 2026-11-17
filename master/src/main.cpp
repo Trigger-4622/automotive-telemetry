@@ -3236,8 +3236,14 @@ static void sleepCheck() {
     if (fwUpdateBusy()) return;          // a firmware upload in progress finishes first
 
     const uint32_t idleMs = (uint32_t)Cfg.sleepIdleS * 1000UL;
-    const uint32_t quietFor = millis() - (s_lastCanMs ? s_lastCanMs : 0);
-    if (s_lastCanMs == 0 && millis() < idleMs) return;   // still early after boot
+    // The frame's time first, the clock second. The receive task stamps frames
+    // on the other core: read the other way round, a frame stamped in between
+    // is newer than "now", the difference wraps to 49 days of quiet, and the
+    // master slept on a busy bus (sleep_busy_bus_race).
+    const uint32_t last = s_lastCanMs;
+    const uint32_t now  = millis();
+    const uint32_t quietFor = now - last;               // last 0: nothing heard since boot
+    if (last == 0 && now < idleMs) return;               // still early after boot
     if (quietFor < idleMs) return;
 
     const uint32_t holdMax = max((uint32_t)(idleMs * 3), (uint32_t)300000);
@@ -3357,7 +3363,8 @@ void masterGetStats(MasterStats &out) {
     out.espTx      = s_espnowFrames;
     out.espFail    = s_espnowFailed;
     out.espMetrics = s_espnowMetrics;
-    out.lastCanAgeMs = s_lastCanMs ? millis() - s_lastCanMs : 0xFFFFFFFF;
+    const uint32_t lastCan = s_lastCanMs;               // before the clock: see sleepCheck()
+    out.lastCanAgeMs = lastCan ? millis() - lastCan : 0xFFFFFFFF;
     out.night   = s_night;
     twai_status_info_t st = {};
     out.busOff = (twai_get_status_info(&st) == ESP_OK) &&

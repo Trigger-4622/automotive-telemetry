@@ -25,3 +25,4 @@ Thumbs.db
 
 # A recorded CAN log converted for the QEMU test (run.py --replay): not ours to commit
 master/test_qemu/shim/replay.bin
+master/test_qemu/shim/settings.json
