@@ -207,7 +207,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   fills in the first seconds from the bytes that have changed by then, and a
   16-bit field needs both its bytes to have changed: on a real 2012 Impreza's
   drive (QEMU) speed's high byte moved at 14.4 km/h, 23.7 s in, the table was
-  full at 10.2 s, and speed was never learned in 40 minutes. Fields that find
+  full at 10.2 s, and speed was never learned in 40 minutes (with the fix:
+  learned and verified 195 s in, from a wheel's speed). Fields that find
   the table full now take turns (`swapIn`, `learn_late_field`) with
   candidates that have been in it 20 s, have 150 samples against every value
   that moved, match none and are no value's best field - swapped out, not

@@ -234,8 +234,14 @@ warmed far enough, and verified only 39.6 minutes in (1,390 agreeing, over
 82-95 degrees). Nothing rejected. **Road speed was never learned** in the
 whole drive, although 0x0D1 carries it (0-91 km/h, the faster road from
 minute 26): the learner's field table was full 12 s in ("evicting as it
-goes"), as on the Forester's bus. Not looked into further here; the car's
-speed is mapped by hand.
+goes"), as on the Forester's bus, before speed's high byte had moved (at
+14.4 km/h, 23.7 s in), and a field that followed nothing was the only kind
+ever let go. Fixed since (`swapIn`, `learn_late_field`): fields that start
+moving late take turns with candidates that match nothing. The same drive
+with the fix, on default settings: engine speed and pedal verified by 35 s
+as before, "take turns" from 136 s, road speed found at 188 s and verified
+at 195 s (56 agreeing, 0 disagreeing, 26-47 km/h) - from 0x0D4's first
+wheel's 16 bits, not 0x0D1, the one-wheel case above.
 
 **The firmware update** (`--ota`) passed - in one attempt of fifteen with
 this shim; the others ended in QEMU's own crash, most of them in the first
