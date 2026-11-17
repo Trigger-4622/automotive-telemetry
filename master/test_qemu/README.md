@@ -47,6 +47,26 @@ lowest point, each task's least stack left.
 
 Not part of `scripts/test_all.py` or CI: it needs the QEMU download.
 
+### A recorded car instead of the made-up one
+
+```bash
+python master/test_qemu/run.py --replay /path/to/candump.log [--readers] [--seconds 450]
+```
+
+`--replay` takes a candump log (`(1672868911.675546) can0 140#04042803000411A0`),
+puts it in the firmware image (`shim/replay.bin`, not committed; the test
+build has a 12 MB app partition for it) and plays it at its own pace, again
+from the top at its end. The simulated ECU answers coolant, engine speed,
+road speed and the accelerator pedal **from the frames just played**, read with
+the layout of Subaru's 2005-2019 cars (engine speed and pedal in 0x140, road
+speed in 0x0D1, coolant in 0x360), so the learner has to find real fields in
+real traffic. A log of another make plays too, but its ECU answers nothing true.
+
+Recordings used (not in this repository): Brooke Lampe and Weizhi Meng's
+*can-log* / *can-train-and-test* dataset, CC BY 4.0, 2017 Subaru Forester,
+`attack-free-1..4.log` - bitbucket.org/brooke-lampe/can-log, also at
+data.dtu.dk (articles 24805509 and 24805533).
+
 ## 2026-11-16: the RAM change (PR #11), before and after
 
 Same simulated car, 150 s each.
@@ -79,3 +99,46 @@ busguard 2248/4096, loopTask 8828/12288, ssm2 3992/6144, codes 3320/6144,
 learner 3364/6144, drivelog 5300/6144. Without the portal, saves that reach
 the flash, SSM2 answers or trouble codes - the car's own `[stack]` line is the
 figure to cut a stack by, not this one.
+
+## 2026-11-17: a real Subaru's traffic
+
+`attack-free-4.log`: a 2017 Forester, 208 s of driving, 336,011 frames
+(1,614 a second), **54 identifiers**, frames of 1, 2, 4, 5, 7 and 8 bytes.
+450 s of it (twice round), before and after the RAM change:
+
+| | Before (main 4e99beb) | After |
+|---|---|---|
+| Boots, panics, restarts | 1, 0, 0 | 1, 0, 0 |
+| Identifiers in the census | 55 of 55 | 55 of 55 (one block of 16 rows from the heap) |
+| Frames a second | 1624 | 1623 |
+| Engine speed | 0x140 bit 16, 12 bits - verified | the same |
+| Road speed | 0x0D4 bit 48, 16 bits - verified | the same |
+| Coolant | 0x360 byte 3 - verified | the same |
+| Rejected by the verifier | 0 | 0 |
+| Learner's tables | 170 fields, 213 bits | 197 fields, 247 bits |
+
+With `--readers` (240 s): 10,740 passes over the tables from the other core,
+no inconsistency.
+
+What the real traffic showed that the made-up car did not:
+
+- **The learner's field table is full two seconds after the bus comes up**
+  ("field table full, evicting as it goes"): 54 identifiers make far more
+  candidate fields than 170 or 197 slots. Every slot the RAM change frees is
+  used.
+- **A car of this generation has more than 48 identifiers** - the census takes
+  one block from the heap (2 KB), as designed.
+- **Engine speed was learned 12 bits wide; the car's field is 14** (the
+  dataset's own table, from opendbc: `Engine_RPM : 16|14@1+`). The drive never
+  goes above 2,541 rpm in any of the four recordings, so bits 12 and 13 never
+  move and the 12- and 14-bit fields read the same; with the table full, which
+  of the two is in it is chance. Above 4,095 rpm the 12-bit one starts again
+  from 0. The re-check against the ECU (`learn_recheck_s`) would turn it down
+  after four disagreements in a row - two minutes above 4,095 rpm, or never if
+  the engine is only up there for moments. Older than the RAM change (both
+  versions do it); not fixed here. The owner's car is not affected today: its
+  engine speed is learned 16 bits wide.
+- Road speed was taken from one wheel's speed (0x0D4), not the car's own
+  figure (0x0D1): the two fit the ECU's whole km/h equally well. Right in a
+  straight line, a little off in a corner.
+

@@ -35,9 +35,42 @@ def find_qemu():
     return q
 
 
-def build(project, extra_ids, readers):
+def convert_log(path, out):
+    """A candump log -> 16 bytes a frame: u32 µs from the first, u16 id, u8 dlc, pad, 8 data.
+    Extended and remote frames, and the diagnostic range (0x7DF-0x7EF: the shim's own ECU
+    answers there) are left out. Returns (frames, seconds, identifiers)."""
+    import struct
+    line_re = re.compile(r"\((\d+\.\d+)\)\s+\S+\s+([0-9A-Fa-f]{3})#([0-9A-Fa-f]{0,16})\s*$")
+    t0 = None
+    ids = set()
+    n = 0
+    last = 0
+    with open(path, errors="replace") as f, open(out, "wb") as o:
+        for line in f:
+            m = line_re.match(line)
+            if not m:
+                continue
+            ident = int(m.group(2), 16)
+            if 0x7DF <= ident <= 0x7EF:
+                continue
+            data = bytes.fromhex(m.group(3) if len(m.group(3)) % 2 == 0 else m.group(3)[:-1])
+            t = float(m.group(1))
+            if t0 is None:
+                t0 = t
+            us = max(last, int(round((t - t0) * 1e6)))
+            last = us
+            o.write(struct.pack("<IHBB8s", us, ident, len(data), 0, data.ljust(8, b"\0")))
+            ids.add(ident)
+            n += 1
+    if not n:
+        sys.exit(f"{path}: no candump lines ('(time) can0 123#0011..') in it")
+    return n, last / 1e6, len(ids)
+
+
+def build(project, extra_ids, readers, replay):
     env = dict(os.environ)
-    env["QEMU_SHIM_FLAGS"] = f"-DQEMU_EXTRA_IDS={extra_ids} -DQEMU_READERS={1 if readers else 0}"
+    env["QEMU_SHIM_FLAGS"] = (f"-DQEMU_EXTRA_IDS={extra_ids} -DQEMU_READERS={1 if readers else 0} "
+                              f"-DQEMU_REPLAY={1 if replay else 0}")
     r = subprocess.run([sys.executable, "-m", "platformio", "run", "-d", project],
                        capture_output=True, text=True, env=env)
     if r.returncode:
@@ -71,6 +104,9 @@ def main():
     ap.add_argument("--extra-ids", type=int, default=0, help="more identifiers on the simulated bus")
     ap.add_argument("--src", default=None, help="master/ directory of another checkout")
     ap.add_argument("--keep", default=None, help="write the serial log here")
+    ap.add_argument("--replay", default=None, metavar="LOG",
+                    help="a recorded candump log in place of the made-up car; the ECU's answers "
+                         "are read off its frames with the Subaru 2005-2019 layout (see README)")
     ap.add_argument("--readers", action="store_true",
                     help="a task on the other core reads the tables as the portal's pages do, "
                          "50 times a second, and checks them (needs the row readers: not for "
@@ -85,11 +121,20 @@ def main():
         if os.path.abspath(tmp_project) != HERE:
             os.makedirs(os.path.join(tmp_project, "shim"), exist_ok=True)
             shutil.copy(os.path.join(HERE, "platformio.ini"), tmp_project)
+            shutil.copy(os.path.join(HERE, "partitions_qemu.csv"), tmp_project)
             shutil.copy(os.path.join(HERE, "shim", "qemu_shim.cpp"), os.path.join(tmp_project, "shim"))
         project = tmp_project
 
-    print(f"== {os.path.relpath(project)}: {a.seconds} s, {25 + a.extra_ids} identifiers")
-    build_dir = build(project, a.extra_ids, a.readers)
+    n_ids = 25 + a.extra_ids
+    if a.replay:
+        shim = os.path.join(project, "shim")
+        frames, secs, n_ids = convert_log(a.replay, os.path.join(shim, "replay.bin"))
+        os.utime(os.path.join(shim, "qemu_shim.cpp"))      # the log is part of it: build it again
+        print(f"== {os.path.relpath(project)}: {a.seconds} s of {os.path.basename(a.replay)} "
+              f"({frames} frames, {secs:.0f} s, {n_ids} identifiers)")
+    else:
+        print(f"== {os.path.relpath(project)}: {a.seconds} s, {n_ids} identifiers")
+    build_dir = build(project, a.extra_ids, a.readers, a.replay)
     work = tempfile.mkdtemp(prefix="qemu_master_")
     flash = os.path.join(work, "flash.bin")
     uart = os.path.join(work, "uart.log")
@@ -127,11 +172,11 @@ def main():
           f"{m.group(1)} fields, {m.group(2)} bits ({m.group(3)} KB, {m.group(4)} KB left)" if m else "")
 
     ids = [int(x) for x in re.findall(r"\[bus \] (\d+) distinct IDs", log)]
-    want = min(25 + a.extra_ids + 1, 128)        # + the ECU's answers (0x7E8)
+    want = min(n_ids + 1, 128)                   # + the ECU's answers (0x7E8)
     check(ids and ids[-1] == want, "every identifier on the bus is in the census",
           f"{ids[-1] if ids else 0} of {want}")
     blocks = len(re.findall(r"census: more than \d+ identifiers", log))
-    if a.extra_ids:
+    if a.extra_ids or a.replay:
         print(f"       census rows taken from the heap: {blocks} block(s) of 16")
 
     rx = [int(x) for x in re.findall(r"\[stats\] CAN rx: (\d+)", log)]
@@ -139,9 +184,14 @@ def main():
           "frames keep arriving",
           f"{(rx[-1] - rx[0]) / (5 * (len(rx) - 1)):.0f} a second" if len(rx) > 3 else "")
 
+    for line in re.findall(r"learner: (0x[0-9A-F]{4} found in .*?) - confirming", log):
+        print("       " + line)
+    for line in re.findall(r"signal '(learned [0-9A-F]{4}' \(0x[0-9A-F]+\) (?:VERIFIED|REJECTED)[^\r\n]*)", log):
+        print("       " + line)
     found = set(re.findall(r"learner: (0x[0-9A-F]{4}) found in", log))
     verified = re.findall(r"signal 'learned ([0-9A-F]{4})' \(0x[0-9A-F]+\) VERIFIED", log)
-    check(len(set(verified)) >= 3, "values learned from the bus and verified against the ECU",
+    # A recorded drive is what it is: its slow values may not move far enough to be confirmed.
+    check(len(set(verified)) >= (2 if a.replay else 3), "values learned from the bus and verified against the ECU",
           f"found {len(found)}, verified {len(set(verified))}: " + " ".join(sorted(set(verified))))
     rejected = re.findall(r"REJECTED", log)
     print(f"       rejected by the verifier: {len(rejected)}")

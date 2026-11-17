@@ -19,6 +19,7 @@ python master/test_host/run.py portal_teach                    # the portal's te
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
 python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # the real master firmware in Espressif's QEMU (needs $QEMU_ESP32S3; not in test_all)
+python master/test_qemu/run.py --replay drive.log   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
@@ -480,6 +481,13 @@ when it does not (`lamp_hazard_switch`).
   have to rest on. Not done, for want of those: the stacks, the reserve, the
   live page's JSON document (estimated at 20-30 KB for a moment, every second
   the portal is open - not measured).
+- Learner, found by replaying a real 2017 Forester's traffic in QEMU
+  (2026-11-17, `master/test_qemu/README.md`), not fixed: engine speed learned
+  as 12 bits of a 14-bit field because the drive stayed under 4,096 rpm (the
+  two fields read the same until then; above it the 12-bit one wraps, and only
+  the re-check would catch it); the field table is full within two seconds on
+  a 54-identifier bus; road speed taken from one wheel. This car's engine
+  speed is 16 bits wide and is not affected.
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
   service 03 at all; that the SSM2 odometer matches the cluster; which frame

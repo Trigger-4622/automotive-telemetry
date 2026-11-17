@@ -36,6 +36,9 @@
 #ifndef QEMU_READERS
 #define QEMU_READERS 0            /**< 1: the task that reads the tables as the portal does. */
 #endif
+#ifndef QEMU_REPLAY
+#define QEMU_REPLAY 0             /**< 1: a recorded log (shim/replay.bin) instead of the made-up car. */
+#endif
 
 #if QEMU_READERS
 #include "Learner.h"
@@ -127,6 +130,35 @@ void fill(size_t i, twai_message_t &m) {
 }
 
 }  // namespace
+
+/* ═══════════════════════════ a recorded car ══════════════════════════════
+ *
+ * run.py --replay turns a candump log ("(time) can0 140#0102..") into
+ * shim/replay.bin: 16 bytes a frame, in the order and at the times recorded.
+ * It is played at its own pace and started again at its end. The engine
+ * computer's answers are read off the frames just played, so what the learner
+ * is asked to find is really in the traffic: engine speed and the pedal in
+ * 0x140, road speed in 0x0D1, coolant in 0x360 - the layout of Subaru's
+ * 2005-2019 cars (opendbc's subaru_forester_2017 / outback_2015).
+ */
+#if QEMU_REPLAY
+struct Rec { uint32_t tUs; uint16_t id; uint8_t dlc; uint8_t pad; uint8_t data[8]; };
+extern "C" const Rec replay_start[] asm("replay_start");
+extern "C" const Rec replay_end[]   asm("replay_end");
+asm(".section .rodata.replay,\"a\"\n.balign 4\n.global replay_start\nreplay_start:\n"
+    ".incbin \"shim/replay.bin\"\n.global replay_end\nreplay_end:\n.previous\n");
+
+namespace {
+size_t   s_recAt = 0;
+uint64_t s_recBase = 0;                     // µs: when record 0 of this round is due
+uint32_t s_rounds = 0;
+// What the recorded car is doing, as its own computer would report it.
+volatile uint16_t s_recRpm = 0;             // rpm
+volatile uint16_t s_recSpeed = 0;           // km/h x 100
+volatile uint8_t  s_recPedal = 0;           // 0..255
+volatile uint8_t  s_recCoolant = 40;        // degrees C + 40
+}
+#endif
 
 /* ═════════════════════ the portal's reading, without it ══════════════════
  *
@@ -243,6 +275,37 @@ esp_err_t __wrap_twai_receive(twai_message_t *message, TickType_t ticks_to_wait)
         portEXIT_CRITICAL(&s_replyMux);
         if (have) return ESP_OK;
 
+#if QEMU_REPLAY
+        const size_t nRec = (size_t)(replay_end - replay_start);
+        if (!s_recBase) s_recBase = now + 50000;
+        const Rec &r = replay_start[s_recAt];
+        uint64_t due = s_recBase + r.tUs;
+        if (now > due + 100000) { s_recBase += now - due; due = now; }   // fell behind: no burst
+        if (due <= now) {
+            memset(message, 0, sizeof *message);
+            message->identifier = r.id;
+            message->data_length_code = r.dlc;
+            memcpy(message->data, r.data, 8);
+            if (r.id == 0x140 && r.dlc >= 4) {
+                s_recPedal = r.data[0];
+                s_recRpm   = (uint16_t)(((r.data[3] & 0x3F) << 8) | r.data[2]);
+            } else if (r.id == 0x0D1 && r.dlc >= 2) {
+                s_recSpeed = (uint16_t)((r.data[0] | (r.data[1] << 8)) * 5.625f);
+            } else if (r.id == 0x360 && r.dlc >= 4) {
+                s_recCoolant = r.data[3];
+            }
+            if (++s_recAt >= nRec) {                     // the end: once more from the top
+                s_recAt = 0;
+                s_recBase += r.tUs + 20000;
+                s_rounds++;
+            }
+            return ESP_OK;
+        }
+        if (now >= limit) return ESP_ERR_TIMEOUT;
+        vTaskDelay(1);
+        continue;
+#endif
+
         size_t best = 0;
         uint64_t bestDue = UINT64_MAX;
         for (size_t i = 0; i < N_TOTAL; i++) {
@@ -267,11 +330,24 @@ esp_err_t __wrap_twai_transmit(const twai_message_t *m, TickType_t) {
     if (!m || m->extd || (m->identifier != 0x7DF && m->identifier != 0x7E0)) return ESP_OK;
     if (m->data_length_code < 3 || m->data[0] != 2 || m->data[1] != 0x01) return ESP_OK;
     const uint8_t pid = m->data[2];
-    const Car c = carNow();
     twai_message_t r = {};
     r.identifier = 0x7E8;
     r.data_length_code = 8;
     r.data[1] = 0x41; r.data[2] = pid;
+#if QEMU_REPLAY
+    switch (pid) {      // coolant, engine speed, road speed, accelerator pedal: what the frames say
+        case 0x00: r.data[0] = 6; r.data[3] = 0x08; r.data[4] = 0x18; r.data[5] = 0x00; r.data[6] = 0x01; break;
+        case 0x20: r.data[0] = 6; r.data[6] = 0x01; break;
+        case 0x40: r.data[0] = 6; r.data[4] = 0x80; break;
+        case 0x05: r.data[0] = 3; r.data[3] = s_recCoolant; break;
+        case 0x0C: { const uint16_t v = (uint16_t)(s_recRpm * 4u);
+                     r.data[0] = 4; r.data[3] = (uint8_t)(v >> 8); r.data[4] = (uint8_t)v; break; }
+        case 0x0D: r.data[0] = 3; r.data[3] = (uint8_t)(s_recSpeed / 100u); break;
+        case 0x49: r.data[0] = 3; r.data[3] = s_recPedal; break;
+        default: return ESP_OK;
+    }
+#else
+    const Car c = carNow();
     switch (pid) {
         case 0x00: r.data[0] = 6; r.data[3] = 0x18; r.data[4] = 0x18; r.data[5] = 0x80; r.data[6] = 0x00; break;
                    // 0x04, 0x05, 0x0C, 0x0D, 0x11
@@ -283,6 +359,7 @@ esp_err_t __wrap_twai_transmit(const twai_message_t *m, TickType_t) {
         case 0x11: r.data[0] = 3; r.data[3] = (uint8_t)(c.pedal * 2.55f); break;
         default: return ESP_OK;                          // not a PID this ECU has: no answer
     }
+#endif
     portENTER_CRITICAL(&s_replyMux);
     const uint8_t next = (uint8_t)((s_replyHead + 1) % 4);
     if (next != s_replyTail) {
