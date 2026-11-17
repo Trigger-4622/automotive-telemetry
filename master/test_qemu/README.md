@@ -31,8 +31,10 @@ Two things about QEMU (Espressif's 9.2.2) itself, found on 2026-11-17:
 - **QEMU itself now and then dies of a segmentation fault** in the first
   second or two of a boot: inside its generated code, on one of the two
   cores' threads (gdb), not in the firmware. In `--replay` runs it happened in
-  three boots of a dozen; with `--ota`, in most attempts. `run.py`
-  tries up to three times and says so each time. With both cores on one
+  three boots of a dozen; in boots of the `--ota` image, in one of six and
+  three of eight (the same with the settle wait off - not the listen-only
+  counter pinning), so a four-boot `--ota` run often needs several tries.
+  `run.py` tries up to three times (five with `--ota`) and says so each time. With both cores on one
   thread (`-accel tcg,thread=single`) it did not happen, but the second core
   never came back after a software restart and the firmware waited for it
   for ever - so `--ota` cannot use that.

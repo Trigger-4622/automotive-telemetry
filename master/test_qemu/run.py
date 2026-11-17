@@ -233,8 +233,10 @@ def main():
     uart = os.path.join(work, "uart.log")
     # QEMU itself (not the firmware) now and then dies of a segmentation fault
     # in the first seconds of a boot (inside its generated code, on one of the
-    # cores' threads): the run is made again, up to three times in all.
-    for attempt in (1, 2, 3):
+    # cores' threads): the run is made again, up to three times in all - five
+    # with --ota, whose four boots each risk it.
+    tries = 5 if a.ota else 3
+    for attempt in range(1, tries + 1):
         image(build_dir, flash)
         try:
             q = subprocess.run([qemu, "-nographic", "-machine", "esp32s3",
@@ -244,7 +246,7 @@ def main():
         except subprocess.TimeoutExpired:
             break
         tail = open(uart, errors="replace").read()[-1500:]
-        if q.returncode == -11 and attempt < 3:
+        if q.returncode == -11 and attempt < tries:
             print("   QEMU itself crashed (segmentation fault, an emulator fault) - running it again")
             continue
         sys.exit(f"QEMU ended by itself (exit {q.returncode}): {q.stderr[-800:]}\n--- serial log's end:\n{tail}")

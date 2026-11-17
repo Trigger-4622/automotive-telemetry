@@ -31,7 +31,7 @@ emulated ESP32-S3 - real stacks, heap and both cores, which the harness cannot
 show - against a simulated car; it has no radio and no CAN error counters (the
 settings file and the drive log work: its flash is read in DIO mode, QEMU
 misreads QIO), and is a test build that must never be flashed. QEMU itself now
-and then segfaults early in a boot; run.py tries up to three times and says so.
+and then segfaults early in a boot; run.py tries again (3 times, 5 with --ota).
 In a cloud session `scripts/cloud-setup.sh` (session-start hook) has installed
 what they need; if it printed "NOT set up", say so rather than skipping the
 tests. Firmware builds need `*.platformio.org` on the environment's network
