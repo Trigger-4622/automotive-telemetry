@@ -78,7 +78,7 @@ values. What the car has shown about that so far:
 What the search turned up (web, Espressif docs and issues, other projects):
 
 - No ESP32-S3 TWAI erratum beyond the listen-only one (fixed). The S3 cannot
-  read CAN FD frames - irrelevant on a 2009 car.
+  read CAN FD frames - irrelevant on a 2010 car.
 - "Long critical sections or higher-priority interrupts cause bus errors" (an
   Espressif-side remark): on this controller a late interrupt loses frames to
   a FIFO overrun; it cannot corrupt bits on the wire. Not the cause.

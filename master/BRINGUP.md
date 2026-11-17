@@ -1,4 +1,4 @@
-# Master node bring-up — 2009 Subaru Legacy B4
+# Master node bring-up — 2010 Subaru Legacy B4
 
 Work through this in order. Each step proves one thing, so when something
 fails you know which thing it was.

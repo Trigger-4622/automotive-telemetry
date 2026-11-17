@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-CAN-bus telemetry for the owner's 2009 Subaru Legacy B4: a master that reads
+CAN-bus telemetry for the owner's 2010 Subaru Legacy B4: a master that reads
 the car's bus and broadcasts over ESP-NOW, and two screens that draw it. See
 README.md for the layout. Three standalone PlatformIO projects:
 
@@ -340,7 +340,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 
 ## The car
 
-2009 Legacy B4, 500 kbit/s CAN on OBD pins 6/14. The ECU answers SSM2 (SYS
+2010 Legacy B4 (fifth generation, BM), 500 kbit/s CAN on OBD pins 6/14. The ECU answers SSM2 (SYS
 A11009, ROM 5B443C4107) and OBD-II on 0x7E0/0x7E8. About 25 broadcast IDs.
 The car's saved config (`master/test_host/fixtures/`: read back 2026-09-25
 with diag mode 2 = OBD-II only - the file the P1718 scenarios drive with - and
@@ -519,7 +519,15 @@ when it does not (`lamp_hazard_switch`).
   (the learned -0.5 offset was OBD's whole km/h): this car's 0x333 is laid out
   like the 2017 Forester's 0x0D1 (speed bytes 0-1, brake byte 2, a flag in
   byte 3). Of this car's signal IDs only 0x002 (steering, same layout) also
-  exists on the Forester - its other addresses do not carry over. The learner rules above are harness only; on the
+  exists on the Forester - its other addresses do not carry over. The same
+  for a 2012 Impreza (CANdid, 2026-11-17): its 26 identifiers are the
+  newer set (0x0D0-0x0D4, 0x140-0x15A, 0x280-0x282, 0x360-0x378, 0x660) and
+  only 0x002 is shared. Its annotated lock-to-lock capture confirms this
+  car's mapping of 0x002: bytes 0-1 big-endian signed, 0.1 degree, left
+  positive (about +-550 at full lock); byte 2 constant, byte 3 a rolling
+  counter, byte 4 the sum of bytes 0-3 - nothing else in the frame. No public
+  data for the 2010-2014 Legacy/Outback was found (open-can-db has the
+  2005-2009 one only). The learner rules above are harness only; on the
   car, the serial log's "no longer agrees with the ECU" lines say what a
   re-check turned down.
 - RAM (2026-11-16): harness, build and QEMU (`master/test_qemu/README.md`:

@@ -1,6 +1,6 @@
 # Automotive Telemetry
 
-A CAN-bus master and two gauge screens for a 2009 Subaru Legacy B4. The master
+A CAN-bus master and two gauge screens for a 2010 Subaru Legacy B4. The master
 reads the car's CAN bus from the OBD port (listening, plus OBD-II and Subaru
 SSM2 requests) and broadcasts engineering units over ESP-NOW. Any number of
 screens listen and draw them.
