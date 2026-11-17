@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-CAN-bus telemetry for the owner's 2009 Subaru Legacy B4: a master that reads
+CAN-bus telemetry for the owner's 2010 Subaru Legacy B4: a master that reads
 the car's bus and broadcasts over ESP-NOW, and two screens that draw it. See
 README.md for the layout. Three standalone PlatformIO projects:
 
@@ -203,7 +203,16 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   coolant byte). Hand-made signals are never re-checked. A reading is paired
   only with a frame that arrived after the value settled at its level - a
   once-a-second frame (the car's 0x705) was paired with readings up to a second
-  newer and the MAF never fitted there (`learn_slow_frame`).
+  newer and the MAF never fitted there (`learn_slow_frame`). The field table
+  fills in the first seconds from the bytes that have changed by then, and a
+  16-bit field needs both its bytes to have changed: on a real 2012 Impreza's
+  drive (QEMU) speed's high byte moved at 14.4 km/h, 23.7 s in, the table was
+  full at 10.2 s, and speed was never learned in 40 minutes. Fields that find
+  the table full now take turns (`swapIn`, `learn_late_field`) with
+  candidates that have been in it 20 s, have 150 samples against every value
+  that moved, match none and are no value's best field - swapped out, not
+  marked dead, so they come back later; discovery starts a row further on
+  each pass so no frame is always last in line.
 - **Listen-only is NOT silent on this chip by itself.** Espressif erratum
   (ESP32/S2/S3/C3): a listen-only TWAI controller still sends ACTIVE error
   flags, and listen-only freezes its error counters, so one started with REC 0
@@ -340,7 +349,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 
 ## The car
 
-2009 Legacy B4, 500 kbit/s CAN on OBD pins 6/14. The ECU answers SSM2 (SYS
+2010 Legacy B4 (fifth generation, BM), 500 kbit/s CAN on OBD pins 6/14. The ECU answers SSM2 (SYS
 A11009, ROM 5B443C4107) and OBD-II on 0x7E0/0x7E8. About 25 broadcast IDs.
 The car's saved config (`master/test_host/fixtures/`: read back 2026-09-25
 with diag mode 2 = OBD-II only - the file the P1718 scenarios drive with - and
@@ -519,7 +528,15 @@ when it does not (`lamp_hazard_switch`).
   (the learned -0.5 offset was OBD's whole km/h): this car's 0x333 is laid out
   like the 2017 Forester's 0x0D1 (speed bytes 0-1, brake byte 2, a flag in
   byte 3). Of this car's signal IDs only 0x002 (steering, same layout) also
-  exists on the Forester - its other addresses do not carry over. The learner rules above are harness only; on the
+  exists on the Forester - its other addresses do not carry over. The same
+  for a 2012 Impreza (CANdid, 2026-11-17): its 26 identifiers are the
+  newer set (0x0D0-0x0D4, 0x140-0x15A, 0x280-0x282, 0x360-0x378, 0x660) and
+  only 0x002 is shared. Its annotated lock-to-lock capture confirms this
+  car's mapping of 0x002: bytes 0-1 big-endian signed, 0.1 degree, left
+  positive (about +-550 at full lock); byte 2 constant, byte 3 a rolling
+  counter, byte 4 the sum of bytes 0-3 - nothing else in the frame. No public
+  data for the 2010-2014 Legacy/Outback was found (open-can-db has the
+  2005-2009 one only). The learner rules above are harness only; on the
   car, the serial log's "no longer agrees with the ECU" lines say what a
   re-check turned down.
 - RAM (2026-11-16): harness, build and QEMU (`master/test_qemu/README.md`:
@@ -536,8 +553,9 @@ when it does not (`lamp_hazard_switch`).
   (2026-11-17, `master/test_qemu/README.md`), not fixed: engine speed learned
   as 12 bits of a 14-bit field because the drive stayed under 4,096 rpm (the
   two fields read the same until then; above it the 12-bit one wraps, and only
-  the re-check would catch it); the field table is full within two seconds on
-  a 54-identifier bus; road speed taken from one wheel. This car's engine
+  the re-check would catch it); road speed taken from one wheel. (The field
+  table filling within seconds, which kept late-moving fields out for good, is
+  fixed: `learn_late_field` above.) This car's engine
   speed is 16 bits wide and is not affected.
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under

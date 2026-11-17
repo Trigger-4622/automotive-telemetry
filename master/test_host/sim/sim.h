@@ -40,6 +40,10 @@ struct EcuConfig {
      *  list is longer than the simulator's 36), answering unknown ones with
      *  four bytes of 0x40. */
     bool     supportAllPids  = false;
+    /** The engine ECU answers only coolant, engine speed, road speed and
+     *  throttle (PIDs 0x05 0x0C 0x0D 0x11), as the QEMU test's does for a
+     *  recorded drive: few values, so a learned one keeps its learner slot. */
+    bool     fewPids         = false;
     /** The engine ECU's PID 01 says "lamp on, one code"; the TCM's own PID 01
      *  always says "no lamp, no codes". */
     bool     ecmMilOn        = false;
@@ -78,6 +82,11 @@ struct BusFaults {
     bool     busOffNow = false;        ///< Force the controller bus-off.
     bool     silenceBus = false;       ///< Car asleep: nothing is broadcast.
     int      extraIds = 0;             ///< More distinct IDs, 20 Hz each.
+    /** The extra IDs carry, in bytes 2-3, a figure that follows the engine
+     *  loosely (engine speed with a slow wobble of its own): related enough
+     *  that the learner never drops them as useless, never close enough to be
+     *  a match - a bus full of such frames fills the learner's field table. */
+    bool     extraEngine = false;
     int      burstFramesPerMs = 0;     ///< Flood: this many extra frames every ms.
     /**
      * A marginal link: the master's controller misreads this fraction of the

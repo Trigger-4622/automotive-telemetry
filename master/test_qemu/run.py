@@ -215,16 +215,21 @@ def main():
     shim = os.path.join(project, "shim")
     if a.settings:
         shutil.copy(a.settings, os.path.join(shim, "settings.json"))
-        os.utime(os.path.join(shim, "qemu_shim.cpp"))      # the file is part of it: build it again
     if a.replay:
         frames, secs, n_ids, size = convert_log(a.replay, os.path.join(shim, "replay.bin"))
-        os.utime(os.path.join(shim, "qemu_shim.cpp"))
         print(f"== {os.path.relpath(project)}: {a.seconds} s of {os.path.basename(a.replay)} "
               f"({frames} frames, {secs:.0f} s, {n_ids} identifiers; {size / 1e6:.2f} MB in the image)")
     else:
         print(f"== {os.path.relpath(project)}: {a.seconds} s, {n_ids} identifiers")
     if a.settings:
         print(f"   with the settings of {os.path.basename(a.settings)}")
+    # The shim embeds replay.bin and settings.json (.incbin), which the build does
+    # not see as inputs, and PlatformIO goes by content, not file times: the shim
+    # is compiled afresh every time, or a run would quietly use the last files.
+    for env in ("master-qemu", "master-qemu-ota"):
+        obj = os.path.join(project, ".pio", "build", env, "test_qemu", "shim", "qemu_shim.cpp.o")
+        if os.path.exists(obj):
+            os.remove(obj)
     if a.ota:
         print("   the firmware update test, on the board's partition table")
     build_dir = build(project, a.extra_ids, a.readers, a.replay, a.settings, a.ota)
@@ -323,8 +328,12 @@ def main():
               f"{rd[-1][0]} passes, {rd[-1][1]}{rd[-1][3]}" if rd else "no [read ] line")
 
     if a.settings:
-        m = re.search(r"\[qemu \] the car's settings applied as the portal's upload does: (\w+)", log)
-        check(m and m.group(1) == "saved", "the car's settings applied and saved", m.group(0)[8:] if m else "")
+        m = re.search(r"\[qemu \] the car's settings applied as the portal's upload does: (\w+) \((\d+) signals\)", log)
+        import json
+        want_sig = len(json.load(open(a.settings)).get("signals", []))
+        check(m and m.group(1) == "saved" and int(m.group(2)) == want_sig,
+              "the settings given applied and saved (not an older file)",
+              f"{m.group(2)} of {want_sig} signals" if m else "")
         saves = len(re.findall(r"config: saved", log))
         fails = re.findall(r"config: .*(?:fail|could not|not saved)[^\r\n]*", log, re.I)
         check(not fails, "every settings save reached the flash",

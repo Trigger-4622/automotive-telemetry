@@ -79,7 +79,11 @@ it) and plays it at its own pace, again from the top at its end.
 
 `--settings` puts a settings file in the image (`shim/settings.json`, not
 committed) and applies it right after the master has loaded its own, as the
-portal's "Everything, as JSON" upload does: `fromJson(.., true)` and a save. The simulated ECU answers coolant, engine speed,
+portal's "Everything, as JSON" upload does: `fromJson(.., true)` and a save.
+
+Once a minute the serial log shows the drive log's status (`[dlog ]`) and
+every fresh value in the metric store, with how often each indicator changed
+(`[mets ]`) - what the displays would be sent. The simulated ECU answers coolant, engine speed,
 road speed and the accelerator pedal **from the frames just played**, read with
 the layout of Subaru's 2005-2019 cars (engine speed and pedal in 0x140, road
 speed in 0x0D1, coolant in 0x360), so the learner has to find real fields in

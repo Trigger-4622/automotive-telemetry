@@ -659,8 +659,15 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
         const uint64_t dt = extraLast ? now - extraLast : 0;
         extraLast = now;
         const int n = (int)std::min<uint64_t>(faults.extraIds, dt * faults.extraIds / 50000 + 1);
-        for (int k = 0; k < n; k++, extraNext = (extraNext + 1) % faults.extraIds)
-            deliver(frame(0x500 + extraNext, {(uint8_t)extraNext, s_cnt, 0, 0, 0, 0, 0, 0}));
+        for (int k = 0; k < n; k++, extraNext = (extraNext + 1) % faults.extraIds) {
+            uint16_t e = 0;
+            if (faults.extraEngine) {
+                const double t = elapsedS();
+                e = (uint16_t)std::max(0.0, truth().rpm * (1.0 + 0.002 * extraNext) +
+                                            600.0 * std::sin(t / (2.0 + 0.37 * extraNext)));
+            }
+            deliver(frame(0x500 + extraNext, {(uint8_t)extraNext, s_cnt, (uint8_t)e, (uint8_t)(e >> 8), 0, 0, 0, 0}));
+        }
     }
     return soonest;
 }
@@ -673,8 +680,14 @@ static const uint8_t ECM_PIDS[] = {0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0B, 0x0
                                    0x49, 0x4A, 0x4C};
 static const uint8_t TCM_PIDS[] = {0x01, 0x05, 0x0D, 0x20, 0x21};
 
+static const uint8_t FEW_PIDS[] = {0x05, 0x0C, 0x0D, 0x11};
+
 template <size_t N>
 static bool has(const uint8_t (&set)[N], uint8_t pid) {
+    if (ecu.fewPids && N > 8) {                  // the engine ECU's list only
+        for (uint8_t p : FEW_PIDS) if (p == pid) return true;
+        return false;
+    }
     for (uint8_t p : set) if (p == pid) return true;
     // (The engine ECU's list only: the TCM's stays as it is.)
     return ecu.supportAllPids && N > 8 && pid >= 1 && pid <= 0xA6;
@@ -683,6 +696,11 @@ static bool has(const uint8_t (&set)[N], uint8_t pid) {
 template <size_t N>
 static void bitmap(const uint8_t (&set)[N], uint8_t base, uint8_t out[4]) {
     std::memset(out, 0, 4);
+    if (ecu.fewPids && N > 8) {
+        for (uint8_t p : FEW_PIDS)
+            if (p > base && p <= base + 32) out[(p - base - 1) / 8] |= (uint8_t)(0x80 >> ((p - base - 1) % 8));
+        return;
+    }
     for (uint8_t p : set)
         if (p > base && p <= base + 32) {
             const int i = p - base - 1;
