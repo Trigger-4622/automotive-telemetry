@@ -540,6 +540,8 @@ void WebPortal::setupRoutes() {
         doc["used_kb"] = st.usedKb;
         doc["cap_kb"]  = st.capKb;
         doc["free_kb"] = st.freeKb;
+        doc["own"]     = st.own;
+        doc["part_kb"] = st.partKb;
         doc["note"]    = st.note;
         JsonArray fa = doc["files"].to<JsonArray>();
         for (size_t i = 0; i < n; i++) {
@@ -563,7 +565,7 @@ void WebPortal::setupRoutes() {
             s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
             return;
         }
-        File f = LittleFS.open(path, "r");
+        File f = driveLogOpen(path);         // on the logs' own partition
         if (!f) { s_server.send(404, "application/json", "{\"error\":\"no such log\"}"); return; }
         s_server.streamFile(f, "application/octet-stream");
         f.close();

@@ -574,7 +574,8 @@ static void scConfigMountGlitch() {
     runUntil(3);
     check(simfs::formats == 0, "one failed mount does not format", fmt("%d formats", simfs::formats));
     check(Cfg.broadcastMs == 77, "the saved settings are loaded", fmt("broadcast_ms %u", Cfg.broadcastMs));
-    check(simfs::files.count("/log/00001.tlg") == 1, "the drive logs are kept");
+    check(simfs::files.count("/log/00001.tlg") + simfs::files.count(simfs::logKey("/log/00001.tlg")) == 1,
+          "the drive logs are kept");
 }
 
 /** A partition never formatted (the first flash) is still formatted once. */
@@ -3221,7 +3222,7 @@ static void scDriveLog() {
     runUntil(45);
     driveLogStatus(st);
     check(!st.recording, "closed when the car went off", st.file);
-    const LogFile L = readLog("/log/00001.tlg");
+    const LogFile L = readLog(simfs::logKey("/log/00001.tlg"));
     check(L.ok && L.hz == 10 && L.ids == std::vector<uint16_t>({268, 269, 4097}), "header: 10 Hz, RPM, speed, boost");
     const double secs = L.t.empty() ? 0 : L.t.back() / 1000.0;
     check(std::fabs(L.rows.size() - secs * 10) < secs * 0.5 + 2 && secs > 38, "ten rows a second for the whole drive",
@@ -3248,7 +3249,7 @@ static void scDriveLog() {
     char path[32];
     check(!driveLogPath("../config.json", path, sizeof path) && !driveLogPath("00009.tlg", path, sizeof path),
           "only log files can be named");
-    check(driveLogDelete("00001.tlg") && !simfs::files.count("/log/00001.tlg"), "deleted on request");
+    check(driveLogDelete("00001.tlg") && !simfs::files.count(simfs::logKey("/log/00001.tlg")), "deleted on request");
     JsonDocument d;
     check(!deserializeJson(d, simfs::files["/config.json"]) && (d["log_on"] | false), "the settings untouched");
     commonChecks();
@@ -3262,13 +3263,14 @@ static void scDriveLogHeldFile() {
       "log_ids":[268,269,4097,273,260,261,262,263,264,265,266,267,270,271,272,274,275,276,277,278,279,280,281,282]})");
     std::string old(28 * 1024, '\0');
     std::memcpy(&old[0], "TLG1", 4);
-    simfs::files["/log/00001.tlg"] = old;
-    simfs::files["/log/00002.tlg"] = old;
-    simfs::held.insert("/log/00001.tlg");
+    simfs::logsBlank = false;                     // the logs' partition, in use since an earlier drive
+    simfs::files[simfs::logKey("/log/00001.tlg")] = old;
+    simfs::files[simfs::logKey("/log/00002.tlg")] = old;
+    simfs::held.insert(simfs::logKey("/log/00001.tlg"));
     boot();
     runUntil(35);
     DriveLogStatus st; driveLogStatus(st);
-    check(simfs::files.count("/log/00001.tlg") && !simfs::files.count("/log/00002.tlg"),
+    check(simfs::files.count(simfs::logKey("/log/00001.tlg")) && !simfs::files.count(simfs::logKey("/log/00002.tlg")),
           "the next oldest made room, the open one kept");
     check(st.recording && !std::strcmp(st.file, "00003.tlg"), "still recording", st.note);
     // 28 KB that cannot go and the new drive reach the 64 KB cap: it stops,
@@ -3281,8 +3283,10 @@ static void scDriveLogHeldFile() {
 }
 
 /** The space it may use: the oldest drive goes to make room, and the settings
- *  always keep 128 KB of the partition. */
+ *  always keep 128 KB of the partition - on a master still on the older
+ *  partition table, whose logs share the settings partition. */
 static void scDriveLogFull() {
+    simfs::logsPartition = false;
     // 24 values: 100-byte rows, 1 KB a second.
     storedConfig(R"({"log_on":true,"log_hz":10,"log_max_kb":64,
       "log_ids":[268,269,4097,273,260,261,262,263,264,265,266,267,270,271,272,274,275,276,277,278,279,280,281,282]})");
@@ -3311,6 +3315,175 @@ static void scDriveLogFull() {
     check(!deserializeJson(d, simfs::files["/config.json"]) && (d["oil_every_km"] | 0) == 8000,
           "a settings save still fits");
     commonChecks();
+}
+
+/* ───────────── the drive logs' own partition (the upper 8 MB) ───────────── */
+
+static const char *LOG24 = R"({"log_on":true,"log_hz":20,"log_max_kb":8000,)"
+    R"("log_ids":[268,269,4097,273,260,261,262,263,264,265,266,267,270,271,272,274,275,276,277,278,279,280,281,282]})";
+
+static size_t logBytesOn(bool own) {
+    size_t n = 0;
+    const std::string pre = own ? simfs::logKey("/log/") : "/log/";
+    for (const auto &kv : simfs::files)
+        if (kv.first.compare(0, pre.size(), pre) == 0) n += kv.second.size();
+    return n;
+}
+
+/**
+ * With the new partition table the logs have the upper 8 MB to themselves: a
+ * blank partition formatted once at the first boot, more than the 1200 KB the
+ * settings partition ever allowed, and nothing of it on the settings
+ * partition, which keeps its files, its size and its free space.
+ */
+static void scLogOwnPartition() {
+    storedConfig(LOG24);                          // 24 values at 20 Hz: 2 KB a second
+    simfs::files["/evlog.json"] = "[]";
+    const size_t settingsBefore = simfs::usedBytes();
+    boot();
+    runUntil(5);
+    DriveLogStatus st; driveLogStatus(st);
+    check(st.own && st.partKb == 8192, "the logs are on their own 8 MB partition",
+          fmt("own %d, %u KB", st.own, st.partKb));
+    check(simfs::logsFormats == 1 && simfs::formats == 0,
+          "the new partition formatted once, the settings partition never",
+          fmt("%d / %d formats", simfs::logsFormats, simfs::formats));
+    check(st.capKb == 8000, "all of log_max_kb may be used", fmt("%u KB", st.capKb));
+    runUntil(760);                                // ~1.5 MB of one drive
+    const size_t own = logBytesOn(true);
+    check(own > 1200 * 1024, "more than the settings partition ever held (1200 KB)",
+          fmt("%zu KB", own / 1024));
+    check(logBytesOn(false) == 0, "nothing of it on the settings partition");
+    driveLogStatus(st);
+    check(st.recording && !st.note[0], "still recording", st.note);
+    // The settings themselves grow as the learner saves (~20 KB); the logs add nothing.
+    check(simfs::usedBytes() < settingsBefore + 64 * 1024, "the settings partition holds only the settings",
+          fmt("%zu KB used of 1536, was %zu KB", simfs::usedBytes() / 1024, settingsBefore / 1024));
+    portalPost(R"({"oil_every_km":8000})");
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/config.json"]) && (d["oil_every_km"] | 0) == 8000,
+          "settings saves as before");
+    LogFileInfo li[4];
+    const size_t nl = driveLogList(li, 4);
+    char path[32];
+    std::string got;
+    if (nl && driveLogPath(li[0].name, path, sizeof path)) {
+        driveLogFlush();
+        File f = driveLogOpen(path);
+        char b[4096]; size_t n;
+        while (f && (n = f.readBytes(b, sizeof b)) > 0) got.append(b, n);
+    }
+    check(nl == 1 && got.size() > 1200 * 1024 && got == simfs::files[simfs::logKey(std::string("/log/") + li[0].name)],
+          "the portal's download reads it from there", fmt("%zu KB", got.size() / 1024));
+    commonChecks();
+}
+
+/** The partition fills: the oldest drive goes, and LittleFS keeps room to work. */
+static void scLogOwnFull() {
+    storedConfig(LOG24);
+    simfs::logsBytes = 600 * 1024;                // a small partition, to fill it in minutes
+    boot();
+    runUntil(200); carOff(); runUntil(205);       // ~400 KB
+    carOn(); runUntil(400);                       // ~400 KB more: the first must go
+    LogFileInfo li[8];
+    const size_t nl = driveLogList(li, 8);
+    check(nl == 1 && !std::strcmp(li[0].name, "00002.tlg"), "the oldest drive deleted to make room",
+          fmt("%zu files, first %s", nl, nl ? li[0].name : "-"));
+    check(simfs::usedBytesOf("@logs") + 16 * 1024 <= simfs::logsBytes, "LittleFS keeps working room",
+          fmt("%zu of %zu KB", simfs::usedBytesOf("@logs") / 1024, simfs::logsBytes / 1024));
+    commonChecks();
+}
+
+/** A master still on the older partition table (no "logs"): the logs stay on
+ *  the settings partition, at most 1200 KB of it, whatever log_max_kb says. */
+static void scLogOldTable() {
+    simfs::logsPartition = false;
+    storedConfig(LOG24);
+    boot();
+    runUntil(5);
+    DriveLogStatus st; driveLogStatus(st);
+    check(!st.own && st.capKb == 1200, "on the settings partition, 1200 KB at most",
+          fmt("own %d, %u KB", st.own, st.capKb));
+    check(simfs::logsFormats == 0 && simfs::formats == 0, "nothing formatted");
+    runUntil(700);
+    check(logBytesOn(false) <= 1200 * 1024 && logBytesOn(false) > 1000 * 1024, "the logs kept to 1200 KB",
+          fmt("%zu KB", logBytesOn(false) / 1024));
+    portalPost(R"({"oil_every_km":8000})");
+    JsonDocument d;
+    check(!deserializeJson(d, simfs::files["/config.json"]) && (d["oil_every_km"] | 0) == 8000,
+          "a settings save still fits");
+    commonChecks();
+}
+
+/** A drive file as the older firmware left it on the settings partition. */
+static std::string oldDrive(size_t rows, uint8_t seed) {
+    std::string d(16, '\0');
+    std::memcpy(&d[0], "TLG1", 4);
+    d[4] = 1; d[5] = 10; d[6] = 2;
+    d += std::string("\x0c\x01\x0d\x01", 4);
+    for (size_t r = 0; r < rows; r++)
+        for (int k = 0; k < 12; k++) d += (char)(seed + r * 7 + k);
+    return d;
+}
+
+/** The first boot with the new table: the drives on the settings partition
+ *  are moved to the logs' own, byte for byte, and the numbering goes on. */
+static void scLogMoveOld() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_ids":[268,269]})");
+    const std::string a = oldDrive(30000, 1), b = oldDrive(5000, 9);   // 352 KB and 59 KB
+    simfs::files["/log/00004.tlg"] = a;
+    simfs::files["/log/00007.tlg"] = b;
+    const std::string cfg = simfs::files["/config.json"];
+    boot();
+    runUntil(2);                                  // the move is the logger's first act
+    check(!simfs::files.count("/log/00004.tlg") && !simfs::files.count("/log/00007.tlg"),
+          "gone from the settings partition");
+    check(simfs::files[simfs::logKey("/log/00004.tlg")] == a && simfs::files[simfs::logKey("/log/00007.tlg")] == b,
+          "on the logs partition, byte for byte");
+    // (A file this short gains the firmware's own tables at boot - not the move's doing.)
+    JsonDocument before, after;
+    deserializeJson(before, cfg);
+    deserializeJson(after, simfs::files["/config.json"]);
+    check((after["log_on"] | false) && after["log_ids"].size() == 2 && after["log_ids"][1] == before["log_ids"][1],
+          "the settings kept");
+    runUntil(20);
+    DriveLogStatus st; driveLogStatus(st);
+    check(st.recording && !std::strcmp(st.file, "00008.tlg"), "the new drive numbered after them", st.file);
+    LogFileInfo li[8];
+    const size_t nl = driveLogList(li, 8);
+    check(nl == 3 && !std::strcmp(li[0].name, "00004.tlg") && li[0].rows == 30000, "listed in the portal",
+          fmt("%zu files, %s %u rows", nl, nl ? li[0].name : "-", nl ? li[0].rows : 0));
+    commonChecks();
+}
+
+/** A move cut short by a power cut (the copy whole, the original not yet
+ *  deleted): only the original goes - no second copy, nothing lost. */
+static void scLogMoveCut() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_ids":[268,269]})");
+    const std::string a = oldDrive(3000, 3);
+    simfs::logsBlank = false;
+    simfs::files["/log/00002.tlg"] = a;
+    simfs::files[simfs::logKey("/log/00002.tlg")] = a;
+    boot();
+    runUntil(10);
+    check(!simfs::files.count("/log/00002.tlg") && simfs::files[simfs::logKey("/log/00002.tlg")] == a,
+          "the original deleted, the copy kept as it was");
+    check(simfs::logsFormats == 0, "the partition in use not formatted");
+    commonChecks();
+}
+
+/** A copy that falls short (the flash refusing writes): the partial copy is
+ *  removed and the original stays where it was. */
+static void scLogMoveFails() {
+    storedConfig(R"({"log_on":false})");
+    const std::string a = oldDrive(30000, 5);
+    simfs::files["/log/00001.tlg"] = a;
+    simfs::writeBudget = 64 * 1024;               // the flash takes 64 KB, then nothing
+    boot();
+    runUntil(10);
+    simfs::writeBudget = -1;
+    check(simfs::files["/log/00001.tlg"] == a, "the original kept, unchanged");
+    check(!simfs::files.count(simfs::logKey("/log/00001.tlg")), "no partial copy left");
 }
 
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
@@ -4127,6 +4300,9 @@ static const Scenario SCENARIOS[] = {
     {"g_taught", scGTaught, 0},
     {"drive_log", scDriveLog, 0},
     {"drive_log_full", scDriveLogFull, 0},
+    {"log_own_partition", scLogOwnPartition, 0}, {"log_own_full", scLogOwnFull, 0},
+    {"log_old_table", scLogOldTable, 0}, {"log_move_old", scLogMoveOld, 0},
+    {"log_move_cut", scLogMoveCut, 0}, {"log_move_fails", scLogMoveFails, 0},
 };
 
 static const Scenario *s_sc = nullptr;

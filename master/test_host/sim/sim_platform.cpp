@@ -14,6 +14,7 @@
 
 #include "Arduino.h"
 #include "LittleFS.h"
+#include <cstring>
 #include "MasterPacket.h"
 #include "WebPortal.h"
 #include "WiFi.h"
@@ -256,15 +257,25 @@ std::set<std::string> held;
 int  renames = 0, removes = 0;
 size_t totalBytes = 1536 * 1024;
 std::set<std::string> dirs;
-size_t usedBytes() {
+bool   logsPartition = true;
+bool   logsBlank = true;                       // as it is after the update: never formatted
+int    logsMountFails = 0;
+int    logsFormats = 0;
+size_t logsBytes = 8192 * 1024;
+std::string logKey(const std::string &path) { return "@logs" + path; }
+size_t usedBytesOf(const std::string &prefix) {
     size_t n = 2 * 4096;                       // superblocks
-    for (const auto &kv : files) n += (kv.second.size() + 4095) / 4096 * 4096 + 4096;
+    for (const auto &kv : files) {
+        const bool mine = prefix.empty() ? kv.first[0] != '@' : kv.first.compare(0, prefix.size(), prefix) == 0;
+        if (mine) n += (kv.second.size() + 4095) / 4096 * 4096 + 4096;
+    }
     return n;
 }
+size_t usedBytes() { return usedBytesOf(""); }
 }
 LittleFSFS LittleFS;
 
-bool LittleFSFS::mkdir(const char *p) { simfs::dirs.insert(p); return true; }
+bool LittleFSFS::mkdir(const char *p) { simfs::dirs.insert(key(p)); return true; }
 size_t File::size() const { return _st ? _st->data.size() : 0; }
 const char *File::name() const {
     if (!_st) return "";
@@ -280,39 +291,57 @@ File File::openNextFile() {
     return f;
 }
 
-bool LittleFSFS::begin(bool formatOnFail) {
+bool LittleFSFS::begin(bool formatOnFail, const char *, uint8_t, const char *label) {
+    if (label && !std::strcmp(label, "logs")) {
+        _pfx = "@logs";
+        if (!simfs::logsPartition) return false;          // ESP_ERR_NOT_FOUND: never formatted
+        bool fails = simfs::logsBlank;
+        if (simfs::logsMountFails > 0) { simfs::logsMountFails--; fails = true; }
+        if (!fails) return true;
+        if (!formatOnFail) return false;
+        simfs::logsFormats++;
+        for (auto it = simfs::files.begin(); it != simfs::files.end();)
+            it = it->first.compare(0, 5, "@logs") == 0 ? simfs::files.erase(it) : std::next(it);
+        simfs::logsBlank = false;
+        return true;
+    }
+    _pfx.clear();
     if (!simfs::mountOk) return false;
     bool fails = simfs::blank;
     if (simfs::mountFails > 0) { simfs::mountFails--; fails = true; }
     if (!fails) return true;
     if (!formatOnFail) return false;
     // The core formats a partition that will not mount, then mounts it.
+    // The settings partition's files only: the logs' own partition is another chip area.
     simfs::formats++;
-    simfs::files.clear();
-    simfs::dirs.clear();
+    for (auto it = simfs::files.begin(); it != simfs::files.end();)
+        it = it->first[0] != '@' ? simfs::files.erase(it) : std::next(it);
+    for (auto it = simfs::dirs.begin(); it != simfs::dirs.end();)
+        it = (*it)[0] != '@' ? simfs::dirs.erase(it) : std::next(it);
     simfs::blank = false;
     return true;
 }
-bool LittleFSFS::exists(const char *p) { return simfs::files.count(p) > 0; }
+bool LittleFSFS::exists(const char *p) { return simfs::files.count(key(p)) > 0; }
 bool LittleFSFS::remove(const char *p) {
     simfs::removes++;
-    if (simfs::held.count(p)) return false;
-    return simfs::files.erase(p) > 0;
+    if (simfs::held.count(key(p))) return false;
+    return simfs::files.erase(key(p)) > 0;
 }
 bool LittleFSFS::rename(const char *from, const char *to) {
     simfs::renames++;
-    if (!simfs::files.count(from)) return false;
-    if (simfs::files.count(to) && !simfs::renameOverwrites) return false;
-    simfs::files[to] = simfs::files[from];
-    simfs::files.erase(from);
+    if (!simfs::files.count(key(from))) return false;
+    if (simfs::files.count(key(to)) && !simfs::renameOverwrites) return false;
+    simfs::files[key(to)] = simfs::files[key(from)];
+    simfs::files.erase(key(from));
     return true;
 }
-File LittleFSFS::open(const char *path, const char *mode) {
+File LittleFSFS::open(const char *p, const char *mode) {
     File f;
+    const std::string path = key(p);
     const bool w = mode && mode[0] == 'w', a = mode && mode[0] == 'a';
     if (!w && !a && !simfs::files.count(path)) {
         // A directory: a path made with mkdir, or one files live under.
-        const std::string pre = std::string(path) + "/";
+        const std::string pre = path + "/";
         std::vector<std::string> list;
         for (const auto &kv : simfs::files)
             if (kv.first.compare(0, pre.size(), pre) == 0 && kv.first.find('/', pre.size()) == std::string::npos)

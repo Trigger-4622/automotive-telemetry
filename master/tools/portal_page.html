@@ -204,7 +204,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
  <div class="card"><h2>Drive log <small>to the master's flash</small></h2>
   <div class="f"><div class="l"><b>Record every drive</b><span>from the car coming on to it going off, one file a drive · the files are on the Diagnostics tab</span></div><input type="checkbox" data-k="log_on"></div>
   <div class="f"><div class="l"><b>Rows per second</b></div><input type="number" data-k="log_hz" min="1" max="20"></div>
-  <div class="f"><div class="l"><b>Space for logs</b><span>KB of the 1.5 MB settings partition · the oldest drive goes first</span></div><input type="number" data-k="log_max_kb" min="64" max="1200"></div>
+  <div class="f"><div class="l"><b>Space for logs</b><span>KB of the logs' own 8 MB partition (1200 at most on an older partition table) · the oldest drive goes first</span></div><input type="number" data-k="log_max_kb" min="64" max="8000"></div>
   <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
    <div id="lgIds" class="row" style="margin-top:8px"></div>
    <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
@@ -443,7 +443,7 @@ const ADV=[
   ['oil_at_km','Oil last changed at','num','km on the odometer · -1 = no reminder',-1,9999999],
   ['log_on','Record every drive','bool'],
   ['log_hz','Drive log rows per second','num','1–20',1,20],
-  ['log_max_kb','Space for drive logs','num','KB',64,1200]]],
+  ['log_max_kb','Space for drive logs','num','KB',64,8000]]],
  ['Power',[
   ['sleep_enabled','Sleep when the car is off','bool'],
   ['sleep_idle_s','Sleep after','num','s',10,3600],
@@ -1278,7 +1278,7 @@ async function pollLogsOnce(){
  if(TAB!=='diag'||TEACH)return;
  try{LOGS=await req('/api/logs',null,5000)}catch(e){return}
  const d=LOGS;
- $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on flash`;
+ $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on ${d.own?'the logs partition':'the settings partition (older partition table)'}`;
  $('#lgSay').innerHTML=!d.on?'Recording is off: switch it on under Settings, Drive log.':
   d.rec?`<span class="ok">Recording <b>${esc(d.file)}</b></span>: ${d.rows} rows so far.`:
   d.note?`<span class="warn">${esc(d.note)}</span>`:'Recording starts when the car comes on.';
@@ -1298,7 +1298,7 @@ function renderLogIds(){
  const ids=C.log_ids||[];if(!$('#lgIds'))return;
  $('#lgIds').innerHTML=ids.map((id,i)=>`<span class="pill">${esc(nm(id))}<button class="x" onclick="logRm(${i})">✕</button></span>`).join('')||
   '<span class="muted">Nothing chosen: nothing is recorded.</span>';
- const hz=C.log_hz||10,bps=(4+4*ids.length)*hz,cap=(C.log_max_kb||1024)*1024;
+ const hz=C.log_hz||10,bps=(4+4*ids.length)*hz,cap=(C.log_max_kb||8000)*1024;
  $('#lgEst').textContent=ids.length?`${ids.length} of 24 · ${(bps/1024).toFixed(2)} KB a second · about ${Math.round(cap/bps/60)} min of driving fit`:'';
  if(document.activeElement!==$('#lgAdd'))$('#lgAdd').innerHTML='<option value="0">Add a value…</option>'+metricOpts(-1,id=>!ids.includes(id))}
 function logAdd(){const id=+$('#lgAdd').value,ids=C.log_ids||[];if(!id||ids.length>=24)return;C.log_ids=ids.concat(id);setDirty(true);renderLogIds()}

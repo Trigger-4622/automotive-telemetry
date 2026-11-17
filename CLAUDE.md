@@ -67,7 +67,9 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 - Cloud sessions cannot flash hardware. Flashing happens on the owner's PC:
   full `esptool read_flash` backup and `verify_flash` first, check the
   partition table matches the build, plain `pio run -t upload`, then read back
-  the settings partition.
+  the settings partition. The master's table gained the `logs` partition on
+  2026-11-17 (the first upload after it writes the new table; the settings
+  partition, 0x670000 + 0x180000, must read back identical to the backup).
 
 ## Things that must stay in sync (`scripts/check_sync.py` enforces them)
 
@@ -401,10 +403,19 @@ when it does not (`lamp_hazard_switch`).
   derives longitudinal G from the speed's slope and lateral G from speed x yaw
   (`gDerive`, SRC_DERIVED: a taught field outranks it). ISO 8855 signs.
 - **Drive log** (`master/src/DriveLog.*`): `log_on`, `log_hz`, `log_ids`,
-  `log_max_kb`; `/log/NNNNN.tlg` on the settings partition, oldest deleted
-  first (one open for a download will not delete and is passed over), 128 KB
-  always left for settings saves, 4 KB writes announced with
-  `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
+  `log_max_kb` (64-8000, default 8000); `/log/NNNNN.tlg` on the logs' own
+  LittleFS partition `logs` - the upper 8 MB of the 16 MB flash, which the
+  stock 8 MB layout left blank (`master/partitions_16mb.csv`: its first six
+  entries byte-identical to the stock table, so the settings partition never
+  moves). Formatted once when found blank, after three failed mounts; drives
+  the older firmware left on the settings partition are moved across once,
+  each checked before its original goes (`log_move_old`, `log_move_cut`,
+  `log_move_fails`). Without the partition (an older table) they stay on the
+  settings partition as before: at most 1200 KB, 128 KB always left for
+  settings saves (`log_old_table`, `drive_log_full`). Oldest deleted first
+  (one open for a download will not delete and is passed over), 4 KB writes
+  announced with `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
+  The QEMU test has no `logs` partition (its flash refuses LittleFS anyway).
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
   stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once.

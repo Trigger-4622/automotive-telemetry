@@ -1,0 +1,13 @@
+# The master's partition table: the stock 8 MB layout (default_8MB.csv), entry
+# for entry the same - the settings partition ("spiffs") does not move, so the
+# saved settings and learned signals survive the change - and the drive logs'
+# own partition in the upper 8 MB of the 16 MB flash, which that layout left
+# blank. See src/DriveLog.h.
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x330000,
+app1,     app,  ota_1,   0x340000, 0x330000,
+spiffs,   data, spiffs,  0x670000, 0x180000,
+coredump, data, coredump,0x7F0000, 0x10000,
+logs,     data, spiffs,  0x800000, 0x800000,

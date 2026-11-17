@@ -396,7 +396,9 @@ public:
     int32_t  oilAtKm     = -1;
     bool     logOn       = false;  /**< Record drives to flash.             */
     uint8_t  logHz       = 10;     /**< Rows per second (1-20).             */
-    uint16_t logMaxKb    = 1024;   /**< Flash the logs may use [KB].        */
+    uint16_t logMaxKb    = 8000;   /**< Flash the logs may use [KB]: 64-8000 on
+                                        their own partition, 1200 at most on the
+                                        settings partition (older table).      */
     std::vector<uint16_t> logIds;  /**< Recorded metrics, in column order.  */
     /** @brief What a drive log records out of the box: enough to compare
      *         SI-Drive modes (boost against its target, load, timing). */
