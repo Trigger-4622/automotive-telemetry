@@ -15,6 +15,8 @@
 #include "Arduino.h"
 #include "LittleFS.h"
 #include <cstring>
+#include "Update.h"
+#include "esp_ota_ops.h"
 #include "MasterPacket.h"
 #include "WebPortal.h"
 #include "WiFi.h"
@@ -195,6 +197,60 @@ EspClassMock ESP;
 uint32_t EspClassMock::getFreeHeap() { return sim::heapFree; }
 uint32_t EspClassMock::getMinFreeHeap() { return sim::heapFree; }
 uint32_t EspClassMock::getMaxAllocHeap() { return sim::heapFree / 2; }
+/* ═════════════════════════ firmware update ═════════════════════════════ */
+
+namespace sim {
+std::string otaImage;
+int  otaBegins = 0;
+bool otaSwitched = false, otaAborted = false;
+int  otaState = ESP_OTA_IMG_UNDEFINED;          // flashed over USB: no trial
+bool otaMarkedValid = false, otaLastInvalid = false;
+}
+UpdateClass Update;
+bool UpdateClass::begin(size_t, int, int, uint8_t, const char *) {
+    sim::otaBegins++;
+    sim::otaImage.clear();
+    sim::otaAborted = false;
+    _err = 0;
+    _running = true;
+    return true;
+}
+size_t UpdateClass::write(uint8_t *data, size_t len) {
+    if (!_running) return 0;
+    if (sim::otaImage.empty() && len && data[0] != 0xE9) { _err = 1; return 0; }   // as the core: "Magic byte is wrong"
+    sim::otaImage.append((const char *)data, len);
+    return len;
+}
+bool UpdateClass::end(bool) {
+    if (!_running) return false;
+    _running = false;
+    if (sim::otaImage.size() < 1024 || (uint8_t)sim::otaImage[0] != 0xE9) { _err = 2; return false; }
+    sim::otaSwitched = true;
+    return true;
+}
+void UpdateClass::abort() { _running = false; sim::otaAborted = true; }
+const char *UpdateClass::errorString() { return _err == 1 ? "Magic byte is wrong" : _err ? "Image invalid" : "No Error"; }
+
+static esp_partition_t s_app0 = {"app0"};
+const esp_partition_t *esp_ota_get_running_partition() { return &s_app0; }
+esp_err_t esp_ota_get_state_partition(const esp_partition_t *, esp_ota_img_states_t *st) {
+    if (sim::otaState == ESP_OTA_IMG_UNDEFINED) return ESP_ERR_NOT_FOUND;   // no otadata entry
+    *st = (esp_ota_img_states_t)sim::otaState;
+    return ESP_OK;
+}
+esp_err_t esp_ota_mark_app_valid_cancel_rollback() {
+    sim::otaMarkedValid = true;
+    if (sim::otaState == ESP_OTA_IMG_PENDING_VERIFY) sim::otaState = ESP_OTA_IMG_VALID;
+    return ESP_OK;
+}
+static esp_partition_t s_app1 = {"app1"};
+const esp_partition_t *esp_ota_get_last_invalid_partition() { return sim::otaLastInvalid ? &s_app1 : nullptr; }
+int esp_ota_get_app_elf_sha256(char *dst, size_t size) {
+    const char *h = "5f3a9c0d1e2b4a6f00112233445566778899aabbccddeeff0011223344556677";
+    std::snprintf(dst, size, "%s", h);
+    return (int)std::strlen(dst);
+}
+
 void EspClassMock::restart() {
     if (sim::restartReturns) { sim::restarts++; std::printf("*** ESP.restart() (expected)\n"); return; }
     std::printf("*** ESP.restart()\n");

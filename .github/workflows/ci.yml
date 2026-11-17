@@ -60,3 +60,12 @@ jobs:
           key: pio-${{ runner.os }}-${{ hashFiles(format('{0}/platformio.ini', matrix.project)) }}
       - run: pip install platformio
       - run: pio run -d ${{ matrix.project }}
+      # The master's image for the portal's "Update firmware" (Settings >
+      # Firmware): download it from the run's artifacts on the phone.
+      - name: Keep the master firmware for a Wi-Fi update
+        if: matrix.project == 'master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: master-firmware
+          path: master/.pio/build/master-bridge/firmware.bin
+          if-no-files-found: error

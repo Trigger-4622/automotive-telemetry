@@ -16,6 +16,8 @@
 #include "Arduino.h"
 #include "LittleFS.h"
 #include "DiagCodes.h"
+#include "FwUpdate.h"
+#include "esp_ota_ops.h"
 #include "DriveLog.h"
 #include "DtcText.h"
 #include "Learner.h"
@@ -3486,6 +3488,140 @@ static void scLogMoveFails() {
     check(!simfs::files.count(simfs::logKey("/log/00001.tlg")), "no partial copy left");
 }
 
+/* ───────────── firmware update over the portal (FwUpdate) ───────────── */
+
+/** A firmware image as a build makes one: the ESP32 magic byte first, and the
+ *  master's mark somewhere inside (at @p markAt; npos = left out). */
+static std::string fwImage(size_t bytes, size_t markAt) {
+    std::string img(bytes, '\0');
+    for (size_t i = 0; i < bytes; i++) img[i] = (char)(i * 131 + 7);
+    img[0] = (char)0xE9;
+    if (markAt != std::string::npos) {
+        const char *m = "CANTELEMETRY-MASTER-FIRMWARE/1";
+        std::memcpy(&img[markAt], m, std::strlen(m));
+    }
+    return img;
+}
+/** Send an image as the portal's upload does, in @p piece-byte pieces. */
+static bool fwSend(const std::string &img, size_t piece, char *why, size_t cap) {
+    if (!fwUpdateBegin(why, cap)) return false;
+    for (size_t at = 0; at < img.size(); at += piece) {
+        const size_t n = std::min(piece, img.size() - at);
+        if (!fwUpdateWrite((const uint8_t *)img.data() + at, n, why, cap)) return false;
+    }
+    return fwUpdateEnd(why, cap);
+}
+
+/** Parked: the image goes in whole, its mark found even where two pieces
+ *  meet, and the master is set to boot into it. Every write announced as a
+ *  stall (the CAN interrupt is held off while flash is written). */
+static void scFwUpdate() {
+    sim::speedOverride = [](double) { return 0.0; };
+    boot();
+    runUntil(15);
+    FwStatus fs; fwStatus(fs);
+    check(fs.version && !std::strcmp(fs.slot, "app0") && !fs.trial && !fs.rolledBack && std::strlen(fs.build) == 16,
+          "the portal says which firmware runs", fmt("%s, build %s, %s", fs.version, fs.build, fs.slot));
+    const std::string img = fwImage(1100 * 1024, 1460 * 300 - 11);   // the mark across two pieces
+    char why[96] = "";
+    const bool ok = fwSend(img, 1460, why, sizeof why);
+    check(ok && sim::otaSwitched && sim::otaImage == img, "written whole and switched to", why);
+    check(!fwUpdateBusy(), "and finished");
+    runUntil(20);
+    check(!sim::sleepEntered && simBugs() == 0, "the car side carried on", fmt("%d", simBugs()));
+    commonChecks();
+}
+
+/** Moving: refused before anything is written. */
+static void scFwUpdateMoving() {
+    sim::speedOverride = [](double) { return 60.0; };
+    boot();
+    runUntil(15);
+    char why[96] = "";
+    check(!fwUpdateBegin(why, sizeof why) && !std::strcmp(why, "stop the car first"), "refused while moving", why);
+    check(sim::otaBegins == 0 && sim::otaImage.empty(), "nothing written");
+    commonChecks();
+}
+
+/** Not the master's firmware: a display's (no mark) or not an image at all -
+ *  nothing switched, the running firmware stays. */
+static void scFwUpdateWrongImage() {
+    sim::speedOverride = [](double) { return 0.0; };
+    boot();
+    runUntil(15);
+    char why[96] = "";
+    const std::string display = fwImage(900 * 1024, std::string::npos);
+    check(!fwSend(display, 1460, why, sizeof why) && std::strstr(why, "not the master's firmware"),
+          "a display's firmware is refused at the end", why);
+    check(!sim::otaSwitched && sim::otaAborted, "nothing switched, the slot's writing undone");
+    std::string notImage = fwImage(400 * 1024, 5000);
+    notImage[0] = 'P';                                   // a zip, a page - anything but an image
+    check(!fwSend(notImage, 1460, why, sizeof why) && std::strstr(why, "not a firmware image"),
+          "anything else is refused at the first piece", why);
+    check(!sim::otaSwitched && !fwUpdateBusy(), "nothing switched");
+    commonChecks();
+}
+
+/** An upload that stops coming (the phone left the Wi-Fi): given up after
+ *  FW_STALL_MS, and the master sleeps as usual once the bus is quiet - not
+ *  held awake by it for ever. */
+static void scFwUpdateCut() {
+    storedConfig(R"({"sleep_idle_s":20})");
+    sim::speedOverride = [](double) { return 0.0; };
+    boot();
+    runUntil(10);
+    char why[96] = "";
+    const std::string img = fwImage(600 * 1024, 4000);
+    check(fwUpdateBegin(why, sizeof why) &&
+          fwUpdateWrite((const uint8_t *)img.data(), 64 * 1024, why, sizeof why), "an upload starts", why);
+    carOff();
+    runUntil(35);                                      // quiet 25 s: would sleep, but the upload holds it
+    check(!sim::sleepEntered && fwUpdateBusy(), "no sleep in the middle of an upload");
+    runUntil(50);
+    check(!fwUpdateBusy() && sim::otaAborted && !sim::otaSwitched, "given up when nothing more came, nothing switched");
+    runUntil(80);
+    check(sim::sleepEntered, "then sleeps as usual");
+}
+
+/** A new firmware on trial: kept only after 30 s of running with the portal
+ *  up - a crash before then boots the previous one (the bootloader's doing). */
+static void scFwTrial() {
+    sim::otaState = ESP_OTA_IMG_PENDING_VERIFY;
+    boot();
+    runUntil(20);
+    FwStatus fs; fwStatus(fs);
+    check(fs.trial && !sim::otaMarkedValid, "on trial for its first 30 s");
+    check(logHas("new, on trial"), "and says so at boot");
+    runUntil(40);
+    fwStatus(fs);
+    check(sim::otaMarkedValid && !fs.trial, "kept once it has run 30 s");
+    commonChecks();
+}
+
+/** On trial and the car goes off: confirmed before deep sleep (a wake is a
+ *  reset, which would go back to the previous firmware). */
+static void scFwTrialSleep() {
+    storedConfig(R"({"sleep_idle_s":10})");
+    sim::otaState = ESP_OTA_IMG_PENDING_VERIFY;
+    boot();
+    runUntil(5);
+    carOff();
+    runUntil(40);
+    check(sim::sleepEntered && sim::otaMarkedValid, "kept before it slept");
+}
+
+/** Flashed over USB (no trial) or rolled back: nothing to confirm; a
+ *  rollback is reported. */
+static void scFwRolledBack() {
+    sim::otaLastInvalid = true;
+    boot();
+    runUntil(40);
+    FwStatus fs; fwStatus(fs);
+    check(fs.rolledBack && logHas("did not run properly"), "the rollback is reported");
+    check(!sim::otaMarkedValid, "nothing on trial, nothing confirmed");
+    commonChecks();
+}
+
 struct Scenario { const char *name; void (*fn)(); double budgetS; };
 /* ───────────── body values: flashing, positions, derived ───────────── */
 
@@ -4303,6 +4439,9 @@ static const Scenario SCENARIOS[] = {
     {"log_own_partition", scLogOwnPartition, 0}, {"log_own_full", scLogOwnFull, 0},
     {"log_old_table", scLogOldTable, 0}, {"log_move_old", scLogMoveOld, 0},
     {"log_move_cut", scLogMoveCut, 0}, {"log_move_fails", scLogMoveFails, 0},
+    {"fw_update", scFwUpdate, 0}, {"fw_update_moving", scFwUpdateMoving, 0},
+    {"fw_update_wrong_image", scFwUpdateWrongImage, 0}, {"fw_update_cut", scFwUpdateCut, 0},
+    {"fw_trial", scFwTrial, 0}, {"fw_trial_sleep", scFwTrialSleep, 0}, {"fw_rolled_back", scFwRolledBack, 0},
 };
 
 static const Scenario *s_sc = nullptr;

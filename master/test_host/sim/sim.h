@@ -208,6 +208,16 @@ extern bool bootButtonDown;
  *  counts it in @ref restarts and carries on, for a scenario that expects it. */
 extern bool restartReturns;
 extern int  restarts;
+/** @name Firmware update (Update.h / esp_ota_ops.h mocks)
+ *  @{ */
+extern std::string otaImage;     ///< What Update.write() was given.
+extern int  otaBegins;           ///< Update.begin() calls.
+extern bool otaSwitched;         ///< Update.end() accepted it: the next boot is into it.
+extern bool otaAborted;          ///< Update.abort() since the last begin.
+extern int  otaState;            ///< The running image's esp_ota_img_states_t.
+extern bool otaMarkedValid;      ///< esp_ota_mark_app_valid_cancel_rollback() called.
+extern bool otaLastInvalid;      ///< A previous update was rolled back.
+/** @} */
 
 /** CAN-TX recessive hold observation. gpioHoldPin/Enabled track gpio_hold_en on
  *  the TX pin (latched high across sleep); txDrivenHigh is its driven level. */

@@ -70,6 +70,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   the settings partition. The master's table gained the `logs` partition on
   2026-11-17 (the first upload after it writes the new table; the settings
   partition, 0x670000 + 0x180000, must read back identical to the backup).
+  From that firmware on, the master also updates over Wi-Fi (below); the
+  screens have one app slot each and are USB only.
 
 ## Things that must stay in sync (`scripts/check_sync.py` enforces them)
 
@@ -416,6 +418,23 @@ when it does not (`lamp_hazard_switch`).
   (one open for a download will not delete and is passed over), 4 KB writes
   announced with `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
   The QEMU test has no `logs` partition (its flash refuses LittleFS anyway).
+- **Firmware update over Wi-Fi** (master only, `master/src/FwUpdate.*`;
+  portal Settings > Firmware, `/api/update`): the upload goes into the spare
+  app slot (app0/app1; a USB upload always writes app0 and resets otadata to
+  it), is checked (0xE9 image, `FW_MARK` - a display's ESP32-S3 image would
+  pass every other check - then the core's checksum, hash and chip check) and
+  the master restarts into it through `masterBeforeRestart()`. Refused while
+  moving (speed > 2 km/h); every write announced with `masterBusStall()`; an
+  upload that stops for `FW_STALL_MS` is dropped, and sleep waits for one in
+  progress. Rollback is the bootloader's (`CONFIG_BOOTLOADER_APP_ROLLBACK_
+  ENABLE`; `verifyRollbackLater()` overrides Arduino's confirm-at-once): a new
+  firmware is on trial until it has run `FW_CONFIRM_MS` (30 s) with the portal
+  up, or reaches a clean deep sleep with it up; any reset before that boots
+  the previous one. A firmware older than this one has no `FW_MARK` and is
+  refused (going back to it is a USB job). CI keeps the master's `firmware.bin`
+  as the `master-firmware` artifact. Scenarios `fw_update*`, `fw_trial*`,
+  `fw_rolled_back`. Not tried on the board: the upload's speed over the AP,
+  the frames each flash write costs, the restart into app1.
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
   stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once.

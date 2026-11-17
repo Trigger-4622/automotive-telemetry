@@ -51,6 +51,7 @@
 #include "Learner.h"
 #include "Ssm2.h"
 #include "DiagCodes.h"
+#include "FwUpdate.h"
 #include "DriveLog.h"
 #include "WebPortal.h"
 
@@ -3197,6 +3198,9 @@ static void canShutdown() {
  * on the filesystem rather than in RAM.
  */
 static void enterDeepSleep() {
+    // A wake is a reset: a new firmware still on trial would be rolled back.
+    // One that got this far with its portal up is working - kept first.
+    fwUpdateTick(!Cfg.portalOn || Portal.running(), true);
     log_i("bus quiet for %u s - sleeping, will wake on CAN activity",
           Cfg.sleepIdleS);
     Cfg.serviceSave();               // never lose a pending save to sleep
@@ -3229,6 +3233,7 @@ static void enterDeepSleep() {
  */
 static void sleepCheck() {
     if (!Cfg.sleepEnabled) return;
+    if (fwUpdateBusy()) return;          // a firmware upload in progress finishes first
 
     const uint32_t idleMs = (uint32_t)Cfg.sleepIdleS * 1000UL;
     const uint32_t quietFor = millis() - (s_lastCanMs ? s_lastCanMs : 0);
@@ -3763,6 +3768,7 @@ void setup() {
     const esp_reset_reason_t rr = esp_reset_reason();
     evLog(EV_BOOT, (uint16_t)rr, MasterConfig::CFG_VERSION);
     log_i("boot: reset reason %d", (int)rr);
+    fwBootReport();                  // which firmware, and whether the last update was rolled back
 
     // Listen-only to begin with while there is a settle wait: it runs from
     // the bus's first frame, and busGuardTask switches to normal after it.
@@ -3922,6 +3928,7 @@ void loop() {
         }
     }
     Portal.loop();
+    fwUpdateTick(!Cfg.portalOn || Portal.running());
     if (Cfg.radioDbm != s_radioDbmApplied) applyRadioPower();
     Cfg.serviceSave();
     evService();

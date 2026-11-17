@@ -18,6 +18,7 @@
 #include <LittleFS.h>
 
 #include "DiagCodes.h"
+#include "FwUpdate.h"
 #include "DriveLog.h"
 #include "Learner.h"
 #include "MasterConfig.h"
@@ -616,6 +617,65 @@ void WebPortal::setupRoutes() {
         sendOk();
         delay(300);
         ESP.restart();
+    });
+
+    /*
+     * Firmware update (FwUpdate): the upload goes into the spare app slot as
+     * it arrives, is checked, and the master restarts into it - and keeps it
+     * only once it has run properly. Refused while moving.
+     */
+    s_server.on("/api/update", HTTP_GET, []() {
+        FwStatus fs;
+        fwStatus(fs);
+        JsonDocument d;
+        d["version"]     = fs.version;
+        d["build"]       = fs.build;
+        d["slot"]        = fs.slot;
+        d["trial"]       = fs.trial;
+        d["rolled_back"] = fs.rolledBack;
+        d["busy"]        = fs.busy;
+        d["received"]    = fs.received;
+        d["mark"]        = fs.mark;
+        char why[48] = "";
+        d["allowed"]     = fwUpdateAllowed(why, sizeof why);
+        d["why"]         = why;
+        sendJson(d);
+    });
+    static bool s_updOk = false;
+    static char s_updWhy[96] = "";
+    s_server.on("/api/update", HTTP_POST, []() {
+        if (!s_updOk) {
+            JsonDocument d;
+            d["error"] = s_updWhy[0] ? s_updWhy : "no firmware received";
+            String out;
+            serializeJson(d, out);
+            s_server.send(409, "application/json", out);
+            return;
+        }
+        masterBeforeRestart();
+        sendOk();
+        delay(300);
+        ESP.restart();
+    }, []() {
+        // Called as the upload arrives: the whole of it, before the answer above.
+        HTTPUpload &up = s_server.upload();
+        switch (up.status) {
+            case UPLOAD_FILE_START:
+                s_updWhy[0] = '\0';
+                s_updOk = fwUpdateBegin(s_updWhy, sizeof s_updWhy);
+                break;
+            case UPLOAD_FILE_WRITE:
+                if (s_updOk) s_updOk = fwUpdateWrite(up.buf, up.currentSize, s_updWhy, sizeof s_updWhy);
+                break;
+            case UPLOAD_FILE_END:
+                if (s_updOk) s_updOk = fwUpdateEnd(s_updWhy, sizeof s_updWhy);
+                break;
+            default:                                  // UPLOAD_FILE_ABORTED: the connection went
+                fwUpdateAbort();
+                s_updOk = false;
+                snprintf(s_updWhy, sizeof s_updWhy, "the upload was cut off");
+                break;
+        }
     });
 
     s_server.on("/api/reboot", HTTP_POST, []() {
