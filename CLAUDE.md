@@ -467,8 +467,13 @@ when it does not (`lamp_hazard_switch`).
   they stood for read with the SSM2 request, the two logged SSM2 values this
   ECU does not offer - Front O2 #1, Knock correction - replaced by A/F 1
   lambda and Knock corr fine). Left for the owner: both front doors on one bit
-  (0x431 bit 40), "Brake" overlapping the speed's high byte (0x333), SSM2 at
-  5 Hz against a 10 Hz log. The learner rules above are harness only; on the
+  (0x431 bit 40), SSM2 at 5 Hz against a 10 Hz log. A file of 2026-11-17
+  (config5, upload pending) also moves "Brake" to 0x333 byte 2 (it overlapped
+  the speed's high byte) and sets the speed to Subaru's 0.05625 km/h per bit
+  (the learned -0.5 offset was OBD's whole km/h): this car's 0x333 is laid out
+  like the 2017 Forester's 0x0D1 (speed bytes 0-1, brake byte 2, a flag in
+  byte 3). Of this car's signal IDs only 0x002 (steering, same layout) also
+  exists on the Forester - its other addresses do not carry over. The learner rules above are harness only; on the
   car, the serial log's "no longer agrees with the ECU" lines say what a
   re-check turned down.
 - RAM (2026-11-16): harness, build and QEMU (`master/test_qemu/README.md`:
