@@ -39,4 +39,8 @@ another one instead. The P1718 scenarios drive with the first fixture.
 | `portal_tests.js` | The portal's teach-by-doing analysis, run in Node (`portal_teach`) |
 
 What it cannot show: preemption in the middle of code that never blocks,
-real electrical bus behaviour, and radio timing. Those need the car.
+real electrical bus behaviour, and radio timing. Those need the car - except
+a race between a clock reading and what another task writes meanwhile: a
+scenario can let the other tasks run right after a `millis()` reading
+(`simrtos::g_afterMillis`, `sleep_busy_bus_race`). `../test_qemu` runs the
+real firmware on both cores of an emulated chip.

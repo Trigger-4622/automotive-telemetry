@@ -1,8 +1,11 @@
-# The test build only: one large app partition, so a recorded CAN log of a
-# few megabytes can ride in the firmware image (shim/replay.bin).
+# The test build only (never flashed): one large app partition, so a recorded
+# CAN drive of up to ~11.8 MB rides in the firmware image (shim/replay.bin);
+# the settings partition and a "logs" partition, as the master's own table has
+# them, so the settings file and the drive logger run for real.
 # Name,   Type, SubType, Offset,   Size
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
-app0,     app,  ota_0,   0x10000,  0xC00000,
-spiffs,   data, spiffs,  0xC10000, 0x180000,
-coredump, data, coredump,0xD90000, 0x10000,
+app0,     app,  ota_0,   0x10000,  0xC80000,
+spiffs,   data, spiffs,  0xC90000, 0x180000,
+coredump, data, coredump,0xE10000, 0x10000,
+logs,     data, spiffs,  0xE20000, 0x1E0000,

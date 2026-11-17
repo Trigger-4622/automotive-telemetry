@@ -226,7 +226,7 @@ void MasterConfig::loadDefaults() {
     ssmRemoved.clear();
     dtcPollS = 60;
     oilEveryKm = 7500; oilAtKm = -1;
-    logOn = false; logHz = 10; logMaxKb = 1024;
+    logOn = false; logHz = 10; logMaxKb = 8000;
     defaultLogIds(logIds);
 
     unlock();
@@ -774,7 +774,9 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     oilAtKm    = jint(v["oil_at_km"], oilAtKm, -1, 9999999);
     logOn      = v["log_on"] | logOn;
     logHz      = (uint8_t)jint(v["log_hz"], logHz, 1, 20);
-    logMaxKb   = (uint16_t)jint(v["log_max_kb"], logMaxKb, 64, 1200);
+    // Up to the logs' own 8 MB partition; on the settings partition (the
+    // older partition table) the logger itself keeps them to 1200 KB.
+    logMaxKb   = (uint16_t)jint(v["log_max_kb"], logMaxKb, 64, 8000);
     if (v["log_ids"].is<JsonArrayConst>()) {
         logIds.clear();
         for (JsonVariantConst a : v["log_ids"].as<JsonArrayConst>()) {

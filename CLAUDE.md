@@ -19,7 +19,8 @@ python master/test_host/run.py portal_teach                    # the portal's te
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
 python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # the real master firmware in Espressif's QEMU (needs $QEMU_ESP32S3; not in test_all)
-python master/test_qemu/run.py --replay drive.log   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
+python master/test_qemu/run.py --replay drive.log [--settings cfg.json]   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
+python master/test_qemu/run.py --ota                # ...a Wi-Fi firmware update, kept, a second one crashing, rolled back
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
@@ -27,8 +28,10 @@ python master/tools/known_catalogue.py        # after adding metric IDs to Maste
 The harnesses are the only way to exercise the firmware's logic without
 hardware. `master/test_qemu` (its README) runs the real compiled master on an
 emulated ESP32-S3 - real stacks, heap and both cores, which the harness cannot
-show - against a simulated car; it has no radio, no CAN error counters and no
-working settings file, and is a test build that must never be flashed.
+show - against a simulated car; it has no radio and no CAN error counters (the
+settings file and the drive log work: its flash is read in DIO mode, QEMU
+misreads QIO), and is a test build that must never be flashed. QEMU itself now
+and then segfaults early in a boot; run.py tries again (3 times, 5 with --ota).
 In a cloud session `scripts/cloud-setup.sh` (session-start hook) has installed
 what they need; if it printed "NOT set up", say so rather than skipping the
 tests. Firmware builds need `*.platformio.org` on the environment's network
@@ -67,7 +70,11 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 - Cloud sessions cannot flash hardware. Flashing happens on the owner's PC:
   full `esptool read_flash` backup and `verify_flash` first, check the
   partition table matches the build, plain `pio run -t upload`, then read back
-  the settings partition.
+  the settings partition. The master's table gained the `logs` partition on
+  2026-11-17 (the first upload after it writes the new table; the settings
+  partition, 0x670000 + 0x180000, must read back identical to the backup).
+  From that firmware on, the master also updates over Wi-Fi (below); the
+  screens have one app slot each and are USB only.
 
 ## Things that must stay in sync (`scripts/check_sync.py` enforces them)
 
@@ -118,6 +125,14 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   asking every PID while the ECU is off. `masterBeforeRestart()` takes the
   controller off the bus and latches the TX pad recessive (RTC hold) across
   every portal restart; `txRecessiveBoot()` drives the pin before releasing it.
+- **A stamp written by another task: read it, then the clock**
+  (`sleep_busy_bus_race`). `s_lastCanMs` is written by the receive task on
+  core 1; `millis() - s_lastCanMs` evaluated the other way round wraps to 49
+  days when a frame is stamped in between, and the sleep check put the master
+  to sleep on a busy bus (QEMU, a real 40-minute drive, 2026-11-17).
+  `settleLeft()`, `heardWithin()` and `diagBusAlive()` already read it first.
+  The harness shows such races only through `simrtos::g_afterMillis` (other
+  tasks run right after a clock reading, as a preemption or the other core).
 - **Asking the car** (`pacing_p2can*`, `obd_two_ecus`, `obd_pending`,
   `dtc_functional_fc`, `dtc_tcm_silent`): one request on the bus at a time,
   whoever sends it - the OBD-II poller, SSM2 and the code reader all take
@@ -401,10 +416,41 @@ when it does not (`lamp_hazard_switch`).
   derives longitudinal G from the speed's slope and lateral G from speed x yaw
   (`gDerive`, SRC_DERIVED: a taught field outranks it). ISO 8855 signs.
 - **Drive log** (`master/src/DriveLog.*`): `log_on`, `log_hz`, `log_ids`,
-  `log_max_kb`; `/log/NNNNN.tlg` on the settings partition, oldest deleted
-  first (one open for a download will not delete and is passed over), 128 KB
-  always left for settings saves, 4 KB writes announced with
-  `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
+  `log_max_kb` (64-8000, default 8000); `/log/NNNNN.tlg` on the logs' own
+  LittleFS partition `logs` - the upper 8 MB of the 16 MB flash, which the
+  stock 8 MB layout left blank (`master/partitions_16mb.csv`: its first six
+  entries byte-identical to the stock table, so the settings partition never
+  moves). Formatted once when found blank, after three failed mounts; drives
+  the older firmware left on the settings partition are moved across once,
+  each checked before its original goes (`log_move_old`, `log_move_cut`,
+  `log_move_fails`). Without the partition (an older table) they stay on the
+  settings partition as before: at most 1200 KB, 128 KB always left for
+  settings saves (`log_old_table`, `drive_log_full`). Oldest deleted first
+  (one open for a download will not delete and is passed over), 4 KB writes
+  announced with `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
+  The QEMU test has a 1.9 MB `logs` partition (8 MB with `--ota`).
+- **Firmware update over Wi-Fi** (master only, `master/src/FwUpdate.*`;
+  portal Settings > Firmware, `/api/update`): the upload goes into the spare
+  app slot (app0/app1; a USB upload always writes app0 and resets otadata to
+  it), is checked (0xE9 image, `FW_MARK` - a display's ESP32-S3 image would
+  pass every other check - then the core's checksum, hash and chip check) and
+  the master restarts into it through `masterBeforeRestart()`. Refused while
+  moving (speed > 2 km/h); every write announced with `masterBusStall()`; an
+  upload that stops for `FW_STALL_MS` is dropped, and sleep waits for one in
+  progress. Rollback is the bootloader's (`CONFIG_BOOTLOADER_APP_ROLLBACK_
+  ENABLE`; `verifyRollbackLater()` overrides Arduino's confirm-at-once): a new
+  firmware is on trial until it has run `FW_CONFIRM_MS` (30 s) with the portal
+  up, or reaches a clean deep sleep with it up; any reset before that boots
+  the previous one. A firmware older than this one has no `FW_MARK` and is
+  refused (going back to it is a USB job). CI keeps the master's `firmware.bin`
+  as the `master-firmware` artifact. Scenarios `fw_update*`, `fw_trial*`,
+  `fw_rolled_back`, `fw_trial_late_clock`. In QEMU (`run.py --ota`, the
+  board's partition table, the real bootloader): written in the portal's
+  pieces, checked, booted on trial, kept after 30 s; a second update crashing
+  before it is kept was rolled back and reported; settings and learned values
+  loaded alike at every boot (one run of fifteen: QEMU itself crashed in the
+  rest, test_qemu/README.md). Not tried on the board: the upload's speed over
+  the AP, the frames each flash write costs.
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
   stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once.

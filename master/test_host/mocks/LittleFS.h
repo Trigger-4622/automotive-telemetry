@@ -28,6 +28,18 @@ extern std::set<std::string> held;
 extern int  renames, removes;
 extern size_t totalBytes;        ///< Partition size LittleFS reports (1.5 MB).
 size_t usedBytes();              ///< What the files take, with LittleFS's block rounding.
+/** @name The drive logs' own partition ("logs", the upper 8 MB of the flash)
+ *  Its files sit in the same map with "@logs" before their path (logKey()),
+ *  so a test sees both partitions at once.
+ *  @{ */
+extern bool   logsPartition;     ///< In the partition table (false = the old table).
+extern bool   logsBlank;         ///< Never formatted: the first boot after the update.
+extern int    logsMountFails;    ///< Mounts that fail before one works.
+extern int    logsFormats;       ///< Formats of it - each erases every log.
+extern size_t logsBytes;         ///< Its size (8 MB).
+std::string logKey(const std::string &path);   ///< "/log/00001.tlg" there.
+size_t usedBytesOf(const std::string &prefix); ///< "" = the settings partition.
+/** @} */
 }
 
 class File {
@@ -57,13 +69,20 @@ private:
 
 class LittleFSFS {
 public:
-    bool begin(bool formatOnFail = false);
+    /** As the core's: @p partitionLabel "spiffs" is the settings partition,
+     *  "logs" the drive logs' own (see simfs::logsPartition). */
+    bool begin(bool formatOnFail = false, const char *basePath = "/littlefs",
+               uint8_t maxOpenFiles = 10, const char *partitionLabel = "spiffs");
     File open(const char *path, const char *mode = "r");
     bool exists(const char *path);
     bool remove(const char *path);
     bool rename(const char *from, const char *to);
     bool mkdir(const char *path);
-    size_t totalBytes() { return simfs::totalBytes; }
-    size_t usedBytes()  { return simfs::usedBytes(); }
+    size_t totalBytes() { return _pfx.empty() ? simfs::totalBytes : simfs::logsBytes; }
+    size_t usedBytes()  { return simfs::usedBytesOf(_pfx); }
+private:
+    std::string _pfx;                       ///< "" or "@logs": where its files sit.
+    std::string key(const char *p) const { return _pfx + p; }
 };
 extern LittleFSFS LittleFS;
+namespace fs { using ::LittleFSFS; }

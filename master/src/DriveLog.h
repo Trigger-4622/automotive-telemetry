@@ -3,10 +3,14 @@
  * @brief The drive logger: chosen values at up to 20 Hz to the master's
  *        flash, one file per drive, downloaded from the portal.
  *
- * Files live in /log on the LittleFS partition the settings use (1.5 MB), so
- * the partition table does not change. The logs may take `log_max_kb`; the
- * oldest drive is deleted to make room, and 128 KB of the partition is always
- * left free so a settings save can never run out of space.
+ * Files live in /log on their own LittleFS partition, "logs": the upper 8 MB
+ * of the master's 16 MB flash (partitions_16mb.csv; the partitions before it
+ * are the stock 8 MB layout, unchanged, so the settings never move). The logs
+ * may take `log_max_kb` (up to 8000 KB); the oldest drive is deleted to make
+ * room. Drives the older firmware left on the settings partition are moved
+ * across once. A master still on the older partition table keeps them on the
+ * settings partition as before: at most 1200 KB of its 1.5 MB, with 128 KB
+ * always left free so a settings save can never run out of space.
  *
  * File format (.tlg, little-endian):
  *   "TLG1"  u8 version (1)  u8 hz  u8 columns  u8 0
@@ -22,6 +26,7 @@
  */
 #pragma once
 #include <Arduino.h>
+#include <LittleFS.h>
 
 /** @brief One file, for the portal's list. */
 struct LogFileInfo {
@@ -40,8 +45,11 @@ struct DriveLogStatus {
     char     file[16];      /**< ...into this file.                    */
     uint32_t rows;          /**< Rows in it so far.                    */
     uint32_t usedKb;        /**< What every log file takes.            */
-    uint32_t capKb;         /**< log_max_kb.                           */
+    uint32_t capKb;         /**< What they may take (log_max_kb, or less
+                                 on the settings partition).            */
     uint32_t freeKb;        /**< Free on the partition.                */
+    bool     own;           /**< On their own partition (else the settings'). */
+    uint32_t partKb;        /**< That partition's size.                */
     uint32_t flushes;       /**< Writes to flash since boot.           */
     char     note[64];      /**< Why it stopped, if it did.            */
 };
@@ -55,6 +63,8 @@ size_t driveLogList(LogFileInfo *out, size_t max);
  * @return false for anything but a plain "NNNNN.tlg" that exists.
  */
 bool driveLogPath(const char *name, char *path, size_t cap);
+/** @brief Open a path driveLogPath() gave, on the partition the logs are on. */
+File driveLogOpen(const char *path);
 /** @brief Write the rows held in RAM, so a download has them. */
 void driveLogFlush();
 /** @brief Delete one file (the one being written closes first). */

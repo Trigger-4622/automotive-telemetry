@@ -39,6 +39,12 @@
 #ifndef QEMU_REPLAY
 #define QEMU_REPLAY 0             /**< 1: a recorded log (shim/replay.bin) instead of the made-up car. */
 #endif
+#ifndef QEMU_SETTINGS
+#define QEMU_SETTINGS 0           /**< 1: a settings file (shim/settings.json) applied at boot. */
+#endif
+#ifndef QEMU_OTA
+#define QEMU_OTA 0                /**< 1: the firmware update over Wi-Fi, twice, and a rollback. */
+#endif
 
 #if QEMU_READERS
 #include "Learner.h"
@@ -134,7 +140,11 @@ void fill(size_t i, twai_message_t &m) {
 /* ═══════════════════════════ a recorded car ══════════════════════════════
  *
  * run.py --replay turns a candump log ("(time) can0 140#0102..") into
- * shim/replay.bin: 16 bytes a frame, in the order and at the times recorded.
+ * shim/replay.bin, kept small enough for a 40-minute drive to fit the image:
+ *   "RPL2" u16 identifiers u16 0, then per identifier u16 id u8 dlc u8 0,
+ *   then a record a frame: u8 identifier index, u8 time since the last frame
+ *   in 50 us steps (255: a u32 of them follows), u8 mask of the payload bytes
+ *   that changed since that identifier's last frame, then those bytes.
  * It is played at its own pace and started again at its end. The engine
  * computer's answers are read off the frames just played, so what the learner
  * is asked to find is really in the traffic: engine speed and the pedal in
@@ -142,23 +152,111 @@ void fill(size_t i, twai_message_t &m) {
  * 2005-2019 cars (opendbc's subaru_forester_2017 / outback_2015).
  */
 #if QEMU_REPLAY
-struct Rec { uint32_t tUs; uint16_t id; uint8_t dlc; uint8_t pad; uint8_t data[8]; };
-extern "C" const Rec replay_start[] asm("replay_start");
-extern "C" const Rec replay_end[]   asm("replay_end");
+extern "C" const uint8_t replay_start[] asm("replay_start");
+extern "C" const uint8_t replay_end[]   asm("replay_end");
 asm(".section .rodata.replay,\"a\"\n.balign 4\n.global replay_start\nreplay_start:\n"
     ".incbin \"shim/replay.bin\"\n.global replay_end\nreplay_end:\n.previous\n");
 
 namespace {
-size_t   s_recAt = 0;
-uint64_t s_recBase = 0;                     // µs: when record 0 of this round is due
+constexpr size_t RPL_MAX_IDS = 128;
+const uint8_t *s_rp = nullptr, *s_records = nullptr;
+uint16_t s_nIds = 0;
+uint16_t s_rid[RPL_MAX_IDS];
+uint8_t  s_rdlc[RPL_MAX_IDS];
+uint8_t  s_rlast[RPL_MAX_IDS][8];
+bool     s_rPending = false;                 // the next frame decoded, waiting for its time
+twai_message_t s_rNext;
+uint64_t s_rDue = 0;                         // µs: when it is due
 uint32_t s_rounds = 0;
+uint64_t s_played = 0;
 // What the recorded car is doing, as its own computer would report it.
 volatile uint16_t s_recRpm = 0;             // rpm
 volatile uint16_t s_recSpeed = 0;           // km/h x 100
 volatile uint8_t  s_recPedal = 0;           // 0..255
 volatile uint8_t  s_recCoolant = 40;        // degrees C + 40
+
+void replayRewind() {
+    s_rp = s_records;
+    memset(s_rlast, 0, sizeof s_rlast);
+}
+
+bool replayOpen() {
+    if (s_records) return true;
+    const uint8_t *p = replay_start;
+    if (replay_end - p < 8 || memcmp(p, "RPL2", 4)) return false;
+    s_nIds = (uint16_t)(p[4] | p[5] << 8);
+    if (s_nIds > RPL_MAX_IDS) return false;
+    p += 8;
+    for (uint16_t i = 0; i < s_nIds; i++, p += 4) {
+        s_rid[i] = (uint16_t)(p[0] | p[1] << 8);
+        s_rdlc[i] = p[2] > 8 ? 8 : p[2];
+    }
+    s_records = p;
+    replayRewind();
+    return true;
+}
+
+/** Decode the next frame into s_rNext and its time into s_rDue. */
+void replayDecode(uint64_t now) {
+    if (s_rp >= replay_end) {                          // the end: once more from the top
+        replayRewind();
+        s_rDue += 20000;
+        s_rounds++;
+    }
+    const uint8_t idx = *s_rp++;
+    uint32_t dt = *s_rp++;
+    if (dt == 255) { dt = s_rp[0] | s_rp[1] << 8 | s_rp[2] << 16 | (uint32_t)s_rp[3] << 24; s_rp += 4; }
+    const uint8_t mask = *s_rp++;
+    uint8_t *last = s_rlast[idx < RPL_MAX_IDS ? idx : 0];
+    for (uint8_t k = 0; k < 8; k++)
+        if (mask & (1u << k)) last[k] = *s_rp++;
+    if (!s_rDue) s_rDue = now + 50000;
+    s_rDue += (uint64_t)dt * 50;
+    if (now > s_rDue + 100000) s_rDue = now;             // fell behind: no burst
+    memset(&s_rNext, 0, sizeof s_rNext);
+    s_rNext.identifier = s_rid[idx];
+    s_rNext.data_length_code = s_rdlc[idx];
+    memcpy(s_rNext.data, last, 8);
+    s_rPending = true;
+}
 }
 #endif
+
+/* ═══════════════════ the car's settings, as the portal uploads them ═══════
+ *
+ * run.py --settings puts a settings file (the car's own, read off it) into
+ * the image as shim/settings.json; at boot, right after the master has loaded
+ * its own file (MasterConfig::begin), it is applied the way the portal's
+ * "Everything, as JSON" upload does - MasterConfig::fromJson(.., true) and a
+ * save - so the bus comes up with it, as after an upload and its restart.
+ */
+#if QEMU_SETTINGS
+#include <ArduinoJson.h>
+#include "MasterConfig.h"
+extern "C" const char settings_start[] asm("settings_start");
+extern "C" const char settings_end[]   asm("settings_end");
+asm(".section .rodata.settings,\"a\"\n.global settings_start\nsettings_start:\n"
+    ".incbin \"shim/settings.json\"\n.global settings_end\nsettings_end:\n.byte 0\n.previous\n");
+
+static void applySettings() {
+    JsonDocument d;
+    const DeserializationError e = deserializeJson(d, settings_start, (size_t)(settings_end - settings_start));
+    if (e) { Serial.printf("[qemu ] the settings file does not parse: %s\n", e.c_str()); return; }
+    const bool ok = Cfg.fromJson(d.as<JsonVariantConst>(), true) && Cfg.save();
+    Serial.printf("[qemu ] the car's settings applied as the portal's upload does: %s (%u signals)\n",
+                  ok ? "saved" : "NOT saved", (unsigned)Cfg.signals.size());
+}
+#endif
+
+#include "DriveLog.h"
+#include "MasterConfig.h"
+extern "C" void __real__ZN12MasterConfig5beginEv(MasterConfig *);
+extern "C" void __wrap__ZN12MasterConfig5beginEv(MasterConfig *self) {
+    __real__ZN12MasterConfig5beginEv(self);
+#if QEMU_SETTINGS
+    applySettings();
+#endif
+}
 
 /* ═════════════════════ the portal's reading, without it ══════════════════
  *
@@ -255,6 +353,140 @@ void readerTask(void *) {
 }  // namespace
 #endif
 
+/* ═════════════════════ a firmware update, as the portal does it ══════════
+ *
+ * run.py --ota: the board's own partition table (two app slots, the 8 MB logs
+ * partition), and from the loop task - where the portal's upload handler runs
+ * - this firmware's own image read out of the running slot and handed to
+ * fwUpdateBegin / Write / End in the 1436-byte pieces Arduino's WebServer
+ * delivers, then masterBeforeRestart() and ESP.restart() as /api/update does.
+ * What follows is the real bootloader's doing, with the real otadata:
+ *   boot 1 (app0)          once two learned values are verified and saved and
+ *                          the car stands still (refused while it moves): update
+ *   boot 2 (app1, trial)   kept after 30 s with the portal up; then update again
+ *   boot 3 (app0, trial)   a crash 15 s in, before it is kept
+ *   boot 4 (app1)          the bootloader rolled it back: reported, test over
+ * The portal is never really started here; it is marked as up (its one member)
+ * so that a firmware on trial can be kept, as on the board.
+ */
+#if QEMU_OTA
+#include <esp_ota_ops.h>
+#include <esp_image_format.h>
+#include "FwUpdate.h"
+#include "MasterConfig.h"
+#include "MasterTelemetry.h"
+#include "WebPortal.h"
+static_assert(sizeof(WebPortal) == sizeof(bool), "the shim marks the portal as up through its one member");
+
+namespace {
+int      s_otaPhase = -1;
+uint32_t s_otaTick = 0;
+bool     s_otaRefusalSeen = false;
+
+unsigned verifiedSignals() {
+    unsigned n = 0;
+    Cfg.lock();
+    for (const auto &sg : Cfg.signals) n += sg.mode == SIG_VERIFIED;
+    Cfg.unlock();
+    return n;
+}
+
+/** Hand the running image to the update, as the portal's upload handler does. */
+void otaUpload(const char *what) {
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    const esp_partition_pos_t pos = { run->address, run->size };
+    esp_image_metadata_t md = {};
+    if (esp_image_get_metadata(&pos, &md) != ESP_OK) {
+        Serial.println("[ota  ] cannot read the running image");
+        s_otaPhase = 9;
+        return;
+    }
+    static uint8_t buf[1436];                       // HTTP_UPLOAD_BUFLEN
+    char why[96] = "";
+    const uint32_t t0 = millis();
+    bool ok = fwUpdateBegin(why, sizeof why);
+    uint32_t pieces = 0;
+    for (uint32_t off = 0; ok && off < md.image_len; off += sizeof buf, pieces++) {
+        const size_t n = md.image_len - off < sizeof buf ? md.image_len - off : sizeof buf;
+        esp_partition_read(run, off, buf, n);
+        ok = fwUpdateWrite(buf, n, why, sizeof why);
+    }
+    if (ok) ok = fwUpdateEnd(why, sizeof why);
+    Serial.printf("[ota  ] %s: %u bytes from %s in %u pieces, %u ms: %s\n", what, (unsigned)md.image_len,
+                  run->label, (unsigned)pieces, (unsigned)(millis() - t0), ok ? "checked - restarting into it" : why);
+    if (!ok) { s_otaPhase = 9; return; }
+    masterBeforeRestart();
+    delay(300);
+    ESP.restart();
+}
+
+void otaStep() {
+    if (millis() - s_otaTick < 500) return;
+    s_otaTick = millis();
+    FwStatus st;
+    if (s_otaPhase < 0) {
+        fwStatus(st);
+        const bool app1 = !strcmp(st.slot, "app1");
+        s_otaPhase = st.rolledBack ? 4 : st.trial ? (app1 ? 2 : 3) : 1;
+        static const char *const SAY[] = { "", "first boot: updating once two learned values are saved",
+            "the update, on trial: waiting for it to be kept, then a second update",
+            "the second update, on trial: it will crash before it is kept",
+            "after the crash: rolled back by the bootloader" };
+        Serial.printf("[ota  ] boot in %s, %u verified signals in the settings - %s\n", st.slot,
+                      verifiedSignals(), SAY[s_otaPhase]);
+    }
+    char why[48] = "";
+    switch (s_otaPhase) {
+        case 1:
+        case 5:
+            if (s_otaPhase == 1 && (millis() < 60000 || verifiedSignals() < 2)) return;
+            if (!fwUpdateAllowed(why, sizeof why)) {
+                if (!s_otaRefusalSeen) Serial.printf("[ota  ] refused while moving: %s\n", why);
+                s_otaRefusalSeen = true;
+                return;
+            }
+            otaUpload(s_otaPhase == 1 ? "first update" : "second update");
+            break;
+        case 2:
+            fwStatus(st);
+            if (st.trial) return;
+            Serial.printf("[ota  ] kept after %u s on trial\n", (unsigned)(millis() / 1000));
+            s_otaPhase = 5;
+            break;
+        case 3:
+            if (millis() < 15000) return;
+            Serial.println("[ota  ] crashing on purpose, before the trial is over");
+            Serial.flush();
+            abort();
+        case 4:
+            fwStatus(st);
+            Serial.printf("[ota  ] test over: running %s, rolled back %s, on trial %s\n", st.slot,
+                          st.rolledBack ? "yes" : "no", st.trial ? "yes" : "no");
+            s_otaPhase = 9;
+            break;
+        default:
+            break;
+    }
+}
+}  // namespace
+#endif
+
+/* ════════════════════════════ the clock ═══════════════════════════════════
+ *
+ * The board's system timer starts again from 0 at every reset (ESP-IDF 4.4's
+ * esp_restart_noos resets it, SYSTEM_SYSTIMER_RST; a hardware reset does
+ * too). QEMU's runs on through a software restart, so millis() came up after
+ * a restart already past every "since boot" wait. Each boot's clock starts at
+ * its first reading here instead, as on the board. IRAM: read from interrupts.
+ */
+extern "C" int64_t __real_esp_timer_get_time(void);
+extern "C" IRAM_ATTR int64_t __wrap_esp_timer_get_time(void) {
+    static int64_t s_bootUs = -1;
+    const int64_t t = __real_esp_timer_get_time();
+    if (s_bootUs < 0) s_bootUs = t;
+    return t - s_bootUs;
+}
+
 /* ═══════════════════════════ the CAN controller ══════════════════════════ */
 
 extern "C" {
@@ -276,28 +508,20 @@ esp_err_t __wrap_twai_receive(twai_message_t *message, TickType_t ticks_to_wait)
         if (have) return ESP_OK;
 
 #if QEMU_REPLAY
-        const size_t nRec = (size_t)(replay_end - replay_start);
-        if (!s_recBase) s_recBase = now + 50000;
-        const Rec &r = replay_start[s_recAt];
-        uint64_t due = s_recBase + r.tUs;
-        if (now > due + 100000) { s_recBase += now - due; due = now; }   // fell behind: no burst
-        if (due <= now) {
-            memset(message, 0, sizeof *message);
-            message->identifier = r.id;
-            message->data_length_code = r.dlc;
-            memcpy(message->data, r.data, 8);
-            if (r.id == 0x140 && r.dlc >= 4) {
-                s_recPedal = r.data[0];
-                s_recRpm   = (uint16_t)(((r.data[3] & 0x3F) << 8) | r.data[2]);
-            } else if (r.id == 0x0D1 && r.dlc >= 2) {
-                s_recSpeed = (uint16_t)((r.data[0] | (r.data[1] << 8)) * 5.625f);
-            } else if (r.id == 0x360 && r.dlc >= 4) {
-                s_recCoolant = r.data[3];
-            }
-            if (++s_recAt >= nRec) {                     // the end: once more from the top
-                s_recAt = 0;
-                s_recBase += r.tUs + 20000;
-                s_rounds++;
+        if (!replayOpen()) return ESP_ERR_TIMEOUT;
+        if (!s_rPending) replayDecode(now);
+        if (s_rDue <= now) {
+            *message = s_rNext;
+            s_rPending = false;
+            s_played++;
+            const uint8_t *d = message->data;
+            if (message->identifier == 0x140 && message->data_length_code >= 4) {
+                s_recPedal = d[0];
+                s_recRpm   = (uint16_t)(((d[3] & 0x3F) << 8) | d[2]);
+            } else if (message->identifier == 0x0D1 && message->data_length_code >= 2) {
+                s_recSpeed = (uint16_t)((d[0] | (d[1] << 8)) * 5.625f);
+            } else if (message->identifier == 0x360 && message->data_length_code >= 4) {
+                s_recCoolant = d[3];
             }
             return ESP_OK;
         }
@@ -385,13 +609,66 @@ esp_err_t __wrap_esp_wifi_set_max_tx_power(int8_t) { return ESP_OK; }
 esp_err_t __wrap_esp_wifi_set_channel(uint8_t, wifi_second_chan_t) { return ESP_OK; }
 
 /* WebPortal::begin() / loop(), WiFi.mode(), WiFi.disconnect(): never started. */
-void __wrap__ZN9WebPortal5beginEv(void *) {
+#ifdef QEMU_FLASHPROBE
+#include <esp_partition.h>
+#include <esp_flash.h>
+static void flashProbe() {
+    const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "spiffs");
+    if (!p) { Serial.println("[probe] no spiffs partition"); return; }
+    uint32_t id = 0; esp_flash_read_id(NULL, &id);
+    Serial.printf("[probe] flash id %06X size %u, spiffs at 0x%X size %u\n", (unsigned)id,
+                  (unsigned)(esp_flash_default_chip ? esp_flash_default_chip->size : 0), (unsigned)p->address, (unsigned)p->size);
+    esp_err_t e = esp_partition_erase_range(p, 0, 4096);
+    Serial.printf("[probe] erase 4 KB: %s\n", esp_err_to_name(e));
+    uint8_t w[16]; for (int i = 0; i < 16; i++) w[i] = (uint8_t)(0xA0 + i);
+    e = esp_partition_write(p, 0, w, sizeof w);
+    Serial.printf("[probe] write 16 B: %s\n", esp_err_to_name(e));
+    uint8_t r[16] = {0};
+    e = esp_partition_read(p, 0, r, sizeof r);
+    Serial.printf("[probe] read back: %s, %s: %02X %02X %02X %02X\n", esp_err_to_name(e), memcmp(r, w, 16) ? "DIFFERENT" : "same", r[0], r[1], r[2], r[15]);
+    uint8_t r2[16] = {0};
+    esp_flash_read(NULL, r2, p->address, 16);
+    Serial.printf("[probe] esp_flash_read: %02X %02X %02X %02X\n", r2[0], r2[1], r2[2], r2[15]);
+    e = esp_flash_write(NULL, w, p->address + 4096, 16);
+    uint8_t r3[16] = {0};
+    esp_flash_read(NULL, r3, p->address + 4096, 16);
+    Serial.printf("[probe] esp_flash_write %s then read: %02X %02X %02X %02X\n", esp_err_to_name(e), r3[0], r3[1], r3[2], r3[15]);
+    Serial.printf("[probe] read mode %d\n", esp_flash_default_chip ? (int)esp_flash_default_chip->read_mode : -1);
+    e = esp_partition_erase_range(p, 0, 64 * 1024);
+    Serial.printf("[probe] erase 64 KB: %s\n", esp_err_to_name(e));
+}
+#endif
+
+void __wrap__ZN9WebPortal5beginEv(void *self) {
+#if QEMU_OTA
+    *static_cast<bool *>(self) = true;              // "running": see the update test above
+#else
+    (void)self;
+#endif
+#ifdef QEMU_FLASHPROBE
+    flashProbe();
+#endif
     Serial.println("[qemu ] no radio here: the portal and the Wi-Fi are not started");
 #if QEMU_READERS
     xTaskCreatePinnedToCore(readerTask, "readers", 6144, nullptr, 1, nullptr, 0);
 #endif
 }
-void __wrap__ZN9WebPortal4loopEv(void *) {}
+void __wrap__ZN9WebPortal4loopEv(void *) {
+#if QEMU_OTA
+    otaStep();
+#endif
+    // The drive log as the portal's Logs card shows it, once a minute.
+    static uint32_t lastLog = 0;
+    if (millis() - lastLog >= 60000) {
+        lastLog = millis();
+        DriveLogStatus d;
+        driveLogStatus(d);
+        Serial.printf("[dlog ] %s %s, %u rows | %u KB of %u KB, %u KB free | %u writes%s%s\n",
+                      d.recording ? "recording" : "not recording", d.file, (unsigned)d.rows,
+                      (unsigned)d.usedKb, (unsigned)d.capKb, (unsigned)d.freeKb, (unsigned)d.flushes,
+                      d.note[0] ? " | " : "", d.note);
+    }
+}
 bool __wrap__ZN16WiFiGenericClass4modeE11wifi_mode_t(void *, int) { return true; }
 bool __wrap__ZN12WiFiSTAClass10disconnectEbb(void *, bool, bool) { return true; }
 

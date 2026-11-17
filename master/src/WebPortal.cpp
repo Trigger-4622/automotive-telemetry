@@ -18,6 +18,7 @@
 #include <LittleFS.h>
 
 #include "DiagCodes.h"
+#include "FwUpdate.h"
 #include "DriveLog.h"
 #include "Learner.h"
 #include "MasterConfig.h"
@@ -266,7 +267,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
  <div class="card"><h2>Drive log <small>to the master's flash</small></h2>
   <div class="f"><div class="l"><b>Record every drive</b><span>from the car coming on to it going off, one file a drive · the files are on the Diagnostics tab</span></div><input type="checkbox" data-k="log_on"></div>
   <div class="f"><div class="l"><b>Rows per second</b></div><input type="number" data-k="log_hz" min="1" max="20"></div>
-  <div class="f"><div class="l"><b>Space for logs</b><span>KB of the 1.5 MB settings partition · the oldest drive goes first</span></div><input type="number" data-k="log_max_kb" min="64" max="1200"></div>
+  <div class="f"><div class="l"><b>Space for logs</b><span>KB of the logs' own 8 MB partition (1200 at most on an older partition table) · the oldest drive goes first</span></div><input type="number" data-k="log_max_kb" min="64" max="8000"></div>
   <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
    <div id="lgIds" class="row" style="margin-top:8px"></div>
    <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
@@ -293,6 +294,13 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
    <button class="b d" onclick="if(confirm('Restore factory settings and reboot?\n\nThis also deletes every learned value. For the bus settings alone, use Safe bus settings.'))post('/api/defaults','Restored - rebooting')">Factory reset</button>
   </div>
   <p class="say" style="margin:10px 0 0">Every other setting is on the <a href="#" onclick="go('adv');return false" class="acc">Advanced</a> tab.</p></div>
+ <div class="card"><h2>Firmware</h2>
+  <p class="say" id="fwInfo" style="margin:0 0 10px">…</p>
+  <div class="row">
+   <input type="file" id="fwFile" accept=".bin,application/octet-stream">
+   <button class="b p" id="fwBtn" onclick="fwUpload()">Update firmware</button>
+  </div>
+  <p class="say" id="fwSay" style="margin:10px 0 0">The master's <b>firmware.bin</b> from a build (GitHub: the CI run's <b>master-firmware</b> download). It goes into the spare slot and the master restarts into it; if the new one does not run properly, it goes back to this one by itself. Not while driving.</p></div>
 </section>
 
 <section id="t-adv" class="cfg" hidden>
@@ -361,13 +369,16 @@ async function req(u,o,ms){
 /* One request of each kind at a time: a poll still waiting is not joined by
    the next one, so a slow moment cannot pile up into a slow minute. */
 const BUSY={};
+/* A firmware upload in progress: nothing else is polled (the master serves one
+   connection at a time, and the upload holds it). */
+let UPD=false;
 async function solo(k,fn){if(BUSY[k])return;BUSY[k]=1;try{await fn()}finally{BUSY[k]=0}}
 async function post(u,msg,then){try{await req(u,{method:'POST'},8000);toast(msg);if(then)setTimeout(then,500)}catch(e){toast('Failed')}}
 function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v)}
 function go(t){TAB=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
  ['dash','bus','src','set','adv','diag'].forEach(x=>$('#t-'+x).hidden=x!==t);
  if(t==='bus')pollBus();if(t==='src')renderSources();if(t==='dash'&&L)renderDash();if(t==='adv'){renderAdv();jsonShow()}
- if(t==='diag'){pollEvlog();pollCodes();pollLogs()}if(t==='set')pollCodes()}
+ if(t==='diag'){pollEvlog();pollCodes();pollLogs()}if(t==='set'){pollCodes();fwInfo()}}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
 /* ───────────── settings: every input bound to the config by data-k ───────────── */
@@ -505,7 +516,7 @@ const ADV=[
   ['oil_at_km','Oil last changed at','num','km on the odometer · -1 = no reminder',-1,9999999],
   ['log_on','Record every drive','bool'],
   ['log_hz','Drive log rows per second','num','1–20',1,20],
-  ['log_max_kb','Space for drive logs','num','KB',64,1200]]],
+  ['log_max_kb','Space for drive logs','num','KB',64,8000]]],
  ['Power',[
   ['sleep_enabled','Sleep when the car is off','bool'],
   ['sleep_idle_s','Sleep after','num','s',10,3600],
@@ -623,7 +634,7 @@ function extract(b,st,len,be,sg){
 /*</teach-core>*/
 function pollBus(){return solo('bus',pollBusOnce)}
 async function pollBusOnce(){
- if(TAB!=='bus'||TEACH)return;
+ if(TAB!=='bus'||TEACH||UPD)return;
  try{BUS=await req('/api/bus',null,4000)}catch(e){return}
  const now=Date.now(),dt=ZT?(now-ZT)/1000:0;ZT=now;
  $('#bN').textContent=BUS.census.length+' IDs';
@@ -1278,7 +1289,7 @@ function evDetail(e){
  return''}
 function pollEvlog(){return solo('ev',pollEvlogOnce)}
 async function pollEvlogOnce(){
- if(TAB!=='diag'||TEACH)return;
+ if(TAB!=='diag'||TEACH||UPD)return;
  let d;try{d=await req('/api/evlog',null,5000)}catch(e){return}
  const ev=d.events||[],rows=ev.slice().reverse();
  $('#evN').textContent=ev.length+' events';
@@ -1299,7 +1310,7 @@ let CODES=null,LOGS=null;
 const ago=s=>s<90?`${s} s ago`:s<5400?`${Math.round(s/60)} min ago`:`${Math.round(s/3600)} h ago`;
 function pollCodes(){return solo('codes',pollCodesOnce)}
 async function pollCodesOnce(){
- if((TAB!=='diag'&&TAB!=='set')||TEACH)return;
+ if((TAB!=='diag'&&TAB!=='set')||TEACH||UPD)return;
  try{CODES=await req('/api/codes',null,5000)}catch(e){return}
  renderCodes()}
 function renderCodes(){
@@ -1337,10 +1348,10 @@ const kb=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixe
 const dur=s=>{s=Math.round(s);return s<60?s+' s':Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s'};
 function pollLogs(){return solo('logs',pollLogsOnce)}
 async function pollLogsOnce(){
- if(TAB!=='diag'||TEACH)return;
+ if(TAB!=='diag'||TEACH||UPD)return;
  try{LOGS=await req('/api/logs',null,5000)}catch(e){return}
  const d=LOGS;
- $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on flash`;
+ $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on ${d.own?'the logs partition':'the settings partition (older partition table)'}`;
  $('#lgSay').innerHTML=!d.on?'Recording is off: switch it on under Settings, Drive log.':
   d.rec?`<span class="ok">Recording <b>${esc(d.file)}</b></span>: ${d.rows} rows so far.`:
   d.note?`<span class="warn">${esc(d.note)}</span>`:'Recording starts when the car comes on.';
@@ -1360,7 +1371,7 @@ function renderLogIds(){
  const ids=C.log_ids||[];if(!$('#lgIds'))return;
  $('#lgIds').innerHTML=ids.map((id,i)=>`<span class="pill">${esc(nm(id))}<button class="x" onclick="logRm(${i})">✕</button></span>`).join('')||
   '<span class="muted">Nothing chosen: nothing is recorded.</span>';
- const hz=C.log_hz||10,bps=(4+4*ids.length)*hz,cap=(C.log_max_kb||1024)*1024;
+ const hz=C.log_hz||10,bps=(4+4*ids.length)*hz,cap=(C.log_max_kb||8000)*1024;
  $('#lgEst').textContent=ids.length?`${ids.length} of 24 · ${(bps/1024).toFixed(2)} KB a second · about ${Math.round(cap/bps/60)} min of driving fit`:'';
  if(document.activeElement!==$('#lgAdd'))$('#lgAdd').innerHTML='<option value="0">Add a value…</option>'+metricOpts(-1,id=>!ids.includes(id))}
 function logAdd(){const id=+$('#lgAdd').value,ids=C.log_ids||[];if(!id||ids.length>=24)return;C.log_ids=ids.concat(id);setDirty(true);renderLogIds()}
@@ -1371,7 +1382,7 @@ function logRm(i){C.log_ids=(C.log_ids||[]).filter((_,k)=>k!==i);setDirty(true);
    themselves, and are not held up behind a full status document. */
 function poll(){return solo('live',pollOnce)}
 async function pollOnce(){
- if(TEACH)return;
+ if(TEACH||UPD)return;
  let d;try{d=await req('/api/live',null,4000)}catch(e){
   const c=$('#conn');c.className='pill crit';c.lastChild.textContent='offline';return}
  const now=Date.now();
@@ -1395,6 +1406,39 @@ async function pollOnce(){
  if(TAB==='dash')renderDash();
  if(TAB==='bus')renderBusTiles();
  if(TAB==='src'||TAB==='set')updateSourceText()}
+/* ───────────── firmware update ───────────── */
+async function fwInfo(){
+ try{const d=await req('/api/update',{},5000);
+  $('#fwInfo').innerHTML=`Version <b>${esc(d.version)}</b> · build ${esc(d.build.slice(0,8))} · slot ${esc(d.slot)}`+
+   (d.trial?' · <b>new, on trial</b>: kept once it has run 30 s':'')+
+   (d.rolled_back?' · <b>the last update did not run properly</b> - the master went back to this firmware':'')+
+   (d.allowed?'':` · updates refused now: ${esc(d.why)}`);
+  return d}catch(e){return null}}
+async function fwUpload(){
+ const f=$('#fwFile').files[0],say=m=>$('#fwSay').textContent=m;
+ if(!f){toast('Choose the firmware .bin first');return}
+ if(!/\.bin$/i.test(f.name)||f.size<200000||f.size>3300000){toast('That is not a master firmware .bin');return}
+ const before=await fwInfo();
+ if(!before){toast('The master does not answer - is this phone on its Wi-Fi?');return}
+ if(!before.allowed){toast('Not now: '+before.why);return}
+ if(!confirm(`Update the master with ${f.name} (${Math.round(f.size/1024)} KB)?\n\nIt restarts into the new firmware and keeps it once it has run 30 s; if it does not run properly, it goes back to the one it has now. Stay near the car until it is back.`))return;
+ UPD=true;$('#fwBtn').disabled=true;
+ const x=new XMLHttpRequest(),fd=new FormData();fd.append('fw',f,f.name);
+ x.upload.onprogress=e=>{if(e.lengthComputable)say(`Sending… ${Math.round(100*e.loaded/e.total)} %`)};
+ const done=m=>{UPD=false;$('#fwBtn').disabled=false;say(m)};
+ x.onload=()=>{let j={};try{j=JSON.parse(x.responseText)}catch(e){}
+  if(x.status===200){say('Checked - the master is restarting into it. If this phone leaves its Wi-Fi, join it again.');fwWait(before.build,done)}
+  else done('Not updated: '+(j.error||('HTTP '+x.status))+'. The master runs as before.')};
+ x.onerror=x.ontimeout=()=>done('The upload was cut off - nothing changed. Try again.');
+ x.timeout=300000;x.open('POST','/api/update');x.send(fd)}
+function fwWait(old,done){const t0=Date.now();
+ const tick=async()=>{const d=await fwInfo();
+  if(d&&d.build!==old&&!d.trial){done('Updated: the new firmware runs and is kept.');load(true);return}
+  if(d&&d.build===old&&d.rolled_back){done('The new firmware did not run properly - the master went back to the one it had. Nothing else changed.');return}
+  if(d&&d.trial)$('#fwSay').textContent='The new firmware is running - kept once it has run 30 s…';
+  if(Date.now()-t0>240000){done('No answer from the master yet - join its Wi-Fi again and open this page.');return}
+  setTimeout(tick,3000)};
+ setTimeout(tick,6000)}
 load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);
 setInterval(pollCodes,3000);setInterval(pollLogs,3000);
 </script></body></html>
@@ -1878,6 +1922,8 @@ void WebPortal::setupRoutes() {
         doc["used_kb"] = st.usedKb;
         doc["cap_kb"]  = st.capKb;
         doc["free_kb"] = st.freeKb;
+        doc["own"]     = st.own;
+        doc["part_kb"] = st.partKb;
         doc["note"]    = st.note;
         JsonArray fa = doc["files"].to<JsonArray>();
         for (size_t i = 0; i < n; i++) {
@@ -1901,7 +1947,7 @@ void WebPortal::setupRoutes() {
             s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
             return;
         }
-        File f = LittleFS.open(path, "r");
+        File f = driveLogOpen(path);         // on the logs' own partition
         if (!f) { s_server.send(404, "application/json", "{\"error\":\"no such log\"}"); return; }
         s_server.streamFile(f, "application/octet-stream");
         f.close();
@@ -1952,6 +1998,65 @@ void WebPortal::setupRoutes() {
         sendOk();
         delay(300);
         ESP.restart();
+    });
+
+    /*
+     * Firmware update (FwUpdate): the upload goes into the spare app slot as
+     * it arrives, is checked, and the master restarts into it - and keeps it
+     * only once it has run properly. Refused while moving.
+     */
+    s_server.on("/api/update", HTTP_GET, []() {
+        FwStatus fs;
+        fwStatus(fs);
+        JsonDocument d;
+        d["version"]     = fs.version;
+        d["build"]       = fs.build;
+        d["slot"]        = fs.slot;
+        d["trial"]       = fs.trial;
+        d["rolled_back"] = fs.rolledBack;
+        d["busy"]        = fs.busy;
+        d["received"]    = fs.received;
+        d["mark"]        = fs.mark;
+        char why[48] = "";
+        d["allowed"]     = fwUpdateAllowed(why, sizeof why);
+        d["why"]         = why;
+        sendJson(d);
+    });
+    static bool s_updOk = false;
+    static char s_updWhy[96] = "";
+    s_server.on("/api/update", HTTP_POST, []() {
+        if (!s_updOk) {
+            JsonDocument d;
+            d["error"] = s_updWhy[0] ? s_updWhy : "no firmware received";
+            String out;
+            serializeJson(d, out);
+            s_server.send(409, "application/json", out);
+            return;
+        }
+        masterBeforeRestart();
+        sendOk();
+        delay(300);
+        ESP.restart();
+    }, []() {
+        // Called as the upload arrives: the whole of it, before the answer above.
+        HTTPUpload &up = s_server.upload();
+        switch (up.status) {
+            case UPLOAD_FILE_START:
+                s_updWhy[0] = '\0';
+                s_updOk = fwUpdateBegin(s_updWhy, sizeof s_updWhy);
+                break;
+            case UPLOAD_FILE_WRITE:
+                if (s_updOk) s_updOk = fwUpdateWrite(up.buf, up.currentSize, s_updWhy, sizeof s_updWhy);
+                break;
+            case UPLOAD_FILE_END:
+                if (s_updOk) s_updOk = fwUpdateEnd(s_updWhy, sizeof s_updWhy);
+                break;
+            default:                                  // UPLOAD_FILE_ABORTED: the connection went
+                fwUpdateAbort();
+                s_updOk = false;
+                snprintf(s_updWhy, sizeof s_updWhy, "the upload was cut off");
+                break;
+        }
     });
 
     s_server.on("/api/reboot", HTTP_POST, []() {
