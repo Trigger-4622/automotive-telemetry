@@ -448,7 +448,8 @@ when it does not (`lamp_hazard_switch`).
   board's partition table, the real bootloader): written in the portal's
   pieces, checked, booted on trial, kept after 30 s; a second update crashing
   before it is kept was rolled back and reported; settings and learned values
-  loaded alike at every boot. Not tried on the board: the upload's speed over
+  loaded alike at every boot (one run of fifteen: QEMU itself crashed in the
+  rest, test_qemu/README.md). Not tried on the board: the upload's speed over
   the AP, the frames each flash write costs.
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::

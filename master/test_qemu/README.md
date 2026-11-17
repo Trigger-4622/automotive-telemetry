@@ -33,7 +33,7 @@ Two things about QEMU (Espressif's 9.2.2) itself, found on 2026-11-17:
   cores' threads (gdb), not in the firmware. In `--replay` runs it happened in
   three boots of a dozen; in boots of the `--ota` image, in one of six and
   three of eight (the same with the settle wait off - not the listen-only
-  counter pinning), so a four-boot `--ota` run often needs several tries.
+  counter pinning), and in whole `--ota` runs in fourteen attempts of fifteen.
   `run.py` tries up to three times (five with `--ota`) and says so each time. With both cores on one
   thread (`-accel tcg,thread=single`) it did not happen, but the second core
   never came back after a software restart and the firmware waited for it
@@ -218,18 +218,26 @@ Fixed (the frame's time first, as everything else reads it), and shown in
 the host harness by `sleep_busy_bus_race`. The car's settings have sleep off.
 In QEMU the sleep then crashed in `esp_now_deinit` (no Wi-Fi here) and the
 master restarted, which is how it showed. On default settings again, with the
-fix (B2): still running when this was written - one boot and no sleep at 28 minutes.
+fix (B2): one boot for the whole 2,520 s, no sleep, 27 of 27 identifiers,
+1,146 frames a second, the heap's lowest point 49 KB, least stack left
+busguard 1980/4096, 117,641 passes over the tables from the other core with
+no inconsistency.
 
-What B learned from the Impreza on default settings, in the first minute:
-engine speed (0x140 from bit 16, all 14 bits - this drive goes over 3,000
-rpm) and the accelerator pedal, both verified; the coolant (0x360 byte 3) 13
-minutes in, once it had warmed far enough to be found. **Road speed was not
-learned**, although 0x0D1 carries it (0-91 km/h, the faster road from minute
-26): the learner's field table was full 12 s in ("evicting as it goes"), as
-on the Forester's bus. Not looked into further here; the car's speed is
-mapped by hand.
+What B2 learned from the Impreza on default settings: engine speed (0x140
+from bit 16, all 14 bits) and the accelerator pedal, found and verified in
+the first 34 s; the coolant (0x360 byte 3) found 13 minutes in, once it had
+warmed far enough, and verified only 39.6 minutes in (1,390 agreeing, over
+82-95 degrees). Nothing rejected. **Road speed was never learned** in the
+whole drive, although 0x0D1 carries it (0-91 km/h, the faster road from
+minute 26): the learner's field table was full 12 s in ("evicting as it
+goes"), as on the Forester's bus. Not looked into further here; the car's
+speed is mapped by hand.
 
-**The firmware update** (`--ota`), passed:
+**The firmware update** (`--ota`) passed - in one attempt of fifteen with
+this shim; the others ended in QEMU's own crash, most of them in the first
+second of the boot right after the first update (from app1), several after
+it had been booted on trial. So `--ota` shows the update working when QEMU
+lasts, and is not a test to repeat often:
 
 | Boot | Slot | What happened |
 |---|---|---|
