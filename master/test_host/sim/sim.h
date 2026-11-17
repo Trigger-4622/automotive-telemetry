@@ -40,6 +40,10 @@ struct EcuConfig {
      *  list is longer than the simulator's 36), answering unknown ones with
      *  four bytes of 0x40. */
     bool     supportAllPids  = false;
+    /** The engine ECU answers only coolant, engine speed, road speed and
+     *  throttle (PIDs 0x05 0x0C 0x0D 0x11), as the QEMU test's does for a
+     *  recorded drive: few values, so a learned one keeps its learner slot. */
+    bool     fewPids         = false;
     /** The engine ECU's PID 01 says "lamp on, one code"; the TCM's own PID 01
      *  always says "no lamp, no codes". */
     bool     ecmMilOn        = false;

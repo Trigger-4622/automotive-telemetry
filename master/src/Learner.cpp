@@ -803,8 +803,8 @@ void evict() {
  * no value at all - so speed's fields never got one in a 40-minute drive
  * (learn_late_field). A candidate gives its place to a waiting field when it
  * has been in the table SWAP_MIN_MS, has SWAP_MIN_N samples against every value
- * that has moved and matches none of them, and is no value's best field; the
- * weakest goes first. It is not marked dead: it comes back on a later pass,
+ * that has moved and is still being sampled (not learned, heard within 15 s),
+ * matches none of them, and is no value's best field; the weakest goes first. It is not marked dead: it comes back on a later pass,
  * so a field judged before its own value moved gets its chance after all.
  */
 void swapIn(Census &cen) {
@@ -819,7 +819,13 @@ void swapIn(Census &cen) {
             double best = 0;
             for (size_t ai = 0; ai < NA_MAX && !keep; ai++) {
                 const Ref &r = s_ar[ai];
-                if (!r.metric) continue;
+                // Only values still sampled can judge: a learned one is no
+                // longer sent to the learner, and a candidate that came after
+                // it would wait for its samples for ever (on the Impreza's
+                // drive engine speed was learned at 32 s and not one field was
+                // swapped in fifteen minutes).
+                if (!r.metric || r.state == LS_LEARNED || alreadyLearned(r.metric) ||
+                    now - r.lastMs > 15000) continue;
                 if (r.best == (int16_t)i) { keep = true; break; }   // a value's best field
                 if (!moved(r)) continue;
                 const Acc &a = s_acc[i * NA_MAX + ai];

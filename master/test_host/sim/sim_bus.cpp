@@ -680,8 +680,14 @@ static const uint8_t ECM_PIDS[] = {0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0B, 0x0
                                    0x49, 0x4A, 0x4C};
 static const uint8_t TCM_PIDS[] = {0x01, 0x05, 0x0D, 0x20, 0x21};
 
+static const uint8_t FEW_PIDS[] = {0x05, 0x0C, 0x0D, 0x11};
+
 template <size_t N>
 static bool has(const uint8_t (&set)[N], uint8_t pid) {
+    if (ecu.fewPids && N > 8) {                  // the engine ECU's list only
+        for (uint8_t p : FEW_PIDS) if (p == pid) return true;
+        return false;
+    }
     for (uint8_t p : set) if (p == pid) return true;
     // (The engine ECU's list only: the TCM's stays as it is.)
     return ecu.supportAllPids && N > 8 && pid >= 1 && pid <= 0xA6;
@@ -690,6 +696,11 @@ static bool has(const uint8_t (&set)[N], uint8_t pid) {
 template <size_t N>
 static void bitmap(const uint8_t (&set)[N], uint8_t base, uint8_t out[4]) {
     std::memset(out, 0, 4);
+    if (ecu.fewPids && N > 8) {
+        for (uint8_t p : FEW_PIDS)
+            if (p > base && p <= base + 32) out[(p - base - 1) / 8] |= (uint8_t)(0x80 >> ((p - base - 1) % 8));
+        return;
+    }
     for (uint8_t p : set)
         if (p > base && p <= base + 32) {
             const int i = p - base - 1;

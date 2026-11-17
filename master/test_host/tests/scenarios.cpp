@@ -4189,21 +4189,25 @@ static void scLearnNotCoarse() {
  * Impreza's 40-minute drive (QEMU, 2026-11-17) speed's low byte moved 8 s in,
  * its high byte at 23.7 s (14.4 km/h) - and the table was full at 10.2 s, so
  * speed was never learned in the whole drive: none of its 16-bit fields ever
- * got a place. Here the car creeps at 1-11 km/h for 90 s (only the low byte
+ * got a place. Here the car creeps at 1-11 km/h for 240 s (only the low byte
  * moves) while 40 frames whose bytes follow the engine loosely - never dropped
- * as useless, never a match - fill the table; then it drives.
+ * as useless, never a match - fill the table; then it drives. 240 s: well
+ * after engine speed is learned, whose samples then stop - a candidate still
+ * waiting for its 150 of them used to be kept for ever, and on the real drive
+ * not one field was ever swapped.
  */
 static void scLearnLateField() {
     faults.extraIds = 40;
     faults.extraEngine = true;
+    ecu.fewPids = true;              // as on the recorded drive: a learned value keeps its slot
     sim::speedOverride = [](double t) {
-        return t < 90 ? 6 + 5 * std::sin(t / 4.0) : 50 + 40 * std::sin((t - 90) / 12.0);
+        return t < 240 ? 6 + 5 * std::sin(t / 4.0) : 50 + 40 * std::sin((t - 240) / 12.0);
     };
     simfs::files["/config.json"] = fmt(R"({"cfg_ver":%d,"diag_mode":2})", (int)MasterConfig::CFG_VERSION);
     boot();
     runUntil(80);
     check(logHas("field table full"), "the field table is full while only speed's low byte moves");
-    runUntil(420);
+    runUntil(600);
     const SigInfo spd = learnedFor(METRIC_ID_SPEED);
     check(spd.found && spd.s.canId == 0x252 && spd.s.bitLength >= 16 && spd.s.mode == SIG_VERIFIED,
           "speed is learned from its 16-bit field once its high byte moves", spd.found ? sigStr(spd) : "not learned");
