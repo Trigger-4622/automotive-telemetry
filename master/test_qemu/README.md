@@ -28,12 +28,14 @@ Two things about QEMU (Espressif's 9.2.2) itself, found on 2026-11-17:
   reads, not the boot loader's - so no file system could ever be read and
   every save failed. Dual (DIO) reads are right: the test build uses
   `board_build.flash_mode = dio` (the master's own build stays QIO).
-- **Now and then QEMU itself dies of a segmentation fault**, early in a boot
-  that formats or writes the flash: inside its generated code, on one of the
-  two cores' threads (gdb), not in the firmware. `run.py` runs it again once
-  and says so. With both cores on one thread (`-accel tcg,thread=single`) it
-  does not happen, but the second core never comes back after a software
-  restart and the firmware waits for it for ever - so `--ota` cannot use it.
+- **QEMU itself now and then dies of a segmentation fault** in the first
+  second or two of a boot: inside its generated code, on one of the two
+  cores' threads (gdb), not in the firmware. In `--replay` runs it happened in
+  three boots of a dozen; with `--ota`, in most attempts. `run.py`
+  tries up to three times and says so each time. With both cores on one
+  thread (`-accel tcg,thread=single`) it did not happen, but the second core
+  never came back after a software restart and the firmware waited for it
+  for ever - so `--ota` cannot use that.
 
 ## Running it
 
@@ -178,3 +180,69 @@ What the real traffic showed that the made-up car did not:
   figure (0x0D1): the two fit the ECU's whole km/h equally well. Right in a
   straight line, a little off in a corner.
 
+## 2026-11-17: a 40-minute drive, and the firmware update
+
+CANdid's 2012 Impreza drive (`6_driving_CAN.log`, above), 2,520 s of it - the
+whole drive and the first minutes again - with `--readers`, side by side:
+
+- **A**: PR #12 (drive logs on their own partition, the update over Wi-Fi)
+  with the car's own settings (`--settings`, the file of 2026-11-17: sleep
+  off, drive log on at 10 Hz with 15 values, `log_max_kb` 8000);
+- **C**: main before it (16575b8), the same settings;
+- **B**: PR #12 on default settings (sleep on, nothing learned yet).
+
+| | C: before (main 16575b8) | A: PR #12 |
+|---|---|---|
+| Boots, panics, restarts | 1, 0, 0 | 1, 0, 0 |
+| Identifiers in the census | 27 of 27 | 27 of 27 |
+| Frames a second | 1157 | 1157 |
+| OBD-II answers | 63,822 | 64,096 |
+| Settings: applied as uploaded, saves | saved, 2 of 2 reached the flash | the same |
+| **Drive log** | **stopped 33.6 minutes in: "log space full (log_max_kb 1200)"** - on the settings partition | recorded to the end, on its own partition |
+| Learner's tables | 178 fields (142 KB) | 172 fields (137 KB): the logs partition's LittleFS keeps about 5 KB of buffers |
+| Heap's lowest point | 48 KB | 48 KB |
+| Least stack left | busguard 2064/4096 | busguard 2004/4096 |
+| Tables read from the other core | 113,424 passes, no inconsistency | 114,187 passes, no inconsistency |
+
+The car's learned signals sit on identifiers this Impreza does not have, so
+with its settings nothing new was learned, as it should be: they cover the
+values the ECU offers.
+
+**B found a bug.** 17.5 minutes in, at 1,100 frames a second: "bus quiet for
+90 s - sleeping". The sleep check read the clock first and the last frame's
+time second; the receive task stamps frames on the other core, and a frame
+stamped in between is newer than "now" - the difference wraps to 49 days.
+Fixed (the frame's time first, as everything else reads it), and shown in
+the host harness by `sleep_busy_bus_race`. The car's settings have sleep off.
+In QEMU the sleep then crashed in `esp_now_deinit` (no Wi-Fi here) and the
+master restarted, which is how it showed. On default settings again, with the
+fix (B2): still running when this was written - one boot and no sleep at 28 minutes.
+
+What B learned from the Impreza on default settings, in the first minute:
+engine speed (0x140 from bit 16, all 14 bits - this drive goes over 3,000
+rpm) and the accelerator pedal, both verified; the coolant (0x360 byte 3) 13
+minutes in, once it had warmed far enough to be found. **Road speed was not
+learned**, although 0x0D1 carries it (0-91 km/h, the faster road from minute
+26): the learner's field table was full 12 s in ("evicting as it goes"), as
+on the Forester's bus. Not looked into further here; the car's speed is
+mapped by hand.
+
+**The firmware update** (`--ota`), passed:
+
+| Boot | Slot | What happened |
+|---|---|---|
+| 1 | app0 | refused while the car moved; at a stop, 621,520 bytes in 433 pieces, 3.5 s, checked, restart |
+| 2 | app1 | "new, on trial"; kept after 30 s; a second update, checked, restart |
+| 3 | app0 | "new, on trial"; crashes on purpose 15 s in, before it is kept |
+| 4 | app1 | the bootloader went back: "the last update did not run properly - back on this firmware" |
+
+The settings and the 4 learned (verified) signals loaded alike at boots 2-4,
+and the drive logs mounted their own 8 MB partition every time. Not shown
+here: how long the flash writes take on the board (QEMU's take no time),
+the upload over the air, and what the writes cost the CAN receiver.
+
+Two things this run showed about QEMU, not the firmware: its clock ran on
+through a restart, so the first try kept a firmware on trial at once (the
+trial is now timed from the boot - `fw_trial_late_clock` - and the shim
+restarts the clock at every boot, as the board's does); and the
+segmentation faults above.

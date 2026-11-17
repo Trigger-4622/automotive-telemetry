@@ -31,7 +31,7 @@ emulated ESP32-S3 - real stacks, heap and both cores, which the harness cannot
 show - against a simulated car; it has no radio and no CAN error counters (the
 settings file and the drive log work: its flash is read in DIO mode, QEMU
 misreads QIO), and is a test build that must never be flashed. QEMU itself now
-and then segfaults in a boot that writes the flash; run.py runs it again once.
+and then segfaults early in a boot; run.py tries up to three times and says so.
 In a cloud session `scripts/cloud-setup.sh` (session-start hook) has installed
 what they need; if it printed "NOT set up", say so rather than skipping the
 tests. Firmware builds need `*.platformio.org` on the environment's network
@@ -444,8 +444,12 @@ when it does not (`lamp_hazard_switch`).
   the previous one. A firmware older than this one has no `FW_MARK` and is
   refused (going back to it is a USB job). CI keeps the master's `firmware.bin`
   as the `master-firmware` artifact. Scenarios `fw_update*`, `fw_trial*`,
-  `fw_rolled_back`. Not tried on the board: the upload's speed over the AP,
-  the frames each flash write costs, the restart into app1.
+  `fw_rolled_back`, `fw_trial_late_clock`. In QEMU (`run.py --ota`, the
+  board's partition table, the real bootloader): written in the portal's
+  pieces, checked, booted on trial, kept after 30 s; a second update crashing
+  before it is kept was rolled back and reported; settings and learned values
+  loaded alike at every boot. Not tried on the board: the upload's speed over
+  the AP, the frames each flash write costs.
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
   stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once.

@@ -160,7 +160,8 @@ def ota_report(log, check):
           "after the crash the bootloader went back to the kept firmware, and said so")
     sig = [int(x) for x in re.findall(r"config: loaded \((\d+) signals", log)]
     ver = [int(x) for x in re.findall(r"\[ota  \] boot in \w+, (\d+) verified signals", log)]
-    check(len(sig) >= 4 and len(set(sig[1:])) == 1 and min(ver[1:] or [0]) >= 2,
+    # The first boot has nothing stored yet: "loaded" from the second on.
+    check(len(sig) == len(parts) - 1 and len(set(sig)) == 1 and min(ver[1:] or [0]) >= 2,
           "the settings and the learned values kept through every restart",
           f"signals per boot {sig}, verified per boot {ver}")
     own = re.findall(r"log: drive logs on their own partition \((\d+) KB\)", log)
@@ -231,8 +232,9 @@ def main():
     flash = os.path.join(work, "flash.bin")
     uart = os.path.join(work, "uart.log")
     # QEMU itself (not the firmware) now and then dies of a segmentation fault
-    # early on, since the flash took writes: the run is made again, once.
-    for attempt in (1, 2):
+    # in the first seconds of a boot (inside its generated code, on one of the
+    # cores' threads): the run is made again, up to three times in all.
+    for attempt in (1, 2, 3):
         image(build_dir, flash)
         try:
             q = subprocess.run([qemu, "-nographic", "-machine", "esp32s3",
@@ -242,7 +244,7 @@ def main():
         except subprocess.TimeoutExpired:
             break
         tail = open(uart, errors="replace").read()[-1500:]
-        if q.returncode == -11 and attempt == 1:
+        if q.returncode == -11 and attempt < 3:
             print("   QEMU itself crashed (segmentation fault, an emulator fault) - running it again")
             continue
         sys.exit(f"QEMU ended by itself (exit {q.returncode}): {q.stderr[-800:]}\n--- serial log's end:\n{tail}")
