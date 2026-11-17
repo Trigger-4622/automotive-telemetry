@@ -790,6 +790,190 @@ static void scCensusFull() {
     commonChecks();
 }
 
+/**
+ * The census is 48 rows that are always there and more in blocks of 16 when a
+ * bus has more identifiers (it was 128 rows, 17 KB, for a car with about 25).
+ * This car takes none of them; a busier bus gets every row it did before,
+ * read the same way - by the portal's Bus tab, a row at a time in identifier
+ * order, and by the learner.
+ */
+static bool logHas(const char *text);
+static void scCensusRows() {
+    const auto runFor = [](double s) { runUntil(tNow() + s); };
+    boot();
+    runUntil(30);
+    const size_t own = masterCensusCount();
+    check(own >= 10 && own <= 48, "this car's identifiers fit the rows that are always there",
+          fmt("%u of 48", (unsigned)own));
+    check(!logHas("more rows"), "no block of rows taken from the heap for it");
+    {   // the same list the metric store hands out whole, slot by slot
+        static MetricViewM all[192];
+        const size_t n = masterGetMetrics(all, 192);
+        size_t w = 0; bool same = true;
+        for (size_t i = 0; i < masterMetricSlots(); i++) {
+            MetricViewM v;
+            if (!masterMetricAt(i, v)) continue;
+            same &= w < n && all[w].id == v.id && all[w].value == v.value && all[w].source == v.source;
+            w++;
+        }
+        check(same && w == n && n > 10, "the metric store read slot by slot is the store",
+              fmt("%u of %u", (unsigned)w, (unsigned)n));
+    }
+
+    faults.extraIds = 40;                        // a busier bus: 0x500..0x527 as well
+    runUntil(40);
+    const size_t n = masterCensusCount();
+    check(n == own + 40 && n > 48, "a bus with more identifiers gets more rows",
+          fmt("%u rows", (unsigned)n));
+    check(logHas("more rows"), "and says so once a block");
+
+    // A frame of the test's own, landing in a row past the fixed ones.
+    twai_message_t m = {};
+    m.identifier = 0x6A5; m.data_length_code = 8;
+    const uint8_t first[8]  = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    const uint8_t second[8] = {0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x08};
+    memcpy(m.data, first, 8);  injectFrame(m); runFor(0.05);
+    memcpy(m.data, second, 8); injectFrame(m); runFor(0.05);
+    memcpy(m.data, first, 8);  injectFrame(m); runFor(0.05);
+    uint8_t order[128];
+    const size_t no = masterCensusOrder(order, sizeof order);
+    bool sorted = no == masterCensusCount(), once = true, found = false;
+    bool seen[128] = {false};
+    uint32_t last = 0;
+    size_t mineAt = 0;
+    for (size_t i = 0; i < no; i++) {
+        CensusView v;
+        if (!masterCensusRow(order[i], v)) { sorted = false; break; }
+        sorted &= i == 0 || v.id >= last;
+        last = v.id;
+        once &= order[i] < 128 && !seen[order[i]];
+        if (order[i] < 128) seen[order[i]] = true;
+        if (v.id == 0x6A5) { found = true; mineAt = order[i]; }
+    }
+    check(sorted && once, "the rows in identifier order, each once", fmt("%u rows", (unsigned)no));
+    CensusView v = {};
+    uint8_t ed[64] = {0}, ed2[64] = {0};
+    const bool got = found && masterCensusRow(mineAt, v, ed);
+    check(got && mineAt >= 48, "the test's frame sits in a row past the fixed 48",
+          fmt("row %u", (unsigned)mineAt));
+    check(got && v.count == 3 && v.dlc == 8 && !memcmp(v.data, first, 8) &&
+          v.changed[0] == 0x01 && v.changed[7] == 0x80 && v.changed[3] == 0 && v.ageMs < 200,
+          "its count, payload and changed bits are right",
+          fmt("x%u, changed %02X..%02X", (unsigned)v.count, v.changed[0], v.changed[7]));
+    check(got && ed[0] == 2 && ed[63] == 2 && ed[1] == 0 && masterCensusEdges(0x6A5, false, ed2) &&
+          !memcmp(ed, ed2, 64), "and so are its per-bit flip counters",
+          fmt("bit 0 flipped %u, bit 63 %u", ed[0], ed[63]));
+    CensusView none;
+    check(!masterCensusRow(masterCensusCount(), none), "no row past the last");
+
+    masterResetCensus();                         // the portal's "reset"
+    runFor(0.002);
+    const size_t afterReset = masterCensusCount();
+    runUntil(50);
+    // (all but the ones sent once: the test's own frame, a computer's first answer)
+    check(afterReset < n && masterCensusCount() > 48 && masterCensusCount() + 3 >= n,
+          "after a reset the bus fills it again, past the fixed rows",
+          fmt("%u right after, %u later", (unsigned)afterReset, (unsigned)masterCensusCount()));
+    bool live = true;
+    for (size_t i = 48; i < masterCensusCount(); i++) {
+        CensusView r;
+        live &= masterCensusRow(i, r) && r.count > 0 && r.ageMs < 2000;
+    }
+    check(live, "the rows past 48 are live again");
+    check(learnedFor(METRIC_ID_RPM).found, "learning works alongside");
+    commonChecks();
+}
+
+/**
+ * The verifier's counters follow their signals when the table changes - in
+ * place, where a second copy of the table (4.6 KB) used to be kept for it.
+ * Every way a table changes, and a few hundred arbitrary ones, against the
+ * plain copy it replaced.
+ */
+static void scVerifyCarry() {
+    const size_t CAP = 96;
+    uint32_t rnd = 12345;
+    const auto next = [&]() { rnd = rnd * 1664525u + 1013904223u; return rnd >> 8; };
+    int bad = 0, cases = 0;
+    std::string firstBad;
+    const auto run = [&](const std::vector<uint8_t> &from, const char *what) {
+        uint16_t marks[CAP], want[CAP];
+        for (size_t i = 0; i < CAP; i++) marks[i] = (uint16_t)(100 + i);
+        for (size_t i = 0; i < CAP; i++)
+            want[i] = i < from.size() && from[i] != 0xFF && from[i] < CAP ? (uint16_t)(100 + from[i]) : 0;
+        masterVerifyCarryTest(marks, from.data(), from.size(), CAP);
+        cases++;
+        for (size_t i = 0; i < CAP; i++)
+            if (marks[i] != want[i]) {
+                if (!bad++) firstBad = fmt("%s: row %u holds %u, should hold %u", what, (unsigned)i, marks[i], want[i]);
+                break;
+            }
+    };
+    std::vector<uint8_t> f(40);
+    for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)i;
+    run(f, "nothing moved");
+    for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)(i < 7 ? i : i + 1);
+    run(f, "a row removed");
+    for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)(i < 7 ? i : i == 7 ? 0xFF : i - 1);
+    run(f, "a row put in");
+    for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)i;
+    f[3] = 9; f[9] = 3;
+    run(f, "two rows swapped");
+    f[3] = 9; f[9] = 20; f[20] = 3;
+    run(f, "three rows in a ring");
+    for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)(f.size() - 1 - i);
+    run(f, "the table turned round");
+    for (size_t i = 0; i < f.size(); i++) f[i] = 5;
+    run(f, "every row from one");
+    f.assign(96, 0);
+    for (size_t i = 0; i < 96; i++) f[i] = (uint8_t)((i + 1) % 96);
+    run(f, "a full table shifted round");
+    f.clear();
+    run(f, "an empty table");
+    for (int k = 0; k < 400; k++) {
+        f.resize(next() % 97);
+        for (auto &x : f) {
+            const uint32_t r = next() % 100;
+            x = r < 25 ? 0xFF : (uint8_t)(next() % 96);        // new rows, moved rows, rows shared
+        }
+        if (k % 3 == 0) {                                      // a shuffle: every row moved
+            for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)i;
+            for (size_t i = f.size(); i > 1; i--) std::swap(f[i - 1], f[next() % i]);
+        }
+        run(f, "an arbitrary change");
+    }
+    check(bad == 0, "every row holds its signal's counters after the table changed",
+          bad ? firstBad : fmt("%d tables", cases));
+}
+
+/**
+ * Every task's stack is watched, the four started outside main.cpp as well
+ * (they never were): the least each has had left is what says whether a stack
+ * - 61 KB of the heap between them - could be smaller.
+ */
+static void scStackWatch() {
+    boot();
+    runUntil(8);
+    StackView sv[16];
+    const size_t n = masterStacks(sv, 16);
+    std::string names;
+    bool sane = true;
+    for (size_t i = 0; i < n; i++) {
+        names += std::string(i ? " " : "") + sv[i].name;
+        sane &= sv[i].size >= 4096 && sv[i].minFree > 0 && sv[i].minFree <= sv[i].size;
+    }
+    bool all = true;
+    for (const char *want : {"twai_rx", "obd_poll", "broadcast", "housekeep", "busguard", "loopTask",
+                             "ssm2", "codes", "learner", "drivelog"})
+        all &= (" " + names + " ").find(std::string(" ") + want + " ") != std::string::npos;
+    check(all && n == 10, "all ten tasks report their stack", names);
+    check(sane, "each with its size and the least it has had left");
+    runUntil(70);
+    check(serialOut.find("[stack] least left of size: twai_rx ") != std::string::npos &&
+          serialOut.find(" drivelog ") != std::string::npos, "and the serial log lists them once a minute");
+    commonChecks();
+}
+
 /** A flood the receive queue cannot keep up with. */
 static void scRxFlood() {
     boot();
@@ -3882,7 +4066,8 @@ static const Scenario SCENARIOS[] = {
     {"sleep", scSleep, 0}, {"clock_wrap", scClockWrap, 0}, {"both", scBoth, 0},
     {"obd_only", scObdOnly, 0}, {"ecu_off", scEcuOff, 0}, {"ssm_stmin", scSsmStmin, 0},
     {"ssm_stmin_reserved", scSsmStminReserved, 0}, {"ssm_cut", scSsmCut, 0}, {"ssm_dead", scSsmDead, 0},
-    {"portal_actions", scPortalActions, 0}, {"census_full", scCensusFull, 0}, {"rx_flood", scRxFlood, 0},
+    {"portal_actions", scPortalActions, 0}, {"census_full", scCensusFull, 0},
+    {"census_rows", scCensusRows, 0}, {"verify_carry", scVerifyCarry, 0}, {"stack_watch", scStackWatch, 0}, {"rx_flood", scRxFlood, 0},
     {"timing_250", scTiming250, 0}, {"timing_125", scTiming125, 0}, {"timing_500", scTiming500, 0},
     {"timing_1m", scTiming1M, 0}, {"sleep_held", scSleepHeld, 0},
     {"settle", scSettle, 0}, {"settle_restart", scSettleRestart, 0}, {"settle_portal", scSettlePortal, 0},

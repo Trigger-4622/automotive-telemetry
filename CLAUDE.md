@@ -18,11 +18,17 @@ python master/test_host/run.py [scenario] [-v]                 # master in a sim
 python master/test_host/run.py portal_teach                    # the portal's teach-by-doing analysis, in Node
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
+python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # the real master firmware in Espressif's QEMU (needs $QEMU_ESP32S3; not in test_all)
+python master/test_qemu/run.py --replay drive.log   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
 
-The harnesses are the only way to exercise the firmware without hardware.
+The harnesses are the only way to exercise the firmware's logic without
+hardware. `master/test_qemu` (its README) runs the real compiled master on an
+emulated ESP32-S3 - real stacks, heap and both cores, which the harness cannot
+show - against a simulated car; it has no radio, no CAN error counters and no
+working settings file, and is a test build that must never be flashed.
 In a cloud session `scripts/cloud-setup.sh` (session-start hook) has installed
 what they need; if it printed "NOT set up", say so rather than skipping the
 tests. Firmware builds need `*.platformio.org` on the environment's network
@@ -246,6 +252,22 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   block: serial `[stats]` and `/api/live` (`heap`, `heap_min`, `heap_block`);
   the loop task's stack is in the `[ctrl ]` headroom figure. The sim's heap is
   a constant 180 KB, so it cannot show exhaustion itself.
+- **Static RAM is the learner's heap too** (2026-11-16: data + bss 84 KB, was
+  123 KB; `pio run` prints it - check it after adding a table). Never keep a
+  `static` copy of a table for a portal page or a task: read it a row at a
+  time (`masterCensusRow` / `masterCensusOrder`, `masterMetricAt`,
+  `learnerStatusRow`; the learner's `Census` holds one row), or take it from
+  the heap for the length of the request (`/api/logs`). The census is 48 rows
+  that are always there and blocks of 16 the receive task takes when a bus
+  has more identifiers (128 at most, as before; 2 KB a block out of the
+  reserve, never given back - none on this car, `census_rows`). The verifier's
+  counters follow their signals in place when the table changes
+  (`verifyCarry`, `verify_carry`: no second copy of the table). Stacks are
+  61 KB of the heap and nothing here can measure them: each task's least
+  headroom is in the serial log (`[stack]`, once a minute) and `/api/live`
+  (`stacks`: [least left, size]) - a task started outside main.cpp reports in
+  with `masterWatchStack()` (`stack_watch`). Cut a stack only from the car's
+  figures.
 - **Let errors pass** (`tx_passive`, default on; "passive transmit mode" in
   the code): the master never sends an error frame. A controller cannot stop
   signalling errors, or acknowledging, while it transmits (only listen-only
@@ -445,10 +467,32 @@ when it does not (`lamp_hazard_switch`).
   they stood for read with the SSM2 request, the two logged SSM2 values this
   ECU does not offer - Front O2 #1, Knock correction - replaced by A/F 1
   lambda and Knock corr fine). Left for the owner: both front doors on one bit
-  (0x431 bit 40), "Brake" overlapping the speed's high byte (0x333), SSM2 at
-  5 Hz against a 10 Hz log. The learner rules above are harness only; on the
+  (0x431 bit 40), SSM2 at 5 Hz against a 10 Hz log. A file of 2026-11-17
+  (config5, upload pending) also moves "Brake" to 0x333 byte 2 (it overlapped
+  the speed's high byte) and sets the speed to Subaru's 0.05625 km/h per bit
+  (the learned -0.5 offset was OBD's whole km/h): this car's 0x333 is laid out
+  like the 2017 Forester's 0x0D1 (speed bytes 0-1, brake byte 2, a flag in
+  byte 3). Of this car's signal IDs only 0x002 (steering, same layout) also
+  exists on the Forester - its other addresses do not carry over. The learner rules above are harness only; on the
   car, the serial log's "no longer agrees with the ECU" lines say what a
   re-check turned down.
+- RAM (2026-11-16): harness, build and QEMU (`master/test_qemu/README.md`:
+  before and after side by side, a 70-identifier bus, a 10 minute soak, the
+  tables read from the other core - no crash, no inconsistency). On the car: the boot line
+  `learner started: N fields x 20 values ... (X KB, Y KB left)` (N should be
+  higher than before), `/api/live` `heap_min` after a drive with the portal
+  used and settings saved (how much of the 95 KB reserve is never touched),
+  and `stacks` - the figures a smaller `HEAP_RESERVE` or smaller stacks would
+  have to rest on. Not done, for want of those: the stacks, the reserve, the
+  live page's JSON document (estimated at 20-30 KB for a moment, every second
+  the portal is open - not measured).
+- Learner, found by replaying a real 2017 Forester's traffic in QEMU
+  (2026-11-17, `master/test_qemu/README.md`), not fixed: engine speed learned
+  as 12 bits of a 14-bit field because the drive stayed under 4,096 rpm (the
+  two fields read the same until then; above it the 12-bit one wraps, and only
+  the re-check would catch it); the field table is full within two seconds on
+  a 54-identifier bus; road speed taken from one wheel. This car's engine
+  speed is 16 bits wide and is not affected.
 - Codes, oil change, G-meter, drive log and timers (above): harness only. On
   the car: whether the TCM answers 0x7E1 (or only 0x7DF) and lists P1718 under
   service 03 at all; that the SSM2 odometer matches the cluster; which frame

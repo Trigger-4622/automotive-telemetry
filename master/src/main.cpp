@@ -79,23 +79,25 @@ static constexpr size_t MAX_MASTER_METRICS = 192;
  *  enough that a source going away hands over within half a second. */
 /* The hold time is Cfg.sourceHoldMs - editable in the portal. */
 
-/** @brief One parsed channel awaiting broadcast. */
+/** @brief One parsed channel awaiting broadcast. Small members together: 32
+ *         bytes a slot rather than 36, times 192. */
 struct MasterMetric {
     uint16_t id;            /**< Metric ID — see @ref MetricIDs.        */
-    float    value;         /**< Latest engineering-unit value.         */
-    uint32_t lastUpdateMs;  /**< millis() of the last update, for TTL.  */
     uint8_t  source;        /**< @ref MetricSource of the last write.   */
     bool     used;          /**< Slot has been claimed.                 */
-    float    sentValue;     /**< Value in the last broadcast.           */
-    uint32_t sentMs;        /**< millis() of the last broadcast.        */
     bool     everSent;      /**< At least one broadcast has carried it. */
     uint8_t  repeats;       /**< Bursts still to carry its last change. */
+    float    value;         /**< Latest engineering-unit value.         */
+    uint32_t lastUpdateMs;  /**< millis() of the last update, for TTL.  */
+    float    sentValue;     /**< Value in the last broadcast.           */
+    uint32_t sentMs;        /**< millis() of the last broadcast.        */
     /** The ECU's latest answer for it (OBD-II or SSM2), kept whatever the
      *  source priority let through: the reference learned signals are
      *  checked against, even while one of them is what gets published. */
     float    reqValue;
     uint32_t reqMs;         /**< millis() of that answer; 0 = none yet.  */
 };
+static_assert(sizeof(MasterMetric) == 32, "MasterMetric grew: 192 of them are static RAM");
 
 /** @brief The metric store, shared between the CAN and broadcast tasks. */
 static MasterMetric s_metrics[MAX_MASTER_METRICS] = {};
@@ -494,10 +496,29 @@ static SemaphoreHandle_t s_twaiReg = nullptr;
 
 /** The tasks whose stack headroom the portal and the heartbeat report: an
  *  overflow is a panic, and a panic is a restart in the middle of a drive. */
-static struct { TaskHandle_t h; const char *name; } s_tasks[] = {
-    { nullptr, "twai_rx" }, { nullptr, "obd_poll" }, { nullptr, "broadcast" },
-    { nullptr, "housekeep" }, { nullptr, "busguard" }, { nullptr, "loopTask" },
+static struct { TaskHandle_t h; const char *name; uint16_t size; } s_tasks[] = {
+    { nullptr, "twai_rx", 6144 }, { nullptr, "obd_poll", 4096 }, { nullptr, "broadcast", 6144 },
+    { nullptr, "housekeep", 4096 }, { nullptr, "busguard", 4096 }, { nullptr, "loopTask", 12 * 1024 },
+    // Started by their own modules, which report in with masterWatchStack():
+    // these four were never watched, and stacks are 61 KB of the heap - the
+    // figures say which of them could be smaller.
+    { nullptr, "ssm2", 6144 }, { nullptr, "codes", 6144 }, { nullptr, "learner", 6144 },
+    { nullptr, "drivelog", 6144 },
 };
+
+void masterWatchStack(const char *name) {
+    for (auto &t : s_tasks)
+        if (!t.h && !strcmp(t.name, name)) { t.h = xTaskGetCurrentTaskHandle(); return; }
+}
+
+size_t masterStacks(StackView *out, size_t max) {
+    size_t w = 0;
+    for (const auto &t : s_tasks) {
+        if (!t.h || w >= max) continue;
+        out[w++] = { t.name, t.size, (uint32_t)uxTaskGetStackHighWaterMark(t.h) };   // bytes on ESP-IDF
+    }
+    return w;
+}
 
 /** @brief Milliseconds of guard pause left (0 = not paused). */
 static uint32_t guardPauseLeft() {
@@ -665,8 +686,27 @@ struct CanIdCount {
     uint32_t expected[2]; /**< Its frames due over the same gaps.           */
     /** @} */
 };
-static CanIdCount s_census[MAX_CENSUS] = {};
+/**
+ * The first CENSUS_FIXED rows are always there; a bus with more identifiers
+ * gets the rest in blocks of CENSUS_BLOCK, up to MAX_CENSUS as before. All 128
+ * as one table held 17 KB for a car that sends about 25 identifiers - RAM the
+ * learner sizes its tables from. A block is taken by the receive task when
+ * the row is first needed and never given back, so a row once handed out
+ * stays where it is for every reader. Blocks come out of the heap the learner
+ * left for the portal (2 KB each): none on this car (census_rows).
+ */
+static constexpr size_t CENSUS_FIXED = 48;
+static constexpr size_t CENSUS_BLOCK = 16;
+static CanIdCount s_census[CENSUS_FIXED] = {};
+static CanIdCount *s_censusMore[(MAX_CENSUS - CENSUS_FIXED) / CENSUS_BLOCK] = {};
 static volatile uint8_t s_censusUsed = 0;
+
+/** Row @p i of the census. Only for i below s_censusUsed. */
+static inline CanIdCount &censusAt(size_t i) {
+    if (i < CENSUS_FIXED) return s_census[i];
+    const size_t k = i - CENSUS_FIXED;
+    return s_censusMore[k / CENSUS_BLOCK][k % CENSUS_BLOCK];
+}
 
 /** @name Bus-load and transmit accounting
  *  Bits on the wire, estimated per frame, so the portal can show load as a
@@ -782,6 +822,8 @@ static void censusServiceReset() {
     s_censusUsed = 0;
     s_censusFull = false;
     memset(s_census, 0, sizeof(s_census));
+    for (CanIdCount *blk : s_censusMore)
+        if (blk) memset(blk, 0, CENSUS_BLOCK * sizeof(CanIdCount));
 }
 
 /**
@@ -792,7 +834,7 @@ static void censusAdd(const twai_message_t &msg) {
     const uint8_t dlc = msg.data_length_code > 8 ? 8 : msg.data_length_code;
     const uint32_t nowUs = micros();
     for (uint8_t i = 0; i < s_censusUsed; i++) {
-        CanIdCount &c = s_census[i];
+        CanIdCount &c = censusAt(i);
         if (c.id == msg.identifier && c.extd == (bool)msg.extd) {
             c.count++;
             c.dlc = dlc;
@@ -810,7 +852,17 @@ static void censusAdd(const twai_message_t &msg) {
         }
     }
     if (s_censusUsed >= MAX_CENSUS) { s_censusFull = true; return; }
-    CanIdCount &c = s_census[s_censusUsed];
+    if (s_censusUsed >= CENSUS_FIXED) {
+        CanIdCount *&blk = s_censusMore[(s_censusUsed - CENSUS_FIXED) / CENSUS_BLOCK];
+        if (!blk) {
+            blk = (CanIdCount *)calloc(CENSUS_BLOCK, sizeof(CanIdCount));
+            if (!blk) { s_censusFull = true; return; }    // as when the table is full
+            log_i("census: more than %u identifiers on this bus - %u more rows (%u bytes of heap)",
+                  (unsigned)s_censusUsed, (unsigned)CENSUS_BLOCK,
+                  (unsigned)(CENSUS_BLOCK * sizeof(CanIdCount)));
+        }
+    }
+    CanIdCount &c = censusAt(s_censusUsed);
     c.id     = msg.identifier;
     c.count  = 1;
     c.dlc    = dlc;
@@ -847,13 +899,13 @@ static void censusPrint() {
     for (uint8_t k = 0; k < lines; k++) {
         uint8_t best = 0xFF;
         for (uint8_t i = 0; i < n; i++)
-            if (!shown[i] && (best == 0xFF || s_census[i].count > s_census[best].count))
+            if (!shown[i] && (best == 0xFF || censusAt(i).count > censusAt(best).count))
                 best = i;
         if (best == 0xFF) break;
         shown[best] = true;
         Serial.printf("        %s0x%03X  dlc %u  x%u\n",
-                      s_census[best].extd ? "ext " : "", s_census[best].id,
-                      s_census[best].dlc, s_census[best].count);
+                      censusAt(best).extd ? "ext " : "", censusAt(best).id,
+                      censusAt(best).dlc, censusAt(best).count);
     }
 }
 
@@ -1062,6 +1114,63 @@ static bool sameSignal(const RtSignal &a, const RtSignal &b) {
            a.metricId == b.metricId && a.refMetric == b.refMetric;
 }
 
+/** No earlier row to carry from (verifyCarry). */
+static constexpr uint8_t CARRY_NONE = 0xFF;
+
+/**
+ * @brief Move the verifier's counters to where their signals now are, in
+ *        place: row i becomes what row from[i] was, or empty for CARRY_NONE.
+ *
+ * This used to be done from a second copy of the whole table, 4.6 KB kept for
+ * the moment a table changes. Without one, the order matters: a row is
+ * written only once nothing still waits to read what it held, and rows that
+ * wait on each other in a ring go round through one spare row.
+ *
+ * Never inlined: its spare row is on the receive task's stack only while it
+ * runs, not under the log lines of the refresh that calls it.
+ *
+ * @param n Rows in the new table; the rows after them are emptied.
+ */
+static void __attribute__((noinline)) verifyCarry(VerifyState *v, const uint8_t *from, size_t n, size_t cap) {
+    static constexpr uint8_t DONE = 0xFE;
+    static uint8_t src[MAX_SIGNALS];        // receive task only; not on its stack
+    if (cap > MAX_SIGNALS) cap = MAX_SIGNALS;
+    for (size_t i = 0; i < cap; i++) {
+        src[i] = i < n ? from[i] : CARRY_NONE;
+        if (src[i] != CARRY_NONE && src[i] >= cap) src[i] = CARRY_NONE;
+        if (src[i] == i) src[i] = DONE;                 // stays where it is
+    }
+    const auto wanted = [&](size_t i) {                 // does a row still to be written read row i?
+        for (size_t k = 0; k < cap; k++)
+            if (k != i && src[k] == i) return true;
+        return false;
+    };
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (size_t i = 0; i < cap; i++) {
+            if (src[i] == DONE || wanted(i)) continue;
+            if (src[i] == CARRY_NONE) memset(&v[i], 0, sizeof(VerifyState));
+            else                      v[i] = v[src[i]];
+            src[i] = DONE;
+            moved = true;
+        }
+    }
+    // What is left reads each other in rings (two rows that swapped places).
+    for (size_t i = 0; i < cap; i++) {
+        if (src[i] == DONE) continue;
+        const VerifyState spare = v[i];
+        size_t at = i;
+        while (src[at] != i) {
+            const size_t next = src[at];
+            v[at] = v[next];
+            src[at] = DONE;
+            at = next;
+        }
+        v[at] = spare;
+        src[at] = DONE;
+    }
+}
+
 /**
  * @brief Re-copy the signal table when the portal or the learner changed it.
  *
@@ -1070,21 +1179,42 @@ static bool sameSignal(const RtSignal &a, const RtSignal &b) {
  * across by identity. Clearing them all on every change would mean a signal
  * could only be verified in a quiet spell long enough to collect all its
  * samples at once, which on a moving car may never come.
+ *
+ * The old table is compared with the new one before it is replaced, and the
+ * counters are moved in place (verifyCarry): this used to keep a second copy
+ * of both, the table's on the heap from its first change on.
  */
 static void refreshSignals() {
     if (s_sigGen == Cfg.generation) return;
-    static std::vector<RtSignal> prev;
-    static VerifyState prevV[MAX_SIGNALS];
-    prev.swap(s_sigs);
-    memcpy(prevV, s_verify, sizeof(s_verify));
     const bool clear = s_verifyClearReq;
     s_verifyClearReq = false;
 
+    static uint8_t from[MAX_SIGNALS];       // receive task only; not on its stack
     Cfg.lock();
     s_sigGen = Cfg.generation;
-    s_sigs   = Cfg.signals;
+    const size_t n = Cfg.signals.size() < MAX_SIGNALS ? Cfg.signals.size() : MAX_SIGNALS;
+    for (size_t i = 0; i < n; i++) {
+        from[i] = CARRY_NONE;
+        const RtSignal &sg = Cfg.signals[i];
+        // A candidate's progress, and a learned signal's re-checks.
+        const bool rechecked = sg.learned && sg.publishes();
+        if (clear || (sg.mode != SIG_AUTO && !rechecked)) continue;
+        for (size_t j = 0; j < s_sigs.size(); j++)
+            if (s_sigs[j].mode == sg.mode && sameSignal(s_sigs[j], sg)) {
+                from[i] = (uint8_t)j;
+                break;
+            }
+    }
+    if (s_sigs.capacity() < n) {
+        // Room for a few more than there are, the old table let go first: the
+        // learner adds rows one at a time, and each used to be a new block
+        // taken while the old one was still held.
+        std::vector<RtSignal>().swap(s_sigs);
+        s_sigs.reserve(n + 8 < MAX_SIGNALS ? n + 8 : MAX_SIGNALS);
+    }
+    s_sigs.assign(Cfg.signals.begin(), Cfg.signals.begin() + n);
     Cfg.unlock();
-    if (s_sigs.size() > MAX_SIGNALS) s_sigs.resize(MAX_SIGNALS);
+    verifyCarry(s_verify, from, n, MAX_SIGNALS);
     for (auto &sg : s_sigs) {
         sg.ownMask = leverOwnMask(sg);
         if (!sg.ownMask) continue;
@@ -1099,18 +1229,6 @@ static void refreshSignals() {
         if (nTold < 4) nTold++;
         log_i("signal '%s' (0x%03X): read from its own field, %u of its %u saved bits",
               sg.name, sg.canId, (unsigned)__builtin_popcount(sg.ownMask), (unsigned)sg.nBits);
-    }
-    memset(s_verify, 0, sizeof(s_verify));
-    if (clear) return;
-    for (size_t i = 0; i < s_sigs.size(); i++) {
-        // A candidate's progress, and a learned signal's re-checks.
-        const bool rechecked = s_sigs[i].learned && s_sigs[i].publishes();
-        if (s_sigs[i].mode != SIG_AUTO && !rechecked) continue;
-        for (size_t j = 0; j < prev.size() && j < MAX_SIGNALS; j++)
-            if (prev[j].mode == s_sigs[i].mode && sameSignal(prev[j], s_sigs[i])) {
-                s_verify[i] = prevV[j];
-                break;
-            }
     }
 }
 
@@ -3290,7 +3408,7 @@ void masterGetStats(MasterStats &out) {
     }
     const uint8_t n = s_censusUsed;
     for (uint8_t i = 0; i < n; i++) {
-        const CanIdCount &c = s_census[i];
+        const CanIdCount &c = censusAt(i);
         if (!idPeriodic(c) || idOnRequest(c)) continue;
         for (int m = 0; m < 2; m++) { out.missed[m] += c.missed[m]; out.expected[m] += c.expected[m]; }
     }
@@ -3306,7 +3424,7 @@ size_t masterMissedIds(MissView *out, size_t max) {
     size_t w = 0;
     const uint8_t n = s_censusUsed;
     for (uint8_t i = 0; i < n; i++) {
-        const CanIdCount &c = s_census[i];
+        const CanIdCount &c = censusAt(i);
         if (!idPeriodic(c) || idOnRequest(c) || !(c.expected[0] + c.expected[1])) continue;
         MissView v = {c.id, c.extd, (c.periodUs + 500) / 1000, {c.missed[0], c.missed[1]},
                       {c.expected[0], c.expected[1]}};
@@ -3325,16 +3443,30 @@ size_t masterMissedIds(MissView *out, size_t max) {
     return w;
 }
 
-size_t masterCensusRaw(CensusView *out, size_t max) {
+size_t masterCensusCount() { return s_censusUsed; }
+
+bool masterCensusRow(size_t index, CensusView &out, uint8_t *edges) {
+    if (index >= s_censusUsed) return false;
+    const CanIdCount &c = censusAt(index);
+    out.id = c.id; out.count = c.count; out.dlc = c.dlc; out.extd = c.extd;
+    memcpy(out.data, c.data, 8);
+    memcpy(out.changed, c.changed, 8);
+    out.ageMs = millis() - c.lastMs;
+    if (edges) memcpy(edges, c.edges, 64);   // bytes: a torn copy is off by one flip at most
+    return true;
+}
+
+size_t masterCensusOrder(uint8_t *order, size_t max) {
+    // By identifier: rows that stay put are what you can map against, and on
+    // CAN the lower ID is also the higher priority, the order a DBC lists them.
     const uint8_t n = s_censusUsed;
-    const uint32_t now = millis();
     size_t w = 0;
-    for (uint8_t i = 0; i < n && w < max; i++, w++) {
-        const CanIdCount &c = s_census[i];
-        out[w].id = c.id; out[w].count = c.count; out[w].dlc = c.dlc; out[w].extd = c.extd;
-        memcpy(out[w].data, c.data, 8);
-        memcpy(out[w].changed, c.changed, 8);
-        out[w].ageMs = now - c.lastMs;
+    for (uint8_t i = 0; i < n && w < max; i++) {
+        const uint32_t id = censusAt(i).id;
+        size_t at = w;
+        while (at > 0 && censusAt(order[at - 1]).id > id) { order[at] = order[at - 1]; at--; }
+        order[at] = i;
+        w++;
     }
     return w;
 }
@@ -3348,36 +3480,11 @@ uint64_t masterExtract(const uint8_t *d, uint8_t dlc, uint8_t start, uint8_t len
 bool masterCensusEdges(uint32_t id, bool extd, uint8_t out[64]) {
     const uint8_t n = s_censusUsed;
     for (uint8_t i = 0; i < n; i++)
-        if (s_census[i].id == id && s_census[i].extd == extd) {
-            memcpy(out, s_census[i].edges, 64);   // bytes: a torn copy is off by one flip at most
+        if (censusAt(i).id == id && censusAt(i).extd == extd) {
+            memcpy(out, censusAt(i).edges, 64);   // bytes: a torn copy is off by one flip at most
             return true;
         }
     return false;
-}
-
-size_t masterGetCensus(CensusView *out, size_t max) {
-    const uint8_t n = s_censusUsed;
-    size_t w = 0;
-    const uint32_t now = millis();
-    for (uint8_t i = 0; i < n && w < max; i++) {
-        const CanIdCount &c = s_census[i];
-        out[w].id    = c.id;
-        out[w].count = c.count;
-        out[w].dlc   = c.dlc;
-        out[w].extd  = c.extd;
-        memcpy(out[w].data, c.data, 8);
-        memcpy(out[w].changed, c.changed, 8);
-        out[w].ageMs = now - c.lastMs;
-        w++;
-    }
-    // By identifier: rows that stay put are what you can map against, and on
-    // CAN the lower ID is also the higher priority, the order a DBC lists them.
-    for (size_t a = 0; a + 1 < w; a++)
-        for (size_t b = a + 1; b < w; b++)
-            if (out[b].id < out[a].id) {
-                CensusView t = out[a]; out[a] = out[b]; out[b] = t;
-            }
-    return w;
 }
 
 size_t masterGetMetrics(MetricViewM *out, size_t max) {
@@ -3396,16 +3503,44 @@ size_t masterGetMetrics(MetricViewM *out, size_t max) {
     return w;
 }
 
-size_t masterEventLog(EvView *out, size_t max) {
-    static EvRecord snap[EV_MAX];
-    const size_t n = evSnapshot(snap, EV_MAX);
-    size_t w = 0;
-    for (size_t i = 0; i < n && w < max; i++) {
-        out[w].ms = snap[i].ms; out[w].type = snap[i].type;
-        out[w].act = snap[i].act; out[w].a = snap[i].a; out[w].b = snap[i].b;
-        w++;
+bool masterMetricAt(size_t slot, MetricViewM &out) {
+    if (slot >= MAX_MASTER_METRICS) return false;
+    const uint32_t now = millis();
+    portENTER_CRITICAL(&s_metricMux);
+    const MasterMetric &m = s_metrics[slot];
+    const bool used = m.used;
+    if (used) {
+        out.id     = m.id;
+        out.value  = m.value;
+        out.ageMs  = now - m.lastUpdateMs;
+        out.source = m.source;
     }
+    portEXIT_CRITICAL(&s_metricMux);
+    return used;
+}
+
+size_t masterMetricSlots() { return MAX_MASTER_METRICS; }
+
+size_t masterEventLog(EvView *out, size_t max) {
+    // Straight from the ring, oldest first: this used to go through a second
+    // copy of it kept only for the purpose.
+    portENTER_CRITICAL(&s_evMux);
+    const uint8_t n = s_evCount;
+    const uint8_t start = (uint8_t)((s_evHead + EV_MAX - n) % EV_MAX);
+    size_t w = 0;
+    for (uint8_t i = 0; i < n && w < max; i++, w++) {
+        const EvRecord &r = s_ev[(start + i) % EV_MAX];
+        out[w].ms = r.ms; out[w].type = r.type; out[w].act = r.act; out[w].a = r.a; out[w].b = r.b;
+    }
+    portEXIT_CRITICAL(&s_evMux);
     return w;
+}
+
+void masterVerifyCarryTest(uint16_t *marks, const uint8_t *from, size_t n, size_t cap) {
+    std::vector<VerifyState> v(cap);
+    for (size_t i = 0; i < cap; i++) { v[i] = {}; v[i].agree = marks[i]; v[i].rcStamp = marks[i] * 7u; }
+    verifyCarry(v.data(), from, n, cap);
+    for (size_t i = 0; i < cap; i++) marks[i] = v[i].rcStamp == v[i].agree * 7u ? v[i].agree : 0xFFFF;
 }
 
 const char *masterEventName(uint8_t type) { return evName(type); }
@@ -3693,6 +3828,24 @@ static void portalRescueCheck() {
  * Worth watching during bring-up: `CAN rx` climbing proves the wiring and
  * bitrate are right, and `SSM`/`OBD` climbing proves the ECU is answering.
  */
+/**
+ * @brief Each task's least stack left, once a minute: what a stack could be
+ *        cut to is read off the car, not guessed.
+ *
+ * A function of its own, never inlined: loop()'s frame lies under every
+ * portal page and every save, and must not grow by this list.
+ */
+static void __attribute__((noinline)) stackHeartbeat() {
+    static uint8_t beat = 11;
+    if (++beat < 12) return;
+    beat = 0;
+    Serial.printf("[stack] least left of size:");
+    for (const auto &t : s_tasks)
+        if (t.h)
+            Serial.printf(" %s %u/%u", t.name, (unsigned)uxTaskGetStackHighWaterMark(t.h), (unsigned)t.size);
+    Serial.printf("\n");
+}
+
 void loop() {
     static uint32_t last = 0;
     if (millis() - last >= 5000) {
@@ -3751,6 +3904,7 @@ void loop() {
                           (unsigned)ls.errIdle, (unsigned)ls.txFailed, (unsigned)ls.arbLost,
                           (unsigned)ls.lomTecRead, (unsigned)ls.lomRepins,
                           (unsigned)ls.stackMinFree, ls.stackMinTask);
+            stackHeartbeat();
             static bool stackWarned = false;
             if (!stackWarned && ls.stackMinTask[0] && ls.stackMinFree < 512) {
                 stackWarned = true;

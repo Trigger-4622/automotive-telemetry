@@ -161,6 +161,15 @@ struct Ref {
  */
 struct Excl { uint32_t id; uint8_t start, len; bool be; uint16_t metric; float k; uint8_t strikes; };
 struct Dead { uint32_t id; uint8_t start, len; bool be; };
+/** An evicted candidate, in four bytes: the learner only looks at 11-bit
+ *  identifiers (discover()), and a field is at most 16 bits long. 512 of them
+ *  at eight bytes were 4 KB. */
+struct Evicted {
+    uint16_t id; uint8_t start, lenBe;
+    bool is(uint32_t i, uint8_t s, uint8_t l, bool b) const {
+        return id == i && start == s && lenBe == (uint8_t)(l | (b ? 0x80 : 0));
+    }
+};
 struct Sample { uint16_t metric; float value; };
 /** @brief A value without a slot: just enough to tell whether it moves. */
 struct Watch { uint16_t metric; bool init, lastBit; float lo, hi; uint32_t seenMs, movedMs; };
@@ -179,7 +188,7 @@ bool     s_exDirty = false;  /**< Changed since last written to the settings. */
  *  evaluation): their field is not proposed for their value again. */
 constexpr size_t MAX_OFF = 16;
 Dead     s_off[MAX_OFF]; uint16_t s_offMetric[MAX_OFF]; size_t s_noff = 0;
-Dead     s_dead[MAX_DEAD];   size_t s_ndead = 0, s_deadHead = 0;
+Evicted  s_dead[MAX_DEAD];   size_t s_ndead = 0, s_deadHead = 0;
 Watch    s_watch[MAX_WATCH]; size_t s_nWatch = 0;
 uint16_t s_learned[MAX_LEARNED]; volatile size_t s_nLearned = 0;
 volatile bool s_resetReq = false;
@@ -346,10 +355,44 @@ void loadExclusions() {
     s_exDirty = false;
 }
 
-const CensusView *lookup(const CensusView *cen, size_t n, uint32_t id, uint8_t &ci) {
-    if (ci < n && cen[ci].id == id && !cen[ci].extd) return &cen[ci];
-    for (size_t i = 0; i < n; i++)
-        if (cen[i].id == id && !cen[i].extd) { ci = (uint8_t)i; return &cen[i]; }
+/**
+ * @brief The census, a row at a time.
+ *
+ * The learner used to copy all of it for every batch of readings - 4 KB kept
+ * for the purpose - and only ever looks at one frame at once. One row is held,
+ * the one last asked for: candidates of one frame sit together, so it is
+ * fetched once for all of them.
+ */
+class Census {
+public:
+    Census() : _n(masterCensusCount()) { s_at = -1; }
+    size_t size() const { return _n; }
+    /** Row @p i, or nullptr. Good until the next call. */
+    const CensusView *row(size_t i) {
+        if (i >= _n) return nullptr;
+        if (s_at != (int)i) {
+            s_at = -1;
+            if (!masterCensusRow(i, s_row)) return nullptr;   // reset under us
+            s_at = (int)i;
+        }
+        return &s_row;
+    }
+private:
+    size_t _n;
+    // The row held: the learner task's alone, and not on its stack.
+    static CensusView s_row;
+    static int        s_at;
+};
+CensusView Census::s_row;
+int        Census::s_at = -1;
+
+const CensusView *lookup(Census &cen, uint32_t id, uint8_t &ci) {
+    const CensusView *e = cen.row(ci);
+    if (e && e->id == id && !e->extd) return e;
+    for (size_t i = 0; i < cen.size(); i++) {
+        e = cen.row(i);
+        if (e && e->id == id && !e->extd) { ci = (uint8_t)i; return e; }
+    }
     return nullptr;
 }
 
@@ -413,13 +456,12 @@ bool tooCoarse(double k, float need, const Ref &r) {
 
 bool isDead(uint32_t id, uint8_t start, uint8_t len, bool be) {
     for (size_t i = 0; i < s_ndead; i++)
-        if (s_dead[i].id == id && s_dead[i].start == start && s_dead[i].len == len &&
-            s_dead[i].be == be) return true;
+        if (s_dead[i].is(id, start, len, be)) return true;
     return false;
 }
 
 void markDead(uint32_t id, uint8_t start, uint8_t len, bool be) {
-    s_dead[s_deadHead] = { id, start, len, be };
+    s_dead[s_deadHead] = { (uint16_t)id, start, (uint8_t)(len | (be ? 0x80 : 0)) };
     s_deadHead = (s_deadHead + 1) % MAX_DEAD;
     if (s_ndead < MAX_DEAD) s_ndead++;
 }
@@ -471,9 +513,11 @@ void addBit(const CensusView &e, uint8_t ci, uint8_t bit) {
  * Intel and Motorola pairs, and 12/14-bit variants where status flags share
  * the top of a byte.
  */
-void discover(const CensusView *cen, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        const CensusView &e = cen[i];
+void discover(Census &cen) {
+    for (size_t i = 0; i < cen.size(); i++) {
+        const CensusView *row = cen.row(i);
+        if (!row) continue;
+        const CensusView &e = *row;
         if (e.extd || e.dlc == 0 || e.count < 5 || e.ageMs > 10000) continue;
         if (e.id >= 0x7DF && e.id <= 0x7EF) continue;        // diagnostic replies
         const uint8_t ci = (uint8_t)i;
@@ -541,7 +585,7 @@ void commitAnalog(size_t ai) {
     }
 }
 
-void sampleAnalog(size_t ai, float y, const CensusView *cen, size_t n) {
+void sampleAnalog(size_t ai, float y, Census &cen) {
     Ref &r = s_ar[ai];
     const bool first = !r.init;
     trackSwing(r, y);
@@ -582,7 +626,7 @@ void sampleAnalog(size_t ai, float y, const CensusView *cen, size_t n) {
     const uint32_t settled = now - r.levelSince;
     for (size_t i = 0; i < s_nc; i++) {
         Cand &c = s_c[i];
-        const CensusView *e = lookup(cen, n, c.id, c.ci);
+        const CensusView *e = lookup(cen, c.id, c.ci);
         s_px[i * NA_MAX + ai] = (!e || e->ageMs > 5000 || e->ageMs > settled)
             ? NAN : (float)masterExtract(e->data, e->dlc, c.start, c.len, c.be) - c.x0;
     }
@@ -602,7 +646,7 @@ void commitBits(size_t bi, bool yb) {
     }
 }
 
-void sampleBit(size_t bi, float y, const CensusView *cen, size_t n) {
+void sampleBit(size_t bi, float y, Census &cen) {
     Ref &r = s_br[bi];
     const bool yb = y > 0.5f;
     const bool same = r.init && yb == r.lastBit;
@@ -631,7 +675,7 @@ void sampleBit(size_t bi, float y, const CensusView *cen, size_t n) {
     const uint32_t sinceFlip = millis() - r.lastMoveMs;      // as for values: a frame from
     for (size_t i = 0; i < s_nb; i++) {                      // after the switch last flipped
         BitCand &b = s_b[i];
-        const CensusView *e = lookup(cen, n, b.id, b.ci);
+        const CensusView *e = lookup(cen, b.id, b.ci);
         const bool ok = e && e->ageMs <= 5000 && e->ageMs <= sinceFlip && b.bit / 8 < e->dlc;
         putBit(vv, i, ok);
         putBit(vx, i, ok && ((e->data[b.bit / 8] >> (b.bit % 8)) & 1));
@@ -989,7 +1033,7 @@ void doUnlearn(uint16_t m) {
 /* ─────────────────────────────────── task ──────────────────────────────── */
 
 void task(void *) {
-    static CensusView cen[128];
+    masterWatchStack("learner");
     Sample buf[64];
     uint32_t lastDisc = 0, lastEval = 0;
 
@@ -1009,8 +1053,8 @@ void task(void *) {
         if (!Cfg.learnEnabled) continue;
 
         const uint32_t now = millis();
-        const size_t nc = masterCensusRaw(cen, 128);
-        if (now - lastDisc >= 2000) { lastDisc = now; discover(cen, nc); }
+        Census cen;
+        if (now - lastDisc >= 2000) { lastDisc = now; discover(cen); }
 
         for (size_t i = 0; i < n; i++) {
             const uint16_t m = buf[i].metric;
@@ -1018,8 +1062,8 @@ void task(void *) {
             int slot = findSlot(bit ? s_br : s_ar, bit ? NB_MAX : NA_MAX, m);
             if (slot < 0) slot = allocSlot(bit, m, watchMoving(m, bit, buf[i].value));
             if (slot < 0) continue;                 // all slots busy; next time
-            if (bit) sampleBit(slot, buf[i].value, cen, nc);
-            else     sampleAnalog(slot, buf[i].value, cen, nc);
+            if (bit) sampleBit(slot, buf[i].value, cen);
+            else     sampleAnalog(slot, buf[i].value, cen);
         }
         if (now - lastEval >= 2000) { lastEval = now; evaluate(); }
         if (s_exDirty) saveExclusions();
@@ -1077,13 +1121,13 @@ void learnerOnRef(uint16_t metric, float value) {
     xQueueSend(s_q, &s, 0);     // never block the publisher
 }
 
-size_t learnerStatus(LearnView *out, size_t max) {
-    size_t w = 0;
-    for (size_t i = 0; i < NA_MAX + NB_MAX && w < max; i++) {
+size_t learnerStatusRows() { return NA_MAX + NB_MAX + MAX_LEARNED; }
+
+bool learnerStatusRow(size_t i, LearnView &v) {
+    if (i < NA_MAX + NB_MAX) {                          // a slot being worked on
         const bool isBit = i >= NA_MAX;
         const Ref &r = isBit ? s_br[i - NA_MAX] : s_ar[i];
-        if (!r.metric) continue;
-        LearnView &v = out[w++];
+        if (!r.metric) return false;
         v.metric = r.metric; v.state = r.state; v.isBit = isBit;
         v.fit = r.bestFit; v.samples = r.bestN;
         if (isBit) v.progress = min(1.0f, r.toggles / 3.0f);
@@ -1100,6 +1144,7 @@ size_t learnerStatus(LearnView *out, size_t max) {
                 v.len = s_c[r.best].len; v.be = s_c[r.best].be;
             }
         }
+        return true;
     }
     /*
      * Values already read from the bus whose slot has since gone to another
@@ -1107,16 +1152,24 @@ size_t learnerStatus(LearnView *out, size_t max) {
      * portal's count of listening values fall back towards zero as learning
      * went on - the better it worked, the less it seemed to have done.
      */
-    for (size_t i = 0; i < s_nLearned && w < max; i++) {
-        const uint16_t m = s_learned[i];
-        bool listed = !m;
-        for (size_t k = 0; k < w && !listed; k++) listed = out[k].metric == m;
-        if (listed) continue;
-        LearnView &v = out[w++];
-        memset(&v, 0, sizeof(v));
-        v.metric = m; v.state = LS_LEARNED; v.isBit = isBitMetric(m);
-        v.progress = 1.0f; v.fit = 1.0f;
-    }
+    const size_t k = i - (NA_MAX + NB_MAX);
+    if (k >= s_nLearned) return false;
+    const uint16_t m = s_learned[k];
+    if (!m) return false;
+    for (const Ref &r : s_ar) if (r.metric == m) return false;     // listed with its slot
+    for (const Ref &r : s_br) if (r.metric == m) return false;
+    for (size_t j = 0; j < k; j++) if (s_learned[j] == m) return false;   // listed already
+    memset(&v, 0, sizeof(v));
+    v.metric = m; v.state = LS_LEARNED; v.isBit = isBitMetric(m);
+    v.progress = 1.0f; v.fit = 1.0f;
+    return true;
+}
+
+size_t learnerStatus(LearnView *out, size_t max) {
+    size_t w = 0;
+    const size_t rows = learnerStatusRows();
+    for (size_t i = 0; i < rows && w < max; i++)
+        if (learnerStatusRow(i, out[w])) w++;
     return w;
 }
 

@@ -70,6 +70,16 @@ void learnerOnRef(uint16_t metric, float value);
  */
 size_t learnerStatus(LearnView *out, size_t max);
 
+/**
+ * @name The same list a row at a time
+ * For the portal, which used to keep room for all of it (3 KB).
+ * @{ */
+/** @brief Rows to ask learnerStatusRow() for (most are empty). */
+size_t learnerStatusRows();
+/** @return false for a row with nothing in it. */
+bool learnerStatusRow(size_t i, LearnView &out);
+/** @} */
+
 /** @brief Candidate fields and bits currently being tracked. */
 void learnerCounts(uint16_t &fields, uint16_t &bits);
 
