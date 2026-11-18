@@ -29,6 +29,13 @@ Needs `g++` (WinLibs GCC: `winget install BrechtSanders.WinLibs.POSIX.UCRT`) and
 run each, shown as `device_config[<file>]`); `DEVICE_CONFIG=path` replays
 another one instead. The P1718 scenarios drive with the first fixture.
 
+`traffic/candid_impreza_indicators.json` is real indicator traffic for the
+portal's teach tests: an excerpt of two 2012 Subaru Imprezas' "Indicator"
+captures from the CANdid dataset (University of Adelaide, CC BY 4.0,
+doi.org/10.25909/29068553) - the frames that matter, only where they change,
+one stretch per period the teach run needs. Its `source` field says exactly
+what was kept. Not a settings file: it stays out of `fixtures/`.
+
 | Part | What it is |
 | --- | --- |
 | `mocks/` | Arduino, FreeRTOS, TWAI, LittleFS, Wi-Fi/ESP-NOW headers, same API as ESP-IDF 4.4 |

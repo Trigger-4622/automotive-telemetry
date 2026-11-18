@@ -534,7 +534,9 @@ function hint(id){
  return'hold it at a few different levels for a couple of seconds each'}
 function field(x){
  if(!x.id)return'<span class="muted">—</span>';
- const tbl=x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
+ const on01=x.map&&x.bits&&(x.m>>8)===0x12&&x.map.every(p=>p[1]===0||p[1]===1);
+ const tbl=on01?' • on when '+x.map.filter(p=>p[1]===1).map(p=>x.bits.map((b,i)=>`${b} ${(p[0]>>i)&1?'set':'clear'}`).join(', ')).join(' or '):
+  x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
  if(x.bits&&x.bits.length)return`${hex(x.id,3)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
  if(x.l===1)return`${hex(x.id,3)} <span class="muted">bit ${x.s}</span>`;
  const k=x.s>>3;
@@ -740,16 +742,6 @@ function posLabel(m,v){
  if(m===0x1005)return v<0?'R':v===0?'N':String(v);
  return String(v)}
 const bitOf=(b,bit)=>(b[bit>>3]>>(bit&7))&1;
-/** Flips of @p bit across polls, pair by pair: from the master's flip counters
-    (@p E, a 64-entry array per poll, wrapping at 256) where both polls of the
-    pair have them - every flash counted, however far apart the polls - or
-    else from the two payloads. */
-function flipsOf(P,E,bit){
- let n=0;
- for(let i=1;i<P.length;i++){
-  const a=E&&E[i-1],b=E&&E[i];
-  n+=a&&b&&a.length===64&&b.length===64?(b[bit]-a[bit])&255:bitOf(P[i],bit)!==bitOf(P[i-1],bit)?1:0}
- return n}
 /** The step a reading counts for: the one it was both asked for and answered
     in, after that step's first @p skip ms. @p durs are the steps' lengths,
     times are ms from the start. -1: none - a reading that straddles a change
@@ -766,6 +758,43 @@ function teachSlot(durs,skip,tReq,tResp){
  let s=0;
  for(let i=0;i<durs.length;i++){const e=s+durs[i];if(tReq>=s+skip&&tResp<=e)return i;s=e}
  return -1}
+/** One bit through one step's polls (@p P payloads, @p E flip counters):
+    its flips (n), the share of polls it was away from @p rest (p), and per
+    poll whether anything happened there (act: away from rest, or flipped
+    since the poll before). */
+function bitTrace(P,E,bit,rest){
+ const act=[];let n=0,away=0;
+ for(let i=0;i<P.length;i++){
+  let d=0;
+  if(i){const a=E&&E[i-1],b=E&&E[i];
+   d=a&&b&&a.length===64&&b.length===64?(b[bit]-a[bit])&255:bitOf(P[i],bit)!==bitOf(P[i-1],bit)?1:0}
+  const aw=bitOf(P[i],bit)!==rest;n+=d;away+=aw?1:0;act.push(aw||d>0)}
+ return{n,p:P.length?away/P.length:0,act}}
+/** An OFF step at rest - allowing for the driver. A hand still on the lever
+    when the step began (@p lag: the step before had this bit going) leaves
+    flashes at its start; one already on it for the next step (@p early: the
+    step after has it going) leaves flashes at its end. Whatever happened
+    must lie at those ends, around a still middle of at least 40 % of the
+    step's polls: a counter or a status bit has none. On real Subaru traffic
+    a driver two seconds late used to lose the lamps' bits altogether. */
+function restsIn(act,lag,early){
+ const n=act.length;if(!n)return false;
+ if(!act.includes(true))return true;
+ let best=0,from=0;
+ for(let i=0,run=0;i<n;i++){run=act[i]?0:run+1;if(run>best){best=run;from=i-run+1}}
+ if(best<Math.max(2,Math.ceil(0.4*n)))return false;
+ return(lag||!act.slice(0,from).includes(true))&&(early||!act.slice(from+best).includes(true))}
+/** Flashing in a step: three flips or more, or - from a frame sent slower than
+    the lamp flashes - two, with the bit lit for part of the step. */
+const flashIn=t=>t.n>=3||(t.n>=2&&t.p>=0.15&&t.p<=0.85);
+/** Held away from rest in a step: switched once or twice at most, so in one
+    stretch, and for half the step or more - a driver late on the lever holds
+    it for the rest of the step only. */
+const heldIn=t=>t.p>=0.5&&t.n<=2;
+/** Nothing at all: not one flip, never away from rest. */
+const silentIn=t=>t.n===0&&t.p===0;
+/** The value a bit rests at: what it reads in most of the OFF steps' polls. */
+const restOf=(offP,bit)=>offP.filter(b=>bitOf(b,bit)).length*2>offP.length?1:0;
 /** On/off: A and C are the OFF steps, B the ON one. */
 function teachBits(id,A,B,C,EA,EB,EC,dlc){
  const res=[],p=(arr,bit)=>arr.filter(b=>bitOf(b,bit)).length/arr.length,haveC=C.length>=2;
@@ -777,60 +806,98 @@ function teachBits(id,A,B,C,EA,EB,EC,dlc){
   const score=Math.min(Math.abs(pb-pa),Math.abs(pb-pc));
   if(score>=0.7&&steady>=0.8){res.push({id,s:bit,l:1,be:false,score,inv:pb<(pa+pc)/2});continue}
   // A turn signal flashes, so it is on for only part of the ON step and the
-  // test above never passes. It rests through both OFF steps - a flash or two
-  // at their start is a hand still on the lever - and flips again and again
-  // in the ON one.
-  const rest=pa<0.5?0:1;
-  if(Math.max(pa,1-pa)<0.8||Math.max(pc,1-pc)<0.8||(pc<0.5?0:1)!==rest)continue;
-  const fa=flipsOf(A,EA,bit),fb=flipsOf(B,EB,bit),fc=haveC?flipsOf(C,EC,bit):fa;
-  if(fa>2||fc>2||fb<3||fb<=2*Math.max(fa,fc))continue;
-  res.push({id,s:bit,l:1,be:false,score:0.7+0.3*Math.min(1,fb/8),inv:rest===1,blink:Math.max(1,Math.round(fb/2))})}
+  // test above never passes. It rests through both OFF steps - flashes at
+  // their ends are the driver's hand, late or early on the lever - and
+  // flashes in the ON one.
+  const rest=restOf(haveC?A.concat(C):A,bit);
+  const ta=bitTrace(A,EA,bit,rest),tb=bitTrace(B,EB,bit,rest),tc=haveC?bitTrace(C,EC,bit,rest):ta;
+  if(!flashIn(tb)||!restsIn(ta.act,false,true)||!restsIn(tc.act,true,false))continue;
+  res.push({id,s:bit,l:1,be:false,score:0.7+0.3*Math.min(1,tb.n/8),inv:rest===1,blink:Math.max(1,Math.round(tb.n/2))})}
  return res}
 /** The indicators in one run, steps A L B R C H D: off, left, off, right,
-    off, hazard lights, off. A lamp that flashes with the left indicator and
-    not with the right is the left one, and the other way round; one that
-    flashes with both cannot tell the side and is only reported. A bit held on
-    for one of them alone is its lever or switch - the displays flash those
-    themselves. Candidates carry the role they fill (L, R, H or both) and,
-    except for both, the metric; best first within each role, three at most. */
+    off, hazard lights, off.
+    - A lamp that flashes with the left indicator and is silent with the
+      right is the left one, and the other way round; one that flashes with
+      both cannot tell the side and is only reported (both). Silent means
+      not one flip: a bit that pulses on some flashes of either side (the
+      2012 Impreza's 0x361 bit 51) used to pass for a side when the right
+      step happened to catch few of its pulses.
+    - A bit held for one side is its lever (or the body computer's request) -
+      the displays flash those themselves. It may be held in the hazard step
+      as well: many cars set both sides' bits for the hazard lights.
+    - A bit held, or flashing, in the hazard step alone is the hazard lights.
+    - A car that sends one flasher for both sides and the side as a bit of
+      its own in the same frame: the side's signal is the flasher while that
+      bit says so - a bit combination with a value table (how 'gated').
+    Every OFF step rests, but for the driver's hand at its ends (restsIn).
+    Candidates carry the role they fill (L, R, H or both) and, except for
+    both, the metric; best first within each role, three at most. */
 function teachTurns(S){
- const OFF=['A','B','C','D'],ON=['L','R','H'],ALL=OFF.concat(ON);
+ const OFF=['A','B','C','D'],ON=['L','R','H'],ALL=['A','L','B','R','C','H','D'];
  const ids=new Set();ALL.forEach(k=>(S[k]||[]).forEach(poll=>poll.forEach((x,id)=>ids.add(id))));
  const res=[];
  for(const id of ids){
   if(id>=0x7DF&&id<=0x7EF)continue;
   const st={};ALL.forEach(k=>st[k]=(S[k]||[]).map(poll=>poll.get(id)).filter(Boolean));
   if(ALL.some(k=>st[k].length<2))continue;
-  const dlc=Math.max(...ALL.map(k=>Math.max(...st[k].map(x=>x.b.length))));
+  const dlc=Math.max(...ALL.map(k=>Math.max(...st[k].map(x=>x.b.length)))),offP=OFF.flatMap(k=>st[k].map(x=>x.b));
+  const mine=[],tr=[];
   for(let bit=0;bit<dlc*8;bit++){
-   const f={},p={};
-   for(const k of ALL){const a=st[k];f[k]=flipsOf(a.map(x=>x.b),a.map(x=>x.e),bit);p[k]=a.filter(x=>bitOf(x.b,bit)).length/a.length}
-   const rest=OFF.reduce((s,k)=>s+p[k],0)/OFF.length<0.5?0:1,away=k=>rest?1-p[k]:p[k];
-   // At rest in every OFF step (a flash or two at its start is a hand still
-   // on the lever)...
-   const still=k=>away(k)<=0.25&&f[k]<=2;
-   if(!OFF.every(still))continue;
-   const noise=Math.max(...OFF.map(k=>f[k]));
-   // ...and flashing, or held away from rest, in the ON steps.
-   const fl=ON.filter(k=>f[k]>=3&&f[k]>2*noise),held=ON.filter(k=>away(k)>=0.8&&f[k]<=2);
+   const rest=restOf(offP,bit),t={};
+   for(const k of ALL)t[k]=bitTrace(st[k].map(x=>x.b),st[k].map(x=>x.e),bit,rest);
+   tr[bit]=t}
+  // Another bit of the same byte that changed level in that step too (not
+  // flashing): the two are bits of a value - the steering angle, nudged by
+  // the hand on the lever (both 2012 Imprezas: 0x002, 0x0D0) - not a switch.
+  const valueBit=(bit,k)=>{for(let o=bit&~7;o<(bit&~7)+8;o++)
+   if(o!==bit&&tr[o]&&tr[o][k].p>=0.3&&!flashIn(tr[o][k]))return true;return false};
+  for(let bit=0;bit<dlc*8;bit++){
+   const t=tr[bit],rest=restOf(offP,bit);
+   const fl=k=>flashIn(t[k]),hd=k=>heldIn(t[k]),sil=k=>silentIn(t[k]),busy=k=>fl(k)||hd(k);
    let role=null,how='flash';
-   if(fl.includes('L')&&fl.includes('R'))role='both';
-   else if(fl.includes('L')&&still('R'))role='L';
-   else if(fl.includes('R')&&still('L'))role='R';
-   else if(fl.length===1&&fl[0]==='H'&&still('L')&&still('R'))role='H';
-   else if(!fl.length&&held.length===1&&ON.every(k=>k===held[0]||still(k))){role=held[0];how='held'}
+   if(fl('L')&&fl('R'))role='both';
+   else if(fl('L')&&sil('R'))role='L';
+   else if(fl('R')&&sil('L'))role='R';
+   else if(fl('H')&&sil('L')&&sil('R'))role='H';
+   else if(hd('L')&&sil('R')&&(hd('H')||sil('H'))){role='L';how='held'}
+   else if(hd('R')&&sil('L')&&(hd('H')||sil('H'))){role='R';how='held'}
+   else if(hd('H')&&sil('L')&&sil('R')){role='H';how='held'}
    if(!role)continue;
-   const n=fl.reduce((s,k)=>s+f[k],0);
+   if(how==='held'&&valueBit(bit,role))continue;
+   // ...and at rest in every OFF step, but for the driver's hand at its ends.
+   if(!restsIn(t.A.act,false,busy('L'))||!restsIn(t.B.act,busy('L'),busy('R'))||
+      !restsIn(t.C.act,busy('R'),busy('H'))||!restsIn(t.D.act,busy('H'),false))continue;
+   const n=ON.filter(fl).reduce((s,k)=>s+t[k].n,0),nf=ON.filter(fl).length||1;
    // The car's own flasher beats a lever bit (the displays then flash with
    // the car); for the hazard lights, their switch beats a lamp of their own.
-   const score=how==='flash'?1+0.5*Math.min(1,n/(8*fl.length)):(role==='H'?1.6:0.9)+0.1*away(held[0]);
-   const r={id,s:bit,l:1,be:false,inv:rest===1,role,how,blink:how==='flash'?Math.max(1,Math.round(n/2)):0,score};
+   // A side's lamp flashes with the hazard lights as well: a bit that flashed
+   // through one side's step alone is more likely something else that was
+   // busy just then (the 2012 Impreza's 0x140 bit 48, an engine bit that
+   // flipped as fast as the lamp for a while).
+   const withH=(role==='L'||role==='R')&&fl('H');
+   const score=how==='flash'?1.1+0.3*Math.min(1,n/(8*nf))+(withH?0.4:0):(role==='H'?1.6:0.9)+0.1*(hd('H')&&role!=='H'?0:t[role].p);
+   const r={id,s:bit,l:1,be:false,inv:rest===1,role,how,blink:how==='flash'?Math.max(1,Math.round(n/2)):0,score,rest,heldH:hd('H'),withH};
    if(TURN_ROLE[role])r.metric=TURN_ROLE[role];
-   res.push(r)}}
+   mine.push(r)}
+  // One flasher for both sides and the side as a bit of its own: the side
+  // that has no lamp of its own is the flasher while that bit is at rest,
+  // and the other the flasher while it is set (both flash with the car).
+  const flashers=mine.filter(r=>r.role==='both'),sides=mine.filter(r=>r.how==='held'&&(r.role==='L'||r.role==='R'));
+  for(const F of flashers.slice(0,1))for(const D of sides.slice(0,1)){
+   const code=(f,d)=>(f?1:0)|(d?2:0),fOn=1-F.rest,dOn=1-D.rest,other=D.role==='L'?'R':'L';
+   const gate=(role,dState)=>{const hit=code(fOn,dState);
+    return{id,s:F.s,l:1,be:false,bits:[F.s,D.s],map:[0,1,2,3].map(c=>[c,c===hit?1:0]),role,how:'gated',
+     flasher:F.s,side:D.s,sideSet:dState===dOn,blink:F.blink,score:1.45,metric:TURN_ROLE[role]}};
+   mine.push(gate(D.role,dOn),gate(other,D.rest))}
+  res.push(...mine)}
+ // Where one side's lamp flashed with the hazard lights as well, a bit that
+ // flashed in that side's step alone is something else that was busy then.
+ const lampWithH=k=>res.some(r=>r.role===k&&r.how==='flash'&&r.withH);
+ const keep=res.filter(r=>!(r.how==='flash'&&(r.role==='L'||r.role==='R')&&!r.withH&&lampWithH(r.role)));
  const order=['L','R','H','both'];
- res.sort((a,b)=>order.indexOf(a.role)-order.indexOf(b.role)||b.score-a.score);
+ keep.sort((a,b)=>order.indexOf(a.role)-order.indexOf(b.role)||b.score-a.score);
  const per={};
- return res.filter(r=>(per[r.role]=(per[r.role]||0)+1)<=3)}
+ return keep.filter(r=>(per[r.role]=(per[r.role]||0)+1)<=3)}
 /** A moving value: A held still, B moved through its range. */
 function teachValues(id,A,B,dlc){
  const res=[],v=a=>{const mu=a.reduce((x,y)=>x+y,0)/a.length;return a.reduce((x,y)=>x+(y-mu)**2,0)/a.length};
@@ -1057,7 +1124,7 @@ function teachKinds(m){
  return isSwitch(m)?[['bit','On / off'],['val','A moving value']]:[['val','A moving value'],['bit','On / off']]}
 /* What the chosen kind of teaching asks of the driver, said before Start. */
 function teachHow(m,kind){
- if(kind==='turn')return'One run teaches all three: the left indicator, the right one, then the hazard lights, each left flashing for a few seconds - so the master can tell the two sides apart.';
+ if(kind==='turn')return'One run of about a minute teaches all three: the left indicator, the right one, then the hazard lights, 8 seconds each with a pause between - so the master can tell the two sides apart. Do each when the page asks (a second or two late is fine), and switch it off when it says Off.';
  if(kind==='pos')return m===0x100F?'Foot on the brake, and move the lever through the positions as asked. It ends back where it started, so every bit is checked twice.':
   'Select the positions as asked. End on the first one again, so every bit is checked twice.';
  if(kind==='mot')return(m===0x100D?'Drive straight on, then brake firmly to a stop when asked.':'Drive straight on, then through a corner, or a few, when asked.')+
@@ -1079,12 +1146,14 @@ async function teachStart(){
  TTOK=kind==='pos'?$('#tP').value.trim().split(/[\s,]+/).filter(Boolean).slice(0,8):[];
  if(kind==='pos'&&TTOK.length<2){toast('List at least two positions');return}
  if(kind==='mot'&&!isMotion(m)){toast('A corner or a hard stop teaches lateral G, longitudinal G or yaw rate');return}
- const off=k=>[k,'<b>Off</b>: indicators and hazard lights off',5000];
+ // Long steps: a driver a few seconds late or early on the lever still leaves
+ // each step a clear middle (restsIn) - 6 and 5 s were too short for one 3 s late.
+ const off=k=>[k,'<b>Off</b>: indicators and hazard lights off',7000];
  const steps=kind==='mot'?[['A','Drive straight on at a steady speed',4000],
    ['B',m===0x100D?'Now brake firmly to a stop (or accelerate hard)':'Now drive through a corner, or a few',10000]]:
   kind==='bit'?[['A','Leave it OFF',5000],['B','Turn it ON now, and leave it on (flashing is fine)',6000],['C','Turn it OFF again',5000]]:
-  kind==='turn'?[off('A'),['L','<b>Left</b> indicator on - let it flash',6000],off('B'),['R','<b>Right</b> indicator on - let it flash',6000],
-   off('C'),['H','<b>Hazard lights</b> on',6000],off('D')]:
+  kind==='turn'?[off('A'),['L','<b>Left</b> indicator on - let it flash',8000],off('B'),['R','<b>Right</b> indicator on - let it flash',8000],
+   off('C'),['H','<b>Hazard lights</b> on',8000],off('D')]:
   kind==='pos'?TTOK.map((t,i)=>['p'+i,`Put it in <b>${esc(t)}</b> and hold it there`,5000]):
   [['A','Hold it still',3000],['B','Move it slowly through its whole range, back and forth',9000]];
  // A hand takes a moment to do what a step asks: the start of each is not
@@ -1154,10 +1223,11 @@ function teachAnalyze(steps){
  if(kind==='mot'){const R={};steps.forEach(k=>R[k]=motionRef(m,TEACH.P[k]));TRES=teachFindMotion(S,R,steps)}
  else TRES=teachFind(kind,S,steps,TTOK);
  if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':
-  kind==='turn'?'Let each one flash through its whole step and switch it off as soon as the next step asks, or they may not be broadcast.':
+  kind==='turn'?'Let each one flash through its step and switch it off when the page says Off. If it still finds nothing, the indicators may not be broadcast: save the readings below and send them.':
   'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}
  const pat=(c,n)=>Array.from({length:n},(_,i)=>(c>>i)&1).join('');
- const say=r=>r.role?(r.how==='flash'?`flashed ${r.blink} time${r.blink>1?'s':''}`:'held on')+ROLE_SAY[r.role]+(r.inv?' (inverted)':''):
+ const say=r=>r.how==='gated'?`the flasher (bit ${r.flasher}, both sides) while bit ${r.side} is ${r.sideSet?'set':'clear'} - this car sends the side apart from the flashing`:
+  r.role?(r.how==='flash'?`flashed ${r.blink} time${r.blink>1?'s':''}`:'held on')+ROLE_SAY[r.role]+(r.heldH&&r.role!=='H'?' (and with the hazard lights)':'')+(r.inv?' (inverted)':''):
   r.codes?r.names.map((t,g)=>`${esc(t)} <span class="mono">${pat(r.codes[g],r.bits.length)}</span>`).join(' • '):
   r.pos!==undefined?`on only in ${esc(r.names[r.pos])}${r.inv?' (inverted)':''} - as ${esc(nm(r.metric))}`:
   kind==='mot'?`followed ${(r.score*100).toFixed(0)}% · scale ${+r.k.toPrecision(3)}${Math.abs(r.o)>1e-3?', offset '+(+r.o.toPrecision(3)):''}${m!==0x100D?' (approximate)':''}`:
@@ -1166,8 +1236,12 @@ function teachAnalyze(steps){
  let head='<p class="say" style="margin-top:8px">These followed you, best first:</p>';
  if(kind==='turn'){
   const got=['L','R','H'].filter(k=>TRES.some(r=>r.role===k)),miss=['L','R','H'].filter(k=>!got.includes(k));
+  const either=TRES.find(r=>r.role==='both'),sides=miss.filter(k=>k!=='H');
   head=`<p class="say" style="margin-top:8px">${got.length?'Found '+got.map(k=>'<b>'+ROLE_NAME[k]+'</b>').join(', ')+'. ':''}`+
-   `${miss.length?'Nothing only for '+miss.map(k=>ROLE_NAME[k].toLowerCase()).join(' or ')+'. ':''}The first under each is the best.</p>`+
+   `${miss.length?'Nothing only for '+miss.map(k=>ROLE_NAME[k].toLowerCase()).join(' or ')+'. ':''}`+
+   (sides.length&&either?`${field({id:either.id,s:either.s,l:1})} flashes for either side, and nothing in the run said which side it was - save the readings below and send them. `:'')+
+   (miss.includes('H')&&got.includes('L')&&got.includes('R')?'With both sides found, the screens show the hazard lights as both arrows anyway. ':'')+
+   `The first under each is the best.</p>`+
    (got.length>1?'<div class="row" style="margin:0 0 6px"><button class="b p" onclick="teachUseAll()">Use the first of each</button></div>':'')}
  $('#tRes').innerHTML=head+TRES.map((r,i)=>
   `<div class="lr"><div class="lt"><span>${r.role?`<b>${ROLE_NAME[r.role]}</b> · `:''}${field({id:r.id,s:r.s,l:r.l,be:r.be,bits:r.bits})}${r.sg?' <span class="muted">signed</span>':''}</span>
@@ -1180,6 +1254,7 @@ const where=g=>hex(g.can_id,3)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):
 function teachSig(r,m){
  const s={name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
  if(r.codes){s.bits=r.bits;s.map=r.codes.map((c,g)=>[c,posValue(m,r.names[g],g)])}
+ else if(r.map){s.bits=r.bits;s.map=r.map}            // the flasher while the side's bit says so
  else if(r.inv){s.scale=-1;s.offset=1}
  return s}
 /** Put taught signals in, each replacing whatever fed its value before - once

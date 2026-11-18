@@ -3829,6 +3829,50 @@ static void scSignalBits() {
 }
 
 /**
+ * A car that sends one flasher for both sides (body frame bit 17) and the side
+ * as a bit of its own (bit 18, set for the right): the portal teaches each
+ * side as that flasher while the side bit says so - a two-bit combination
+ * with a table, every code in it. The left lamp flashes on the displays with
+ * the left indicator and stays dark with the right, and the other way round.
+ */
+static void scTurnGated() {
+    body.enabled = true;
+    simfs::files["/config.json"] = sigFile({
+        bodySigBits(METRIC_ID_TURN_LEFT, "[17,18]", "[[0,0],[1,1],[2,0],[3,0]]"),
+        bodySigBits(METRIC_ID_TURN_RIGHT, "[17,18]", "[[0,0],[1,0],[2,0],[3,1]]")});
+    boot();
+    runUntil(3);
+    // Sampled every 50 ms through 4 s: how often each lamp was shown lit, dark or not at all.
+    const auto watch = [](double from) {
+        struct { int litL = 0, darkL = 0, litR = 0, darkR = 0, gone = 0; } c;
+        for (int i = 0; i < 80; i++) {
+            runUntil(from + 0.05 * i);
+            double l = -1, r = -1;
+            const bool sl = shownNow(METRIC_ID_TURN_LEFT, l), sr = shownNow(METRIC_ID_TURN_RIGHT, r);
+            if (!sl || !sr) { c.gone++; continue; }
+            (l > 0.5 ? c.litL : c.darkL)++;
+            (r > 0.5 ? c.litR : c.darkR)++;
+        }
+        return c;
+    };
+    auto off = watch(tNow());
+    check(off.litL == 0 && off.litR == 0 && off.gone == 0, "off: both lamps shown, both dark",
+          fmt("lit %d/%d, not shown %d", off.litL, off.litR, off.gone));
+    body.turnLeft = true;
+    auto left = watch(tNow() + 0.1);
+    check(left.litL >= 30 && left.darkL >= 30, "left on: the left lamp flashes", fmt("lit %d dark %d", left.litL, left.darkL));
+    check(left.litR == 0, "...and the right stays dark", fmt("lit %d", left.litR));
+    body.turnLeft = false;
+    runUntil(tNow() + 1);
+    body.turnRight = true;
+    auto right = watch(tNow() + 0.1);
+    check(right.litR >= 30 && right.darkR >= 30, "right on: the right lamp flashes", fmt("lit %d dark %d", right.litR, right.darkR));
+    check(right.litL == 0, "...and the left stays dark", fmt("lit %d", right.litL));
+    body.turnRight = false;
+    commonChecks();
+}
+
+/**
  * A lever taught with a bit that is not its own (as on the car on 2026-09-30:
  * eight bits, some of which only changed with the lever that day). Here it is
  * the front left door (bit 8), shut while it was taught: with the door open,
@@ -4492,6 +4536,7 @@ static const Scenario SCENARIOS[] = {
     {"derived_lever", scDerivedLever, 0}, {"derived_doors", scDerivedDoors, 0},
     {"signal_bits", scSignalBits, 0}, {"lamp_radio_loss", scLampRadioLoss, 0},
     {"lever_tolerant", scLeverTolerant, 0},
+    {"turn_gated", scTurnGated, 0},
     {"lever_own_field", scLeverOwnField, 0},
     {"candidate_judged", scCandidateJudged, 0}, {"candidate_second_look", scCandidateSecondLook, 0},
     {"learn_not_coarse", scLearnNotCoarse, 0},

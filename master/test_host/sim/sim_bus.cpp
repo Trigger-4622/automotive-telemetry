@@ -505,7 +505,7 @@ static uint8_t s_cnt = 0;
 sim::Body sim::body;
 static double s_turnSince = -1;       ///< When the lamp's flashing started.
 bool sim::turnLampLit() {
-    if (!body.turnLeft) { s_turnSince = -1; return false; }
+    if (!body.turnLeft && !body.turnRight) { s_turnSince = -1; return false; }
     const double t = elapsedS();
     if (s_turnSince < 0) s_turnSince = t;
     return std::fmod(t - s_turnSince, 0.7) < 0.35;   // lit first, like a flasher
@@ -528,8 +528,9 @@ static void bodyFrame(uint64_t now) {
                                  (((int)(elapsedS() / 1.5)) & 1 ? 0x08 : 0));
     const uint8_t b4 = lv == 'N' ? 0x00 : 0x80;
     const uint8_t b5 = lv == 'R' ? 0x04 : 0x00;
-    const twai_message_t m = frame(0x3D1, {(uint8_t)(lever << 4), body.doors,
-                                           (uint8_t)(turnLampLit() ? 1 : 0), b3, b4, b5, 0, cnt++});
+    const bool lit = turnLampLit();
+    const uint8_t b2 = (uint8_t)((lit && body.turnLeft ? 1 : 0) | (lit ? 2 : 0) | (body.turnRight ? 4 : 0));
+    const twai_message_t m = frame(0x3D1, {(uint8_t)(lever << 4), body.doors, b2, b3, b4, b5, 0, cnt++});
     if (tcmSee(m)) deliver(m);
 }
 
