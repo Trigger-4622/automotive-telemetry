@@ -81,6 +81,19 @@ it) and plays it at its own pace, again from the top at its end.
 committed) and applies it right after the master has loaded its own, as the
 portal's "Everything, as JSON" upload does: `fromJson(.., true)` and a save.
 
+`--once` plays the drive once and then leaves the bus quiet, as with the car
+switched off (on default settings the master then sleeps after 90 s, which
+QEMU cannot do: end the run within a minute of the drive). `--flash IMAGE`
+keeps the flash image in that file: a later run on it boots with the
+settings, learned signals and drive logs the earlier one left - only its
+bootloader and app are new - so two drives longer than one image holds run
+one after the other, with a power cycle between them:
+
+```bash
+python master/test_qemu/run.py --replay drive1.log --once --readers --flash two.bin --seconds 1565
+python master/test_qemu/run.py --replay drive2.log --once --readers --flash two.bin --seconds 2434
+```
+
 Once a minute the serial log shows the drive log's status (`[dlog ]`) and
 every fresh value in the metric store, with how often each indicator changed
 (`[mets ]`) - what the displays would be sent. The simulated ECU answers coolant, engine speed,
@@ -95,7 +108,24 @@ Recordings used (not in this repository): Brooke Lampe and Weizhi Meng's
 data.dtu.dk (articles 24805509 and 24805533). And *CANdid* (University of
 Adelaide, CC BY 4.0, doi.org/10.25909/29068553): vehicle 6, a 2012 Subaru
 Impreza (automatic), `6_driving_CAN.log` - 40 minutes (2,374 s, 2,695,619
-frames, 26 identifiers), town first and then a faster road up to 91 km/h.
+frames, 26 identifiers), town first and then a faster road up to 91 km/h -
+and vehicle 3, another 2012 Impreza, `3_driving_CAN.log` - 25 minutes (1,506
+s, 1,707,875 frames, 25 identifiers), in town, the engine off at four stops.
+No recorded drive of a 2010-2014 Legacy or Outback (BM/BR, the owner's
+generation) was found in public (2026-11-18): the one BR source, the SIMPLE
+dataset's 2011 Outback, is oscilloscope samples of the bus, not a drive.
+
+### The settings upload
+
+`--upload` (with `--settings FILE`) uploads that file from the loop task, where
+the portal's handler runs, 45 s in (the learner sized, the car running), again
+and again with less of the heap free each time - taken in 4 KB blocks first,
+as the Wi-Fi's and the portal's are on the board: the way the portal takes it
+now (written to the flash in the server's 1436-byte pieces, then
+`MasterConfig::applyFile`) and the way it took it before (the body in memory:
+the server's buffer and its String, the copy `arg("plain")` returns for the
+parse, the parsed document, the save's). It also prints what the parsed file
+and the save's document hold of the heap.
 
 ### The firmware update over Wi-Fi
 
@@ -266,3 +296,76 @@ through a restart, so the first try kept a firmware on trial at once (the
 trial is now timed from the boot - `fw_trial_late_clock` - and the shim
 restarts the clock at every boot, as the board's does); and the
 segmentation faults above.
+
+## 2026-11-18: two drives, 65 minutes, a power cycle between them
+
+The two 2012 Imprezas' drives one after the other on one flash image
+(`--once --readers --flash`): vehicle 3's 25 minutes, the image kept, then
+vehicle 6's 40 minutes - the same model, so what the first drive learned
+must hold for the second. Twice: on default settings (D) and on the owner's
+config7 (E: their settings of 2026-11-17 with the 2012 Impreza's signals
+added where they had none, applied at the first boot).
+
+| | D: default settings | E: the owner's config7 |
+|---|---|---|
+| Drive 1 (25 min) | engine speed (0x140, 14 bits), pedal, road speed (0x0D1, the car's own speed frame) and coolant (0x360) learned and verified: 264 / 37 / 166 / 68 comparisons, not one disagreeing; nothing rejected | config7 applied and saved (45 of 45 signals); its four Impreza wheel speeds (0x0D4) verified against the ECU's speed (145-147 agreeing, 0 disagreeing); the Impreza indicators (0x282 bits 44/45) changed 314 / 296 times with the car's; steering (0x002) and G (0x0D0) read sensibly |
+| Drive 2 (40 min) | booted with drive 1's signals and kept them: nothing new needed, none re-checked away, nothing rejected | booted with what drive 1 saved (40 signals: config7's five rejected rows became exclusions, as designed); wheel speeds 48.8 / 48.7 / 47.7 / 48.6 km/h at a road speed of 48; indicators 606 / 656 changes |
+| Boots, panics | one boot each drive, none | one boot each drive, none |
+| Heap, lowest | 47 KB, then 80 KB | 36 KB (config7 applied and saved four times), then 78 KB |
+| Least stack left | busguard 1980 of 4096 | busguard 2012 of 4096 |
+| Drive log | - | 908 KB, then 1372 KB: the first drive deleted to make room on the test's 1.9 MB partition, oldest first, as it should |
+
+One FAIL in each second drive was the test's, not the master's: the reader
+task checked the evidence log's entries in order of uptime, and a log kept
+across a restart holds two boots, each starting at 0 - fixed (a boot entry
+starts the order again).
+
+What it showed about the master: at the four stops where the recorded car
+stood with its engine off, the learned engine speed read 8.5 rpm and the
+learned road speed -0.85 km/h. A learned field is a straight-line fit to the
+ECU's answers, and its intercept is the fit's, not a real offset: OBD-II
+speed comes in whole km/h, so the fit leans on it. A display would show
+about -1 km/h standing still (the owner's car's learned speed had -0.5).
+Not fixed here.
+
+## 2026-11-18: the settings upload, and a save that wrote what it had not measured
+
+The owner's settings file of 2026-11-17 (45 signals, 36 KB as the page
+downloads it, 25 KB as the master writes it) would not save from the portal:
+"Save failed". `--settings can-master-config7.json --upload` (the file is the
+owner's, not in the repository), 200 s:
+
+| Free heap (largest block) | Now: to the flash, `applyFile` | Before: the body in memory |
+|---|---|---|
+| 80 KB (69) | saved | NOT saved: the body's String did not fit |
+| 72 KB (44) | saved | NOT saved: the body's String did not fit |
+| 64 KB (44) | saved | NOT saved: the body's String did not fit |
+| 56 KB (44) | saved | NOT saved: the body's String did not fit |
+| 48 KB (37) | saved | NOT saved: the body's String did not fit |
+| 40 KB (30) | NOT saved: out of memory reading it - nothing changed | NOT saved: no block of 36 KB for the body |
+| 32 to 16 KB | NOT saved, the same, nothing changed | NOT saved, the same |
+
+Before, the file could not be saved at any heap the master has: the server
+needs two blocks of 36 KB at once just to keep the request's body (its
+buffer, and the String made from it), before the 38 KB the parsed file takes.
+QEMU has no Wi-Fi, so 83 KB was free here; on the board the AP and the
+phone's connection take their share of that. Now the parsed file (38 KB) is
+the peak, and it is let go before the save builds its document (35 KB): from
+48 KB free, in pieces of any size the heap has.
+
+The first runs also showed two saves failing with "wrote 25632 of 25647
+bytes - keeping the previous settings", one of them an ordinary save with no
+upload near it, each just after the learner had turned some of the file's
+signals into exclusions. ArduinoJson 7 takes a `const char` array for a
+string literal and keeps only its address, and in `MasterConfig::toJson()`
+(a const method) every name, the Wi-Fi name and password, the VIN and the
+ECU's IDs are const arrays: the document went on reading the signal table
+after the lock was let go, and the learner had renamed and moved it by the
+time the save measured and wrote it. The length check caught these two; a
+change of the same length would have been written. Every string now goes in
+as `const char *`, which ArduinoJson copies (`config_doc_snapshot` in the
+harness; the save's document is 2.8 KB larger for it). After the fix: no
+short write, 15 saves, all reached the flash. (The test's first version ran
+the uploads in a task of its own, beside the master's own saves, which never
+happens on the board - both run in the loop task - and its figures were
+lower; it runs from the loop task now.)

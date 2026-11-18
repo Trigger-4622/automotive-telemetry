@@ -93,12 +93,22 @@ static void portalPostBeforeBoot(const char *json) {
     simfs::files["/config.json"] = out;
 }
 
+/** Store a settings upload as the portal's POST handler does: written to the
+ *  flash as it arrives, in the server's 1436-byte pieces. */
+static void portalStore(const std::string &body) {
+    File f = LittleFS.open(MasterConfig::UPLOAD_PATH, "w");
+    for (size_t at = 0; at < body.size(); at += 1436)
+        f.write((const uint8_t *)body.data() + at, std::min<size_t>(1436, body.size() - at));
+    f.close();
+}
+
 /** Apply a settings change exactly as the portal's POST handler does. */
-static void portalPost(const char *json) {
-    JsonDocument d;
-    deserializeJson(d, json);
-    Cfg.fromJson(d.as<JsonVariantConst>(), true);
-    Cfg.save();
+static bool portalPost(const char *json, std::string *why = nullptr) {
+    portalStore(json);
+    char w[120] = "";
+    const bool ok = Cfg.applyFile(MasterConfig::UPLOAD_PATH, w, sizeof w);
+    if (why) *why = w;
+    return ok;
 }
 
 static uint64_t txCount(std::function<bool(const twai_message_t &)> f, double fromS, double toS = 1e9) {
@@ -533,6 +543,141 @@ static void scConfigSaveOutOfMemory() {
     check(d["signals"].size() == 18 && d["ssm"].size() == 72 && d["broadcast_ms"] == 41,
           "with every signal, every SSM parameter and the new value",
           fmt("%zu signals, %zu ssm", d["signals"].size(), d["ssm"].size()));
+    commonChecks("config:");
+}
+
+/**
+ * The settings document is a copy of the settings, not a view of them.
+ * ArduinoJson 7 takes a const char array for a string literal and keeps only
+ * its address - and in toJson() (const) every name, the Wi-Fi name and
+ * password, the VIN and the ECU's IDs are const arrays. The save measures the
+ * document and writes it after toJson() has let the table go, and the learner
+ * renames, adds and drops signals meanwhile (QEMU, the car's settings of
+ * 2026-11-17: "wrote 24650 of 24659 bytes - keeping the previous settings",
+ * a save lost; with names of the same length it would have written the wrong
+ * ones). The portal's GET sends the document over the Wi-Fi the same way.
+ */
+static void scConfigDocSnapshot() {
+    loadCarConfig();
+    boot();
+    runUntil(3);
+    Cfg.lock();
+    if (Cfg.ssm.size()) strlcpy(Cfg.ssm[0].name, "Coolant", sizeof Cfg.ssm[0].name);
+    strlcpy(Cfg.vin, "JF1BM9KL0AG000000", sizeof Cfg.vin);
+    strlcpy(Cfg.ecuId, "5B443C4107", sizeof Cfg.ecuId);
+    const bool haveSig = !Cfg.signals.empty();
+    if (haveSig) strlcpy(Cfg.signals[0].name, "Engine speed", sizeof Cfg.signals[0].name);
+    Cfg.unlock();
+    check(haveSig, "the car's settings have signals");
+    JsonDocument d;
+    Cfg.toJson(d);
+    std::string before;
+    serializeJson(d, before);
+    // What the other tasks do between toJson() and the write: rename, and
+    // grow the table (it moves; the old storage is freed).
+    Cfg.lock();
+    for (auto &x : Cfg.signals) strlcpy(x.name, "renamed", sizeof x.name);
+    for (auto &x : Cfg.ssm) strlcpy(x.name, "renamed", sizeof x.name);
+    strlcpy(Cfg.vin, "XXXXXXXXXXXXXXXXX", sizeof Cfg.vin);
+    strlcpy(Cfg.ecuId, "XXXXXXXXXX", sizeof Cfg.ecuId);
+    strlcpy(Cfg.apSsid, "Changed-meanwhile", sizeof Cfg.apSsid);
+    Cfg.signals.reserve(Cfg.signals.capacity() * 2 + 8);
+    Cfg.unlock();
+    std::string after;
+    serializeJson(d, after);
+    check(after == before, "the document still says what it said when it was made",
+          after == before ? std::string() : fmt("%zu bytes then, %zu now", before.size(), after.size()));
+    check(measureJson(d) == after.size(), "and measures as it is written",
+          fmt("%zu measured, %zu written", measureJson(d), after.size()));
+    check(before.find("\"Engine speed\"") != std::string::npos && before.find("JF1BM9KL0AG000000") != std::string::npos,
+          "with the names and IDs it was made from");
+}
+
+/** A settings file read off the car, from the fixtures beside DEVICE_CONFIG. */
+static std::string readFixture(const char *name) {
+    std::string dir = std::getenv("DEVICE_CONFIG") ? std::getenv("DEVICE_CONFIG") : "";
+    dir = dir.substr(0, dir.find_last_of('/') + 1);
+    std::string text;
+    if (FILE *f = std::fopen((dir + name).c_str(), "rb")) {
+        char buf[4096]; size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+        std::fclose(f);
+    }
+    return text;
+}
+
+/**
+ * A whole settings file uploaded from the portal. The owner's of 2026-11-17
+ * (45 signals, 36 KB) would not save: "Save failed". The server held the
+ * request's body twice while reading it, the handler a third copy for the
+ * parse (arg() returns one), beside the parsed document - more than the heap
+ * the learner leaves. The body now goes to the flash as it arrives and is
+ * parsed from there (MasterConfig::applyFile); what does not parse, or does
+ * not save, leaves the stored settings as they were, and says why.
+ */
+static void scConfigUploadFile() {
+    simfs::files[MasterConfig::UPLOAD_PATH] = R"({"broadcast_ms":9,"sig)";   // a power cut mid-upload
+    loadCarConfig();
+    boot();
+    runUntil(3);
+    check(!simfs::files.count(MasterConfig::UPLOAD_PATH), "an upload a power cut left is removed at boot");
+    check(Cfg.broadcastMs != 9, "and never applied", fmt("broadcast_ms %u", Cfg.broadcastMs));
+
+    // The newest file read off the car, grown to the owner's 45 signals.
+    std::string text = readFixture("car_config_2026-11-14.json");
+    check(!text.empty(), "the 2026-11-14 settings file is there");
+    JsonDocument up;
+    deserializeJson(up, text);
+    JsonArray sigs = up["signals"].as<JsonArray>();
+    const size_t had = sigs.size();
+    for (size_t i = 0; sigs.size() < 45 && i < had; i++) {
+        JsonObject c = sigs.add<JsonObject>();
+        c.set(sigs[i].as<JsonObjectConst>());
+        c["can_id"] = (sigs[i]["can_id"] | 0) + 0x100;
+    }
+    up["broadcast_ms"] = 47;
+    std::string body;
+    serializeJson(up, body);
+    std::string why;
+    const bool ok = portalPost(body.c_str(), &why);
+    check(ok, "the car's whole settings file is applied and saved",
+          fmt("%zu bytes, %zu signals: %s", body.size(), sigs.size(), ok ? "ok" : why.c_str()));
+    check(!simfs::files.count(MasterConfig::UPLOAD_PATH), "the upload is removed once applied");
+    JsonDocument d;
+    deserializeJson(d, simfs::files["/config.json"]);
+    check(d["signals"].size() == 45 && d["broadcast_ms"] == 47, "every signal and the new value saved",
+          fmt("%zu signals, broadcast_ms %d", d["signals"].size(), d["broadcast_ms"] | 0));
+    const std::string good = simfs::files["/config.json"];
+
+    // A file cut short (the phone gave up part way), or not a settings file.
+    check(!portalPost(body.substr(0, body.size() / 2).c_str(), &why) && why.find("not valid JSON") == 0,
+          "a file cut short is refused, saying so", why);
+    check(simfs::files["/config.json"] == good, "and the stored settings are untouched");
+    check(!simfs::files.count(MasterConfig::UPLOAD_PATH), "the refused upload is removed");
+    check(!portalPost("[1,2,3]", &why) && why.find("not a settings file") == 0, "an array is refused", why);
+    check(simfs::files["/config.json"] == good, "and the stored settings are untouched");
+
+    // Out of memory reading it: nothing applied, nothing written.
+    up["broadcast_ms"] = 48;
+    body.clear();
+    serializeJson(up, body);
+    TightAllocator tight(4 * 1024);
+    Cfg.jsonAlloc = &tight;
+    const bool oom = portalPost(body.c_str(), &why);
+    Cfg.jsonAlloc = nullptr;
+    check(!oom && why.find("out of memory") == 0, "out of memory reading it: refused, saying so", why);
+    check(Cfg.broadcastMs == 47, "nothing of it applied", fmt("broadcast_ms %u", Cfg.broadcastMs));
+    check(simfs::files["/config.json"] == good, "and the stored settings are untouched");
+
+    // Read, but the flash will not take the save: the stored file stays.
+    portalStore(body);
+    simfs::writeBudget = 100;
+    char w[120] = "";
+    const bool full = Cfg.applyFile(MasterConfig::UPLOAD_PATH, w, sizeof w);
+    simfs::writeBudget = -1;
+    check(!full && std::string(w).find("applied, but not saved") == 0, "flash full: not saved, saying so", w);
+    check(simfs::files["/config.json"] == good, "and the stored settings are untouched");
+    check(!simfs::files.count(MasterConfig::UPLOAD_PATH), "the upload is removed before the save");
     commonChecks("config:");
 }
 
@@ -4502,6 +4647,8 @@ static const Scenario SCENARIOS[] = {
     {"obd_drops", scObdDrops, 0}, {"config_migration", scConfigMigration, 0},
     {"config_faults", scConfigFaults, 0}, {"config_tmp_only", scConfigTmpOnly, 0},
     {"config_mount_glitch", scConfigMountGlitch, 0}, {"config_save_out_of_memory", scConfigSaveOutOfMemory, 0},
+    {"config_upload_file", scConfigUploadFile, 0},
+    {"config_doc_snapshot", scConfigDocSnapshot, 0},
     {"learner_sizes_last", scLearnerSizesLast, 0}, {"config_first_mount", scConfigFirstMount, 0},
     {"sleep", scSleep, 0}, {"clock_wrap", scClockWrap, 0}, {"both", scBoth, 0},
     {"obd_only", scObdOnly, 0}, {"ecu_off", scEcuOff, 0}, {"ssm_stmin", scSsmStmin, 0},

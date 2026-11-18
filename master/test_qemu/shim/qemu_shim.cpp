@@ -24,6 +24,7 @@
 #include <Arduino.h>
 #include <driver/twai.h>
 #include <esp_now.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
@@ -42,8 +43,17 @@
 #ifndef QEMU_SETTINGS
 #define QEMU_SETTINGS 0           /**< 1: a settings file (shim/settings.json) applied at boot. */
 #endif
+#ifndef QEMU_REPLAY_ONCE
+#define QEMU_REPLAY_ONCE 0        /**< 1: the recorded drive once, then a quiet bus (the car off). */
+#endif
 #ifndef QEMU_OTA
 #define QEMU_OTA 0                /**< 1: the firmware update over Wi-Fi, twice, and a rollback. */
+#endif
+#ifndef QEMU_UPLOAD
+#define QEMU_UPLOAD 0             /**< 1: the settings file uploaded at falling free heap, both ways. */
+#endif
+#if QEMU_UPLOAD && !QEMU_SETTINGS
+#error "QEMU_UPLOAD uploads the settings file: it needs QEMU_SETTINGS"
 #endif
 
 #if QEMU_READERS
@@ -169,6 +179,7 @@ twai_message_t s_rNext;
 uint64_t s_rDue = 0;                         // µs: when it is due
 uint32_t s_rounds = 0;
 uint64_t s_played = 0;
+bool     s_rEnded = false;                   // QEMU_REPLAY_ONCE: the drive is over
 // What the recorded car is doing, as its own computer would report it.
 volatile uint16_t s_recRpm = 0;             // rpm
 volatile uint16_t s_recSpeed = 0;           // km/h x 100
@@ -198,6 +209,16 @@ bool replayOpen() {
 
 /** Decode the next frame into s_rNext and its time into s_rDue. */
 void replayDecode(uint64_t now) {
+#if QEMU_REPLAY_ONCE
+    if (s_rp >= replay_end) {                          // the end: the car is switched off
+        if (!s_rEnded) {
+            s_rEnded = true;
+            Serial.printf("[qemu ] the recorded drive is over (%llu frames): the bus is quiet from here\n",
+                          (unsigned long long)s_played);
+        }
+        return;
+    }
+#endif
     if (s_rp >= replay_end) {                          // the end: once more from the top
         replayRewind();
         s_rDue += 20000;
@@ -252,6 +273,149 @@ static void applySettings() {
 #include "MasterPacket.h"
 #include "MasterTelemetry.h"
 #include "MasterConfig.h"
+
+/* ═════════════════ the settings upload, on the real heap ══════════════════
+ *
+ * The owner's settings file of 2026-11-17 (45 signals) would not save from
+ * the portal: "Save failed". Here it is uploaded again and again, with the car
+ * running and the learner sized, each time with less of the heap left free
+ * (blocks of 4 KB taken first, as the Wi-Fi's and the portal's are on the
+ * board) - the way the portal took it before (the whole body in memory: the
+ * server's buffer and the String it keeps, the copy arg() returns for the
+ * parse, the parsed document, then the save's), and the way it does now (the
+ * body to the flash in the server's 1436-byte pieces, applyFile). Neither
+ * radio nor portal runs here, so what is measured is the free heap each way
+ * needs, not what the board has.
+ */
+#if QEMU_UPLOAD
+#include <LittleFS.h>
+namespace {
+
+void *s_ballast[160];
+size_t s_nBallast = 0;
+
+/** Take heap until about @p kb KB is left free; the result is what is. */
+void ballastTo(size_t kb) {
+    const size_t want = kb * 1024;
+    while (s_nBallast < 159 && ESP.getFreeHeap() > want + 4096 + 64)
+        if (!(s_ballast[s_nBallast++] = malloc(4096))) { s_nBallast--; break; }
+    const size_t f = ESP.getFreeHeap();
+    if (f > want + 96 && s_nBallast < 160)
+        if ((s_ballast[s_nBallast] = malloc(f - want - 64))) s_nBallast++;
+}
+void ballastFree() {
+    while (s_nBallast) free(s_ballast[--s_nBallast]);
+}
+
+/** As the portal does now: the body to the flash a piece at a time, applyFile. */
+bool uploadNew(const char *body, size_t len, char *why, size_t whyLen) {
+    void *server = malloc(1500);                    // the server's HTTPUpload: its 1436-byte buffer
+    File f = LittleFS.open(MasterConfig::UPLOAD_PATH, "w");
+    bool stored = (bool)f;
+    for (size_t at = 0; stored && at < len; at += 1436) {
+        masterBusStall();
+        const size_t n = len - at < 1436 ? len - at : 1436;
+        stored = f.write((const uint8_t *)body + at, n) == n;
+    }
+    if (f) f.close();
+    free(server);
+    if (!stored) { snprintf(why, whyLen, "not stored"); LittleFS.remove(MasterConfig::UPLOAD_PATH); return false; }
+    return Cfg.applyFile(MasterConfig::UPLOAD_PATH, why, whyLen);
+}
+
+/** As the portal did before: the server keeps the body as a String (made from
+ *  its buffer, both alive for a moment - and the buffer is taken whole here,
+ *  where the server grows it with realloc), the handler parses arg("plain"),
+ *  a copy, and the body is kept until the reply, after the save. */
+bool uploadOld(const char *body, size_t len, char *why, size_t whyLen) {
+    char *plain = (char *)malloc(len + 1);
+    if (!plain) { snprintf(why, whyLen, "no block of %u bytes for the body: request dropped", (unsigned)len + 1); return false; }
+    memcpy(plain, body, len);
+    plain[len] = 0;
+    String *kept = new String(plain);
+    free(plain);
+    if (kept->length() != len) { delete kept; snprintf(why, whyLen, "the body's String did not fit: empty body"); return false; }
+    bool parsed;
+    {
+        JsonDocument doc;
+        const DeserializationError e = deserializeJson(doc, String(*kept));
+        parsed = !e && Cfg.fromJson(doc.as<JsonVariantConst>(), true);
+        if (!parsed) snprintf(why, whyLen, "bad json (%s)", e.c_str());
+    }
+    const bool ok = parsed && Cfg.save();
+    if (parsed && !ok) snprintf(why, whyLen, "fs write (the save did not fit)");
+    delete kept;
+    return ok;
+}
+
+/** ArduinoJson's allocations, counted: the most a document held at once. */
+class Counting : public ArduinoJson::Allocator {
+public:
+    size_t now = 0, peak = 0;
+    void *allocate(size_t n) override {
+        void *p = malloc(n);
+        if (p) add(heap_caps_get_allocated_size(p));
+        return p;
+    }
+    void deallocate(void *p) override { if (p) now -= heap_caps_get_allocated_size(p); free(p); }
+    void *reallocate(void *p, size_t n) override {
+        const size_t was = p ? heap_caps_get_allocated_size(p) : 0;
+        void *q = realloc(p, n);
+        if (q) { now -= was; add(heap_caps_get_allocated_size(q)); }
+        return q;
+    }
+private:
+    void add(size_t n) { now += n; if (now > peak) peak = now; }
+};
+
+/** Run from the loop task, as the portal's handler is: never beside a save
+ *  of its own (requestSave() is served there too). */
+void uploadMeasure() {
+    const size_t len = (size_t)(settings_end - settings_start);
+    {
+        Counting parse, save;
+        {
+            JsonDocument d(&parse);
+            deserializeJson(d, settings_start, len);
+        }
+        Cfg.jsonAlloc = &save;
+        Cfg.save();
+        Cfg.jsonAlloc = nullptr;
+        Serial.printf("[upld ] the file parsed holds %u bytes of the heap; the save's document %u\n",
+                      (unsigned)parse.peak, (unsigned)save.peak);
+    }
+    const size_t free0 = ESP.getFreeHeap();
+    Serial.printf("[upld ] the settings file, %u bytes, uploaded as the portal takes it; "
+                  "%u KB free now, largest block %u KB\n", (unsigned)len, (unsigned)(free0 / 1024),
+                  (unsigned)(ESP.getMaxAllocHeap() / 1024));
+    int needNew = -1, needOld = -1;
+    for (int kb = 112; kb >= 16; kb -= 8) {
+        if ((size_t)kb * 1024 > free0) continue;
+        char wn[120] = "", wo[120] = "";
+        ballastTo(kb);
+        const size_t fr = ESP.getFreeHeap(), bl = ESP.getMaxAllocHeap();
+        const uint32_t t0 = millis();
+        const bool okNew = uploadNew(settings_start, len, wn, sizeof wn);
+        const uint32_t tNew = millis() - t0;
+        ballastFree();
+        ballastTo(kb);
+        const bool okOld = uploadOld(settings_start, len, wo, sizeof wo);
+        ballastFree();
+        if (okNew) needNew = kb;
+        if (okOld) needOld = kb;
+        Serial.printf("[upld ] %3u KB free (largest block %2u KB): now %s%s%s (%u ms), before %s%s%s\n",
+                      (unsigned)(fr / 1024), (unsigned)(bl / 1024),
+                      okNew ? "saved" : "NOT saved", okNew ? "" : ": ", wn, (unsigned)tNew,
+                      okOld ? "saved" : "NOT saved", okOld ? "" : ": ", wo);
+    }
+    Serial.printf("[upld ] least free heap that saved: now %d KB, before %d KB\n", needNew, needOld);
+    Serial.printf("[upld ] after: %u signals, %s left on the flash\n", (unsigned)Cfg.signals.size(),
+                  LittleFS.exists(MasterConfig::UPLOAD_PATH) ? "an upload" : "no upload");
+}
+
+}  // namespace
+#endif
+
 extern "C" void __real__ZN12MasterConfig5beginEv(MasterConfig *);
 extern "C" void __wrap__ZN12MasterConfig5beginEv(MasterConfig *self) {
     __real__ZN12MasterConfig5beginEv(self);
@@ -336,8 +500,11 @@ void readerTask(void *) {
             if (!sv[i].minFree || sv[i].minFree > sv[i].size) bad("stacks: a figure that cannot be", i, sv[i].minFree);
         static EvView ev[48];
         events = masterEventLog(ev, 48);
+        // In order within a boot: the log is kept across restarts, and each boot's
+        // own entry (type 0) starts its clock again (run.py --flash, a second drive).
         for (size_t i = 1; i < events; i++)
-            if (ev[i].ms < ev[i - 1].ms && ev[i - 1].ms - ev[i].ms < 0x7FFFFFFF) bad("events: out of order", i);
+            if (ev[i].type != 0 && ev[i].ms < ev[i - 1].ms && ev[i - 1].ms - ev[i].ms < 0x7FFFFFFF)
+                bad("events: out of order", i);
 
         s_passes++;
         if (millis() - lastPrint >= 10000) {
@@ -658,6 +825,10 @@ void __wrap__ZN9WebPortal5beginEv(void *self) {
 void __wrap__ZN9WebPortal4loopEv(void *) {
 #if QEMU_OTA
     otaStep();
+#endif
+#if QEMU_UPLOAD
+    static bool uploaded = false;                   // once the learner has sized, the car running a while
+    if (!uploaded && millis() > 45000) { uploaded = true; uploadMeasure(); }
 #endif
     // The indicators as the screens see them: count every change of each.
     static float lastTurn[2] = {NAN, NAN};

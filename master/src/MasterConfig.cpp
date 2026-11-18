@@ -279,6 +279,8 @@ void MasterConfig::begin() {
         log_e("config: LittleFS mount failed, running on compiled defaults");
         return;
     }
+    // An upload the power cut off (applyFile): never applied, only in the way.
+    if (LittleFS.exists(UPLOAD_PATH)) LittleFS.remove(UPLOAD_PATH);
 
     File f = LittleFS.open(CFG_PATH, "r");
     // A power cut between writing the new file and renaming it leaves only
@@ -453,6 +455,39 @@ void MasterConfig::serviceSave() {
     save();
 }
 
+bool MasterConfig::applyFile(const char *path, char *why, size_t whyLen) {
+    {
+        File f = LittleFS.open(path, "r");
+        if (!f) {
+            snprintf(why, whyLen, "the upload was not stored on the master");
+            return false;
+        }
+        JsonDocument doc = jsonAlloc ? JsonDocument(jsonAlloc) : JsonDocument();
+        const DeserializationError e = deserializeJson(doc, f);
+        f.close();
+        if (e || !fromJson(doc.as<JsonVariantConst>(), true)) {
+            if (e == DeserializationError::NoMemory)
+                snprintf(why, whyLen, "out of memory reading it (%u bytes free) - nothing changed",
+                         (unsigned)ESP.getFreeHeap());
+            else if (e)
+                snprintf(why, whyLen, "not valid JSON (%s) - nothing changed", e.c_str());
+            else
+                snprintf(why, whyLen, "not a settings file - nothing changed");
+            masterBusStall();
+            LittleFS.remove(path);
+            return false;
+        }
+    }                                        // freed: save() builds a document of its own
+    masterBusStall();
+    LittleFS.remove(path);
+    if (!save()) {
+        snprintf(why, whyLen, "applied, but not saved (out of memory or flash, %u bytes free) - "
+                 "the stored settings are kept", (unsigned)ESP.getFreeHeap());
+        return false;
+    }
+    return true;
+}
+
 bool MasterConfig::save() {
     xSemaphoreTake(_saveMutex, portMAX_DELAY);
     const bool ok = saveLocked();
@@ -511,6 +546,17 @@ bool MasterConfig::saveLocked() {
     return true;
 }
 
+/*
+ * Every string of the settings goes in as (const char *), which ArduinoJson
+ * copies (the PID table's names are constants and stay by address). A
+ * const char array - which every member is in here - it takes for a string
+ * literal and keeps only the address of: the document would go on reading the
+ * table after the lock below is let go, while the learner renames, adds and
+ * drops signals (`config_doc_snapshot`: a save measured one thing and wrote
+ * another, and a name could have been written from the wrong signal).
+ */
+static inline const char *copied(const char *s) { return s; }
+
 void MasterConfig::toJson(JsonDocument &doc) const {
     const_cast<MasterConfig *>(this)->lock();
     doc["cfg_ver"]      = CFG_VERSION;
@@ -520,8 +566,8 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["night_source"] = nightSource;
     doc["bitrate_kbps"] = bitrateKbps;
     doc["wifi_channel"] = wifiChannel;
-    doc["ap_ssid"]      = apSsid;
-    doc["ap_pass"]      = apPass;
+    doc["ap_ssid"]      = copied(apSsid);
+    doc["ap_pass"]      = copied(apPass);
     doc["portal_on"]    = portalOn;
     doc["ssm_gap"]      = ssmGapMs;
     doc["ssm_batch"]    = ssmBatchMax;
@@ -561,11 +607,11 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["ldr_light"]    = ldrLight;
     doc["sleep_enabled"] = sleepEnabled;
     doc["sleep_idle_s"]  = sleepIdleS;
-    doc["ecu_id"]       = ecuId;
-    doc["ecu_sys_id"]   = ecuSysId;
-    doc["ecu_flags"]    = ecuFlags;
-    doc["ecu_cal_id"]   = ecuCalId;
-    doc["vin"]          = vin;
+    doc["ecu_id"]       = copied(ecuId);
+    doc["ecu_sys_id"]   = copied(ecuSysId);
+    doc["ecu_flags"]    = copied(ecuFlags);
+    doc["ecu_cal_id"]   = copied(ecuCalId);
+    doc["vin"]          = copied(vin);
     doc["dtc_poll_s"]   = dtcPollS;
     doc["oil_every_km"] = oilEveryKm;
     doc["oil_at_km"]    = oilAtKm;
@@ -596,7 +642,7 @@ void MasterConfig::toJson(JsonDocument &doc) const {
         o["period"]  = e.periodMs;
         o["cap_byte"] = e.capByte;
         o["cap_bit"]  = e.capBit;
-        o["name"]    = e.name;
+        o["name"]    = copied(e.name);
     }
 
     JsonArray pa = doc["pids"].to<JsonArray>();
@@ -632,7 +678,7 @@ void MasterConfig::toJson(JsonDocument &doc) const {
         o["learned"] = s.learned;
         if (s.vtol > 0)    o["vtol"] = s.vtol;
         if (s.vspread > 0) o["vsp"]  = s.vspread;
-        o["name"]   = s.name;
+        o["name"]   = copied(s.name);
         if (s.nBits) {                   // only bit combinations carry the key
             JsonArray bl = o["bits"].to<JsonArray>();
             for (uint8_t k = 0; k < s.nBits; k++) bl.add(s.bitList[k]);

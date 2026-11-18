@@ -182,6 +182,26 @@ public:
     /** @brief Ask loop() to save soon. Safe from any task. */
     void requestSave() { _saveWanted = true; }
 
+    /** Where the portal stores a settings upload while it arrives. */
+    static constexpr const char *UPLOAD_PATH = "/cfg_upload.json";
+
+    /**
+     * @brief Apply a settings file the portal received, from the flash, and
+     *        save: the portal's "Save" and "Upload" (POST /api/config).
+     *
+     * The upload is streamed to @p path as it arrives and parsed from there,
+     * and the parsed document is freed before save() builds its own: never
+     * the request's text, its parsed document and the saved one in memory at
+     * once. Held in memory, the owner's 36 KB file of 2026-11-17 did not
+     * save on the car ("Save failed"). The file is removed either way.
+     * @param why Filled with the reason when it returns false.
+     * @return true when applied and saved; false and the stored settings
+     *         untouched when it does not parse, is not a settings object, or
+     *         the save does not fit (the values may then be applied but not
+     *         kept).
+     */
+    bool applyFile(const char *path, char *why, size_t whyLen);
+
     /** @brief Perform a pending requestSave(). Called from loop(). */
     void serviceSave();
 
