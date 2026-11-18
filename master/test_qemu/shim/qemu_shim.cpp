@@ -42,6 +42,9 @@
 #ifndef QEMU_SETTINGS
 #define QEMU_SETTINGS 0           /**< 1: a settings file (shim/settings.json) applied at boot. */
 #endif
+#ifndef QEMU_REPLAY_ONCE
+#define QEMU_REPLAY_ONCE 0        /**< 1: the recorded drive once, then a quiet bus (the car off). */
+#endif
 #ifndef QEMU_OTA
 #define QEMU_OTA 0                /**< 1: the firmware update over Wi-Fi, twice, and a rollback. */
 #endif
@@ -169,6 +172,7 @@ twai_message_t s_rNext;
 uint64_t s_rDue = 0;                         // µs: when it is due
 uint32_t s_rounds = 0;
 uint64_t s_played = 0;
+bool     s_rEnded = false;                   // QEMU_REPLAY_ONCE: the drive is over
 // What the recorded car is doing, as its own computer would report it.
 volatile uint16_t s_recRpm = 0;             // rpm
 volatile uint16_t s_recSpeed = 0;           // km/h x 100
@@ -198,6 +202,16 @@ bool replayOpen() {
 
 /** Decode the next frame into s_rNext and its time into s_rDue. */
 void replayDecode(uint64_t now) {
+#if QEMU_REPLAY_ONCE
+    if (s_rp >= replay_end) {                          // the end: the car is switched off
+        if (!s_rEnded) {
+            s_rEnded = true;
+            Serial.printf("[qemu ] the recorded drive is over (%llu frames): the bus is quiet from here\n",
+                          (unsigned long long)s_played);
+        }
+        return;
+    }
+#endif
     if (s_rp >= replay_end) {                          // the end: once more from the top
         replayRewind();
         s_rDue += 20000;
