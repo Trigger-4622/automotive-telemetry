@@ -355,13 +355,16 @@ const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.r
  if(id>0x400&&id<=0x408)return dtcName(v);const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
 const SRC={1:['SSM2','ssm'],2:['OBD-II','obd'],3:['calc','calc'],4:['bus','raw']};
 let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='home',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
-function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2400)}
+function toast(m,ms){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',ms||2400)}
 /* Every request has a deadline. The master answers one connection at a time,
    and a request the browser never gives up on - a lost Wi-Fi frame, a busy
    master - froze whatever was waiting for it, the teach countdown included. */
 async function req(u,o,ms){
  const c=new AbortController(),t=setTimeout(()=>c.abort(),ms||6000);
- try{const r=await fetch(u,Object.assign({},o,{signal:c.signal}));if(!r.ok)throw new Error('HTTP '+r.status);return await r.json()}
+ try{const r=await fetch(u,Object.assign({},o,{signal:c.signal}));
+  if(!r.ok){let m='HTTP '+r.status;try{const j=await r.json();if(j&&j.error)m=j.error}catch(e){}throw new Error(m)}  // the master's reason
+  return await r.json()}
+ catch(e){if(e.name==='AbortError')throw new Error('no answer from the master');throw e}
  finally{clearTimeout(t)}}
 /* One request of each kind at a time: a poll still waiting is not joined by
    the next one, so a slow moment cannot pile up into a slow minute. */
@@ -464,12 +467,15 @@ async function save(andReboot){
   if(body.signals){const now=await req('/api/config',null,10000);
    body.signals=mergeSignals(ORIG.signals||[],C.signals||[],now.signals||[])}
   if(body.pids)body.pids=body.pids.map(({name,metrics,...p})=>p);   // read-only extras stay here
-  // Generous: the master writes its flash before it answers.
-  await req('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},15000);
+  // As a form's file: the master writes it to its flash as it comes and reads
+  // it from there (a car's whole settings did not fit in its memory as text,
+  // its parsed copy and the save's at once). Generous: it saves before it answers.
+  const fd=new FormData();fd.append('cfg',new Blob([JSON.stringify(body)],{type:'application/json'}),'config.json');
+  await req('/api/config',{method:'POST',body:fd},20000);
   setDirty(false);
   if(andReboot){await post('/api/reboot','Saved - rebooting');return}
   toast(reboot?'Saved - reboot to apply':'Saved');await load()}
- catch(e){toast('Save failed - try again')}}
+ catch(e){toast('Save failed: '+e.message,8000)}}
 
 /* ───────────── settings: every one in one place ───────────── */
 /*<settings>*/
@@ -1662,15 +1668,59 @@ private:
  *        allocation that size can fail on a fragmented heap - which the page
  *        would see as a settings load that silently never finishes.
  */
-static void sendJson(JsonDocument &doc) {
+static void sendJson(JsonDocument &doc, int code = 200) {
     s_server.setContentLength(measureJson(doc));
-    s_server.send(200, "application/json", "");
+    s_server.send(code, "application/json", "");
     WiFiClient client = s_server.client();
     ClientBuffer out(client);
     serializeJson(doc, out);
 }
 
 static void sendOk() { s_server.send(200, "application/json", "{\"ok\":true}"); }
+
+/*
+ * A settings upload (POST /api/config) is written to the flash as it arrives,
+ * 1.4 KB at a time, and applied from there (MasterConfig::applyFile). Held in
+ * memory - the server keeps a request's body twice while reading it, and once
+ * more until the request is done - the owner's 36 KB file did not fit beside
+ * its parsed document and the save's: "Save failed" (2026-11-18). The page
+ * sends it as a form's file: a bare body's last piece is read with a 5 s
+ * timeout (the server asks for 1436 bytes at a time), a form's is not.
+ */
+enum UpState : uint8_t { UP_NONE, UP_WRITING, UP_STORED, UP_TOO_BIG, UP_FAILED };
+static UpState s_up = UP_NONE;
+static File s_upFile;
+static size_t s_upBytes = 0;
+/** Far above any car's settings (2026-11-17's, 45 signals: 36 KB). */
+static constexpr size_t UPLOAD_MAX = 128 * 1024;
+
+static void upChunk(HTTPRawStatus st, const uint8_t *buf, size_t n) {
+    switch (st) {
+    case RAW_START:
+        masterBusStall();                    // flash writes hold the CAN interrupt off
+        if (s_upFile) s_upFile.close();
+        s_upFile = LittleFS.open(MasterConfig::UPLOAD_PATH, "w");
+        s_upBytes = 0;
+        s_up = s_upFile ? UP_WRITING : UP_FAILED;
+        break;
+    case RAW_WRITE:
+        if (s_up != UP_WRITING || !n) break;
+        if (s_upBytes + n > UPLOAD_MAX) { s_up = UP_TOO_BIG; s_upFile.close(); break; }
+        masterBusStall();
+        if (s_upFile.write(buf, n) != n) { s_up = UP_FAILED; s_upFile.close(); break; }
+        s_upBytes += n;
+        break;
+    case RAW_END:
+        if (s_up == UP_WRITING) { s_upFile.close(); s_up = UP_STORED; }
+        break;
+    case RAW_ABORTED:                        // the phone went away: nothing answered, nothing kept
+        if (s_upFile) s_upFile.close();
+        masterBusStall();
+        LittleFS.remove(MasterConfig::UPLOAD_PATH);
+        s_up = UP_NONE;
+        break;
+    }
+}
 
 /*
  * The lists below are read a row at a time (a copy of each was kept in RAM
@@ -1753,6 +1803,9 @@ static void __attribute__((noinline)) addCensusRows(JsonArray ca, bool edges) {
 }
 
 void WebPortal::setupRoutes() {
+    static const char *HEADERS[] = {"Content-Type"};   // which body an upload is (upChunk)
+    s_server.collectHeaders(HEADERS, 1);
+
     s_server.on("/", HTTP_GET, []() {
         s_server.send_P(200, "text/html", PORTAL_HTML);
     });
@@ -1763,22 +1816,39 @@ void WebPortal::setupRoutes() {
         sendJson(doc);
     });
 
+    /*
+     * Settings in (the page's Save, and Upload): the body goes to the flash as
+     * it arrives and is applied from there (see upChunk).
+     */
     s_server.on("/api/config", HTTP_POST, []() {
-        bool parsed;
-        {
-            // Freed before the save builds its document of the whole
-            // configuration: the two at once were the save's peak of memory.
-            JsonDocument doc;
-            parsed = !deserializeJson(doc, s_server.arg("plain")) &&
-                     Cfg.fromJson(doc.as<JsonVariantConst>(), true);   // false: not an object
+        char why[120] = "";
+        bool ok = false;
+        if (s_up == UP_STORED) {
+            ok = Cfg.applyFile(MasterConfig::UPLOAD_PATH, why, sizeof why);
+        } else {
+            snprintf(why, sizeof why, s_up == UP_TOO_BIG ? "too big for a settings file - nothing changed"
+                     : s_up == UP_NONE ? "no settings in the request - nothing changed"
+                                       : "the master could not store the upload - nothing changed");
+            masterBusStall();
+            LittleFS.remove(MasterConfig::UPLOAD_PATH);
         }
-        if (!parsed) {
-            s_server.send(400, "application/json", "{\"error\":\"bad json\"}");
-            return;
+        s_up = UP_NONE;
+        if (ok) { sendOk(); return; }
+        log_w("portal: settings not saved: %s", why);
+        JsonDocument d;
+        d["error"] = why;
+        sendJson(d, 400);
+    }, []() {
+        // A form's file (the page) or a bare body (anything else): the server
+        // keeps one or the other, and says which only in the content type.
+        if (s_server.header("Content-Type").startsWith("multipart/")) {
+            HTTPUpload &u = s_server.upload();
+            upChunk(u.status == UPLOAD_FILE_START ? RAW_START : u.status == UPLOAD_FILE_WRITE ? RAW_WRITE
+                    : u.status == UPLOAD_FILE_END ? RAW_END : RAW_ABORTED, u.buf, u.currentSize);
+        } else {
+            HTTPRaw &r = s_server.raw();
+            upChunk(r.status, r.buf, r.currentSize);
         }
-        const bool ok = Cfg.save();
-        s_server.send(ok ? 200 : 500, "application/json",
-                      ok ? "{\"ok\":true}" : "{\"error\":\"fs write\"}");
     });
 
     /*

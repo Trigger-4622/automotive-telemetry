@@ -115,6 +115,18 @@ No recorded drive of a 2010-2014 Legacy or Outback (BM/BR, the owner's
 generation) was found in public (2026-11-18): the one BR source, the SIMPLE
 dataset's 2011 Outback, is oscilloscope samples of the bus, not a drive.
 
+### The settings upload
+
+`--upload` (with `--settings FILE`) uploads that file from the loop task, where
+the portal's handler runs, 45 s in (the learner sized, the car running), again
+and again with less of the heap free each time - taken in 4 KB blocks first,
+as the Wi-Fi's and the portal's are on the board: the way the portal takes it
+now (written to the flash in the server's 1436-byte pieces, then
+`MasterConfig::applyFile`) and the way it took it before (the body in memory:
+the server's buffer and its String, the copy `arg("plain")` returns for the
+parse, the parsed document, the save's). It also prints what the parsed file
+and the save's document hold of the heap.
+
 ### The firmware update over Wi-Fi
 
 `--ota` builds the test firmware with the board's own partition table
@@ -315,3 +327,45 @@ ECU's answers, and its intercept is the fit's, not a real offset: OBD-II
 speed comes in whole km/h, so the fit leans on it. A display would show
 about -1 km/h standing still (the owner's car's learned speed had -0.5).
 Not fixed here.
+
+## 2026-11-18: the settings upload, and a save that wrote what it had not measured
+
+The owner's settings file of 2026-11-17 (45 signals, 36 KB as the page
+downloads it, 25 KB as the master writes it) would not save from the portal:
+"Save failed". `--settings can-master-config7.json --upload` (the file is the
+owner's, not in the repository), 200 s:
+
+| Free heap (largest block) | Now: to the flash, `applyFile` | Before: the body in memory |
+|---|---|---|
+| 80 KB (69) | saved | NOT saved: the body's String did not fit |
+| 72 KB (44) | saved | NOT saved: the body's String did not fit |
+| 64 KB (44) | saved | NOT saved: the body's String did not fit |
+| 56 KB (44) | saved | NOT saved: the body's String did not fit |
+| 48 KB (37) | saved | NOT saved: the body's String did not fit |
+| 40 KB (30) | NOT saved: out of memory reading it - nothing changed | NOT saved: no block of 36 KB for the body |
+| 32 to 16 KB | NOT saved, the same, nothing changed | NOT saved, the same |
+
+Before, the file could not be saved at any heap the master has: the server
+needs two blocks of 36 KB at once just to keep the request's body (its
+buffer, and the String made from it), before the 38 KB the parsed file takes.
+QEMU has no Wi-Fi, so 83 KB was free here; on the board the AP and the
+phone's connection take their share of that. Now the parsed file (38 KB) is
+the peak, and it is let go before the save builds its document (35 KB): from
+48 KB free, in pieces of any size the heap has.
+
+The first runs also showed two saves failing with "wrote 25632 of 25647
+bytes - keeping the previous settings", one of them an ordinary save with no
+upload near it, each just after the learner had turned some of the file's
+signals into exclusions. ArduinoJson 7 takes a `const char` array for a
+string literal and keeps only its address, and in `MasterConfig::toJson()`
+(a const method) every name, the Wi-Fi name and password, the VIN and the
+ECU's IDs are const arrays: the document went on reading the signal table
+after the lock was let go, and the learner had renamed and moved it by the
+time the save measured and wrote it. The length check caught these two; a
+change of the same length would have been written. Every string now goes in
+as `const char *`, which ArduinoJson copies (`config_doc_snapshot` in the
+harness; the save's document is 2.8 KB larger for it). After the fix: no
+short write, 15 saves, all reached the flash. (The test's first version ran
+the uploads in a task of its own, beside the master's own saves, which never
+happens on the board - both run in the loop task - and its figures were
+lower; it runs from the loop task now.)

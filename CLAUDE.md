@@ -22,6 +22,7 @@ python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # 
 python master/test_qemu/run.py --replay drive.log [--settings cfg.json]   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
 python master/test_qemu/run.py --replay d1.log --once --flash two.bin     # ...one drive, the car off; run d2.log on two.bin after: a power cycle between drives
 python master/test_qemu/run.py --ota                # ...a Wi-Fi firmware update, kept, a second one crashing, rolled back
+python master/test_qemu/run.py --settings cfg.json --upload   # ...the portal's settings upload at falling free heap, now and as it was
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
 ```
@@ -107,6 +108,11 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   prints it). Check it after any UI addition; the cluster once overflowed.
 - LVGL 8 cannot zoom `ALPHA_8BIT` images (draws nothing); U+00B7 is not in the
   fonts (use U+2022).
+- ArduinoJson 7 takes a `const char[N]` for a string literal and keeps only
+  its address. In a const method every member array is one: put it in as
+  `(const char *)`, which is copied, or the document reads the live table
+  after its lock is let go - the save measured one thing and wrote another
+  while the learner moved the signals (`config_doc_snapshot`, 2026-11-18).
 - Cluster: `board_build.arduino.memory_type = qio_opi` and
   `board_upload.flash_size = 4MB` are required (wrong ones boot-loop); the
   GT911 is mounted 90 degrees out and gestures run on measured axes
@@ -271,9 +277,16 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   for Wi-Fi, the portal and its saves. Anything started after it eats that
   reserve - the trouble-code and drive-log tasks did (13 KB) - so start new
   tasks before `learnerBegin()` (`learner_sizes_last`). A save builds the whole
-  car config (~20 KB of JSON, ~30 KB in ArduinoJson); out of memory it used to
-  write the truncated document as a valid file (learned signals gone), now it
-  writes nothing (`config_save_out_of_memory`). The loop task (portal and
+  car config (~20 KB of JSON, ~30 KB in ArduinoJson; 35 KB for the car's
+  45 signals); out of memory it used to write the truncated document as a
+  valid file (learned signals gone), now it writes nothing
+  (`config_save_out_of_memory`). A settings upload (the page's Save and
+  Upload, POST `/api/config`, sent as a form's file) goes to the flash as it
+  arrives (`/cfg_upload.json`) and is parsed from there, its document freed
+  before the save's (`MasterConfig::applyFile`, `config_upload_file`): held
+  in memory the body was there three times, and the owner's 36 KB file could
+  not be saved at any heap the master has (QEMU `--upload`, 2026-11-18; now
+  from 48 KB free). The page shows the master's reason when a save fails. The loop task (portal and
   saves) has 12 KB (`SET_LOOP_TASK_STACK_SIZE`). Heap now, lowest and largest
   block: serial `[stats]` and `/api/live` (`heap`, `heap_min`, `heap_block`);
   the loop task's stack is in the `[ctrl ]` headroom figure. The sim's heap is

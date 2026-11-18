@@ -98,11 +98,12 @@ def convert_log(path, out):
     return n, tick / 20000, len(index), 8 + 4 * len(index) + len(body)
 
 
-def build(project, extra_ids, readers, replay, settings, ota=False, once=False):
+def build(project, extra_ids, readers, replay, settings, ota=False, once=False, upload=False):
     env = dict(os.environ)
     env["QEMU_SHIM_FLAGS"] = (f"-DQEMU_EXTRA_IDS={extra_ids} -DQEMU_READERS={1 if readers else 0} "
                               f"-DQEMU_REPLAY={1 if replay else 0} -DQEMU_SETTINGS={1 if settings else 0} "
-                              f"-DQEMU_OTA={1 if ota else 0} -DQEMU_REPLAY_ONCE={1 if once else 0}")
+                              f"-DQEMU_OTA={1 if ota else 0} -DQEMU_REPLAY_ONCE={1 if once else 0} "
+                              f"-DQEMU_UPLOAD={1 if upload else 0}")
     pio_env = "master-qemu-ota" if ota else "master-qemu"
     r = subprocess.run([sys.executable, "-m", "platformio", "run", "-d", project, "-e", pio_env],
                        capture_output=True, text=True, env=env)
@@ -219,11 +220,16 @@ def main():
                     help="keep the flash image here: a later run on the same file boots with the "
                          "settings, learned signals and drive logs the earlier one left (a power cycle "
                          "between two drives); only its bootloader and app are rewritten")
+    ap.add_argument("--upload", action="store_true",
+                    help="with --settings: upload that file as the portal does now and as it did before "
+                         "(the body in memory), with less heap free each time; prints what each needs")
     ap.add_argument("--readers", action="store_true",
                     help="a task on the other core reads the tables as the portal's pages do, "
                          "50 times a second, and checks them (needs the row readers: not for "
                          "versions before 2026-11-16)")
     a = ap.parse_args()
+    if a.upload and not a.settings:
+        sys.exit("--upload uploads the --settings file")
     if a.ota and a.replay:
         sys.exit("--ota uses the board's partition table: a recorded drive does not fit it")
     if a.ota and a.seconds == 120:
@@ -262,7 +268,7 @@ def main():
             os.remove(obj)
     if a.ota:
         print("   the firmware update test, on the board's partition table")
-    build_dir = build(project, a.extra_ids, a.readers, a.replay, a.settings, a.ota, a.once)
+    build_dir = build(project, a.extra_ids, a.readers, a.replay, a.settings, a.ota, a.once, a.upload)
     work = tempfile.mkdtemp(prefix="qemu_master_")
     flash = os.path.abspath(a.flash) if a.flash else os.path.join(work, "flash.bin")
     kept = bool(a.flash) and os.path.exists(flash)
@@ -305,7 +311,8 @@ def main():
 
     boots = len(re.findall(r"^rst:0x", log, re.M))
     crash = re.findall(r"Guru Meditation|abort\(\) was called|Backtrace:|stack overflow|Rebooting|"
-                       r"assert failed|CORRUPT HEAP|out of memory", log)
+                       r"assert failed|CORRUPT HEAP|out of memory",
+                       re.sub(r"\[upld \][^\n]*", "", log))   # --upload's lines say it on purpose
     if a.ota:
         ota_report(log, check)
         print("PASSED" if ok else "FAILED")
@@ -313,6 +320,16 @@ def main():
     check(boots == 1 and not crash, "booted once: no panic, no restart",
           f"{boots} boot(s)" + (", " + crash[0] if crash else ""))
 
+    if a.upload:
+        for line in re.findall(r"\[upld \] ([^\r\n]*)", log):
+            print("       " + line)
+        need = re.search(r"least free heap that saved: now (-?\d+) KB, before (-?\d+) KB", log)
+        check(need and int(need.group(1)) > 0, "the settings file saves as the portal takes it now",
+              f"from {need.group(1)} KB free" if need else "not run")
+        check(need and (int(need.group(2)) < 0 or int(need.group(1)) < int(need.group(2))),
+              "with less free heap than the way it took it before",
+              f"before: from {need.group(2)} KB" if need else "")
+        check(re.search(r"\[upld \] after: \d+ signals, no upload left", log), "no upload left on the flash")
     m = re.search(r"learner started: (\d+) fields x \d+ values, (\d+) bits x \d+ switches "
                   r"\((\d+) KB, (\d+) KB left\)", log)
     check(m, "the learner sized its tables from the heap",
@@ -356,7 +373,10 @@ def main():
         h = heap[-1]
         print(f"       heap at the end {int(h[0]) // 1024} KB, lowest {int(h[1]) // 1024} KB, "
               f"largest block {int(h[2]) // 1024} KB   (no Wi-Fi in QEMU: its share is not in this)")
-        check(int(h[1]) > 20 * 1024, "the heap never ran low", f"lowest {int(h[1])} bytes")
+        if a.upload:                             # taken on purpose, down to 16 KB
+            print("       (--upload: the heap was run low on purpose)")
+        else:
+            check(int(h[1]) > 20 * 1024, "the heap never ran low", f"lowest {int(h[1])} bytes")
 
     if a.readers:
         rd = re.findall(r"\[read \] (\d+) passes \| (.*?) \| (\d+) inconsistencies(.*?) \| stack left (\d+)", log)
@@ -372,7 +392,8 @@ def main():
               "the settings given applied and saved (not an older file)",
               f"{m.group(2)} of {want_sig} signals" if m else "")
         saves = len(re.findall(r"config: saved", log))
-        fails = re.findall(r"config: .*(?:fail|could not|not saved)[^\r\n]*", log, re.I)
+        # "wrote N of M bytes": the document changed under the save (config_doc_snapshot)
+        fails = re.findall(r"config: .*(?:fail|could not|not saved|wrote \d+ of \d+ bytes)[^\r\n]*", log, re.I)
         check(not fails, "every settings save reached the flash",
               f"{saves} saves" + (", " + fails[0] if fails else ""))
     for line in re.findall(r"log: [^\r\n]*(?:partition|formatted|moved)[^\r\n]*", log)[:4]:

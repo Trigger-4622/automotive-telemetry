@@ -292,13 +292,16 @@ const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.r
  if(id>0x400&&id<=0x408)return dtcName(v);const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
 const SRC={1:['SSM2','ssm'],2:['OBD-II','obd'],3:['calc','calc'],4:['bus','raw']};
 let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='home',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
-function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2400)}
+function toast(m,ms){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',ms||2400)}
 /* Every request has a deadline. The master answers one connection at a time,
    and a request the browser never gives up on - a lost Wi-Fi frame, a busy
    master - froze whatever was waiting for it, the teach countdown included. */
 async function req(u,o,ms){
  const c=new AbortController(),t=setTimeout(()=>c.abort(),ms||6000);
- try{const r=await fetch(u,Object.assign({},o,{signal:c.signal}));if(!r.ok)throw new Error('HTTP '+r.status);return await r.json()}
+ try{const r=await fetch(u,Object.assign({},o,{signal:c.signal}));
+  if(!r.ok){let m='HTTP '+r.status;try{const j=await r.json();if(j&&j.error)m=j.error}catch(e){}throw new Error(m)}  // the master's reason
+  return await r.json()}
+ catch(e){if(e.name==='AbortError')throw new Error('no answer from the master');throw e}
  finally{clearTimeout(t)}}
 /* One request of each kind at a time: a poll still waiting is not joined by
    the next one, so a slow moment cannot pile up into a slow minute. */
@@ -401,12 +404,15 @@ async function save(andReboot){
   if(body.signals){const now=await req('/api/config',null,10000);
    body.signals=mergeSignals(ORIG.signals||[],C.signals||[],now.signals||[])}
   if(body.pids)body.pids=body.pids.map(({name,metrics,...p})=>p);   // read-only extras stay here
-  // Generous: the master writes its flash before it answers.
-  await req('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},15000);
+  // As a form's file: the master writes it to its flash as it comes and reads
+  // it from there (a car's whole settings did not fit in its memory as text,
+  // its parsed copy and the save's at once). Generous: it saves before it answers.
+  const fd=new FormData();fd.append('cfg',new Blob([JSON.stringify(body)],{type:'application/json'}),'config.json');
+  await req('/api/config',{method:'POST',body:fd},20000);
   setDirty(false);
   if(andReboot){await post('/api/reboot','Saved - rebooting');return}
   toast(reboot?'Saved - reboot to apply':'Saved');await load()}
- catch(e){toast('Save failed - try again')}}
+ catch(e){toast('Save failed: '+e.message,8000)}}
 
 /* ───────────── settings: every one in one place ───────────── */
 /*<settings>*/
