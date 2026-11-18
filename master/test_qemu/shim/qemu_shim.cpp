@@ -350,8 +350,11 @@ void readerTask(void *) {
             if (!sv[i].minFree || sv[i].minFree > sv[i].size) bad("stacks: a figure that cannot be", i, sv[i].minFree);
         static EvView ev[48];
         events = masterEventLog(ev, 48);
+        // In order within a boot: the log is kept across restarts, and each boot's
+        // own entry (type 0) starts its clock again (run.py --flash, a second drive).
         for (size_t i = 1; i < events; i++)
-            if (ev[i].ms < ev[i - 1].ms && ev[i - 1].ms - ev[i].ms < 0x7FFFFFFF) bad("events: out of order", i);
+            if (ev[i].type != 0 && ev[i].ms < ev[i - 1].ms && ev[i - 1].ms - ev[i].ms < 0x7FFFFFFF)
+                bad("events: out of order", i);
 
         s_passes++;
         if (millis() - lastPrint >= 10000) {
