@@ -97,7 +97,7 @@ time — headlights on, brake pressed, gear selected — and watch which ID's
 payload moves. Add a signal, give it a **Ref** metric if the ECU reports the
 same quantity, and set it to Auto; the verifier does the rest.
 
-**Teach by doing** (Bus tab) does the watching for you:
+**Teach by doing** (Signals tab) does the watching for you:
 
 - **On / off** — switches: lights, doors, handbrake, fog lights, VDC off.
   Turn signals and hazards too: leave the lamp flashing through the ON step.
@@ -147,7 +147,7 @@ chip itself is microamps.
   covers the reset window itself.
 - If the car sets P1718/P0700 (transmission ECU losing the engine ECU's CAN
   messages): `P1718_DIAGNOSIS.md` has the causes, the fixes, and a test plan.
-  The portal's Diagnostics tab keeps the evidence (reset reasons, guard trips).
+  The portal's Bus tab keeps the evidence (reset reasons, guard trips).
 - **Silent** mode (CAN tab) makes the controller electrically incapable of
   transmitting, for first contact with an unfamiliar bus.
 - The portal is the only way into the settings (there is no serial console,

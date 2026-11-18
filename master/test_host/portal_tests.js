@@ -557,5 +557,75 @@ console.log('--- trouble code channels and drive logs');
     check(tlgToCsv(new Uint8Array([1, 2, 3]), () => '') === '', 'not a log: nothing');
 }
 
+/*
+ * The page's layout: five tabs, and every setting the master has in exactly
+ * one row - the Settings tab, its Advanced section or the Car tab - from the
+ * page's own settings block, against the keys MasterConfig::toJson writes. A
+ * setting shown twice once had two controls disagreeing about it (the
+ * Settings tab's OBD-II and SSM2 boxes and Advanced's "Mode"); one shown
+ * nowhere can only be changed through the JSON.
+ */
+console.log('--- the page: tabs, and every setting in one place');
+{
+    const block = page.match(/\/\*<settings>\*\/([\s\S]*?)\/\*<\/settings>\*\//);
+    check(!!block, 'the page has a settings block');
+    const S = {};
+    vm.createContext(S);
+    vm.runInContext((block ? block[1] : 'const REBOOT_KEYS=[],SET_MAIN=[],SET_ADV=[],SET_CAR=[];') +
+                    '\n;globalThis.__s={REBOOT_KEYS,SET_MAIN,SET_ADV,SET_CAR};', S);
+    const { REBOOT_KEYS, SET_MAIN, SET_ADV, SET_CAR } = S.__s;
+    const rows = [...SET_MAIN, ...SET_ADV, ...SET_CAR].flatMap(([, r]) => r);
+
+    const cfgSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'MasterConfig.cpp'), 'utf8');
+    const body = cfgSrc.slice(cfgSrc.indexOf('void MasterConfig::toJson'));
+    const toJson = body.slice(0, body.search(/\n}\n/));
+    const keys = [...new Set([...toJson.matchAll(/doc\["([a-z0-9_]+)"\]/g)].map(m => m[1]))];
+    // Not settings: read-only identity, and the tables, which have their own
+    // editors (Signals tab; log_ids on the Car tab).
+    const NOT = ['cfg_ver', 'ecu_id', 'ecu_sys_id', 'ecu_flags', 'ecu_cal_id', 'vin', 'learn_excl', 'log_ids',
+                 'pids', 'signals', 'ssm', 'ssm_removed'];
+    const settings = keys.filter(k => !NOT.includes(k));
+    check(keys.length > 50 && NOT.every(k => keys.includes(k)), 'toJson read', `${keys.length} keys, ${settings.length} settings`);
+    const count = k => rows.filter(r => r[0] === k).length;
+    const twice = settings.filter(k => count(k) > 1), none = settings.filter(k => count(k) === 0);
+    const unknown = rows.map(r => r[0]).filter(k => !settings.includes(k));
+    check(!twice.length, 'no setting in two places', twice.join(' '));
+    check(!none.length, 'every setting has a row', none.join(' '));
+    check(!unknown.length, 'every row is a setting the master has', unknown.join(' '));
+    check(REBOOT_KEYS.every(k => count(k) === 1), 'the settings that need a reboot are all there');
+    const bad = rows.filter(([k, l, t, a]) => !(typeof l === 'string' && l &&
+        (t === 'bool' || (t === 'sel' && Array.isArray(a) && a.length > 1) || (t === 'str' && a > 0) ||
+         (t === 'num' && Array.isArray(a) && a[0] < a[1])))).map(r => r[0]);
+    check(!bad.length, 'every row well formed', bad.join(' '));
+    check(SET_MAIN.every(([, r]) => r.length) && SET_ADV.every(([, r]) => r.length), 'no empty group');
+
+    // The car's own settings files, read off it: every value within its row's
+    // range, every choice among its row's options (else the page would show a
+    // stored setting as invalid, or as another option).
+    const fx = path.join(__dirname, 'fixtures');
+    for (const f of fs.readdirSync(fx).filter(n => n.endsWith('.json'))) {
+        const c = JSON.parse(fs.readFileSync(path.join(fx, f), 'utf8'));
+        const off = rows.filter(([k, , t, a]) => k in c &&
+            (t === 'num' ? !(c[k] >= a[0] && c[k] <= a[1]) : t === 'sel' ? !a.some(o => o[0] === c[k]) : false))
+            .map(([k]) => `${k}=${c[k]}`);
+        check(!off.length, `${f}: every value fits its row`, off.join(' '));
+    }
+
+    // Five tabs, each with its section; no input bound outside the settings
+    // block (it would be a second row for its key); every element the script
+    // looks up exists.
+    const tabs = [...page.matchAll(/<button data-t="([a-z]+)"/g)].map(m => m[1]);
+    check(tabs.join() === 'home,sig,bus,car,set', 'the tabs: Home, Signals, Bus, Car, Settings', tabs.join());
+    check(tabs.every(t => page.includes(`<section id="t-${t}"`)) && (page.match(/<section /g) || []).length === tabs.length,
+          'one section a tab');
+    const script = page.slice(page.indexOf('<script>'));
+    const markup = page.slice(0, page.indexOf('<script>'));
+    check(!/data-k="/.test(markup), 'no setting bound in the markup itself');
+    const ids = new Set([...page.matchAll(/\bid="([A-Za-z0-9_-]+)"/g)].map(m => m[1]));
+    const missing = [...new Set([...script.matchAll(/\$\('#([A-Za-z0-9_-]+)/g)].map(m => m[1]))]
+        .filter(i => !i.endsWith('-') && !ids.has(i));                // '#t-'+tab is put together at run time
+    check(!missing.length, 'every element the script uses exists', missing.join(' '));
+}
+
 console.log(failures ? `FAILED: ${failures} check(s)` : 'all portal checks passed');
 process.exit(failures ? 1 : 0);

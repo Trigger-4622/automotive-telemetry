@@ -151,7 +151,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   long answers have passed (`otherAnswer`, `othersFinish`). The code reader
   waits 150 ms a request, and a transmission computer silent for three reads
   is asked at every tenth (at once on "Read now" and when the car comes on).
-  The Sources tab shows how long the ECU takes ("answers in", `/api/live`
+  The Signals tab shows how long the ECU takes ("answers in", `/api/live`
   `obd.lat`, `lat_max`) and answers that came after their wait (`late`): if
   that is not 0 on the car, raise `obd_p2can`.
 - **OBD-II poll order** (`obd_order`, `obd_poll_order`, `obd_poll_all`): the
@@ -193,7 +193,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   (`learn_excl`, at most 32, written by the learner only; "Restart learning"
   keeps them, "Forget learned values" clears them - `learn_excl_kept`). A
   learned signal in use is checked against the ECU every `learn_recheck_s`
-  (30 s; 0 = off, at most 3600; portal Advanced, Learning, applied without a
+  (30 s; 0 = off, at most 3600; portal Settings > Advanced > Learning, applied without a
   restart - `learn_recheck_setting`): the pollers ask its covered value once
   (`masterRecheckWanted`), the answer is kept beside the metric whatever the
   source priority (`MasterMetric::reqValue`, also what candidates are verified
@@ -305,7 +305,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   `s_twaiCtl`, which the guard task holds while it waits) before a request
   whenever our own frames have wound it below 170. The receive-error guard
   stands down while TEC >= 128.
-- **Safe bus settings** (portal Maintenance, `/api/bus_defaults`,
+- **Safe bus settings** (portal Settings > Device, `/api/bus_defaults`,
   `MasterConfig::loadBusDefaults()`, which `loadDefaults()` starts from): the
   bus behaviour alone back to the defaults that transmit, receive and cannot
   break the bus. Keeps the bitrate, pacing, displays, Wi-Fi and everything
@@ -336,7 +336,14 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   and waits up to 5 s on one that has sent nothing yet - which browsers open
   ahead of need. `PortalServer` (WebPortal.cpp.in) drops such a connection as
   soon as another is waiting. The page gives every request a deadline, polls
-  one at a time, and polls nothing else while a teach runs.
+  one at a time, and polls nothing else while a teach runs. Five tabs, each
+  polling only what it shows: Home, Signals (learning, teach by doing, the
+  sources), Bus (its health, the frames, the evidence log), Car (codes, oil
+  change, drive logs) and Settings (the everyday ones, Device, then an
+  Advanced section). Every setting is in exactly one row of the page's
+  settings block (`SET_MAIN`, `SET_ADV`, `SET_CAR`): a new config key gets a
+  row there and nowhere else - `portal_tests.js` checks the block against
+  `MasterConfig::toJson`.
 - **The portals are the only way into the settings** (no serial console, and
   the settings survive a reflash), so nothing may keep an AP from starting.
   Master: a Wi-Fi name of 1-32 bytes and a password of at most 63 are enforced
@@ -361,7 +368,7 @@ VIN's serial masked) holds 18 signals: learned RPM 0x231, pedal/throttle 0x232, 
 0x252. Not yet taught: door, turn signals, high beam, cruise; oil pressure has
 no known source.
 
-Teach by doing (portal Bus tab; its analysis is the `teach-core` JS in
+Teach by doing (portal Signals tab; its analysis is the `teach-core` JS in
 `portal_page.html`, tested by `master/test_host/portal_tests.js`) finds a
 flashing turn signal from the census's per-bit flip counters (`/api/bus?e=1`,
 `masterCensusEdges`), and the gear lever with its Positions mode: the
@@ -420,7 +427,7 @@ when it does not (`lamp_hazard_switch`).
   SSM2 odometer (address 0x10E); portal "Oil changed now"; a `service` lamp
   (spanner, amber under 500 km).
 - **G-meter**: `LAT_ACCEL`/`LON_ACCEL`/`YAW_RATE`, taught from the stability
-  unit's frame with the Bus tab's "A corner or a hard stop" (`motionRef`,
+  unit's frame with the Signals tab's "A corner or a hard stop" (`motionRef`,
   `teachMotion` in teach-core: correlation with the speed's slope, or with
   speed x yaw / the steering, and a fitted scale). Until then the master
   derives longitudinal G from the speed's slope and lateral G from speed x yaw
@@ -440,7 +447,7 @@ when it does not (`lamp_hazard_switch`).
   announced with `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
   The QEMU test has a 1.9 MB `logs` partition (8 MB with `--ota`).
 - **Firmware update over Wi-Fi** (master only, `master/src/FwUpdate.*`;
-  portal Settings > Firmware, `/api/update`): the upload goes into the spare
+  portal Settings > Device, `/api/update`): the upload goes into the spare
   app slot (app0/app1; a USB upload always writes app0 and resets otadata to
   it), is checked (0xE9 image, `FW_MARK` - a display's ESP32-S3 image would
   pass every other check - then the core's checksum, hash and chip check) and
@@ -473,7 +480,7 @@ when it does not (`lamp_hazard_switch`).
   guard (`rx_guard`, `rx_guard_rec`, `rx_guard_errs`; also latches on bus-off
   when `guard` is off), P2CAN wait (`obd_p2can`), request budget
   (`req_max_hz`, off by default), TX recessive hold (`tx_hold`),
-  physical-addressing latch and the evidence log (portal Diagnostics tab) are
+  physical-addressing latch and the evidence log (portal Bus tab) are
   built and tested in the harness (`tcm_p1718` and the scenarios after it)
   and was flashed 2026-09-26 - which made the MIL come sooner, because of the
   listen-only erratum above (fixed since, with the P2CAN pacing now counted
@@ -513,7 +520,7 @@ when it does not (`lamp_hazard_switch`).
   the lamps, the dash screen, and whether the Arduino_GFX driver cured the
   panel speckle.
 - Communication review (2026-11-13: "Asking the car" and the poll order
-  above): harness only. On the car: the Sources tab's "answers in ... ms" and
+  above): harness only. On the car: the Signals tab's "answers in ... ms" and
   "came late" (not 0: raise `obd_p2can`); whether the gauges fed by OBD-II -
   road speed above all, and the timers and G-meter that use it - are livelier
   (`obd_order` 1 puts the old order back); and what the code reader says about
