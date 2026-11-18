@@ -20,6 +20,7 @@ python screens/screen1-round/test_host/run.py [scenario]       # screen renders 
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
 python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # the real master firmware in Espressif's QEMU (needs $QEMU_ESP32S3; not in test_all)
 python master/test_qemu/run.py --replay drive.log [--settings cfg.json]   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
+python master/test_qemu/run.py --replay d1.log --once --flash two.bin     # ...one drive, the car off; run d2.log on two.bin after: a power cycle between drives
 python master/test_qemu/run.py --ota                # ...a Wi-Fi firmware update, kept, a second one crashing, rolled back
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
