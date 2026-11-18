@@ -388,10 +388,26 @@ and a reading counts only for the step it was both asked for and answered in
 (`teachSlot`); a step with fewer than `TEACH_MIN_READS` (3) readings makes the
 page say the master answered too slowly (two can make a slow counter bit look
 like a switch). The indicators are taught in one run - off, left, off, right,
-off, hazard, off (`teachTurns`): a bit that flashes for one side only is that
-side, one that flashes for both is reported and never offered, the hazard
-switch is the bit held on only in the hazard step, and a stalk bit held for
-one side is the fallback (the screens flash those themselves). The lever's
+off, hazard, off, 7 and 8 s a step (`teachTurns`): a bit that flashes for one
+side, with the other side's step silent (not one flip), is that side; one
+that flashes for both is reported and never offered; the hazard switch is the
+bit held, or flashing, in the hazard step alone; a bit held for one side - in
+the hazard step too, if it likes - is the fallback (the screens flash those
+themselves); and a car that sends one flasher for both sides and the side as
+a bit of its own in the same frame gets each side as that flasher while the
+side bit says so (a two-bit combination with a table, `turn_gated`). The OFF
+steps rest but for the driver's hand at their ends (`restsIn`: flashes at a
+step's start where the step before had the bit going, at its end where the
+next has, around a still middle of 40 %), a side's lamp that also flashed
+with the hazard lights beats one that did not (and drops it), and a bit with
+another bit of its byte changing level in the same step is a value's, not a
+switch (the steering angle nudged by the hand on the lever). On two real 2012
+Imprezas' indicator traffic (`master/test_host/traffic/`, CANdid) the run
+used to lose both lamps with a driver 2 s late switching off - an OFF step
+with more than two flips was not at rest - and offered an either-side bit
+that pulses on some flashes (0x361 bit 51) as one side; now both lamps come
+first with the driver up to 3 s late or 2 s early and the master answering
+in 40 ms to 1.3 s. The lever's
 own field is preferred - the shortest run of neighbouring moving bits that
 tells every position apart - over the combination of every bit that moved,
 and a combination's code within a quarter of its width of exactly one entry

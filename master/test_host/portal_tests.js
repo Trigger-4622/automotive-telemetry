@@ -287,6 +287,175 @@ console.log('--- the indicators from a master without flip counters');
 }
 
 /*
+ * The indicators on real Subaru traffic: two 2012 Imprezas' "Indicator"
+ * captures (CANdid, CC BY 4.0 - traffic/candid_impreza_indicators.json says
+ * what was kept). Their left lamp is 0x282 bit 44, the right bit 45; 0x361
+ * bit 50 flashes for either side, bits 51-52 pulse on some flashes of either;
+ * the hand on the lever nudges the steering angle (0x002 bits 11-12, 0x0D0
+ * bits 3-5), and one car's engine frame has a bit (0x140 bit 48) that flips
+ * as fast as a lamp for a while. A run is spliced from the capture's own
+ * periods in the order they happened - an off stretch from the off period
+ * that really followed - with the driver acting late or early by @p lagOn /
+ * @p lagOff ms. The captures have no hazard lights: the hazard stretch is a
+ * left one with the right lamp lit with it and a stand-in switch (bit 46).
+ * The master's census and the phone's polling are modelled as session() does.
+ */
+const CANDID = JSON.parse(fs.readFileSync(path.join(__dirname, 'traffic', 'candid_impreza_indicators.json'), 'utf8'));
+const RUN_STEPS = ['A', 'L', 'B', 'R', 'C', 'H', 'D'];
+const RUN_DURS = [7000, 8000, 7000, 8000, 7000, 8000, 7000];   // as teachStart asks
+function candidRun(car, { lagOn = 0, lagOff = 0, latency = () => 40, pollMs = 150, skipMs = 1500, deadline = 1500 } = {}) {
+    const per = CANDID.cars[car], starts = [];
+    let s = 0; for (const d of RUN_DURS) { starts.push(s); s += d; }
+    const total = s, frames = [];
+    const acts = [[0, 'off0'], [starts[1] + lagOn, 'L'], [starts[2] + lagOff, 'offL'], [starts[3] + lagOn, 'R'],
+                  [starts[4] + lagOff, 'offR'], [starts[5] + lagOn, 'H'], [starts[6] + lagOff, 'offH']];
+    acts.forEach(([t, what], k) => {
+        const end = k + 1 < acts.length ? acts[k + 1][0] : total;
+        for (const [ms, id, hx] of per[what]) {
+            if (ms >= end - t) break;
+            const b = [...Buffer.from(hx, 'hex')];
+            if (what === 'H' && id === 0x282) { setBit(b, 45, (b[5] >> 4) & 1); setBit(b, 46, 1); }
+            frames.push([t + ms, id, b]);
+        }
+        if (what === 'offH' || what === 'offL' || what === 'offR' || what === 'off0') {
+            // the stand-in hazard switch goes back to rest with the hazard stretch
+        }
+    });
+    frames.sort((a, b) => a[0] - b[0]);
+    const S = {}; RUN_STEPS.forEach(k => S[k] = []);
+    const last = new Map(), flips = new Map();
+    let fi = 0, k = 0, tq = 0, lat = latency(0);
+    const feed = upto => {
+        for (; fi < frames.length && frames[fi][0] <= upto; fi++) {
+            const [, id, d] = frames[fi], p = last.get(id);
+            let f = flips.get(id); if (!f) flips.set(id, f = new Array(64).fill(0));
+            if (p) for (let b = 0; b < 8; b++) { let x = (p[b] || 0) ^ (d[b] || 0); for (let q = 0; x; q++, x >>= 1) if (x & 1) f[8 * b + q] = (f[8 * b + q] + 1) & 255; }
+            last.set(id, d.slice());
+        }
+    };
+    while (tq < total) {
+        const done = tq + Math.min(lat, deadline);
+        feed(tq + Math.min(lat, deadline) / 2);
+        if (lat <= deadline) {
+            const i = teachSlot(RUN_DURS, skipMs, tq, done);
+            if (i >= 0) S[RUN_STEPS[i]].push(new Map([...last].map(([id, d]) => [id, { b: d.slice(), e: flips.get(id).slice() }])));
+        }
+        tq = Math.max(tq + pollMs, done); lat = latency(++k);
+    }
+    return S;
+}
+const isAt = (r, id, bit) => r && r.id === id && r.s === bit;
+
+console.log('--- the indicators on real Subaru traffic (two 2012 Imprezas)');
+for (const car of Object.keys(CANDID.cars)) {
+    const r = teachFind('turn', candidRun(car));
+    const L = role(r, 'L'), R = role(r, 'R'), H = role(r, 'H');
+    check(isAt(L[0], 0x282, 44) && L[0].how === 'flash' && L[0].metric === 0x1201, `car ${car}: left is the left lamp`, JSON.stringify(L[0]));
+    check(isAt(R[0], 0x282, 45) && R[0].how === 'flash' && R[0].metric === 0x1202, `car ${car}: right is the right lamp`, JSON.stringify(R[0]));
+    check(isAt(H[0], 0x282, 46), `car ${car}: the hazard switch`, JSON.stringify(H[0]));
+    check(role(r, 'both').some(x => isAt(x, 0x361, 50)), `car ${car}: 0x361 bit 50, the flasher for either side, reported as either`);
+    check(!L.concat(R).some(x => x.id === 0x361 || x.id === 0x002 || x.id === 0x0D0 || x.id === 0x140),
+          `car ${car}: never the either-side bits, the steering or the engine for a side`,
+          L.concat(R).map(x => `${x.role}:${x.id.toString(16)}/${x.s}`).join(' '));
+}
+
+console.log('--- real traffic, a driver seconds late or early, a slow and uneven master');
+{
+    // Before: a driver 2 s late switching off left a few flashes in the OFF
+    // step, which threw the lamps out - nothing found, or an either-side bit
+    // that pulsed on some flashes offered as one side.
+    let ok = 0, wrong = 0, runs = 0;
+    for (const car of Object.keys(CANDID.cars))
+        for (const [lagOn, lagOff] of [[2000, 2000], [3000, 3000], [3000, 1500], [-2000, -1500], [1500, 3000]])
+            for (let seed = 1; seed <= 4; seed++) {
+                const rnd = rng(seed * 7 + lagOn);
+                const r = teachFind('turn', candidRun(car, { lagOn, lagOff, latency: () => 60 + Math.floor(rnd() * 540) }));
+                const L = role(r, 'L')[0], R = role(r, 'R')[0];
+                runs++;
+                if (isAt(L, 0x282, 44) && isAt(R, 0x282, 45)) ok++;
+                else if ((L && !isAt(L, 0x282, 44)) || (R && !isAt(R, 0x282, 45))) wrong++;
+            }
+    check(ok === runs, 'both lamps found in every run', `${ok} of ${runs}, ${wrong} with a wrong bit first`);
+}
+
+/*
+ * Other ways a car can send the indicators (the owner's Legacy is not known
+ * to send separate lamps): frames built for the page's steps A L B R C H D.
+ */
+function turnFrames(kind) {
+    return (t, n, step) => {
+        const lit = (t % 690) < 345, left = step === 'L' || step === 'H', right = step === 'R' || step === 'H';
+        const b = [0, 0, 0, 0, 0, 0, 0, n & 0xFF], c = [0, 0, 0, 0, 0, 0, 0, 0];
+        if (kind === 'gated') {
+            // One flasher for both sides (bit 20) and the side as a bit of its own
+            // (bit 22: set for the right), in the same frame.
+            setBit(b, 20, (left || right) && lit);
+            setBit(b, 22, step === 'R');
+        } else if (kind === 'stalkH') {
+            // Stalk bits that the hazard lights set as well, and one shared flasher.
+            setBit(b, 20, (left || right) && lit);
+            setBit(c, 9, left); setBit(c, 10, right);
+            return { 0x282: b, 0x3B1: c };
+        } else if (kind === 'state') {
+            // A 2-bit state: 01 left, 10 right, 11 hazard lights - held, not flashing.
+            setBit(c, 16, left); setBit(c, 17, right);
+            return { 0x3B1: c, 0x282: b };
+        } else if (kind === 'slow') {
+            // Separate lamps, but in a frame sent twice a second.
+            if (n % 25) return {};
+            setBit(c, 4, left && lit); setBit(c, 5, right && lit);
+            return { 0x4B1: c };
+        } else if (kind === 'nudge') {
+            // The lamps, and the steering angle's low bits moved by the hand on
+            // the lever while it is on (left: 0x002 rises by 3, right: by 5).
+            setBit(b, 12, left && lit); setBit(b, 13, right && lit);
+            const st = step === 'L' ? 3 : step === 'R' ? 5 : 0;
+            return { 0x282: b, 0x002: [0x10, st, 0, 0, 0, 0, 0, 0] };
+        }
+        return { 0x282: b, 0x3B1: c };
+    };
+}
+const TURN_RUN = RUN_STEPS.map((key, i) => ({ key, ms: RUN_DURS[i] }));
+
+console.log('--- one flasher for both sides and the side as a bit beside it');
+{
+    const r = teachFind('turn', session(TURN_RUN, turnFrames('gated')));
+    const L = role(r, 'L')[0], R = role(r, 'R')[0];
+    check(L && L.how === 'gated' && L.id === 0x282 && String(L.bits) === '20,22' && JSON.stringify(L.map) === '[[0,0],[1,1],[2,0],[3,0]]',
+          'left: the flasher while the side bit is clear', JSON.stringify(L));
+    check(R && R.how === 'gated' && String(R.bits) === '20,22' && JSON.stringify(R.map) === '[[0,0],[1,0],[2,0],[3,1]]',
+          'right: the flasher while it is set (it flashes with the car, ahead of the bit held)', JSON.stringify(R));
+    check(role(r, 'R').some(x => x.how === 'held' && x.s === 22), 'the side bit itself still offered for the right, after it');
+}
+
+console.log('--- side bits the hazard lights set too');
+{
+    const r = teachFind('turn', session(TURN_RUN, turnFrames('stalkH')));
+    check(isAt(role(r, 'L')[0], 0x3B1, 9) && role(r, 'L')[0].heldH, 'left: its bit, held, with the hazard lights as well', JSON.stringify(role(r, 'L')[0]));
+    check(isAt(role(r, 'R')[0], 0x3B1, 10), 'right: its bit', JSON.stringify(role(r, 'R')[0]));
+}
+
+console.log('--- a 2-bit state: left, right, both for the hazard lights');
+{
+    const r = teachFind('turn', session(TURN_RUN, turnFrames('state')));
+    check(isAt(role(r, 'L')[0], 0x3B1, 16) && isAt(role(r, 'R')[0], 0x3B1, 17), 'its two bits, one for each side',
+          JSON.stringify([role(r, 'L')[0], role(r, 'R')[0]]));
+}
+
+console.log('--- separate lamps in a frame sent twice a second');
+{
+    const r = teachFind('turn', session(TURN_RUN, turnFrames('slow')));
+    check(isAt(role(r, 'L')[0], 0x4B1, 4) && isAt(role(r, 'R')[0], 0x4B1, 5), 'both lamps', JSON.stringify(r.map(x => [x.role, x.id.toString(16), x.s, x.how])));
+}
+
+console.log('--- the steering nudged by the hand on the lever is not a switch');
+{
+    const r = teachFind('turn', session(TURN_RUN, turnFrames('nudge')));
+    check(isAt(role(r, 'L')[0], 0x282, 12) && isAt(role(r, 'R')[0], 0x282, 13), 'the lamps', JSON.stringify(r.map(x => [x.role, x.id.toString(16), x.s, x.how])));
+    check(!r.some(x => x.id === 0x002), 'nothing from the steering angle');
+}
+
+/*
  * The gear lever. The transmission's frame 0x252 carries the position in bits
  * 52-54 (byte 6): P 0, R 1, N 2, D 4 - bit 55 beside it is a constant, and
  * byte 7 a rolling counter. Five seconds per position, the first 1.5 s not
