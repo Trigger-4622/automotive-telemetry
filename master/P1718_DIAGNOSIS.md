@@ -33,7 +33,7 @@ stops asking a transmission computer that never answers (`dtc_tcm_silent`);
 a code read through 0x7DF gives the engine ECU's long answer its flow control
 instead of leaving it waiting a second (`dtc_functional_fc`).
 
-**On the car:** the portal's Sources tab now says how long the ECU takes
+**On the car:** the portal's Signals tab now says how long the ECU takes
 ("answers in ... ms, slowest ... ms") and counts answers that came after
 their wait ("came late"). If that count is not 0, raise `obd_p2can`.
 
@@ -129,8 +129,8 @@ now; it matches at 1.000.
 1. 10 minutes driving. Screenshot the Bus tab card.
 2. Advanced → Radio transmit power 2 dBm; 10 more minutes; screenshot. (The
    displays sit a metre away; 2 dBm reaches them.)
-3. Optional: Settings, both requests off (listen-only) for 10 minutes;
-   screenshot.
+3. Optional: Settings, "What the master may ask" set to listen only, for 10
+   minutes; screenshot.
 
 If the errors sit near the radio, or fall at 2 dBm: the supply - give the
 transceiver its own clean 3.3 V (or a low-noise LDO) and decouple it
@@ -390,7 +390,7 @@ prefer that.
 | Settle wait | `start_delay_s` (10) | Already built; this branch puts it on the car. Listen-only for 10 s each time the bus comes up. Absent from the stored file, so it takes the default. | `settle*`, `crank_reset` |
 | Physical addressing latch | (none: behaviour) | Auto addressing gives physical several tries before ever using 0x7DF, and never goes back once physical has worked. | `no_functional` |
 | TX recessive hold | `tx_hold` (on) | GPIO 5 driven recessive the instant the firmware starts (always) and latched recessive across deep sleep (this switch). | `tx_hold`, `tx_hold_off` |
-| Evidence log | Diagnostics tab, `/api/evlog` | Boot and reset reasons, bus up, settle end, guard trips with the error counters and what we were transmitting, bus-off, sleep. Kept in `/evlog.json` on LittleFS across reboots and updates. | `crank_reset`, `evlog` |
+| Evidence log | Bus tab, `/api/evlog` | Boot and reset reasons, bus up, settle end, guard trips with the error counters and what we were transmitting, bus-off, sleep. Kept in `/evlog.json` on LittleFS across reboots and updates. | `crank_reset`, `evlog` |
 
 Three more things the audit of the guard task turned up and fixed, each
 with a scenario:
@@ -469,10 +469,11 @@ Codes anyway → only the reset window is left on our side: open Diagnostics
 and look for brown-out boots; fit the pull-up if it is not on; if the log shows
 clean power-ons only, it is the wiring or the car (back to 1).
 
-**3. OBD-II with the fixes** (Settings: OBD-II on, SSM2 off — the mode as
-today). After every drive read Diagnostics. Receive-error guard trips → cause
+**3. OBD-II with the fixes** (Settings: "What the master may ask", OBD-II
+requests only — the mode as today). After every drive read the evidence log
+(Bus tab). Receive-error guard trips → cause
 1 confirmed: the link is marginal; fix the ground and stub, try the late
-sample point (Advanced, reboot), and the guard has meanwhile kept the TCM
+sample point (Settings > CAN connection, reboot), and the guard has meanwhile kept the TCM
 safe. Brown-out boots → cause 2 confirmed; the settle wait covered it. No
 trips, no brown-outs, no codes → fixed; go on. Codes with a clean log → lower
 `rx_guard_rec` (64) and set `req_max_hz` 40, repeat.

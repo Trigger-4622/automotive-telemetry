@@ -145,38 +145,85 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 .lr .lt{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:5px}
 .lr .ls{font-size:12px;color:var(--muted);margin-top:4px;display:flex;justify-content:space-between;gap:10px;align-items:center}
 .step{font-size:18px;font-weight:600;color:var(--acc);margin:10px 0 4px}
+/* A section heading between cards (Sources, Advanced) */
+.sec{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:22px 2px 10px}.sec h2{font-size:15px;font-weight:600}
+/* Home: one line for each thing that needs you, linking to where it is dealt with */
+.note{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--line);border-left:3px solid var(--warn);
+ border-radius:10px;padding:10px 12px;margin-bottom:8px;cursor:pointer;font-size:13px}
+.note.crit{border-left-color:var(--crit)}.note .go{margin-left:auto;color:var(--muted);white-space:nowrap}
+/* The map dialog, over whichever tab opened it */
+.dlg{position:fixed;inset:0;z-index:8;background:#000b;display:flex;justify-content:center;align-items:flex-start;
+ padding:56px 12px 12px;overflow-y:auto}
+.dlg>.card{width:100%;max-width:560px}
 </style></head><body>
 <header>
  <div class="top"><h1>CAN <b>Master</b></h1><span id="conn" class="pill"><i></i><span>connecting</span></span></div>
  <nav>
-  <button data-t="dash" class="on">Dashboard</button>
+  <button data-t="home" class="on">Home</button>
+  <button data-t="sig">Signals</button>
   <button data-t="bus">Bus</button>
-  <button data-t="src">Sources</button>
+  <button data-t="car">Car</button>
   <button data-t="set">Settings</button>
-  <button data-t="adv">Advanced</button>
-  <button data-t="diag">Diagnostics</button>
  </nav>
 </header>
 <main>
 
-<section id="t-dash">
+<!-- Home: how the master is doing, what needs you, the values themselves -->
+<section id="t-home">
  <div class="tiles">
   <div class="tile"><div class="k">CAN bus</div><div class="v" id="dBus">–</div><div class="s" id="dBusS">&nbsp;</div></div>
   <div class="tile"><div class="k">Heard on the bus</div><div class="v ok" id="dRaw">–</div><div class="s">values, nothing asked</div></div>
   <div class="tile"><div class="k">Requested</div><div class="v" id="dReq">–</div><div class="s" id="dReqS">&nbsp;</div></div>
   <div class="tile"><div class="k">Sent to displays</div><div class="v" id="dEsp">–</div><div class="s" id="dEspS">&nbsp;</div></div>
  </div>
+ <div id="hNote"></div>
  <p class="say" id="dSay"></p>
- <div class="card"><h2>Learning <small id="lSub"></small>
-   <label class="muted" style="margin-left:auto;font-size:12px"><input type="checkbox" id="lAll"> show all</label></h2>
-  <p class="say" style="margin:0 0 6px">Every value the master requests is matched against the bus. <b>Listen now</b> takes the best
-   match so far and reads that value from the bus straight away, even if it is not fully confirmed.</p>
-  <div id="lTab"></div></div>
  <div class="card"><h2>Live values <small id="vCount"></small>
   <input id="vq" placeholder="Filter…" style="margin-left:auto;width:140px"></h2>
   <div id="vals"></div></div>
 </section>
 
+<!-- Signals: where every value comes from - learned, taught, mapped, asked -->
+<section id="t-sig" hidden>
+ <p class="say">Where every value comes from. The master learns most of them by itself, from what it asks the ECU;
+  teach it the rest by doing.</p>
+ <div class="card"><h2>Learning <small id="lSub"></small>
+   <label class="muted" style="margin-left:auto;font-size:12px"><input type="checkbox" id="lAll"> show all</label></h2>
+  <p class="say" style="margin:0 0 6px">Every value the master requests is matched against the bus. <b>Listen now</b> takes the best
+   match so far and reads that value from the bus straight away, even if it is not fully confirmed.</p>
+  <div id="lTab"></div>
+  <div class="row" style="margin-top:12px">
+   <button class="b" onclick="post('/api/learn/reset','Learning restarted')">Restart learning</button>
+   <button class="b d" onclick="if(confirm('Delete every automatically learned value?\n\nWhat was mapped or taught by hand stays.'))post('/api/learn/forget','Learned values deleted',()=>load(true))">Forget learned values…</button></div>
+  <p class="say" style="margin:8px 0 0"><b>Restart learning</b> starts the search again; what was learned stays.
+   <b>Forget learned values</b> deletes every learned value, and the fields turned down, so all of it is learned afresh.</p></div>
+ <div class="card" id="teach"><h2>Teach by doing <small>for what the ECU cannot report</small></h2>
+  <p class="say" style="margin:0 0 8px">Turn signals, doors, handbrake, steering, wheel speeds, the gear lever, the G-meter… Pick
+   it, press <b>Start</b> and do what each step asks: the master finds the bits or bytes that followed you.</p>
+  <div class="row"><select id="tM" style="flex:1;min-width:180px"></select>
+   <select id="tK"></select>
+   <button class="b p" id="tBtn" onclick="teachStart()">Start</button></div>
+  <p class="say" id="tHow" style="margin:8px 2px 0"></p>
+  <div class="row" id="tPRow" hidden style="margin-top:8px"><span class="muted">Positions, in the order you will select them:</span>
+   <input id="tP" style="flex:1;min-width:120px" value="P R N D"></div>
+  <div id="tStep"></div><div id="tRes"></div></div>
+ <div id="srcBox">
+  <div class="sec"><h2>Sources</h2><span class="muted">in the order the master prefers</span>
+   <label class="muted" style="margin-left:auto;font-size:12px"><input type="checkbox" id="srcEd" onchange="renderSources()"> edit details</label></div>
+  <div class="card"><h2><span class="tag raw">1</span> Heard on the bus <small>free — nothing is asked</small></h2>
+   <div class="wrap"><table><thead id="sHead"></thead><tbody id="sTab"></tbody></table></div>
+   <div class="row" style="margin-top:10px"><button class="b" onclick="go('bus')">Map a frame by hand…</button></div></div>
+  <div class="card"><h2><span class="tag obd">2</span> OBD-II requests <small id="oSub"></small>
+   <label class="muted" style="margin-left:auto;font-size:12px"><input type="checkbox" id="oAll" onchange="renderSources()"> show unsupported</label></h2>
+   <div class="wrap"><table><thead id="oHead"></thead><tbody id="oTab"></tbody></table></div></div>
+  <div class="card"><h2><span class="tag ssm">3</span> Subaru SSM2 requests <small id="mSub"></small>
+   <label class="muted" style="margin-left:auto;font-size:12px"><input type="checkbox" id="mAll" onchange="renderSources()"> show unsupported</label></h2>
+   <div class="wrap"><table><thead id="mHead"></thead><tbody id="mTab"></tbody></table></div>
+   <div class="row" style="margin-top:10px"><button class="b" onclick="post('/api/ssm/reinit','Asking the ECU again')">Ask the ECU what it supports again</button></div></div>
+ </div>
+</section>
+
+<!-- Bus: the link to the car - load, errors, the frames, the evidence log -->
 <section id="t-bus" hidden>
  <div class="card" id="gCard" hidden style="border-color:var(--warn)"><h2 class="warn">Requests paused to protect the bus</h2>
   <p class="say" id="gSay" style="margin:0 0 10px"></p>
@@ -193,22 +240,94 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <p class="say" style="margin:0 0 8px">Every bus error, the controller records its type, whether it was sending or receiving, and where in the frame it happened. Errors while <b>sending</b> in the ACK slot mean our own transceiver is not driving the bus as it should (supply, ground, its mode pin); errors while <b>receiving</b> in the data or CRC mean the link or the bit timing.</p>
   <div class="wrap"><table><thead><tr><th>Error</th><th>Mode</th><th>Count</th></tr></thead><tbody id="ekTab"></tbody></table></div>
   <div id="lkBox"></div></div>
- <div class="card" id="teach"><h2>Teach by doing <small>for what the ECU cannot report</small></h2>
-  <p class="say" style="margin:0 0 10px">Turn signals, doors, handbrake, steering, wheel speeds, the gear lever… Pick what you are about to
-   operate, press Start and follow the steps. The master finds the bits or bytes that followed you. For the indicators, pick
-   <b>Left turn signal</b>, <b>Right turn signal</b> or <b>Hazard lights</b>: one run teaches all three - the left indicator, the right one,
-   then the hazard lights, each left flashing for a few seconds - so the master can tell the two sides apart. For the gear
-   lever, pick <b>Gear lever</b>, foot on the brake, and move it through the positions as asked: it ends back in P, so every
-   bit is checked twice. For the G-meter, pick <b>Longitudinal G</b> and brake firmly to a stop, or <b>Lateral G</b> or
-   <b>Yaw rate</b> and drive through a corner: the master compares every field with what the speed and the steering say, and
-   works out the scale.</p>
-  <div class="row"><select id="tM" style="flex:1;min-width:180px"></select>
-   <select id="tK"></select>
-   <button class="b p" id="tBtn" onclick="teachStart()">Start</button></div>
-  <div class="row" id="tPRow" hidden style="margin-top:8px"><span class="muted">Positions, in the order you will select them:</span>
-   <input id="tP" style="flex:1;min-width:120px" value="P R N D"></div>
-  <div id="tStep"></div><div id="tRes"></div></div>
- <div class="card" id="mapCard" hidden><h2>Use a value from <span id="mapId" class="acc"></span>
+ <div class="card"><h2>Frames on the bus <small id="bN"></small>
+  <button class="b" style="margin-left:auto" onclick="post('/api/census/reset','Cleared')">Clear</button></h2>
+  <p class="say" style="margin:0 0 8px"><span class="hx"><span class="h">Bright</span></span> bytes just changed,
+   <span class="hx"><span class="l">white</span></span> ones change sometimes, grey ones never. <b>Map</b> reads a value from a frame by hand.</p>
+  <div class="wrap"><table><thead><tr><th>ID</th><th>Hz</th><th>Data</th><th></th></tr></thead><tbody id="bTab"></tbody></table></div></div>
+ <div class="card"><h2>Evidence log <small id="evN"></small>
+  <button class="b" style="margin-left:auto" onclick="if(confirm('Clear the evidence log?'))post('/api/evlog/clear','Cleared',pollEvlog)">Clear</button></h2>
+  <p class="say" style="margin:0 0 8px">Kept on the master's flash across reboots and firmware updates: every boot with its reset reason,
+   the bus coming up and settling, every guard trip with the error counters and what the master was transmitting at the time,
+   bus-off and sleep. Clear it before a test drive, read it after.</p>
+  <p class="say" id="evSay"></p>
+  <div class="wrap"><table><thead><tr><th>Uptime</th><th>Event</th><th>Detail</th><th>Master was</th></tr></thead><tbody id="evTab"></tbody></table></div></div>
+</section>
+
+<!-- Car: what the car says - trouble codes, oil change, drive logs, its computer -->
+<section id="t-car" hidden>
+ <div class="card"><h2>Trouble codes <small id="dcSub"></small>
+   <button class="b" style="margin-left:auto" onclick="post('/api/codes/read','Reading the codes',()=>setTimeout(pollCodes,2500))">Read now</button>
+   <button class="b d" onclick="codesClear()">Clear…</button></h2>
+  <p class="say" style="margin:0 0 8px">Stored, pending and permanent codes from the engine and the transmission computer (OBD-II
+   services 03, 07 and 0A), read when the car comes on and every minute after. The screens show them on the check-engine card.</p>
+  <div class="wrap"><table><thead><tr><th>Code</th><th>Meaning</th><th>Computer</th><th>Kind</th></tr></thead><tbody id="dcTab"></tbody></table></div>
+  <p class="say" id="dcSay" style="margin:8px 0 0"></p></div>
+ <div class="card"><h2>Oil change <small id="svSub"></small></h2>
+  <p class="say" id="svSay" style="margin:0 0 10px"></p>
+  <div class="row"><button class="b" onclick="serviceReset()">Oil changed now</button></div>
+  <div id="carOil" style="margin-top:6px"></div></div>
+ <div class="card"><h2>Drive logs <small id="lgSub"></small>
+   <button class="b d" style="margin-left:auto" onclick="if(confirm('Delete every drive log?'))post('/api/log/clear','Deleted',pollLogs)">Delete all</button></h2>
+  <p class="say" id="lgSay" style="margin:0 0 8px"></p>
+  <div class="wrap"><table><thead><tr><th>Drive</th><th>Length</th><th>Rows</th><th>Size</th><th></th></tr></thead><tbody id="lgTab"></tbody></table></div>
+  <div class="grp" style="margin-top:16px">Recording</div>
+  <div id="carLog"></div>
+  <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
+   <div id="lgIds" class="row" style="margin-top:8px"></div>
+   <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
+ <div class="card"><h2>Engine computer</h2>
+  <p class="say" style="margin:0 0 8px">RomRaider lists its ROM definitions by the <b>calibration ID</b> (its "internal ID") and its
+   logger definitions by the <b>ROM ID</b> SSM2 reports. If its definition files list this calibration ID, RomRaider can read and
+   edit this ROM: check that before buying a cable.</p>
+  <div class="wrap"><table><tbody id="idTab"></tbody></table></div></div>
+</section>
+
+<!-- Settings: every setting once - the everyday ones, the device, then Advanced -->
+<section id="t-set" class="cfg" hidden>
+ <p class="say">Changes apply when you press <b>Save</b>; the ones marked <span class="warn">reboot</span> after a reboot.
+  The oil change and the drive log are set on the <a href="#car" class="acc" onclick="go('car');return false">Car</a> tab.</p>
+ <div id="setMain"></div>
+ <div class="card"><h2>Device</h2>
+  <p class="say" id="sEcu" style="margin:0"></p>
+  <div class="grp">Firmware</div>
+  <p class="say" id="fwInfo" style="margin:0 0 10px">…</p>
+  <div class="row">
+   <input type="file" id="fwFile" accept=".bin,application/octet-stream">
+   <button class="b p" id="fwBtn" onclick="fwUpload()">Update firmware</button>
+  </div>
+  <p class="say" id="fwSay" style="margin:10px 0 0">The master's <b>firmware.bin</b> from a build (GitHub: the CI run's <b>master-firmware</b> download). It goes into the spare slot and the master restarts into it; if the new one does not run properly, it goes back to this one by itself. Not while driving.</p>
+  <div class="grp">Settings file</div>
+  <p class="say" style="margin:0 0 8px">Everything the master keeps - settings, learned values, the request tables - in one file: a backup, or the way to move them to another master.</p>
+  <div class="row">
+   <button class="b" onclick="jsonDownload()">Download</button>
+   <label class="b">Upload…<input type="file" id="jf" accept=".json,application/json" hidden onchange="jsonUpload(this)"></label>
+  </div>
+  <div class="grp">Restart and reset</div>
+  <div class="row">
+   <button class="b" onclick="post('/api/reboot','Rebooting')">Reboot</button>
+   <button class="b p" onclick="if(confirm('Put the CAN bus settings back to the safe defaults and reboot?\n\nRequests on (Auto), errors let pass, 87.5 % triple sampling, both guards on, P2CAN 50 ms, 10 s wait after power-on.\n\nKept: the bitrate, your request pacing, displays, Wi-Fi and every learned value.'))post('/api/bus_defaults','Safe bus settings - rebooting')">Safe bus settings</button>
+   <button class="b d" onclick="if(confirm('Restore factory settings and reboot?\n\nThis also deletes every learned value. For the bus settings alone, use Safe bus settings.'))post('/api/defaults','Restored - rebooting')">Factory reset</button>
+  </div>
+  <p class="say" style="margin:10px 0 0"><b>Safe bus settings</b> puts back only what the master does on the bus, and keeps everything learned.</p></div>
+ <div class="sec"><h2>Advanced</h2><span class="muted">timings, thresholds and the whole configuration</span>
+  <button class="b" id="advBtn" style="margin-left:auto" onclick="advShow(!ADV_ON)">Show</button></div>
+ <div id="advBody" hidden>
+  <p class="say">The defaults suit the car: change one of these for a reason, and note what it was.</p>
+  <div id="setAdv"></div>
+  <div class="card"><h2>Everything, as JSON <small>tables included</small></h2>
+   <p class="say" style="margin:0 0 8px">The complete configuration: edit it here and press <b>Apply</b>, then <b>Save</b>.</p>
+   <textarea id="json" spellcheck="false"></textarea>
+   <div class="row" style="margin-top:8px">
+    <button class="b" onclick="jsonShow()">Show current</button>
+    <button class="b p" onclick="jsonApply()">Apply</button>
+   </div></div>
+ </div>
+</section>
+</main>
+<!-- Map a value from a frame by hand: opened from a frame on the Bus tab, or from a taught field -->
+<div id="mapDlg" class="dlg" hidden onclick="if(event.target===this)mapClose()">
+ <div class="card" id="mapCard"><h2>Use a value from <span id="mapId" class="acc"></span>
    <button class="x" style="margin-left:auto" onclick="mapClose()">✕</button></h2>
   <p class="say" style="margin:0 0 10px">A value you map here is read from the bus and replaces the requested one.</p>
   <div class="f"><div class="l"><b>Metric</b></div><select id="mpM" onchange="mapPrev()"></select></div>
@@ -220,131 +339,9 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
    <div class="row"><input id="mpK" style="width:80px" oninput="mapPrev()"><input id="mpO" style="width:80px" oninput="mapPrev()"></div></div>
   <p style="margin:10px 0">Raw <b id="mpRaw">–</b> → <b id="mpVal" class="ok">–</b> <span class="muted" id="mpRef"></span></p>
   <div class="row"><button class="b p" onclick="mapAdd()">Use this value</button><button class="b" onclick="mapClose()">Cancel</button></div>
- </div>
- <div class="card"><h2>Frames on the bus <small id="bN"></small>
-  <button class="b" style="margin-left:auto" onclick="post('/api/census/reset','Cleared')">Clear</button></h2>
-  <p class="say" style="margin:0 0 8px"><span class="hx"><span class="h">Bright</span></span> bytes just changed,
-   <span class="hx"><span class="l">white</span></span> ones change sometimes, grey ones never.</p>
-  <div class="wrap"><table><thead><tr><th>ID</th><th>Hz</th><th>Data</th><th></th></tr></thead><tbody id="bTab"></tbody></table></div></div>
-</section>
-
-<section id="t-src" class="cfg" hidden>
- <p class="say">Where every value comes from, in the order the master prefers.
-  <label style="float:right" class="muted"><input type="checkbox" id="adv" onchange="renderSources()"> Edit details</label></p>
- <div class="card"><h2><span class="tag raw">1</span> Heard on the bus <small>free — nothing is asked</small></h2>
-  <div class="wrap"><table><thead id="sHead"></thead><tbody id="sTab"></tbody></table></div>
-  <div class="row" style="margin-top:10px"><button class="b" onclick="go('bus')">Teach or map a value…</button></div></div>
- <div class="card"><h2><span class="tag obd">2</span> OBD-II requests <small id="oSub"></small>
-  <label class="muted" style="margin-left:auto;font-size:12px"><input type="checkbox" id="oAll" onchange="renderSources()"> show unsupported</label></h2>
-  <div class="wrap"><table><thead id="oHead"></thead><tbody id="oTab"></tbody></table></div></div>
- <div class="card"><h2><span class="tag ssm">3</span> Subaru SSM2 requests <small id="mSub"></small>
-  <label class="muted" style="margin-left:auto;font-size:12px"><input type="checkbox" id="mAll" onchange="renderSources()"> show unsupported</label></h2>
-  <div class="wrap"><table><thead id="mHead"></thead><tbody id="mTab"></tbody></table></div>
-  <div class="row" style="margin-top:10px"><button class="b" onclick="post('/api/ssm/reinit','Asking the ECU again')">Ask the ECU what it supports again</button></div></div>
-</section>
-
-<section id="t-set" class="cfg" hidden>
- <div class="card"><h2>Requests</h2>
-  <div class="f"><div class="l"><b>Allow OBD-II requests</b><span>asks the engine ECU for values it does not broadcast</span></div><input type="checkbox" id="sObd"></div>
-  <div class="f"><div class="l"><b>Allow Subaru SSM2 requests</b><span>only for what OBD-II cannot give: knock, A/F learning, switches</span></div><input type="checkbox" id="sSsm"></div>
-  <div class="f"><div class="l"><b>Learn automatically</b><span>matches requested values to bus traffic, then stops requesting them</span></div><input type="checkbox" data-k="learn"></div>
-  <div class="f"><div class="l"><b>Let errors pass</b><span>never sends an error frame: a frame the master reads as bad is dropped by the master alone and reaches every other module untouched. It still requests, receives and acknowledges good frames</span></div><input type="checkbox" data-k="tx_passive"></div>
-  <div class="f"><div class="l"><b>Bus guard</b><span>pauses requests if bus errors follow our frames</span></div><input type="checkbox" data-k="guard"></div>
-  <div class="f"><div class="l"><b>Receive-error guard</b><span>switches to listen-only if our controller starts corrupting other modules' frames (a receive-error storm) — the protection against the transmission ECU losing the engine ECU's messages</span></div><input type="checkbox" data-k="rx_guard"></div>
-  <div class="f"><div class="l"><b>Wait after power-on</b><span>seconds of listening only while the car's bus settles, before the first request · 0 = no wait</span></div><input type="number" data-k="start_delay_s" min="0" max="300"></div>
-  <p class="say" style="margin:8px 0 0">With both requests off the master only listens and cannot transmit at all - the CAN controller switches to listen-only the moment you save.</p>
- </div>
- <div class="card"><h2>Displays</h2>
-  <div class="f"><div class="l"><b>Night mode from</b></div><select data-k="night_source"><option value="2">The car's light switch</option><option value="1">Light sensor on GPIO</option><option value="0">Never</option></select></div>
-  <div class="f"><div class="l"><b>Update every</b><span>ms</span></div><input type="number" data-k="broadcast_ms" min="20" max="1000"></div>
-  <div class="f"><div class="l"><b>Drop a value after</b><span>ms without news</span></div><input type="number" data-k="metric_ttl_ms" min="200"></div>
- </div>
- <div class="card"><h2>Oil change <small id="svSub"></small></h2>
-  <div class="f"><div class="l"><b>Change the oil every</b><span>km</span></div><input type="number" data-k="oil_every_km" min="500" max="100000"></div>
-  <div class="f"><div class="l"><b>Last changed at</b><span>odometer reading, km · -1 = no reminder</span></div><input type="number" data-k="oil_at_km" min="-1"></div>
-  <p class="say" id="svSay" style="margin:8px 0 10px"></p>
-  <div class="row"><button class="b" onclick="serviceReset()">Oil changed now</button></div></div>
- <div class="card"><h2>Drive log <small>to the master's flash</small></h2>
-  <div class="f"><div class="l"><b>Record every drive</b><span>from the car coming on to it going off, one file a drive · the files are on the Diagnostics tab</span></div><input type="checkbox" data-k="log_on"></div>
-  <div class="f"><div class="l"><b>Rows per second</b></div><input type="number" data-k="log_hz" min="1" max="20"></div>
-  <div class="f"><div class="l"><b>Space for logs</b><span>KB of the logs' own 8 MB partition (1200 at most on an older partition table) · the oldest drive goes first</span></div><input type="number" data-k="log_max_kb" min="64" max="8000"></div>
-  <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
-   <div id="lgIds" class="row" style="margin-top:8px"></div>
-   <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
- <div class="card"><h2>Power</h2>
-  <div class="f"><div class="l"><b>Sleep when the car is off</b><span>wakes on the first CAN activity</span></div><input type="checkbox" data-k="sleep_enabled"></div>
-  <div class="f"><div class="l"><b>Sleep after</b><span>seconds of silence on the bus</span></div><input type="number" data-k="sleep_idle_s" min="10" max="3600"></div>
- </div>
- <div class="card"><h2>Connection <small>reboot to apply</small></h2>
-  <div class="f"><div class="l"><b>CAN bitrate</b><span>500 kbit/s on the OBD port</span></div>
-   <select data-k="bitrate_kbps"><option value="125">125 kbit/s</option><option value="250">250 kbit/s</option><option value="500">500 kbit/s</option><option value="1000">1 Mbit/s</option></select></div>
-  <div class="f"><div class="l"><b>CAN bit timing</b><span>87.5 % with triple sampling rides out spikes a single 80 % sample reads as errors</span></div>
-   <select data-k="can_timing"><option value="2">87.5 %, triple sampling (recommended)</option><option value="1">87.5 %</option><option value="0">ESP-IDF preset (80 %)</option></select></div>
-  <div class="f"><div class="l"><b>Display channel</b><span>must match every display</span></div><input type="number" data-k="wifi_channel" min="1" max="13"></div>
-  <div class="f"><div class="l"><b>Wi-Fi name</b><span>1-32 characters</span></div><input data-k="ap_ssid" data-t="str" maxlength="32"></div>
-  <div class="f"><div class="l"><b>Wi-Fi password</b><span>8-63 characters, or empty for open</span></div><input data-k="ap_pass" data-t="str" maxlength="63"></div>
- </div>
- <div class="card"><h2>Maintenance</h2>
-  <p class="say" id="sEcu" style="margin:0 0 10px"></p>
-  <div class="row">
-   <button class="b" onclick="post('/api/learn/reset','Learning restarted')">Restart learning</button>
-   <button class="b" onclick="if(confirm('Delete every automatically learned value?'))post('/api/learn/forget','Learned values deleted',()=>load(true))">Forget learned values</button>
-   <button class="b" onclick="post('/api/reboot','Rebooting')">Reboot</button>
-   <button class="b p" onclick="if(confirm('Put the CAN bus settings back to the safe defaults and reboot?\n\nRequests on (Auto), errors let pass, 87.5 % triple sampling, both guards on, P2CAN 50 ms, 10 s wait after power-on.\n\nKept: the bitrate, your request pacing, displays, Wi-Fi and every learned value.'))post('/api/bus_defaults','Safe bus settings - rebooting')">Safe bus settings</button>
-   <button class="b d" onclick="if(confirm('Restore factory settings and reboot?\n\nThis also deletes every learned value. For the bus settings alone, use Safe bus settings.'))post('/api/defaults','Restored - rebooting')">Factory reset</button>
-  </div>
-  <p class="say" style="margin:10px 0 0">Every other setting is on the <a href="#" onclick="go('adv');return false" class="acc">Advanced</a> tab.</p></div>
- <div class="card"><h2>Firmware</h2>
-  <p class="say" id="fwInfo" style="margin:0 0 10px">…</p>
-  <div class="row">
-   <input type="file" id="fwFile" accept=".bin,application/octet-stream">
-   <button class="b p" id="fwBtn" onclick="fwUpload()">Update firmware</button>
-  </div>
-  <p class="say" id="fwSay" style="margin:10px 0 0">The master's <b>firmware.bin</b> from a build (GitHub: the CI run's <b>master-firmware</b> download). It goes into the spare slot and the master restarts into it; if the new one does not run properly, it goes back to this one by itself. Not while driving.</p></div>
-</section>
-
-<section id="t-adv" class="cfg" hidden>
- <p class="say">Every setting the master has. Changes apply when you press Save; the ones marked <span class="warn">reboot</span>
-  take effect after a reboot.</p>
- <div id="advBody"></div>
- <div class="card"><h2>Everything, as JSON <small>tables included</small></h2>
-  <p class="say" style="margin:0 0 8px">The complete configuration. Edit it here, or download it as a backup and upload it later.</p>
-  <textarea id="json" spellcheck="false"></textarea>
-  <div class="row" style="margin-top:8px">
-   <button class="b" onclick="jsonShow()">Show current</button>
-   <button class="b p" onclick="jsonApply()">Apply</button>
-   <button class="b" onclick="jsonDownload()">Download</button>
-   <label class="b">Upload<input type="file" id="jf" accept=".json,application/json" hidden onchange="jsonUpload(this)"></label>
-  </div></div>
-</section>
-
-<section id="t-diag" hidden>
- <div class="card"><h2>Trouble codes <small id="dcSub"></small>
-   <button class="b" style="margin-left:auto" onclick="post('/api/codes/read','Reading the codes',()=>setTimeout(pollCodes,2500))">Read now</button>
-   <button class="b d" onclick="codesClear()">Clear…</button></h2>
-  <p class="say" style="margin:0 0 8px">Stored, pending and permanent codes from the engine and the transmission computer (OBD-II
-   services 03, 07 and 0A), read when the car comes on and every minute after. The screens show them on the check-engine card.</p>
-  <div class="wrap"><table><thead><tr><th>Code</th><th>Meaning</th><th>Computer</th><th>Kind</th></tr></thead><tbody id="dcTab"></tbody></table></div>
-  <p class="say" id="dcSay" style="margin:8px 0 0"></p></div>
- <div class="card"><h2>Engine computer</h2>
-  <p class="say" style="margin:0 0 8px">RomRaider lists its ROM definitions by the <b>calibration ID</b> (its "internal ID") and its
-   logger definitions by the <b>ROM ID</b> SSM2 reports. If its definition files list this calibration ID, RomRaider can read and
-   edit this ROM: check that before buying a cable.</p>
-  <div class="wrap"><table><tbody id="idTab"></tbody></table></div></div>
- <div class="card"><h2>Drive logs <small id="lgSub"></small>
-   <button class="b d" style="margin-left:auto" onclick="if(confirm('Delete every drive log?'))post('/api/log/clear','Deleted',pollLogs)">Delete all</button></h2>
-  <p class="say" id="lgSay" style="margin:0 0 8px"></p>
-  <div class="wrap"><table><thead><tr><th>Drive</th><th>Length</th><th>Rows</th><th>Size</th><th></th></tr></thead><tbody id="lgTab"></tbody></table></div></div>
- <div class="card"><h2>Evidence log <small id="evN"></small>
-  <button class="b" style="margin-left:auto" onclick="if(confirm('Clear the evidence log?'))post('/api/evlog/clear','Cleared',pollEvlog)">Clear</button></h2>
-  <p class="say" style="margin:0 0 8px">Kept on the master's flash across reboots and firmware updates: every boot with its reset reason,
-   the bus coming up and settling, every guard trip with the error counters and what the master was transmitting at the time,
-   bus-off and sleep. Clear it before a test drive, read it after.</p>
-  <p class="say" id="evSay"></p>
-  <div class="wrap"><table><thead><tr><th>Uptime</th><th>Event</th><th>Detail</th><th>Master was</th></tr></thead><tbody id="evTab"></tbody></table></div></div>
-</section>
-</main>
-<div id="save"><span class="muted" id="saveMsg">Unsaved changes</span><button class="b" onclick="load()">Discard</button><button class="b p" onclick="save()">Save</button></div>
+ </div></div>
+<div id="save"><span class="muted" id="saveMsg">Unsaved changes</span><button class="b" onclick="load()">Discard</button>
+ <button class="b" id="saveRb" hidden onclick="save(true)">Save &amp; reboot</button><button class="b p" onclick="save()">Save</button></div>
 <div id="toast"></div>
 <script>
 'use strict';
@@ -357,7 +354,7 @@ const un=id=>META[id]?META[id][1]:'';
 const fmt=(id,v)=>{if(id===0x100F&&v>32&&v<127)return String.fromCharCode(Math.round(v));
  if(id>0x400&&id<=0x408)return dtcName(v);const d=META[id]?META[id][3]:2;return (+v).toFixed(d)};
 const SRC={1:['SSM2','ssm'],2:['OBD-II','obd'],3:['calc','calc'],4:['bus','raw']};
-let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='dash',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
+let C={},ORIG={},L=null,LOADED=false,DIRTY=false,TAB='home',PREV=null,RATES={load:0,tx:0,errs:0},LSIG='',LLOAD=Date.now();
 function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2400)}
 /* Every request has a deadline. The master answers one connection at a time,
    and a request the browser never gives up on - a lost Wi-Fi frame, a busy
@@ -374,16 +371,25 @@ const BUSY={};
 let UPD=false;
 async function solo(k,fn){if(BUSY[k])return;BUSY[k]=1;try{await fn()}finally{BUSY[k]=0}}
 async function post(u,msg,then){try{await req(u,{method:'POST'},8000);toast(msg);if(then)setTimeout(then,500)}catch(e){toast('Failed')}}
-function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v)}
-function go(t){TAB=t;document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
- ['dash','bus','src','set','adv','diag'].forEach(x=>$('#t-'+x).hidden=x!==t);
- if(t==='bus')pollBus();if(t==='src')renderSources();if(t==='dash'&&L)renderDash();if(t==='adv'){renderAdv();jsonShow()}
- if(t==='diag'){pollEvlog();pollCodes();pollLogs()}if(t==='set'){pollCodes();fwInfo()}}
+/* The save bar: what is not saved yet, and whether part of it waits for a reboot. */
+function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v);if(!v)return;
+ const rb=Object.keys(C).filter(k=>REBOOT_KEYS.includes(k)&&!same(C[k],ORIG[k])).length;
+ $('#saveMsg').textContent=rb?`Unsaved changes · ${rb===1?'one applies':'some apply'} after a reboot`:'Unsaved changes';
+ $('#saveRb').hidden=!rb}
+/* Five tabs, each polling only what it shows (the master answers one request
+   at a time): Home and Signals /api/live, Bus also /api/bus and the evidence
+   log, Car the codes and the drive logs, Settings the firmware once. */
+const TABS=['home','sig','bus','car','set'];
+function go(t){if(!TABS.includes(t))t='home';TAB=t;
+ document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+ TABS.forEach(x=>$('#t-'+x).hidden=x!==t);
+ try{history.replaceState(null,'','#'+t)}catch(e){}
+ if(t==='home'&&L)renderHome();if(t==='sig'){renderSources();if(L)renderLearn()}
+ if(t==='bus'){pollBus();pollEvlog()}if(t==='car'){pollCodes();pollLogs()}
+ if(t==='set'){fwInfo();if(ADV_ON&&LOADED&&!JSON_ED)jsonShow()}}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
 /* ───────────── settings: every input bound to the config by data-k ───────────── */
-const MODE_TOG={0:[1,1],1:[0,1],2:[1,0],3:[1,1],4:[0,0]};
-const togToMode=(o,s)=>o&&s?0:s?1:o?2:4;
 function parseEl(el){
  if(el.type==='checkbox')return el.checked;
  if(el.dataset.t==='str')return el.value;
@@ -391,7 +397,7 @@ function parseEl(el){
 function fillBound(){
  document.querySelectorAll('[data-k]').forEach(el=>{const v=C[el.dataset.k];if(v===undefined)return;
   if(el.type==='checkbox')el.checked=!!v;else if(document.activeElement!==el)el.value=v});
- const t=MODE_TOG[C.diag_mode]||[1,1];$('#sObd').checked=!!t[0];$('#sSsm').checked=!!t[1];renderLogIds()}
+ renderLogIds()}
 /* Settings that would lock this page away: the AP will not start without a
    name, nor with a key WPA2 cannot use; and with the Wi-Fi off at boot only
    the BOOT button brings the page back. */
@@ -409,8 +415,8 @@ document.addEventListener('change',e=>{
   const why=v===undefined?'':refused(el.dataset.k,v);
   if(why){toast(why);if(el.type==='checkbox')el.checked=!!C[el.dataset.k];else el.value=C[el.dataset.k]??'';return}
   if(v!==undefined){C[el.dataset.k]=v;fillBound();setDirty(true)}return}
- if(el.id==='sObd'||el.id==='sSsm'){C.diag_mode=togToMode($('#sObd').checked,$('#sSsm').checked);fillBound();setDirty(true);return}
- if(el.closest('#t-src')&&!['adv','oAll','mAll'].includes(el.id))setDirty(true)});
+ // An edit in the source tables (the switches above them only change the view).
+ if(el.closest('#srcBox')&&!['srcEd','oAll','mAll'].includes(el.id))setDirty(true)});
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b),clone=o=>JSON.parse(JSON.stringify(o));
 const inside=sel=>{const a=document.activeElement;return!!(a&&a.closest&&a.closest(sel))};
 /* soft: keep every edit not saved yet and take the master's version of the rest -
@@ -422,15 +428,14 @@ async function load(soft){
  if(soft&&LOADED){
   // A table row being edited right now keeps its data: its inputs write back
   // by row number, and a refreshed table may have rows in other places.
-  const hold=inside('#t-src')?['signals','pids','ssm']:[];
+  const hold=inside('#srcBox')?['signals','pids','ssm']:[];
   for(const k of Object.keys(n)){
    if(hold.includes(k))continue;
    if(!DIRTY||same(C[k],ORIG[k])){C[k]=n[k];ORIG[k]=clone(n[k])}}}
  else{C=n;ORIG=clone(n);setDirty(false)}
  LOADED=true;fillBound();
- if(!inside('#t-src'))renderSources();
- if(TAB==='adv'&&!inside('#t-adv')){renderAdv();jsonShow()}}
-const REBOOT_KEYS=['bitrate_kbps','wifi_channel','ap_ssid','ap_pass','portal_on','can_sp875','can_timing'];
+ if(!inside('#srcBox'))renderSources();
+ if(TAB==='set'&&ADV_ON&&!JSON_ED)jsonShow()}
 const RO_KEYS=['cfg_ver','ecu_id','ecu_sys_id','ecu_flags','ecu_cal_id','vin'];
 const sigKey=s=>[s.can_id,s.ext?1:0,s.start,s.len,s.be?1:0,s.metric].join(':');
 /* Three-way merge of the signal table: what the master holds now, plus exactly
@@ -447,8 +452,9 @@ function mergeSignals(base,mine,theirs){
   out.push(m)}
  return out}
 /* Only what changed is sent, so a save can never overwrite something the master
-   changed by itself (learned signals, the remembered ECU identity). */
-async function save(){
+   changed by itself (learned signals, the remembered ECU identity).
+   @p andReboot: then reboot, so the settings marked reboot apply. */
+async function save(andReboot){
  if(!LOADED){toast('Not loaded yet');return}
  const body={};
  for(const k of Object.keys(C))if(!RO_KEYS.includes(k)&&!same(C[k],ORIG[k]))body[k]=C[k];
@@ -460,95 +466,128 @@ async function save(){
   if(body.pids)body.pids=body.pids.map(({name,metrics,...p})=>p);   // read-only extras stay here
   // Generous: the master writes its flash before it answers.
   await req('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},15000);
-  setDirty(false);toast(reboot?'Saved - reboot to apply':'Saved');await load()}
+  setDirty(false);
+  if(andReboot){await post('/api/reboot','Saved - rebooting');return}
+  toast(reboot?'Saved - reboot to apply':'Saved');await load()}
  catch(e){toast('Save failed - try again')}}
 
-/* ───────────── advanced: every setting ───────────── */
-const ADV=[
- ['Requests',[
-  ['diag_mode','Mode','sel',[[0,'Auto: listen → OBD-II → SSM2'],[1,'SSM2 requests only'],[2,'OBD-II requests only'],[3,'Both, no preference'],[4,'Listen only - nothing is transmitted']]],
-  ['start_delay_s','Listen only after the bus comes up for','num','s · 0 = no wait',0,300],
-  ['obd_addr','OBD-II addressing','sel',[[0,'Auto (engine ECU first)'],[1,'Engine ECU only (0x7E0)'],[2,'All ECUs (0x7DF)']]],
-  ['obd_gap','Pause between OBD-II requests','num','ms',0,255],
-  ['obd_order','When more OBD-II values are due than there is time for','sel',[[0,'The most overdue for its period first'],[1,'Each in turn']]],
-  ['obd_to','OBD-II reply timeout','num','ms',20,2000],
-  ['obd_p2can','After an unanswered request, wait at least (ISO 15765-4 P2CAN)','num','ms from the send · 0 = off',0,2000],
-  ['req_max_hz','Request budget','num','requests/s · 0 = no cap',0,200],
-  ['ssm_gap','Pause between SSM2 requests','num','ms',50,5000],
-  ['ssm_batch','Values per SSM2 request','num','2–33',2,33],
-  ['ssm_to','SSM2 reply timeout','num','ms',100,5000],
-  ['ssm_switches','Read SSM2 switch inputs','bool'],
-  ['cover_ms','Skip a request while a better source is fresher than','num','ms',100,30000]]],
- ['Learning',[
-  ['learn','Learn automatically','bool'],
-  ['learn_r2','Fit needed to call it a match','num','0.5–0.99999',0.5,0.99999,0.0001],
-  ['learn_min_n','Samples needed','num','',10,5000],
-  ['learn_steady','Steady-sample tolerance','num','× the movement needed',0.01,10,0.01],
-  ['learn_phi','Switch correlation needed','num','0.5–1',0.5,1,0.01],
-  ['verify_n','Confirmations before trusting a match','num','samples',5,250],
-  ['learn_recheck_s','Check learned values against the ECU every','num','s per value · 0 = off',0,3600]]],
- ['Bus guard',[
-  ['guard','Bus guard on','bool'],
-  ['guard_errs','Errors after our frames that trip it','num','',1,100],
-  ['guard_win','…within','num','s',1,120],
-  ['guard_pause','Pause requests for','num','s',1,3600],
-  ['guard_trips','Trips before switching to listen-only','num','',1,50],
-  ['rx_guard','Receive-error guard: listen-only when our controller corrupts other modules\' frames','bool'],
-  ['rx_guard_rec','…receive-error counter that trips it','num','96 = error-warning level',16,255],
-  ['rx_guard_errs','…or receive errors within the guard window that trip it','num','',1,250]]],
- ['CAN controller',[
-  ['bitrate_kbps','Bitrate','sel',[[125,'125 kbit/s'],[250,'250 kbit/s'],[500,'500 kbit/s'],[1000,'1 Mbit/s']],1],
-  ['tx_passive','Let errors pass: never send an error frame','bool'],
-  ['can_timing','Bit timing','sel',[[2,'87.5 %, triple sampling (recommended)'],[1,'87.5 %'],[0,'ESP-IDF preset (80 %)']],1],
-  ['can_sp875','With the ESP-IDF preset: 87.5 % instead','bool',null,null,null,null,1]]],
+/* ───────────── settings: every one in one place ───────────── */
+/*<settings>*/
+/* Every setting the master has, each in exactly one row (portal_tests.js
+   checks it against MasterConfig::toJson): the everyday ones on the Settings
+   tab, the rest under its Advanced section, the oil change and the drive log
+   on the Car tab. A row: [key, label, type, arg, about] - type 'bool', 'sel'
+   (arg: [[value, text], ...]), 'num' (arg: [min, max, step]) or 'str' (arg:
+   its longest, in bytes); about: the line under the label. */
+const REBOOT_KEYS=['bitrate_kbps','wifi_channel','ap_ssid','ap_pass','portal_on','can_sp875','can_timing'];
+const SET_MAIN=[
+ ['Requests and learning',[
+  ['diag_mode','What the master may ask','sel',[[0,'Auto: listen → OBD-II → SSM2'],[1,'SSM2 requests only'],[2,'OBD-II requests only'],[3,'Both, no preference'],[4,'Listen only - nothing is transmitted']],
+   'Listen only: nothing is transmitted at all - the CAN controller switches to listen-only the moment you save'],
+  ['learn','Learn automatically','bool',0,'matches requested values to bus traffic, then stops requesting them'],
+  ['ssm_switches','Read the ECU\'s switch inputs','bool',0,'SSM2, every 200 ms, wherever no frame gives them: A/C, brake, clutch, lights, the oil pressure switch…'],
+  ['start_delay_s','Wait after power-on','num',[0,300],'seconds of listening only while the car\'s bus settles, before the first request · 0 = no wait']]],
+ ['Bus protection',[
+  ['tx_passive','Let errors pass','bool',0,'never sends an error frame: a frame the master reads as bad is dropped by the master alone and reaches every other module untouched. It still requests, receives and acknowledges good frames'],
+  ['guard','Bus guard','bool',0,'pauses requests if bus errors follow our frames'],
+  ['rx_guard','Receive-error guard','bool',0,'switches to listen-only if our controller starts corrupting other modules\' frames (a receive-error storm) — the protection against the transmission ECU losing the engine ECU\'s messages']]],
+ ['CAN connection',[
+  ['bitrate_kbps','CAN bitrate','sel',[[125,'125 kbit/s'],[250,'250 kbit/s'],[500,'500 kbit/s'],[1000,'1 Mbit/s']],'500 kbit/s on the OBD port'],
+  ['can_timing','CAN bit timing','sel',[[2,'87.5 %, triple sampling (recommended)'],[1,'87.5 %'],[0,'ESP-IDF preset (80 %)']],'87.5 % with triple sampling rides out spikes a single 80 % sample reads as errors']]],
  ['Displays',[
-  ['radio_dbm','Radio transmit power','num','dBm - lower draws less from the supply',2,20],
-  ['broadcast_ms','Send every','num','ms',20,1000],
-  ['keepalive_ms','Re-send unchanged values every','num','ms',50,1400],
-  ['metric_ttl_ms','Drop a value after','num','ms',200,10000],
-  ['hold_ms','A better source holds a value for','num','ms',0,5000],
   ['night_source','Night mode from','sel',[[2,"The car's light switch"],[1,'Light sensor on GPIO'],[0,'Never']]],
-  ['ldr_dark','Light sensor: night below','num','ADC',0,4095],
-  ['ldr_light','Light sensor: day above','num','ADC',0,4095]]],
- ['Codes, oil change, drive log',[
-  ['dtc_poll_s','Read the trouble codes every','num','s while the car is on · 0 = only when asked',0,3600],
-  ['oil_every_km','Oil change every','num','km',500,100000],
-  ['oil_at_km','Oil last changed at','num','km on the odometer · -1 = no reminder',-1,9999999],
-  ['log_on','Record every drive','bool'],
-  ['log_hz','Drive log rows per second','num','1–20',1,20],
-  ['log_max_kb','Space for drive logs','num','KB',64,8000]]],
+  ['broadcast_ms','Update every','num',[20,1000],'ms'],
+  ['metric_ttl_ms','Drop a value after','num',[200,10000],'ms without news']]],
  ['Power',[
-  ['sleep_enabled','Sleep when the car is off','bool'],
-  ['sleep_idle_s','Sleep after','num','s',10,3600],
+  ['sleep_enabled','Sleep when the car is off','bool',0,'wakes on the first CAN activity'],
+  ['sleep_idle_s','Sleep after','num',[10,3600],'seconds of silence on the bus']]],
+ ['Wi-Fi',[
+  ['wifi_channel','Display channel','num',[1,13],'must match every display · 1–13'],
+  ['ap_ssid','Wi-Fi name','str',32,'1–32 characters'],
+  ['ap_pass','Wi-Fi password','str',63,'8–63 characters, or empty for open']]]];
+const SET_ADV=[
+ ['Requests',[
+  ['obd_addr','OBD-II addressing','sel',[[0,'Auto (engine ECU first)'],[1,'Engine ECU only (0x7E0)'],[2,'All ECUs (0x7DF)']]],
+  ['obd_gap','Pause between OBD-II requests','num',[0,255],'ms'],
+  ['obd_order','When more OBD-II values are due than there is time for','sel',[[0,'The most overdue for its period first'],[1,'Each in turn']]],
+  ['obd_to','OBD-II reply timeout','num',[20,2000],'ms'],
+  ['obd_p2can','After an unanswered request, wait at least (ISO 15765-4 P2CAN)','num',[0,2000],'ms from the send · 0 = off'],
+  ['req_max_hz','Request budget','num',[0,200],'requests/s · 0 = no cap'],
+  ['ssm_gap','Pause between SSM2 requests','num',[50,5000],'ms'],
+  ['ssm_batch','Values per SSM2 request','num',[2,33],'2–33'],
+  ['ssm_to','SSM2 reply timeout','num',[100,5000],'ms'],
+  ['cover_ms','Skip a request while a better source is fresher than','num',[100,30000],'ms'],
+  ['dtc_poll_s','Read the trouble codes every','num',[0,3600],'s while the car is on · 0 = only when asked']]],
+ ['Learning',[
+  ['learn_r2','Fit needed to call it a match','num',[0.5,0.99999,0.0001],'0.5–0.99999'],
+  ['learn_min_n','Samples needed','num',[10,5000]],
+  ['learn_steady','Steady-sample tolerance','num',[0.01,10,0.01],'× the movement needed'],
+  ['learn_phi','Switch correlation needed','num',[0.5,1,0.01],'0.5–1'],
+  ['verify_n','Confirmations before trusting a match','num',[5,250],'samples'],
+  ['learn_recheck_s','Check learned values against the ECU every','num',[0,3600],'s per value · 0 = off']]],
+ ['Bus protection',[
+  ['guard_errs','Bus guard: errors after our frames that trip it','num',[1,100]],
+  ['guard_win','…within','num',[1,120],'s'],
+  ['guard_pause','Pause requests for','num',[1,3600],'s'],
+  ['guard_trips','Trips before switching to listen-only','num',[1,50]],
+  ['rx_guard_rec','Receive-error guard: the receive-error counter that trips it','num',[16,255],'96 = error-warning level'],
+  ['rx_guard_errs','…or receive errors within the guard window that trip it','num',[1,250]],
   ['tx_hold','Hold the CAN TX line recessive across sleep','bool']]],
- ['Network',[
-  ['wifi_channel','Display channel','num','1–13',1,13,1,1],
-  ['ap_ssid','Wi-Fi name','str','1–32 characters',null,32,null,1],
-  ['ap_pass','Wi-Fi password','str','8–63 characters or empty',null,63,null,1],
-  ['portal_on','Start this Wi-Fi at boot','bool',null,null,null,null,1]]]];
-function renderAdv(){
- $('#advBody').innerHTML=ADV.map(([title,rows])=>`<div class="card"><h2>${title}</h2>`+rows.map(r=>{
-  const [k,label,type,a,min,max,step]=r,tag=REBOOT_KEYS.includes(k)?' <span class="warn">reboot</span>':'';
-  let input;
-  if(type==='bool')input=`<input type="checkbox" data-k="${k}">`;
-  else if(type==='sel')input=`<select data-k="${k}">${a.map(o=>`<option value="${o[0]}">${esc(o[1])}</option>`).join('')}</select>`;
-  else if(type==='str')input=`<input data-k="${k}" data-t="str"${max?` maxlength="${max}"`:''}>`;
-  else input=`<input type="number" data-k="${k}"${min!=null?` min="${min}"`:''}${max!=null?` max="${max}"`:''}${step?` step="${step}"`:''}>`;
-  const hint=type==='num'||type==='str'?(a?`<span>${esc(a)}</span>`:''):'';
-  return`<div class="f"><div class="l"><b>${esc(label)}${tag}</b>${hint}</div>${input}</div>`}).join('')+'</div>').join('');
+ ['CAN connection',[
+  ['can_sp875','With the ESP-IDF preset: 87.5 % instead','bool']]],
+ ['Displays',[
+  ['radio_dbm','Radio transmit power','num',[2,20],'dBm - lower draws less from the supply'],
+  ['keepalive_ms','Re-send unchanged values every','num',[50,1400],'ms'],
+  ['hold_ms','A better source holds a value for','num',[0,5000],'ms'],
+  ['ldr_dark','Light sensor: night below','num',[0,4095],'ADC'],
+  ['ldr_light','Light sensor: day above','num',[0,4095],'ADC']]],
+ ['Wi-Fi',[
+  ['portal_on','Start this Wi-Fi at boot','bool',0,'off: only the BOOT button, held 3 s while the master runs, brings this page back']]]];
+const SET_CAR=[
+ ['Oil change',[
+  ['oil_every_km','Change the oil every','num',[500,100000],'km'],
+  ['oil_at_km','Last changed at','num',[-1,9999999],'odometer reading, km · -1 = no reminder']]],
+ ['Drive log',[
+  ['log_on','Record every drive','bool',0,'from the car coming on to it going off, one file a drive'],
+  ['log_hz','Rows per second','num',[1,20],'1–20'],
+  ['log_max_kb','Space for logs','num',[64,8000],'KB of the logs\' own 8 MB partition (1200 at most on an older partition table) · the oldest drive goes first']]]];
+/*</settings>*/
+function fieldRow([k,label,type,arg,about]){
+ const tag=REBOOT_KEYS.includes(k)?' <span class="warn">reboot</span>':'';
+ let input;
+ if(type==='bool')input=`<input type="checkbox" data-k="${k}">`;
+ else if(type==='sel')input=`<select data-k="${k}">${arg.map(o=>`<option value="${o[0]}">${esc(o[1])}</option>`).join('')}</select>`;
+ else if(type==='str')input=`<input data-k="${k}" data-t="str" maxlength="${arg}">`;
+ else{const [mn,mx,st]=arg;input=`<input type="number" data-k="${k}" min="${mn}" max="${mx}"${st?` step="${st}"`:''}>`}
+ return`<div class="f"><div class="l"><b>${esc(label)}${tag}</b>${about?`<span>${esc(about)}</span>`:''}</div>${input}</div>`}
+const fieldCard=([title,rows])=>`<div class="card"><h2>${esc(title)}</h2>${rows.map(fieldRow).join('')}</div>`;
+function renderSettings(){
+ $('#setMain').innerHTML=SET_MAIN.map(fieldCard).join('');
+ $('#setAdv').innerHTML=SET_ADV.map(fieldCard).join('');
+ $('#carOil').innerHTML=SET_CAR[0][1].map(fieldRow).join('');
+ $('#carLog').innerHTML=SET_CAR[1][1].map(fieldRow).join('');
  fillBound()}
-function jsonShow(){$('#json').value=JSON.stringify(C,null,1)}
+/* The Advanced section, open or closed as it was left on this phone. */
+let ADV_ON=false;
+function advShow(on){ADV_ON=!!on;$('#advBody').hidden=!ADV_ON;$('#advBtn').textContent=ADV_ON?'Hide':'Show';
+ try{localStorage.setItem('advOn',ADV_ON?'1':'')}catch(e){}
+ if(ADV_ON&&LOADED&&!JSON_ED)jsonShow()}
+/* The JSON editor shows the configuration as it is, refreshed with it - until
+   it is edited: then it is left alone until Apply or Show current. */
+let JSON_ED=false;
+function jsonShow(){$('#json').value=JSON.stringify(C,null,1);JSON_ED=false}
+$('#json').oninput=()=>{JSON_ED=true};
 function jsonApply(){
  let o;try{o=JSON.parse($('#json').value)}catch(e){toast('Not valid JSON: '+e.message);return}
  if(typeof o!=='object'||!o){toast('Expected an object');return}
- C=Object.assign(C,o);fillBound();renderSources();renderAdv();setDirty(true);toast('Applied - press Save to keep it')}
+ C=Object.assign(C,o);JSON_ED=false;fillBound();renderSources();setDirty(true);toast('Applied - press Save to keep it')}
 function jsonDownload(){const a=document.createElement('a');
  a.href=URL.createObjectURL(new Blob([JSON.stringify(C,null,1)],{type:'application/json'}));
  a.download='can-master-config.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 function jsonUpload(inp){const f=inp.files[0];if(!f)return;const r=new FileReader();
  r.onload=()=>{$('#json').value=r.result;jsonApply()};r.readAsText(f);inp.value=''}
 
-/* ───────────── dashboard ───────────── */
+/* ───────────── home, and the learning card on Signals ───────────── */
 const LS=[['Waiting for the ECU','muted'],['Needs movement','warn'],['Searching','acc'],['Found — confirming','acc'],['Listening','ok'],['Not found yet','muted']];
 function hint(id){
  if(id===0x010C)return'hold a few different revs for a couple of seconds each';
@@ -565,7 +604,21 @@ function field(x){
  if(x.l<8&&!x.be)return`${hex(x.id,3)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
  return`${hex(x.id,3)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
 async function learnAct(a,m){await post(`/api/learn/${a}?m=${m}`,a==='accept'?`Listening for ${nm(m)}`:`Requesting ${nm(m)} again`,()=>load(true))}
-function renderDash(){
+/* What needs the driver, from what /api/live already carries: one line each,
+   linking to the tab where it is dealt with. */
+function homeNotes(d){
+ const v=id=>{const m=d.metrics.find(x=>x.id===id&&x.age<5000);return m?m.v:null},out=[];
+ if(d.guard.rx_silent||d.guard.silent)out.push(['crit','<b>Listen-only to protect the bus</b>: bus errors followed our frames','bus']);
+ else if(d.guard.pause)out.push(['warn',`<b>Requests paused</b> for ${Math.ceil(d.guard.pause/1000)} s after bus errors`,'bus']);
+ const n=v(0x0400),mil=v(0x0101);
+ if(n>0)out.push(['crit',`<b>${Math.round(n)} trouble code${n>=2?'s':''}</b>${mil?' · check-engine lamp on':''}`,'car']);
+ else if(mil)out.push(['crit','<b>Check-engine lamp on</b>','car']);
+ const km=v(0x1F10);
+ if(km!==null&&km<=0)out.push(['crit',`<b>Oil change overdue</b> by ${Math.round(-km)} km`,'car']);
+ else if(km!==null&&km<500)out.push(['warn',`<b>Oil change due</b> in ${Math.round(km)} km`,'car']);
+ const TAB_NAME={bus:'Bus',car:'Car'};
+ return out.map(([c,t,tab])=>`<div class="note ${c}" onclick="go('${tab}')"><span>${t}</span><span class="go">${TAB_NAME[tab]} ›</span></div>`).join('')}
+function renderHome(){
  const d=L,live=d.metrics.filter(m=>m.age<2500);
  const by=s=>live.filter(m=>m.src===s).length;
  const nRaw=by(4),nObd=by(2),nSsm=by(1);
@@ -576,7 +629,7 @@ function renderDash(){
  $('#dReq').textContent=nObd+nSsm;
  $('#dReqS').innerHTML=`<span class="tag obd">OBD-II ${nObd}</span> <span class="tag ssm">SSM2 ${nSsm}</span> · ${RATES.tx.toFixed(0)} req/s`;
  $('#dEsp').textContent=`${(d.esp.mps||0).toFixed(0)}/s`;$('#dEspS').textContent=`values, in ${(d.esp.fps||0).toFixed(0)} packets/s`;
- const learned=d.learn.filter(x=>x.st===4).length,todo=d.learn.filter(x=>x.st>=1&&x.st<=3).length;
+ const todo=d.learn.filter(x=>x.st>=1&&x.st<=3).length;
  let say;
  if(!d.bus.alive)say='<b>No CAN traffic.</b> The ignition is off, or the transceiver is not wired to the OBD port.';
  else if(d.silent)say='<b>Listening only.</b> Nothing is transmitted; every value shown comes from the car\'s own broadcasts.';
@@ -586,12 +639,24 @@ function renderDash(){
   if(nObd)say+=`OBD-II is asked for ${nObd} the car does not broadcast`+(nSsm?`, and SSM2 for ${nSsm} more OBD-II has no PID for. `:'. ');
   else if(nSsm)say+=`SSM2 is asked for ${nSsm}. `;
   if(d.obd.answers===2&&d.ssm.answers===2)say+='<span class="warn">The ECU answers neither OBD-II nor SSM2.</span> ';
-  if(d.guard.rx_silent)say+='<span class="crit">Our controller was corrupting other modules\' frames, so the master switched itself to listen-only.</span> See the Bus and Diagnostics tabs. ';
+  if(d.guard.rx_silent)say+='<span class="crit">Our controller was corrupting other modules\' frames, so the master switched itself to listen-only.</span> See the Bus tab. ';
   else if(d.guard.silent)say+='<span class="crit">Bus errors kept following our requests, so the master switched itself to listen-only.</span> See the Bus tab. ';
   else if(d.guard.pause)say+=`<span class="warn">Requests paused for ${Math.ceil(d.guard.pause/1000)} s after bus errors.</span> `;
-  if(todo)say+=`${todo} more ${todo===1?'is':'are'} being learned.`;
+  if(todo)say+=`${todo} more ${todo===1?'is':'are'} being learned (Signals tab).`;
  }
- $('#dSay').innerHTML=say;
+ $('#dSay').innerHTML=say;$('#hNote').innerHTML=homeNotes(d);
+ const q=$('#vq').value.trim().toLowerCase();
+ const vrows=d.metrics.filter(m=>(m.id&0xFF00)!==0x1F00&&(!q||nm(m.id).toLowerCase().includes(q)));
+ $('#vCount').textContent=`${live.length} live`;
+ const groups={};vrows.forEach(m=>{const g=META[m.id]?META[m.id][2]:'Other';(groups[g]=groups[g]||[]).push(m)});
+ const GO=['Engine','Fuel & mixture','Temperatures','Driving','Electrical','Status & switches','Custom','Other'];
+ $('#vals').innerHTML=GO.filter(g=>groups[g]).map(g=>`<div class="grp">${g}</div><div class="vals">`+
+  groups[g].sort((a,b)=>a.id-b.id).map(m=>{const s=SRC[m.src]||['?','no'];
+   return`<div class="val${m.age>2500?' stale':''}"><div class="n"><span class="tag ${s[1]}">${s[0]}</span>${esc(nm(m.id))}</div>
+   <div class="x">${fmt(m.id,m.v)}<u>${esc(un(m.id))}</u></div></div>`}).join('')+'</div>').join('')||
+  '<p class="empty">No values yet.</p>'}
+function renderLearn(){
+ const d=L,learned=d.learn.filter(x=>x.st===4).length,todo=d.learn.filter(x=>x.st>=1&&x.st<=3).length;
  $('#lSub').textContent=d.silent?'needs requests turned on':`${learned} listening · ${todo} in progress · ${d.learn_f} fields, ${d.learn_b} bits watched`;
  const order=[2,3,1,5,4,0],all=$('#lAll').checked;
  const rows=d.learn.filter(x=>all||x.st!==0).sort((a,b)=>order.indexOf(a.st)-order.indexOf(b.st)||b.fit-a.fit);
@@ -608,19 +673,9 @@ function renderDash(){
    if(x.id)act=`<button class="b s" onclick="learnAct('accept',${x.m})">Listen now</button>`}
   return`<div class="lr"><div class="lt"><b>${esc(nm(x.m))}</b><span class="${s[1]}">${s[0]}</span></div>
    <div class="bar"><i style="width:${w.toFixed(0)}%;background:${col}"></i></div><div class="ls"><span>${sub}</span>${act}</div></div>`}).join('')||
-  '<p class="empty">Nothing to learn yet — the master learns from the values it requests.</p>';
- const q=$('#vq').value.trim().toLowerCase();
- const vrows=d.metrics.filter(m=>(m.id&0xFF00)!==0x1F00&&(!q||nm(m.id).toLowerCase().includes(q)));
- $('#vCount').textContent=`${live.length} live`;
- const groups={};vrows.forEach(m=>{const g=META[m.id]?META[m.id][2]:'Other';(groups[g]=groups[g]||[]).push(m)});
- const GO=['Engine','Fuel & mixture','Temperatures','Driving','Electrical','Status & switches','Custom','Other'];
- $('#vals').innerHTML=GO.filter(g=>groups[g]).map(g=>`<div class="grp">${g}</div><div class="vals">`+
-  groups[g].sort((a,b)=>a.id-b.id).map(m=>{const s=SRC[m.src]||['?','no'];
-   return`<div class="val${m.age>2500?' stale':''}"><div class="n"><span class="tag ${s[1]}">${s[0]}</span>${esc(nm(m.id))}</div>
-   <div class="x">${fmt(m.id,m.v)}<u>${esc(un(m.id))}</u></div></div>`}).join('')+'</div>').join('')||
-  '<p class="empty">No values yet.</p>'}
-$('#vq').oninput=()=>L&&renderDash();
-$('#lAll').onchange=()=>L&&renderDash();
+  '<p class="empty">Nothing to learn yet — the master learns from the values it requests.</p>'}
+$('#vq').oninput=()=>L&&renderHome();
+$('#lAll').onchange=()=>L&&renderLearn();
 
 /* ───────────── bus ───────────── */
 let ZP={},ZC={},ZT=0,ZHZ={},MAP=null,BUS=null;
@@ -634,7 +689,7 @@ function extract(b,st,len,be,sg){
 /*</teach-core>*/
 function pollBus(){return solo('bus',pollBusOnce)}
 async function pollBusOnce(){
- if(TAB!=='bus'||TEACH||UPD)return;
+ if((TAB!=='bus'&&!MAP)||TEACH||UPD)return;
  try{BUS=await req('/api/bus',null,4000)}catch(e){return}
  const now=Date.now(),dt=ZT?(now-ZT)/1000:0;ZT=now;
  $('#bN').textContent=BUS.census.length+' IDs';
@@ -664,7 +719,7 @@ function renderLink(d){
   `<b>${n}</b>: missed ${k.miss[i]} of ${k.exp[i]} of the car's regular frames (${pc(k.miss[i],k.exp[i])}); ${k.rx[i]?(1000*k.err[i]/k.rx[i]).toFixed(1):'–'} bus errors per 1000 frames`).join('<br>')+'</p>';
  if(k.chk>=20){const near=100*k.near/k.chk,hot=k.hot/10;
   h+=`<p class="say" style="margin:0 0 8px">${near.toFixed(0)} % of ${k.chk} bus errors came while our radio was transmitting or within 3 ms of it, and it is that busy ${hot.toFixed(0)} % of the time. `+
-   (near>=30&&near>=2*hot?'<span class="warn">Far above chance: the radio is disturbing the CAN side - its 3.3 V supply or ground. Try Advanced → Radio transmit power 2 dBm and compare.</span>':'About chance: the radio is not what causes them.')+'</p>'}
+   (near>=30&&near>=2*hot?'<span class="warn">Far above chance: the radio is disturbing the CAN side - its 3.3 V supply or ground. Try Settings → Advanced → Displays: radio transmit power 2 dBm, and compare.</span>':'About chance: the radio is not what causes them.')+'</p>'}
  if(k.ids&&k.ids.length)h+='<div class="wrap"><table><thead><tr><th>ID</th><th>Every</th><th>Missed</th><th>Share</th></tr></thead><tbody>'+
   k.ids.map(r=>`<tr><td>${r.x?'ext ':''}${hex(r.i,3)}</td><td>${r.p} ms</td><td>${r.m} of ${r.e}</td><td>${pc(r.m,r.e)}</td></tr>`).join('')+'</tbody></table></div>'+
   '<p class="say" style="margin:8px 0 0">Misses on one module\'s IDs only: the link to that module, where the master taps in. Spread over every module: the master\'s own side - supply, ground, transceiver. More in normal mode than listen-only: its own transceiver driving the bus upsets it.</p>';
@@ -677,8 +732,8 @@ function renderBusTiles(){
  $('#bErrTxS').textContent=`${d.bus.err_idle} while we were quiet`;
  const g=d.guard;$('#gCard').hidden=!(g.silent||g.pause);
  const trips=C.guard_trips||3;
- if(g.rx_silent)$('#gSay').innerHTML='Our controller\'s receive-error counter climbed into the error-warning region: it was error-flagging — destroying — other modules\' frames, which is how the transmission ECU loses the engine ECU\'s messages. It was switched to <b>listen-only</b>. Check the transceiver ground and stub length, try the late sample point (Advanced), then resume. The Diagnostics tab has the record.';
- else if(g.silent)$('#gSay').innerHTML='Bus errors kept following our frames, so the controller was switched to <b>listen-only</b> — it cannot disturb the car now. Fix the wiring (see below), then resume. The guard can be turned off in Settings.';
+ if(g.rx_silent)$('#gSay').innerHTML='Our controller\'s receive-error counter climbed into the error-warning region: it was error-flagging — destroying — other modules\' frames, which is how the transmission ECU loses the engine ECU\'s messages. It was switched to <b>listen-only</b>. Check the transceiver ground and stub length, try the late sample point (Settings → CAN connection: bit timing), then resume. The evidence log below has the record.';
+ else if(g.silent)$('#gSay').innerHTML='Bus errors kept following our frames, so the controller was switched to <b>listen-only</b> — it cannot disturb the car now. Fix the wiring (see below), then resume. The guard can be turned off in Settings → Bus protection.';
  else if(g.pause)$('#gSay').innerHTML=`Bus errors followed our frames, so all requests are paused for another ${Math.ceil(g.pause/1000)} s (pause ${g.trips} of ${trips}; the last one switches to listen-only).`;
  $('#bLoad').textContent=d.bus.alive?RATES.load.toFixed(0)+'%':'–';
  const bar=$('#bBar');bar.style.width=Math.min(100,RATES.load)+'%';
@@ -694,7 +749,7 @@ function renderBusTiles(){
   s=RATES.load<50?`Load is comfortable — CAN only struggles past about 70%. Our requests add ${RATES.tx.toFixed(0)} frames/s.`:
    `Load is high (${RATES.load.toFixed(0)}%); our share is ${RATES.tx.toFixed(0)} frames/s.`;
   if(RATES.errs>0||d.bus.tec||d.bus.rec){
-   s+=d.bus.err_tx>d.bus.err_idle?' <span class="crit">Errors mostly follow our own frames.</span> The link from the master to the bus is marginal: check the transceiver ground to OBD pin 4/5, that its 120 Ω terminator is removed, and the stub length. The late sample point (Advanced) may also help.':
+   s+=d.bus.err_tx>d.bus.err_idle?' <span class="crit">Errors mostly follow our own frames.</span> The link from the master to the bus is marginal: check the transceiver ground to OBD pin 4/5, that its 120 Ω terminator is removed, and the stub length. The late sample point (Settings → CAN connection: bit timing) may also help.':
     ' <span class="warn">Errors also happen while we are quiet</span> — they are not ours (cranking and modules waking produce a few).';
   }else s+=' <span class="ok">No errors</span> — every frame is getting through.';
   if(d.bus.missed)s+=` <span class="muted">${d.bus.missed} frames dropped on our side (harmless).</span>`;
@@ -702,11 +757,13 @@ function renderBusTiles(){
  $('#bSay').innerHTML=s}
 function metricOpts(sel,filter){return Object.keys(META).map(Number).filter(id=>(id&0xFF00)!==0x1F00&&(!filter||filter(id))).sort((a,b)=>a-b)
  .map(id=>`<option value="${id}" ${id===sel?'selected':''}>${esc(nm(id))}${un(id)?' ('+esc(un(id))+')':''}</option>`).join('')}
-function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapCard').hidden=false;$('#mapId').textContent=hex(id,3);
+/* The map dialog sits over the tab that opened it; while it is open the frames
+   are read (pollBus), so its preview follows the bus. */
+function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapDlg').hidden=false;$('#mapId').textContent=hex(id,3);
  $('#mpS').value=p.s||0;$('#mpL').value=p.l||8;$('#mpK').value=p.k||1;$('#mpO').value=p.o||0;$('#mpBE').value=p.be?'1':'0';
- $('#mpSg').checked=!!p.sg;$('#mpM').innerHTML=metricOpts(p.m||0x010C);mapPrev();
- $('#mapCard').scrollIntoView({behavior:'smooth'})}
-function mapClose(){MAP=null;$('#mapCard').hidden=true}
+ $('#mpSg').checked=!!p.sg;$('#mpM').innerHTML=metricOpts(p.m||0x010C);mapPrev();pollBus()}
+function mapClose(){MAP=null;$('#mapDlg').hidden=true}
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&MAP)mapClose()});
 function mapPrev(){
  if(!MAP||!BUS)return;const c=BUS.census.find(x=>x.id===MAP.id&&!!x.ext===MAP.ext);if(!c)return;
  const raw=extract(hb(c.d),+$('#mpS').value,+$('#mpL').value||8,$('#mpBE').value==='1',$('#mpSg').checked);
@@ -1061,7 +1118,16 @@ function teachKinds(m){
  if(isMotion(m))return[['mot','A corner or a hard stop'],['val','A moving value']];
  if(m===TURN_ROLE.L||m===TURN_ROLE.R||m===TURN_ROLE.H)return[['turn','Left, right and hazard, in one go'],['bit','On / off']];
  return isSwitch(m)?[['bit','On / off'],['val','A moving value']]:[['val','A moving value'],['bit','On / off']]}
-function teachKindShown(){$('#tPRow').hidden=$('#tK').value!=='pos'}
+/* What the chosen kind of teaching asks of the driver, said before Start. */
+function teachHow(m,kind){
+ if(kind==='turn')return'One run teaches all three: the left indicator, the right one, then the hazard lights, each left flashing for a few seconds - so the master can tell the two sides apart.';
+ if(kind==='pos')return m===0x100F?'Foot on the brake, and move the lever through the positions as asked. It ends back where it started, so every bit is checked twice.':
+  'Select the positions as asked. End on the first one again, so every bit is checked twice.';
+ if(kind==='mot')return(m===0x100D?'Drive straight on, then brake firmly to a stop when asked.':'Drive straight on, then through a corner, or a few, when asked.')+
+  ' The master compares every field with what the speed and the steering say, and works out the scale.';
+ if(kind==='bit')return'Leave it off, switch it on when asked (flashing is fine), then off again.';
+ return'Hold it still, then move it slowly through its whole range, back and forth.'}
+function teachKindShown(){const k=$('#tK').value;$('#tPRow').hidden=k!=='pos';$('#tHow').textContent=teachHow(+$('#tM').value,k)}
 function teachPick(){const m=+$('#tM').value;
  $('#tK').innerHTML=teachKinds(m).map(([v,t])=>`<option value="${v}">${t}</option>`).join('');
  if(TEACH_POS[m])$('#tP').value=TEACH_POS[m];teachKindShown()}
@@ -1213,7 +1279,7 @@ const SMODE=['Off','On','Checking','Verified','Rejected'];
 function curVal(id){const m=L&&L.metrics.find(x=>x.id===id);if(!m)return'<span class="muted">—</span>';
  const s=SRC[m.src]||['?','no'];return`${fmt(id,m.v)} <span class="muted">${esc(un(id))}</span> <span class="tag ${s[1]}">${s[0]}</span>`}
 function renderSources(){
- if(!LOADED)return;const adv=$('#adv').checked;
+ if(!LOADED)return;const adv=$('#srcEd').checked;
  const sig=C.signals||[];
  $('#sHead').innerHTML=adv?'<tr><th>Mode</th><th>Metric</th><th>ID</th><th>Start</th><th>Len</th><th>BE</th><th>Sgn</th><th>Scale</th><th>Offset</th><th>Verify vs</th><th></th></tr>':
   '<tr><th>Value</th><th>Where</th><th>Status</th><th>Now</th><th></th></tr>';
@@ -1274,7 +1340,7 @@ function updateSourceText(){
   (s.refused?` · ${s.refused} refused by the ECU`:'')+(s.last_err?` · last problem: ${s.last_err}`:'');
  $('#sEcu').innerHTML=s.ecu_id?`ECU <b>${esc(s.ecu_id)}</b> · SYS ${esc(s.sys_id)} · ${s.flags} capability bytes${s.init?'':' (remembered)'} · this master ${esc(L.mac)}`:`This master ${esc(L.mac)}`}
 
-/* ───────────── diagnostics: the evidence log ───────────── */
+/* ───────────── the evidence log (Bus tab) ───────────── */
 const EVN={0:'Boot',1:'Bus up',2:'Bus settled',3:'Bus guard trip',4:'Receive-error guard',5:'Bus-off',6:'Sleep',7:'Resumed'};
 const RST={0:'unknown',1:'power-on',2:'external reset',3:'software reset',4:'panic',5:'interrupt watchdog',6:'task watchdog',7:'watchdog',8:'wake from deep sleep',9:'brown-out',10:'SDIO'};
 const ACTS=a=>{const p=[];if(a&4)p.push('listen-only');else if(a&8)p.push('free to transmit');if(a&1)p.push('OBD-II polling');if(a&2)p.push('settling');
@@ -1289,7 +1355,7 @@ function evDetail(e){
  return''}
 function pollEvlog(){return solo('ev',pollEvlogOnce)}
 async function pollEvlogOnce(){
- if(TAB!=='diag'||TEACH||UPD)return;
+ if(TAB!=='bus'||TEACH||UPD)return;
  let d;try{d=await req('/api/evlog',null,5000)}catch(e){return}
  const ev=d.events||[],rows=ev.slice().reverse();
  $('#evN').textContent=ev.length+' events';
@@ -1304,13 +1370,13 @@ async function pollEvlogOnce(){
  if(!s)s=`<span class="ok">${boots.length} boot${boots.length===1?'':'s'}, no brown-out, no guard trip, no bus-off</span> — if the lamp still came on, the master was not the one disturbing the bus.`;
  $('#evSay').innerHTML=s}
 
-/* ───────────── trouble codes, the engine computer, oil change, drive logs ───────────── */
+/* ───────────── the Car tab: trouble codes, the engine computer, oil change, drive logs ───────────── */
 const KIND=['stored','pending','permanent'],MOD=['Engine','Transmission'],LIST_SAY=['not asked yet','answered','no reply','not kept'];
 let CODES=null,LOGS=null;
 const ago=s=>s<90?`${s} s ago`:s<5400?`${Math.round(s/60)} min ago`:`${Math.round(s/3600)} h ago`;
 function pollCodes(){return solo('codes',pollCodesOnce)}
 async function pollCodesOnce(){
- if((TAB!=='diag'&&TAB!=='set')||TEACH||UPD)return;
+ if(TAB!=='car'||TEACH||UPD)return;
  try{CODES=await req('/api/codes',null,5000)}catch(e){return}
  renderCodes()}
 function renderCodes(){
@@ -1348,11 +1414,11 @@ const kb=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixe
 const dur=s=>{s=Math.round(s);return s<60?s+' s':Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s'};
 function pollLogs(){return solo('logs',pollLogsOnce)}
 async function pollLogsOnce(){
- if(TAB!=='diag'||TEACH||UPD)return;
+ if(TAB!=='car'||TEACH||UPD)return;
  try{LOGS=await req('/api/logs',null,5000)}catch(e){return}
  const d=LOGS;
  $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on ${d.own?'the logs partition':'the settings partition (older partition table)'}`;
- $('#lgSay').innerHTML=!d.on?'Recording is off: switch it on under Settings, Drive log.':
+ $('#lgSay').innerHTML=!d.on?'Recording is off: switch it on below, under Recording.':
   d.rec?`<span class="ok">Recording <b>${esc(d.file)}</b></span>: ${d.rows} rows so far.`:
   d.note?`<span class="warn">${esc(d.note)}</span>`:'Recording starts when the car comes on.';
  $('#lgTab').innerHTML=d.files.length?d.files.slice().reverse().map(f=>`<tr><td class="mono">${esc(f.name.replace('.tlg',''))}${f.rec?' <span class="ok">● now</span>':''}</td>
@@ -1403,9 +1469,10 @@ async function pollOnce(){
  else if(d.settle){c.className='pill ok';c.lastChild.textContent=`settling · ${Math.ceil(d.settle/1000)} s`}
  else if(d.guard.pause||d.guard.silent){c.className='pill warn';c.lastChild.textContent='requests paused'}
  else{c.className='pill ok';c.lastChild.textContent='live'}
- if(TAB==='dash')renderDash();
+ if(TAB==='home')renderHome();
+ if(TAB==='sig'){renderLearn();updateSourceText()}
  if(TAB==='bus')renderBusTiles();
- if(TAB==='src'||TAB==='set')updateSourceText()}
+ if(TAB==='set')updateSourceText()}
 /* ───────────── firmware update ───────────── */
 async function fwInfo(){
  try{const d=await req('/api/update',{},5000);
@@ -1439,6 +1506,9 @@ function fwWait(old,done){const t0=Date.now();
   if(Date.now()-t0>240000){done('No answer from the master yet - join its Wi-Fi again and open this page.');return}
   setTimeout(tick,3000)};
  setTimeout(tick,6000)}
+renderSettings();
+try{advShow(localStorage.getItem('advOn')==='1')}catch(e){}
+go(location.hash.slice(1));
 load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);
 setInterval(pollCodes,3000);setInterval(pollLogs,3000);
 </script></body></html>
