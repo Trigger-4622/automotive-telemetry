@@ -836,12 +836,20 @@ function teachBits(id,A,B,C,EA,EB,EC,dlc){
       its own in the same frame: the side's signal is the flasher while that
       bit says so - a bit combination with a value table (how 'gated').
     Every OFF step rests, but for the driver's hand at its ends (restsIn).
+    A bit of a number is never a lamp: where another bit of its byte keeps
+    changing while nothing is on, at no steady pace (a counter keeps one),
+    the byte is a value. The owner's 2010 Legacy (2026-11-19) sends no lamp
+    on the OBD port's bus, and the one thing that moved with the indicators
+    was a value - 0x432 byte 5, at 61 or 64 at rest, 63 and 66 with each
+    flash (the lamps' load): its bit 41, quiet through the left step by
+    chance, was offered as the right lamp and then flashed with either side.
+    Such bits are kept apart (the result's .numbers) to be named, not offered.
     Candidates carry the role they fill (L, R, H or both) and, except for
     both, the metric; best first within each role, three at most. */
 function teachTurns(S){
  const OFF=['A','B','C','D'],ON=['L','R','H'],ALL=['A','L','B','R','C','H','D'];
  const ids=new Set();ALL.forEach(k=>(S[k]||[]).forEach(poll=>poll.forEach((x,id)=>ids.add(id))));
- const res=[];
+ const res=[],numbers=[];
  for(const id of ids){
   if(id>=0x7DF&&id<=0x7EF)continue;
   const st={};ALL.forEach(k=>st[k]=(S[k]||[]).map(poll=>poll.get(id)).filter(Boolean));
@@ -857,6 +865,32 @@ function teachTurns(S){
   // the hand on the lever (both 2012 Imprezas: 0x002, 0x0D0) - not a switch.
   const valueBit=(bit,k)=>{for(let o=bit&~7;o<(bit&~7)+8;o++)
    if(o!==bit&&tr[o]&&tr[o][k].p>=0.3&&!flashIn(tr[o][k]))return true;return false};
+  // The other bits of the byte that are busy while nothing is on (in three
+  // OFF steps or more, eight flips in all). A rolling counter's are a run of
+  // neighbours, each flipping about half as often as the one below it, the
+  // lowest at a steady pace; any others make the byte a number - 0x432 byte 5
+  // stepping between 61 and 64 flips six bits at once, the same count each.
+  const restBusy=o=>OFF.filter(k=>tr[o][k].n>0).length>=3&&OFF.reduce((s,k)=>s+tr[o][k].n,0)>=8;
+  const pace=o=>OFF.map(k=>tr[o][k].n/Math.max(1,tr[o][k].act.length));
+  const rate=o=>{const r=pace(o);return r.reduce((a,b)=>a+b,0)/r.length};
+  // And where the bit flashes, another bit of its byte (not the counter's)
+  // flipping there too, out of step with it: a number dipping with each
+  // flash (the other Impreza's 0x361 byte 6, still at rest). Two lamps, or a
+  // lamp and a flasher, flash in step: read together they agree throughout.
+  const numberBit=bit=>{
+   const lo=bit&~7,B=[];for(let o=lo;o<lo+8;o++)if(o!==bit&&tr[o]&&restBusy(o))B.push(o);
+   if(B.length){
+    const r0=pace(B[0]);if(Math.min(...r0)*1.6<Math.max(...r0))return true;  // no steady pace
+    for(let i=1;i<B.length;i++){const q=rate(B[i])/rate(B[i-1]);
+     if(B[i]!==B[i-1]+1||q<0.3||q>0.7)return true}}                            // not a counter's run
+   for(const k of ON){
+    if(!flashIn(tr[bit][k]))continue;
+    const P=st[k].map(x=>x.b);
+    for(let o=lo;o<lo+8;o++){
+     if(o===bit||B.includes(o)||!tr[o]||tr[o][k].n<2)continue;
+     const agree=P.filter(b=>bitOf(b,o)===bitOf(b,bit)).length/P.length;
+     if(agree>0.15&&agree<0.85)return true}}
+   return false};
   for(let bit=0;bit<dlc*8;bit++){
    const t=tr[bit],rest=restOf(offP,bit);
    const fl=k=>flashIn(t[k]),hd=k=>heldIn(t[k]),sil=k=>silentIn(t[k]),busy=k=>fl(k)||hd(k);
@@ -873,6 +907,7 @@ function teachTurns(S){
    // ...and at rest in every OFF step, but for the driver's hand at its ends.
    if(!restsIn(t.A.act,false,busy('L'))||!restsIn(t.B.act,busy('L'),busy('R'))||
       !restsIn(t.C.act,busy('R'),busy('H'))||!restsIn(t.D.act,busy('H'),false))continue;
+   if(numberBit(bit)){numbers.push({id,s:bit,role,how});continue}
    const n=ON.filter(fl).reduce((s,k)=>s+t[k].n,0),nf=ON.filter(fl).length||1;
    // The car's own flasher beats a lever bit (the displays then flash with
    // the car); for the hazard lights, their switch beats a lamp of their own.
@@ -902,8 +937,9 @@ function teachTurns(S){
  const keep=res.filter(r=>!(r.how==='flash'&&(r.role==='L'||r.role==='R')&&!r.withH&&lampWithH(r.role)));
  const order=['L','R','H','both'];
  keep.sort((a,b)=>order.indexOf(a.role)-order.indexOf(b.role)||b.score-a.score);
- const per={};
- return keep.filter(r=>(per[r.role]=(per[r.role]||0)+1)<=3)}
+ const per={},out=keep.filter(r=>(per[r.role]=(per[r.role]||0)+1)<=3);
+ out.numbers=numbers;
+ return out}
 /** A moving value: A held still, B moved through its range. */
 function teachValues(id,A,B,dlc){
  const res=[],v=a=>{const mu=a.reduce((x,y)=>x+y,0)/a.length;return a.reduce((x,y)=>x+(y-mu)**2,0)/a.length};
@@ -1228,6 +1264,14 @@ function teachAnalyze(steps){
  const {S,kind,m}=TEACH;
  if(kind==='mot'){const R={};steps.forEach(k=>R[k]=motionRef(m,TEACH.P[k]));TRES=teachFindMotion(S,R,steps)}
  else TRES=teachFind(kind,S,steps,TTOK);
+ const nums=kind==='turn'&&TRES.numbers&&TRES.numbers.length?TRES.numbers:null;
+ if(!TRES.length&&nums){
+  // Only a value moved with the lamps (their load): say what it was, offer nothing.
+  const ids=[...new Set(nums.map(x=>x.id))];
+  $('#tRes').innerHTML=`<p class="say">Nothing on the bus says the indicators are on. Only part of a number moved with them - `+
+   ids.map(id=>field({id,s:nums.find(x=>x.id===id).s,l:1})).join(', ')+
+   ` - a value that changes all the time; it moved with the lamps' load, whichever side was on, so it is not offered. `+
+   `This car may not send its indicators on this bus. Save the readings below and send them.</p>`;return}
  if(!TRES.length){$('#tRes').innerHTML=`<p class="say">Nothing on the bus followed that. ${kind==='pos'?'Hold each position until the next is asked for, or the lever may not be broadcast.':
   kind==='turn'?'Let each one flash through its step and switch it off when the page says Off. If it still finds nothing, the indicators may not be broadcast: save the readings below and send them.':
   'Try again with a clearer on/off, or the value may not be broadcast.'}</p>`;return}

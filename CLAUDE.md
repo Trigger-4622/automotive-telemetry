@@ -379,8 +379,14 @@ with diag mode 2 = OBD-II only - the file the P1718 scenarios drive with - and
 VIN's serial masked) holds 18 signals: learned RPM 0x231, pedal/throttle 0x232, coolant
 0x451, MAF and fuel level 0x705, intake temp 0x706; mapped by hand handbrake
 0x4B1, lights 0x351, seatbelt 0x432, steering 0x331, reverse 0x451, neutral
-0x252. Not yet taught: door, turn signals, high beam, cruise; oil pressure has
-no known source.
+0x252. Not yet taught: door, high beam, cruise; oil pressure has no known
+source. Turn signals: the indicator run of 2026-11-19 (`master/test_host/
+traffic/legacy_2010_teach_turn.json`) found no frame on this bus that follows
+the lamps - with the right indicator and the hazard lights the only thing that
+moved was 0x432 byte 5, a value (61 or 64 at rest, 63 and 66 with each flash),
+whose bit 41 the page then offered as the right lamp; it flashed with either
+side. Extended identifiers are not in the teach's readings - not yet checked
+whether this bus has any.
 
 Teach by doing (portal Signals tab; its analysis is the `teach-core` JS in
 `portal_page.html`, tested by `master/test_host/portal_tests.js`) finds a
@@ -415,13 +421,19 @@ step's start where the step before had the bit going, at its end where the
 next has, around a still middle of 40 %), a side's lamp that also flashed
 with the hazard lights beats one that did not (and drops it), and a bit with
 another bit of its byte changing level in the same step is a value's, not a
-switch (the steering angle nudged by the hand on the lever). On two real 2012
-Imprezas' indicator traffic (`master/test_host/traffic/`, CANdid) the run
-used to lose both lamps with a driver 2 s late switching off - an OFF step
-with more than two flips was not at rest - and offered an either-side bit
-that pulses on some flashes (0x361 bit 51) as one side; now both lamps come
-first with the driver up to 3 s late or 2 s early and the master answering
-in 40 ms to 1.3 s. The lever's
+switch (the steering angle nudged by the hand on the lever). A bit of a
+number is never offered (`numberBit`, the result's `.numbers`, named on the
+page): another bit of its byte busy with nothing on, other than a rolling
+counter's run (each bit about half as fast as the one below), or flipping out
+of step with it where it flashes - lamps flash in step with each other. A
+number the lamps' load moves follows the indicators: this car's 0x432 byte 5,
+and both Imprezas' 0x361 byte 6 (0x75/0x76 at rest, down to 0x6E with each
+flash), which the run reported as a flasher for either side and, quiet
+through one step by chance, offered as a side. On two real 2012 Imprezas'
+indicator traffic (`master/test_host/traffic/`, CANdid) the run used to lose
+both lamps with a driver 2 s late switching off - an OFF step with more than
+two flips was not at rest; now both lamps come first with the driver up to
+3 s late or 2 s early and the master answering in 40 ms to 1.3 s. The lever's
 own field is preferred - the shortest run of neighbouring moving bits that
 tells every position apart - over the combination of every bit that moved,
 and a combination's code within a quarter of its width of exactly one entry

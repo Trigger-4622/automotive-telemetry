@@ -27,7 +27,7 @@ const T = {};
 vm.createContext(T);
 vm.runInContext(core + '\n;globalThis.__x={teachFind,teachBits,teachPositions,teachTurns,teachSlot,teachPlan,posValue,posLabel,extract,hb,TEACH_MIN_READS,' +
     'motionRef,teachFindMotion,dtcName,tlgToCsv};', T);
-const { teachFind, teachSlot, teachPlan, posValue, posLabel, TEACH_MIN_READS, motionRef, teachFindMotion, dtcName, tlgToCsv } = T.__x;
+const { teachFind, teachSlot, teachPlan, posValue, posLabel, TEACH_MIN_READS, motionRef, teachFindMotion, dtcName, tlgToCsv, hb } = T.__x;
 
 let failures = 0;
 function check(ok, what, info) {
@@ -290,7 +290,7 @@ console.log('--- the indicators from a master without flip counters');
  * The indicators on real Subaru traffic: two 2012 Imprezas' "Indicator"
  * captures (CANdid, CC BY 4.0 - traffic/candid_impreza_indicators.json says
  * what was kept). Their left lamp is 0x282 bit 44, the right bit 45; 0x361
- * bit 50 flashes for either side, bits 51-52 pulse on some flashes of either;
+ * byte 6 is a number each flash of either side moves (bits 50-52 with it);
  * the hand on the lever nudges the steering angle (0x002 bits 11-12, 0x0D0
  * bits 3-5), and one car's engine frame has a bit (0x140 bit 48) that flips
  * as fast as a lamp for a while. A run is spliced from the capture's own
@@ -353,7 +353,12 @@ for (const car of Object.keys(CANDID.cars)) {
     check(isAt(L[0], 0x282, 44) && L[0].how === 'flash' && L[0].metric === 0x1201, `car ${car}: left is the left lamp`, JSON.stringify(L[0]));
     check(isAt(R[0], 0x282, 45) && R[0].how === 'flash' && R[0].metric === 0x1202, `car ${car}: right is the right lamp`, JSON.stringify(R[0]));
     check(isAt(H[0], 0x282, 46), `car ${car}: the hazard switch`, JSON.stringify(H[0]));
-    check(role(r, 'both').some(x => isAt(x, 0x361, 50)), `car ${car}: 0x361 bit 50, the flasher for either side, reported as either`);
+    // 0x361 byte 6 is a number - 0x75 or 0x76 at rest, down to 0x6E with each
+    // flash of either side, a voltage under the lamps' load, it seems. Its
+    // bit 50 used to be reported as a flasher for either side.
+    check(!r.some(x => x.id === 0x361) && (r.numbers || []).some(x => isAt(x, 0x361, 50)),
+          `car ${car}: 0x361 bit 50, part of a number the flashes move, kept apart - not offered for anything`,
+          JSON.stringify(r.filter(x => x.id === 0x361)));
     check(!L.concat(R).some(x => x.id === 0x361 || x.id === 0x002 || x.id === 0x0D0 || x.id === 0x140),
           `car ${car}: never the either-side bits, the steering or the engine for a side`,
           L.concat(R).map(x => `${x.role}:${x.id.toString(16)}/${x.s}`).join(' '));
@@ -405,6 +410,17 @@ function turnFrames(kind) {
             if (n % 25) return {};
             setBit(c, 4, left && lit); setBit(c, 5, right && lit);
             return { 0x4B1: c };
+        } else if (kind === 'counterNibble') {
+            // The lamps in the high nibble of byte 1, a rolling counter in its low one.
+            b[1] = n & 0x0F;
+            setBit(b, 12, left && lit); setBit(b, 13, right && lit);
+        } else if (kind === 'loadValue') {
+            // The lamps, and in another frame a value that jitters between 61 and
+            // 64 at rest and reaches 63 and 66 with each flash of either side (the
+            // lamps' load) - the owner's 0x432 byte 5.
+            setBit(b, 12, left && lit); setBit(b, 13, right && lit);
+            const h = (Math.imul(n, 2654435761) >>> 0) % 7, v = h === 0 ? 61 : 64;
+            return { 0x282: b, 0x432: [0x81, 0x09, 0xFA, 0, 0x1F, v + ((left || right) && lit && h % 2 ? 2 : 0), 0xFF, 0x3F] };
         } else if (kind === 'nudge') {
             // The lamps, and the steering angle's low bits moved by the hand on
             // the lever while it is on (left: 0x002 rises by 3, right: by 5).
@@ -453,6 +469,40 @@ console.log('--- the steering nudged by the hand on the lever is not a switch');
     const r = teachFind('turn', session(TURN_RUN, turnFrames('nudge')));
     check(isAt(role(r, 'L')[0], 0x282, 12) && isAt(role(r, 'R')[0], 0x282, 13), 'the lamps', JSON.stringify(r.map(x => [x.role, x.id.toString(16), x.s, x.how])));
     check(!r.some(x => x.id === 0x002), 'nothing from the steering angle');
+}
+
+console.log('--- lamps beside a rolling counter in their byte');
+{
+    const r = teachFind('turn', session(TURN_RUN, turnFrames('counterNibble')));
+    check(isAt(role(r, 'L')[0], 0x282, 12) && isAt(role(r, 'R')[0], 0x282, 13), 'both lamps', JSON.stringify(r.map(x => [x.role, x.id.toString(16), x.s, x.how])));
+    check(!(r.numbers || []).length, 'the counter does not make their byte a number', JSON.stringify(r.numbers));
+}
+
+console.log('--- a value the lamps\' load moves is not a lamp');
+{
+    const r = teachFind('turn', session(TURN_RUN, turnFrames('loadValue')));
+    check(isAt(role(r, 'L')[0], 0x282, 12) && isAt(role(r, 'R')[0], 0x282, 13), 'the lamps', JSON.stringify(r.map(x => [x.role, x.id.toString(16), x.s, x.how])));
+    check(!r.some(x => x.id === 0x432), 'nothing from the value', JSON.stringify(r.filter(x => x.id === 0x432)));
+}
+
+/*
+ * The owner's 2010 Legacy, its indicator run of 2026-11-19 (traffic/
+ * legacy_2010_teach_turn.json, three of its identifiers). No frame on the
+ * OBD port's bus follows the lamps; 0x432 byte 5 is a value at 61 or 64 that
+ * reaches 63 and 66 with the right indicator's and the hazard lights'
+ * flashes, and its bit 41 - quiet through the left step - was offered as the
+ * right lamp, which then flashed with either side.
+ */
+console.log("--- the owner's 2010 Legacy: only a number moved with the indicators");
+{
+    const run = JSON.parse(fs.readFileSync(path.join(__dirname, 'traffic', 'legacy_2010_teach_turn.json'), 'utf8'));
+    const keys = run.steps.map(x => x[0]), S = {};
+    keys.forEach(k => S[k] = []);
+    for (const x of run.reads)
+        S[keys[x.step]].push(new Map(x.c.map(([id, d, e]) => [id, { b: hb(d), e: hb(e.padEnd(128, '0')) }])));
+    const r = teachFind('turn', S, keys);
+    check(!r.length, 'nothing offered', JSON.stringify(r.map(x => [x.role, x.id.toString(16), x.s, x.how])));
+    check((r.numbers || []).some(x => x.id === 0x432 && x.s === 41), '0x432 bit 41 kept apart as part of a number', JSON.stringify(r.numbers));
 }
 
 /*
