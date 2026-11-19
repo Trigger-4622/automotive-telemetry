@@ -36,6 +36,12 @@ doi.org/10.25909/29068553) - the frames that matter, only where they change,
 one stretch per period the teach run needs. Its `source` field says exactly
 what was kept. Not a settings file: it stays out of `fixtures/`.
 
+`traffic/legacy_2010_teach_turn.json` is the owner's 2010 Legacy's own
+indicator teach run (the portal's "Save these readings", 2026-11-19), cut to
+the readings inside the steps and three identifiers (`about` says which and
+why): no lamp on its bus, and a value the flashes move that must not be
+offered.
+
 | Part | What it is |
 | --- | --- |
 | `mocks/` | Arduino, FreeRTOS, TWAI, LittleFS, Wi-Fi/ESP-NOW headers, same API as ESP-IDF 4.4 |
