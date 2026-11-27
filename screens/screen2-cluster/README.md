@@ -36,13 +36,19 @@ Shared with the round board: `arc_gauge`, `meter_gauge`, `quad`, `text_list`,
 
 - **`park`** — the steering wheel as it is turned, an arc from straight ahead
   to full lock (`steer_max`, 540) and the angle beside it, STRAIGHT in green
-  within `straight_deg` (10). In reverse it comes up by itself and goes back
-  10 s after reverse ends, or at once above 15 km/h, unless you swipe
-  meanwhile (`auto_reverse` false: it never comes up by itself).
+  within `straight_deg` (10). It ships with a rule that brings it up in
+  reverse (below).
 
 Layout version 3 adds the first two to an existing layout once, before `diag`,
 version 4 the parking screen; deleted in the studio, they stay deleted. The
 backlight by day and at night is on the studio's Settings tab.
+
+Any screen can come up by itself (studio: *Show this screen by itself*): on
+conditions of the gear, the speed or any metric that must all hold, going back
+to the screen before after a wait, or at once on conditions of its own; a
+swipe keeps the screen you chose. The parking screen ships with one: in
+reverse, back 10 s after it or at once above 15 km/h. Layout version 5 turns
+version 4's `auto_reverse` switch into that rule. See `src/ui/AutoScreen.h`.
 
 Added here, because they need the width:
 

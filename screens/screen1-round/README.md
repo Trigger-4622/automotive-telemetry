@@ -86,9 +86,15 @@ second to arm a standing start; 80-120 times itself whenever the speed passes
 80 on the way up. Layout version 3 adds both to an existing layout once.
 `park` shows the steering wheel as it is turned, an arc from straight ahead to
 full lock (`steer_max`) and STRAIGHT in green within `straight_deg` of the
-centre; in reverse it comes up by itself and goes back 10 s after reverse ends,
-or at once above 15 km/h - unless you swipe meanwhile (`auto_reverse` false
-leaves the screens alone). Layout version 4 adds it once.
+centre. Layout version 4 adds it once.
+
+**Screens that come up by themselves.** Any screen can have conditions of its
+own (studio: *Show this screen by itself*): the gear, the speed or any metric,
+all of which must hold. The display then changes to it, and goes back to the
+screen before once they stop holding - after a wait you set, or at once when
+one of its "go back at once" conditions holds. A swipe keeps the screen you
+chose. The parking screen ships with one: in reverse, back 10 s after it or at
+once above 15 km/h (`src/ui/AutoScreen.h` has the details).
 
 **Trouble codes and the oil change.** The check-engine card names the codes the
 master read (`P1718 TCM 2/2`, then what it means), one every 3 s; with the

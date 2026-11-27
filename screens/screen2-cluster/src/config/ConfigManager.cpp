@@ -39,7 +39,7 @@ static constexpr const char *FS_PARTITION_LABEL = "spiffs";
  * (e.g. first flash without `pio run -t uploadfs`). The full annotated
  * example lives in data/layout.json. */
 static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
-  "version": 4,
+  "version": 5,
   "global": { "smoothing_alpha": 0.35, "lerp_speed": 0.18,
               "stale_timeout_ms": 1500, "swipe_anim_ms": 250,
               "day_bg": "#101418", "night_bg": "#000000" },
@@ -59,7 +59,9 @@ static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
                       "overlay_text": "SHIFT!" } } },
     { "id": "gmeter", "type": "gmeter", "label": "G", "max_g": 1.0 },
     { "id": "perf", "type": "perf", "label": "PERF" },
-    { "id": "park", "type": "park", "label": "PARK" },
+    { "id": "park", "type": "park", "label": "PARK",
+      "show_when": [ { "gear": "R" } ], "back_after_s": 10,
+      "back_now_when": [ { "metric_id": "0x010D", "op": ">", "value": 15 } ] },
     { "id": "diag", "type": "diag" }
   ]
 })JSON";
@@ -139,7 +141,8 @@ void ConfigManager::begin() {
         }
     }
     if (migrateLayout()) {
-        log_i("layout: updated to version 4 (warning lamps, dash, G-meter, timers, parking)");
+        log_i("layout: updated to version 5 (warning lamps, dash, G-meter, timers, parking, "
+              "screens that come up by themselves)");
         persistLayout();
     }
 }
@@ -225,7 +228,7 @@ bool ConfigManager::persistLayout() {
 
 bool ConfigManager::migrateLayout() {
     const int version = _layout["version"] | 1;
-    if (version >= 4) return false;
+    if (version >= 5) return false;
     if (version < 2) migrateToV2();
 
     // Version 3: the G-meter and the performance timers; version 4: the
@@ -238,6 +241,7 @@ bool ConfigManager::migrateLayout() {
         hasPark |= !strcmp(s["type"] | "", "park");
     }
     if (version >= 3) hasG = hasP = true;          // already offered once
+    if (version >= 4) hasPark = true;
     if (!hasG || !hasP || !hasPark) {
         JsonDocument old;
         old.set(_layout["screens"]);
@@ -265,7 +269,24 @@ bool ConfigManager::migrateLayout() {
         }
         addNew();
     }
-    _layout["version"] = 4;
+
+    // Version 5: any screen comes up by itself on conditions of its own
+    // (show_when - UIBuilder, AutoScreen.h). The parking screen's switch of
+    // version 4 (auto_reverse, on unless false) becomes the rule it stood for:
+    // in reverse, back 10 s after it or at once above 15 km/h.
+    for (JsonObject sc : _layout["screens"].as<JsonArray>()) {
+        if (strcmp(sc["type"] | "", "park")) continue;
+        const bool on = sc["auto_reverse"] | true;
+        sc.remove("auto_reverse");
+        if (!on || !sc["show_when"].isNull()) continue;
+        sc["show_when"].to<JsonArray>().add<JsonObject>()["gear"] = "R";
+        sc["back_after_s"] = 10;
+        JsonObject f = sc["back_now_when"].to<JsonArray>().add<JsonObject>();
+        f["metric_id"] = "0x010D";
+        f["op"] = ">";
+        f["value"] = 15;
+    }
+    _layout["version"] = 5;
     return true;
 }
 

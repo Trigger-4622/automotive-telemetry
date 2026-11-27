@@ -88,7 +88,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   project includes it (DiagCodes.cpp, Telltales.cpp).
 - Shared by the two screens, change both: `include/Palette.h`,
   `include/TelltaleIcons.h`, `src/ui/Telltales.*`, `src/ui/PerfTimer.*`,
-  `src/ui/DriveViews.*`, `tools/embed_studio.py`, `tools/make_icons.py`,
+  `src/ui/DriveViews.*`, `src/ui/AutoScreen.*`, `tools/embed_studio.py`, `tools/make_icons.py`,
   `tools/telltale_icons.json` and all of `test_host/`.
 - Generated, never edit by hand: `master/src/WebPortal.cpp` (from
   `master/tools/portal_page.html` + `WebPortal.cpp.in` via build_portal.py),
@@ -573,19 +573,33 @@ when it does not (`lamp_hazard_switch`).
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
   stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once,
-  version 4 the `park` screen.
+  version 4 the `park` screen, version 5 the rules below.
 - **Parking screen** (screens, `park`; `parkBuild`/`parkUpdate` in the shared
   DriveViews): the steering wheel turned as the driver has it (`metric_id`,
   default the steering angle 0x1006, ISO 8855: positive to the left), an arc
   from straight ahead to full lock either way (`steer_max`, 540), the angle
-  and LEFT or RIGHT, STRAIGHT in green within `straight_deg` (10). With
-  `auto_reverse` (on) reverse - `METRIC_ID_REVERSE` or the lever's R - brings
-  the first such screen up, and it goes back to the screen before
-  `PARK_BACK_MS` (10 s) after reverse ends - not while shuffling R-D-R - or
-  at once above `PARK_BACK_KMH` (15 km/h); a swipe meanwhile keeps the
-  driver's screen (`park_screen`, `park_auto_reverse`, `park_auto_off`).
-  Layout version 4 adds it once, before `diag` (`migrate_v3_layout`). LVGL
-  heap: 2.3 KB on the round board, 2.8 KB on the cluster.
+  and LEFT or RIGHT, STRAIGHT in green within `straight_deg` (10)
+  (`park_screen`). It comes up in reverse by the rule below that it ships
+  with. Layout version 4 adds it once, before `diag` (`migrate_v3_layout`);
+  version 5 turns that version's `auto_reverse` switch into the rule, or into
+  nothing where it was off (`migrate_v4_layout`). LVGL heap: 2.3 KB on the
+  round board, 2.8 KB on the cluster.
+- **Screens that come up by themselves** (screens, shared `AutoScreen.*`;
+  studio: "Show this screen by itself" on every screen): `show_when`, a list
+  of conditions that must all hold - `{"gear":"R"}` (`"op":"!="` for "is
+  not"; the reverse switch, the lever's letter and the gear number all count)
+  or `{"metric_id","op","value"}` (> < >= <= == !=, == on whole numbers); a
+  value the display has not got, or has gone stale, holds nothing. Only
+  conditions coming to hold change the screen; when they stop, back to the
+  screen before after `back_after_s` (10), or at once when one of
+  `back_now_when` holds. A swipe keeps the driver's screen; a screen chosen by
+  hand is never taken away; a rule coming to hold takes over from another, and
+  when its wait ends a rule still holding gets its screen back before the
+  driver's. A rule with a condition that will not read is left out whole,
+  with a warning. The shipped parking screen: gear R, back 10 s after or at
+  once above 15 km/h (`auto_screen_reverse`, `auto_screen_conditions`,
+  `auto_screen_none`). studio_tests.js checks the editor's keys, default,
+  operators and gears against AutoScreen.cpp.
 - **Backlight** (screens): `global.brightness_day` and `brightness_night`, in
   percent, held to 2-100 (never quite off: the screen is how its settings are
   reached); defaults 100 and 27 (round) / 31 (cluster), the old fixed 70 and

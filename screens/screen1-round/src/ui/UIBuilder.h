@@ -14,8 +14,10 @@
  *                  temperature, shift light and a row of warning lamps
  *   "gmeter"     — the G-meter: a friction-circle dot
  *   "perf"       — performance timers: 0-100, 80-120, quarter mile
- *   "park"       — parking: the steering wheel as it is turned, shown by
- *                  itself in reverse
+ *   "park"       — parking: the steering wheel as it is turned
+ *
+ * Any screen can come up by itself on conditions of its own (show_when, on the
+ * gear, the speed or any metric) - see AutoScreen.h.
  *   "diag"       — link diagnostics (rate, drops, heap, uptime, GPIO scan)
  *
  * Circular-canvas discipline: every screen owns a 240×240 root container with
@@ -54,6 +56,7 @@
 #include <lvgl.h>
 #include <vector>
 
+#include "AutoScreen.h"
 #include "DriveViews.h"
 #include "PerfTimer.h"
 #include "TelemetryStore.h"
@@ -397,16 +400,13 @@ private:
     /** @brief The performance timers: 0-100, 80-120, quarter mile. */
     void buildPerf(ScreenDef &sd);
     /** @brief The parking screen: the steering wheel (`"metric_id"`, the
-     *         steering angle; `"steer_max"`, `"straight_deg"`), shown by
-     *         itself in reverse unless `"auto_reverse"` is false. */
+     *         steering angle; `"steer_max"`, `"straight_deg"`). */
     void buildPark(ScreenDef &sd, JsonObject cfg);
     /**
-     * @brief The parking screen comes up by itself when reverse is selected,
-     *        and goes back to the screen before it once the car has been out
-     *        of reverse for @ref PARK_BACK_MS or drives off above
-     *        @ref PARK_BACK_KMH - unless the driver swiped meanwhile.
+     * @brief Whether a screen's condition holds now (AutoScreen.h): the gear
+     *        as the gear readout has it, or a metric the display has fresh.
      */
-    void parkAuto(bool reverse, uint32_t now);
+    bool condHolds(const ScreenCond &c);
     /** @brief Feed the timers every tick, whatever screen is up; draw the
      *         G-meter or the timers when theirs is. */
     void updateDrive(uint32_t now, float lerp);
@@ -618,18 +618,7 @@ private:
     std::vector<GMeterView> _gmeters;   /**< Every G-meter screen.           */
     std::vector<PerfView>   _perfViews; /**< Every timer screen.             */
     std::vector<ParkView>   _parks;     /**< Every parking screen.           */
-    /** Out of reverse this long, the parking screen goes back [ms]...      */
-    static constexpr uint32_t PARK_BACK_MS  = 10000;
-    /** ...or at once above this speed [km/h]. */
-    static constexpr float    PARK_BACK_KMH = 15.0f;
-    /** The parking screen that reverse brings up, and where it goes back to. */
-    struct ParkAuto {
-        int      screen  = -1;     /**< The first with auto_reverse; -1 none. */
-        bool     shown   = false;  /**< Up because of reverse, not a swipe.  */
-        size_t   back    = 0;      /**< The screen before it.                */
-        bool     reverse = false;  /**< In reverse at the last tick.         */
-        uint32_t outMs   = 0;      /**< millis() when reverse ended.         */
-    } _parkAuto;
+    AutoScreens             _auto;      /**< Screens that come up by themselves. */
     /** The performance timers: timed on this display from the master's
      *  speed, whichever screen is showing. */
     PerfTimer _perf;

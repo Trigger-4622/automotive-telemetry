@@ -45,6 +45,8 @@ main{padding:18px;max-width:1100px;margin:0 auto}
     outline:1px solid var(--line)}
 #screenList small{color:var(--muted)}
 .btnrow{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.cond{display:flex;gap:6px;align-items:center;margin:6px 0}.cond>select,.cond>input{flex:1 1 0;min-width:0;width:auto;margin:0}
+.cond>button{flex:none}
 button.b{background:var(--panel2);border:1px solid var(--line);
     color:var(--text);padding:6px 12px;border-radius:8px;cursor:pointer;
     font-size:13px}
@@ -53,7 +55,7 @@ button.primary{background:var(--accent);color:#00232b;font-weight:600;
     border:none}
 button.danger{color:var(--crit)}
 label.f{display:block;margin-bottom:8px;font-size:12px;color:var(--muted)}
-label.f input,label.f select{display:block;width:100%;margin-top:3px;
+label.f input,label.f select,.cond>select,.cond>input{display:block;width:100%;margin-top:3px;
     background:var(--panel2);border:1px solid var(--line);color:var(--text);
     padding:7px 9px;border-radius:8px;font-size:13px}
 label.f input[type=color]{padding:2px;height:34px}
@@ -86,7 +88,7 @@ textarea{width:100%;min-height:420px;background:var(--panel2);
 
 /* Native selects still deserve explicit colours: some browsers ignore the
    inherited background on the popup list even with color-scheme set. */
-label.f select option{background:var(--panel);color:var(--text)}
+label.f select option,.cond option{background:var(--panel);color:var(--text)}
 select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
 #toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);
     background:var(--panel);border:1px solid var(--accent);padding:9px 18px;
@@ -484,9 +486,8 @@ const TYPES_ALL={
   hint:'A dot for the car\'s acceleration: up speeding up, down braking, left in a left-hand bend; the inner ring is half the rim. Lateral and longitudinal G come from the master: taught from the stability unit\'s frame (its Signals tab, <b>A corner or a hard stop</b>), or worked out from the speed and the yaw rate.'},
  park:{t:'Parking - the steering wheel',legend:'Wheel',x:[['metric_id','Steering angle','metric','0x1006'],
   ['steer_max','Full lock, either way (°)','num',540,'min="90" max="1080"'],
-  ['straight_deg','STRAIGHT within (°)','num',10,'min="0" max="90"'],
-  ['auto_reverse','Comes up by itself in reverse','check',true]],
-  hint:'The steering wheel as it is turned, an arc from straight ahead to full lock either way, and <b>STRAIGHT</b> in green when the wheels are. In reverse it comes up by itself and goes back to the screen before 10 s after reverse ends, or at once above 15 km/h; a swipe meanwhile keeps the screen you chose. The angle is the master\'s steering angle (0x1006, positive to the left), taught or mapped on its Signals tab.'},
+  ['straight_deg','STRAIGHT within (°)','num',10,'min="0" max="90"']],
+  hint:'The steering wheel as it is turned, an arc from straight ahead to full lock either way, and <b>STRAIGHT</b> in green when the wheels are. The angle is the master\'s steering angle (0x1006, positive to the left), taught or mapped on its Signals tab. To have it come up in reverse, give it the condition <b>Gear is R</b> under <b>Show this screen by itself</b>.'},
  perf:{t:'Performance timers',
   hint:'0-100 km/h, 80-120 km/h and the quarter mile, timed on this display from the master\'s speed (and RPM). Stand still for half a second to arm a standing start; 80-120 times itself whenever the speed passes 80 on the way up. The best times last until the display is switched off.'},
  diag:{t:'Diagnostics',
@@ -561,6 +562,12 @@ function cleanLayout(l){
   }
   return n;
 }
+/* A screen that comes up by itself (AutoScreen.cpp): when all of show_when
+   holds; back to the screen before back_after_s after, or at once when one
+   of back_now_when holds. A condition is {gear} or {metric_id, op, value}. */
+const COND_OPS=[['>','above'],['<','below'],['>=','at least'],['<=','at most'],['==','equal to'],['!=','not']];
+const GEARS=['P','R','N','D','M','1','2','3','4','5','6','7','8','9'];
+const BACK_AFTER=10;
 /* @core-end */
 
 let layout=null, sel=0, cellSel=0, partSel='', curTab='screens', pollTok=0,
@@ -1124,7 +1131,7 @@ function renderEditor(){
       s.type==='chart'?`<p class="hint">${chartWindow(s)}</p>`:''}</fieldset>`;
   }
   if(sp.hint)h+=`<p class="hint">${sp.hint}</p>`;
-  h+=bgHtml(s)+telltaleFieldForScreen(s)+popupFieldForScreen(s);
+  h+=autoHtml(s)+bgHtml(s)+telltaleFieldForScreen(s)+popupFieldForScreen(s);
   $('#editor').innerHTML=h;
 }
 function bgHtml(s){
@@ -1158,6 +1165,53 @@ function popupFieldForScreen(s){
       nothing is just drawn on top while you are on this screen.</span>
     </label></fieldset>`;
 }
+/* Show this screen by itself: its conditions (all must hold), the wait
+   before going back, and what ends the wait at once. */
+function autoHtml(s){
+  const w=Array.isArray(s.show_when)?s.show_when:[];
+  let h=`<fieldset><legend>Show this screen by itself</legend>
+    <p class="hint">When every condition holds, the display changes to this screen; when they stop holding it
+    goes back to the screen before, after the wait. A swipe meanwhile keeps the screen you chose. A value the
+    display has not got holds no condition. Gear counts the reverse switch, the lever's letter and the gear
+    number; <b>equal to</b> compares whole numbers.</p>
+    ${condRows('show_when',w)}
+    <div class="btnrow"><button class="b" onclick="condAdd('show_when')">Add a condition</button></div>`;
+  if(w.length)h+=`<div class="grid2">${fld('Go back after (s)',inp('back_after_s',s.back_after_s??'','number',
+      `data-num="1" min="0" step="any" placeholder="${BACK_AFTER}"`))}</div>
+    <p class="hint">Go back at once, without the wait, when any of these holds:</p>
+    ${condRows('back_now_when',Array.isArray(s.back_now_when)?s.back_now_when:[])}
+    <div class="btnrow"><button class="b" onclick="condAdd('back_now_when')">Add</button></div>`;
+  return h+'</fieldset>';
+}
+function condRows(k,list){
+  return list.map((c,i)=>{
+    c=c&&typeof c==='object'?c:{};
+    const g=c.gear!==undefined,p=`${k}.${i}.`,id=String(c.metric_id||'');
+    const what=`<select onchange="condWhat('${k}',${i},this.value)"><option value="gear" ${g?'selected':''}>Gear</option>${
+      !g&&id&&!KNOWN[id]?`<option value="${esc(id)}" selected>${esc(id)}</option>`:''}${
+      Object.entries(KNOWN).map(([m,n])=>`<option value="${m}" ${!g&&id===m?'selected':''}>${esc(n)}</option>`).join('')}</select>`;
+    const op=c.op??(g?'==':'>');
+    const ops=(g?COND_OPS.filter(o=>o[0]==='=='||o[0]==='!='):COND_OPS).map(([o,t])=>
+      `<option value="${o}" ${op===o?'selected':''}>${g?(o==='=='?'is':'is not'):t}</option>`).join('');
+    const val=g?`<select onchange="setVal('${p}gear',this)">${GEARS.map(x=>
+        `<option value="${x}" ${String(c.gear).toUpperCase()===x?'selected':''}>${x}</option>`).join('')}</select>`
+      :inp(p+'value',c.value??'','number','data-num="1" step="any"');
+    return `<div class="cond">${what}<select onchange="setVal('${p}op',this)">${ops}</select>${val}
+      <button class="b" title="Remove" onclick="condDel('${k}',${i})">✕</button></div>`;
+  }).join('');
+}
+function condAdd(k){
+  const s=scr();if(!Array.isArray(s[k]))s[k]=[];
+  s[k].push(k==='show_when'&&!s[k].length?{gear:'R'}:{metric_id:'0x010D',op:'>',value:k==='show_when'?100:15});
+  renderEditor();
+}
+function condDel(k,i){
+  const s=scr();if(!Array.isArray(s[k]))return;
+  s[k].splice(i,1);
+  if(!s[k].length){delete s[k];if(k==='show_when'){delete s.back_after_s;delete s.back_now_when;}}
+  renderEditor();
+}
+function condWhat(k,i,v){scr()[k][i]=v==='gear'?{gear:'R'}:{metric_id:v,op:'>',value:0};renderEditor();}
 function telltaleFieldForScreen(s){
   if(s.type==='dash')return '';
   const def=!(BOARD==='cluster'&&s.type==='diag');

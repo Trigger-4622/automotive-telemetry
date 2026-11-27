@@ -511,6 +511,8 @@ void UIBuilder::buildScreen(JsonObject cfg) {
                             lv_palette_main(LV_PALETTE_RED),
                             LV_ALIGN_TOP_MID, 0, 10);
     lv_obj_add_flag(sd.linkIcon, LV_OBJ_FLAG_HIDDEN);
+
+    _auto.add(cfg, _screens.size() - 1);       // its show_when, if it has one
 }
 
 /**
@@ -1606,29 +1608,30 @@ void UIBuilder::buildPark(ScreenDef &sd, JsonObject cfg) {
                                          : parseMetricId(cfg["metric_id"]);
     parkBuild(v, sd.root, LCD_WIDTH, LCD_HEIGHT, cfg["steer_max"] | 540.0f,
               cfg["straight_deg"] | 10.0f);
-    if ((cfg["auto_reverse"] | true) && _parkAuto.screen < 0)
-        _parkAuto.screen = (int)_screens.size() - 1;
 }
 
-void UIBuilder::parkAuto(bool reverse, uint32_t now) {
-    ParkAuto &p = _parkAuto;
-    if (p.screen < 0 || _configActive || _calActive) return;
-    if (reverse && !p.reverse && (int)_active != p.screen) {
-        p.back  = _active;
-        p.shown = true;
-        loadScreen((size_t)p.screen, true);
+bool UIBuilder::condHolds(const ScreenCond &c) {
+    if (!c.metric) {
+        // The gear as the readout has it: the reverse switch over everything,
+        // else the lever's letter and the gear number both count ("D" and "3").
+        char a = 0, b = 0;
+        if (reverseEngaged()) {
+            a = 'R';
+        } else {
+            a = (char)gearLever();
+            MetricSample g;
+            if (Telemetry.peek(METRIC_ID_GEAR, g) && (g.flags & METRIC_FLAG_VALID) && !g.stale) {
+                const long n = lroundf(g.raw);
+                b = n < 0 ? 'R' : n == 0 ? 'N' : n <= 9 ? (char)('0' + n) : 0;
+            }
+        }
+        if (!a && !b) return false;                      // no gear known
+        const bool is = c.gear == a || c.gear == b;
+        return c.op == ScreenCond::NE ? !is : is;
     }
-    if (!reverse && p.reverse) p.outMs = now;
-    p.reverse = reverse;
-    if (!p.shown || reverse) return;
-    // Elapsed time, unsigned (right across the millis() wrap).
-    MetricSample sp;
-    const bool away = Telemetry.peek(METRIC_ID_SPEED, sp) && (sp.flags & METRIC_FLAG_VALID) &&
-                      !sp.stale && sp.raw > PARK_BACK_KMH;
-    if (away || now - p.outMs >= PARK_BACK_MS) {
-        p.shown = false;
-        if ((int)_active == p.screen && p.back < _screens.size()) loadScreen(p.back, false);
-    }
+    MetricSample s;
+    if (!Telemetry.peek(c.metric, s) || !(s.flags & METRIC_FLAG_VALID) || s.stale) return false;
+    return screenCondCompare(c.op, s.raw, c.value);
 }
 
 void UIBuilder::updateDrive(uint32_t now, float lerp) {
@@ -1750,7 +1753,10 @@ void UIBuilder::tick() {
     }
 
     // Last: a screen change starts its slide, and the ticks wait for it.
-    parkAuto(reverse || lever == 'R', now);
+    if (!_configActive && !_calActive) {
+        const int to = _auto.tick(_active, now, [this](const ScreenCond &c) { return condHolds(c); });
+        if (to >= 0 && (size_t)to < _screens.size()) loadScreen((size_t)to, (size_t)to > _active);
+    }
 }
 
 bool UIBuilder::sampleOnce(uint16_t id, float lerp, MetricSample &s) {
@@ -2677,14 +2683,14 @@ void UIBuilder::nextScreen() {
     // The BOOT button during the calibration wizard: back to the gauges.
     if (_calActive) { cancelTouchCalibration(); return; }
     if (_configActive || _screens.size() < 2) return;
-    _parkAuto.shown = false;                 // the driver chose: it stays
+    _auto.swiped();                          // the driver chose: it stays
     loadScreen((_active + 1) % _screens.size(), true);
 }
 
 void UIBuilder::prevScreen() {
     if (_calActive) { cancelTouchCalibration(); return; }
     if (_configActive || _screens.size() < 2) return;
-    _parkAuto.shown = false;
+    _auto.swiped();
     loadScreen((_active + _screens.size() - 1) % _screens.size(), false);
 }
 
