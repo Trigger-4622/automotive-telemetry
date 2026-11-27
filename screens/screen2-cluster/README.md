@@ -25,7 +25,7 @@ board loads here unchanged, it just will not use the extra room.
 ## Screen types
 
 Shared with the round board: `arc_gauge`, `meter_gauge`, `quad`, `text_list`,
-`chart`, `diag`, and the two driving screens:
+`chart`, `diag`, and the three driving screens:
 
 - **`gmeter`** — a friction circle: a dot for the car's acceleration (up
   speeding up, down braking, left in a left-hand bend), the rim at `max_g`
@@ -34,8 +34,15 @@ Shared with the round board: `arc_gauge`, `meter_gauge`, `quad`, `text_list`,
   display (`src/ui/PerfTimer.*`) from the master's speed on the master's own
   clock. Stand still for half a second to arm a standing start.
 
-Layout version 3 adds both to an existing layout once, before `diag`;
-deleted in the studio, they stay deleted.
+- **`park`** — the steering wheel as it is turned, an arc from straight ahead
+  to full lock (`steer_max`, 540) and the angle beside it, STRAIGHT in green
+  within `straight_deg` (10). In reverse it comes up by itself and goes back
+  10 s after reverse ends, or at once above 15 km/h, unless you swipe
+  meanwhile (`auto_reverse` false: it never comes up by itself).
+
+Layout version 3 adds the first two to an existing layout once, before `diag`,
+version 4 the parking screen; deleted in the studio, they stay deleted. The
+backlight by day and at night is on the studio's Settings tab.
 
 Added here, because they need the width:
 

@@ -19,6 +19,8 @@
 #include "FwUpdate.h"
 #include "esp_ota_ops.h"
 #include "DriveLog.h"
+#include "RawRec.h"
+#include <array>
 #include "DtcText.h"
 #include "Learner.h"
 #include "MasterConfig.h"
@@ -4639,6 +4641,399 @@ static void scLampRadioLoss() {
     commonChecks();
 }
 
+/* ──────────────────────────── raw bus recording ───────────────────────── */
+
+/** A recording read back, record by record, as master/tools/canrec.py reads it. */
+struct RecFrame { uint64_t tUs; uint32_t id; bool ext, rtr, tx; uint8_t dlc; uint8_t d[8]; uint16_t session; };
+struct RecDecoded {
+    bool header = false, stopped = false;
+    std::string err;                     ///< The first thing that would not decode.
+    std::vector<RecFrame> frames;
+    std::vector<std::array<uint32_t, 4>> events;   ///< type, a, b, session
+    uint32_t lostBuf = 0, lostCtrl = 0, syncs = 0, sessions = 0, stops = 0, dataBytes = 0;
+    std::vector<uint64_t> sessionStart;  ///< Each session's start time [us].
+    std::vector<uint32_t> sessionAt;     ///< ...and where its record is (data offset).
+    std::vector<uint16_t> sessionNo;     ///< ...and its number.
+};
+static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
+
+static RecDecoded decodeRec(const std::vector<uint8_t> &raw) {
+    RecDecoded r;
+    if (raw.size() < 8192 || std::memcmp(raw.data(), "CANREC1\0", 8)) return r;
+    r.header = true;
+    r.stopped = raw[64] == 0;
+    const uint32_t page = le16(&raw[10]), dataOff = le32(&raw[12]), size = le32(&raw[16]);
+    struct Ref { uint32_t id; bool ext, tx; uint8_t dlc; uint8_t d[8]; };
+    std::vector<Ref> refs;
+    uint64_t t = 0;
+    uint16_t session = 0;
+    uint32_t pos = dataOff;
+    auto uleb = [&](uint64_t &v) {
+        v = 0;
+        for (int sh = 0;; sh += 7) {
+            const uint8_t c = raw[pos++];
+            v |= (uint64_t)(c & 0x7F) << sh;
+            if (!(c & 0x80)) return;
+        }
+    };
+    while (pos + page <= size && raw[pos] != 0xFF && r.err.empty()) {
+        const uint32_t end = pos + page;
+        while (pos < end && raw[pos] != 0xFF && r.err.empty()) {
+            const uint32_t at = pos;
+            const uint8_t tag = raw[pos++];
+            uint64_t dt = 0;
+            if (tag == 0xE1) {
+                t = le64(&raw[pos]); session = le16(&raw[pos + 12]); pos += 15; r.syncs++;
+                if ((at - dataOff) % 4096) r.err = fmt("a sync record mid-sector at %u", at);
+            } else if (tag == 0xE2) {
+                t = le64(&raw[pos]); session = le16(&raw[pos + 8]); pos += 11; r.sessions++;
+                refs.clear();
+                r.sessionStart.push_back(t);
+                r.sessionAt.push_back(at - dataOff);
+                r.sessionNo.push_back(session);
+            } else if (tag == 0xE3) {
+                uleb(dt); t += dt * 10;
+                (raw[pos + 2] == 1 ? r.lostBuf : r.lostCtrl) += le16(&raw[pos]);
+                pos += 3;
+            } else if (tag == 0xE4) {
+                uleb(dt); t += dt * 10;
+                r.events.push_back({raw[pos], le16(&raw[pos + 1]), le16(&raw[pos + 3]), session});
+                pos += 5;
+            } else if (tag == 0xE5) {
+                uleb(dt); t += dt * 10; r.stops++;
+            } else if (tag == 0xE0) {
+                uleb(dt); t += dt * 10;
+                RecFrame f = {};
+                const uint8_t fl = raw[pos++];
+                int idx = -1;
+                if (fl & 8) idx = raw[pos++];
+                f.ext = fl & 1; f.rtr = fl & 2; f.tx = fl & 4;
+                if (f.ext) { f.id = le32(&raw[pos]); pos += 4; } else { f.id = le16(&raw[pos]); pos += 2; }
+                f.dlc = raw[pos++];
+                if (!f.rtr) { std::memcpy(f.d, &raw[pos], f.dlc); pos += f.dlc; }
+                f.tUs = t; f.session = session;
+                if (idx >= 0) {
+                    if (idx > (int)refs.size()) { r.err = fmt("index %d out of order at %u", idx, at); break; }
+                    Ref ref = {f.id, f.ext, f.tx, f.dlc, {}};
+                    std::memcpy(ref.d, f.d, 8);
+                    if (idx == (int)refs.size()) refs.push_back(ref); else refs[idx] = ref;
+                }
+                r.frames.push_back(f);
+            } else if (tag < 0xE0) {
+                if (tag >= refs.size()) { r.err = fmt("index %u before its definition at %u", tag, at); break; }
+                uleb(dt); t += dt * 10;
+                Ref &ref = refs[tag];
+                const uint8_t mask = raw[pos++];
+                for (int i = 0; i < ref.dlc; i++) if (mask & (1 << i)) ref.d[i] = raw[pos++];
+                RecFrame f = {};
+                f.tUs = t; f.id = ref.id; f.ext = ref.ext; f.tx = ref.tx; f.dlc = ref.dlc; f.session = session;
+                std::memcpy(f.d, ref.d, 8);
+                r.frames.push_back(f);
+            } else {
+                r.err = fmt("unknown record 0x%02X at %u", tag, at);
+            }
+            if (pos > end) r.err = fmt("a record crosses a page at %u", at);
+        }
+        pos = end;
+    }
+    r.dataBytes = pos - dataOff;
+    return r;
+}
+
+static bool sameFrame(const RecFrame &f, const twai_message_t &m) {
+    const uint8_t dlc = m.data_length_code > 8 ? 8 : m.data_length_code;
+    return f.id == m.identifier && f.ext == (bool)m.extd && f.rtr == (bool)m.rtr && f.dlc == dlc &&
+           (m.rtr || !std::memcmp(f.d, m.data, dlc));
+}
+
+static RawRecState recState() { RawRecStatus s; rawRecStatus(s); return s.state; }
+/** Run until the recorder is in @p want (or @p maxS passes). */
+static bool recWait(RawRecState want, double maxS) {
+    const double until = tNow() + maxS;
+    while (recState() != want && tNow() < until) runUntil(tNow() + 0.05);
+    return recState() == want;
+}
+static bool anyLogsFile() {
+    for (const auto &kv : simfs::files) if (!kv.first.compare(0, 5, "@logs")) return true;
+    return false;
+}
+
+/** The recording as canrec.py should print it (sessions laid end to end a
+ *  second apart), for run.py to compare with the tool's output. */
+static std::string recCandump(const RecDecoded &r) {
+    std::string out;
+    double offset = 0, last = 0;
+    int cur = -1;
+    uint64_t first = 0;
+    size_t sess = 0;
+    for (const auto &f : r.frames) {
+        if (f.session != cur) {
+            cur = f.session;
+            while (sess + 1 < r.sessionStart.size() && sess < f.session - 1u) sess++;
+            first = r.sessionStart.empty() ? f.tUs : r.sessionStart[f.session ? f.session - 1 : 0];
+            offset = out.empty() ? 0.0 : last + 1.0;
+        }
+        const double ts = offset + (double)(f.tUs - first) / 1e6;
+        last = ts;
+        char line[96], data[20] = "";
+        if (f.rtr) snprintf(data, sizeof data, f.dlc ? "R%u" : "R", f.dlc);
+        else for (int i = 0; i < f.dlc; i++) snprintf(data + 2 * i, 3, "%02X", f.d[i]);
+        snprintf(line, sizeof line, "(%.6f) %s %s#%s\n", ts, f.tx ? "tx0" : "can0",
+                 (f.ext ? fmt("%08X", f.id) : fmt("%03X", f.id)).c_str(), data);
+        out += line;
+    }
+    return out;
+}
+
+/**
+ * The whole bus, recorded: armed from the portal with a drive log on the
+ * partition, the erase takes the logs and drive logging stops; a minute of
+ * the simulated car, and every frame the master received - in order, to the
+ * byte, at its time - and every frame it sent are in the recording. A save
+ * asked for meanwhile waits for the end (a block erase would cost frames).
+ */
+static void scRawRecRoundtrip() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_ids":[268,269]})");
+    sim::speedOverride = [](double) { return 0.0; };
+    sim::keepDelivered = true;
+    boot();
+    runUntil(25);
+    LogFileInfo li[4];
+    check(driveLogList(li, 4) >= 1 && anyLogsFile(), "a drive log on the partition before");
+    char why[160] = "";
+    check(rawRecArm(why, sizeof why), "armed", why);
+    check(recWait(RR_RECORDING, 30), "the partition erased, recording");
+    check(simfs::logsErasedBytes >= simfs::logsBytes, "the whole partition erased first",
+          fmt("%llu KB", (unsigned long long)(simfs::logsErasedBytes / 1024)));
+    check(driveLogList(li, 4) == 0 && !anyLogsFile(), "the drive logs went with it");
+    DriveLogStatus ds;
+    driveLogStatus(ds);
+    check(std::strstr(ds.note, "raw") != nullptr, "drive logging off while the recording has the space", ds.note);
+    const int savesBefore = simfs::renames;
+    Cfg.requestSave();
+    const double t0 = tNow();
+    sim::speedOverride = nullptr;                    // the drive
+    runUntil(t0 + 60);
+    check(simfs::renames == savesBefore, "a save asked for meanwhile waits");
+    RawRecStatus st;
+    rawRecStatus(st);
+    const double stopS = tNow();
+    rawRecStop();
+    runUntil(stopS + 1);
+    check(recState() == RR_STOPPED, "stopped");
+    check(simfs::renames > savesBefore, "the save done once it stopped");
+    const RecDecoded r = decodeRec(simfs::logsRawBytes());
+    check(r.header && r.stopped && r.err.empty() && r.stops == 1 && r.sessions == 1,
+          "the recording reads back", r.err.empty() ? fmt("%zu frames", r.frames.size()) : r.err);
+    check(simfs::flashWriteViolations == 0, "no page written twice");
+    check(r.lostBuf == 0 && r.lostCtrl == 0 && st.lost == 0, "nothing lost",
+          fmt("%u buffer, %u controller", r.lostBuf, r.lostCtrl));
+
+    // Every frame the master received, in order, to the byte, at its time.
+    std::vector<const RecFrame *> rx, tx;
+    for (const auto &f : r.frames) (f.tx ? tx : rx).push_back(&f);
+    size_t j = 0, bad = 0, late = 0;
+    if (!rx.empty())
+        while (j < sim::delivered.size() && sim::delivered[j].tUs + 2000 < rx[0]->tUs) j++;
+    const size_t j0 = j;
+    for (const RecFrame *f : rx) {
+        if (j >= sim::delivered.size() || !sameFrame(*f, sim::delivered[j].msg)) { bad++; j++; continue; }
+        const int64_t d = (int64_t)f->tUs - (int64_t)sim::delivered[j].tUs;
+        if (d < -20 || d > 2000) late++;
+        j++;
+    }
+    size_t missing = 0;                               // received before the stop, not recorded
+    for (size_t k = j; k < sim::delivered.size(); k++)
+        if (tOf(sim::delivered[k].tUs) < stopS - 0.01) missing++;
+    check(rx.size() > 20000 && bad == 0 && missing == 0,
+          "every frame received is in it, in order, to the byte",
+          fmt("%zu frames from #%zu, %zu different, %zu missing", rx.size(), j0, bad, missing));
+    check(late == 0, "each at the time it came, to 10 us", fmt("%zu off", late));
+    // And every frame the master sent.
+    size_t k = 0, txBad = 0;
+    while (!tx.empty() && k < sim::transmitted.size() && sim::transmitted[k].tUs + 2000 < tx[0]->tUs) k++;
+    for (const RecFrame *f : tx) {
+        if (k >= sim::transmitted.size() || !sameFrame(*f, sim::transmitted[k].msg)) txBad++;
+        k++;
+    }
+    size_t txAfter = 0;
+    for (size_t q = k; q < sim::transmitted.size(); q++)
+        if (tOf(sim::transmitted[q].tUs) < stopS - 0.01) txAfter++;
+    check(tx.size() > 100 && txBad == 0 && txAfter == 0, "every frame the master sent is in it",
+          fmt("%zu frames, %zu different, %zu missing", tx.size(), txBad, txAfter));
+    const double bpf = (double)r.dataBytes / r.frames.size();
+    check(bpf < 8, "compact: under 8 bytes a frame", fmt("%.2f bytes a frame, %u KB a minute", bpf,
+          (unsigned)(r.dataBytes / 1024)));
+    // For run.py: the tool must read it the same.
+    if (const char *out = getenv("RAWREC_OUT")) {
+        const std::vector<uint8_t> &raw = simfs::logsRawBytes();
+        FILE *f = fopen((std::string(out) + ".bin").c_str(), "wb");
+        if (f) { fwrite(raw.data(), 1, rawRecSize(), f); fclose(f); }
+        f = fopen((std::string(out) + "_expected.log").c_str(), "wb");
+        if (f) { const std::string s = recCandump(r); fwrite(s.data(), 1, s.size(), f); fclose(f); }
+    }
+    commonChecks();
+}
+
+/** A recording made earlier, as the flash holds it: the header, then a session
+ *  with two frames of 0x123 (in full, then the byte that changed). */
+static void craftRecording(bool stopped) {
+    std::vector<uint8_t> &raw = simfs::logsRawBytes();
+    std::fill(raw.begin(), raw.end(), 0xFF);
+    const uint8_t h[] = {'C', 'A', 'N', 'R', 'E', 'C', '1', 0, 1, 0, 0, 1, 0, 0x10, 0, 0};
+    std::memcpy(raw.data(), h, sizeof h);
+    const uint32_t size = (uint32_t)simfs::logsBytes;
+    std::memcpy(raw.data() + 16, &size, 4);
+    raw[20] = 0xF4; raw[21] = 1; raw[22] = raw[23] = 0;           // 500 kbit/s
+    std::memset(raw.data() + 24, 0, 36);
+    std::memcpy(raw.data() + 28, "earlier", 7);
+    if (stopped) raw[64] = 0;
+    const uint8_t d[] = {
+        0xE2, 0x40, 0x42, 0x0F, 0, 0, 0, 0, 0, 1, 0, 1,                 // session 1 at 1 s
+        0xE0, 0x00, 0x08, 0x00, 0x23, 0x01, 8, 1, 2, 3, 4, 5, 6, 7, 8,   // 0x123 in full, index 0
+        0x00, 0x64, 0x01, 0x11,                                          // 1 ms on: byte 0 now 0x11
+        0xE5, 0x00};                                                     // stopped
+    std::memcpy(raw.data() + 4096, d, stopped ? sizeof d : sizeof d - 2);
+    simfs::logsBlank = true;                          // no LittleFS there
+}
+
+/**
+ * Carried on after a restart: a master that boots with a recording on the
+ * partition leaves it alone - the drive logs do not format it (they would, a
+ * partition LittleFS cannot mount) - and goes on recording behind it, on the
+ * next page, as a new session. Restarted again in the same sector, the next
+ * session is numbered after that one, not after the one the sector began with.
+ */
+static void scRawRecResume() {
+    craftRecording(false);
+    const std::vector<uint8_t> before(simfs::logsRawBytes().begin(), simfs::logsRawBytes().begin() + 4096 + 256);
+    sim::keepDelivered = true;
+    boot();
+    runUntil(15);
+    check(recState() == RR_RECORDING, "recording on after the restart");
+    check(simfs::logsFormats == 0, "the partition not formatted by the drive logs");
+    DriveLogStatus ds;
+    driveLogStatus(ds);
+    check(!ds.recording && std::strstr(ds.note, "raw"), "drive logging off", ds.note);
+    const std::vector<uint8_t> &raw = simfs::logsRawBytes();
+    check(std::equal(before.begin(), before.end(), raw.begin()), "what was recorded before untouched");
+    // Restarts in quick succession (each writes its last frames first, as
+    // masterBeforeRestart does): a page or so apart, mostly in one sector.
+    for (int k = 0; k < 3; k++) {
+        rawRecFlush();
+        rawRecBegin();
+        runUntil(tNow() + 0.02);
+    }
+    rawRecStop();
+    check(raw[64] == 0x00, "stopped: the header says so");
+    const RecDecoded r = decodeRec(raw);
+    size_t first = 0, second = 0;
+    for (const auto &f : r.frames) (f.session == 1 ? first : second)++;
+    check(r.err.empty() && r.sessions == 5 && r.sessionAt.size() == 5 && r.sessionAt[1] == 256,
+          "a new session on the next page", r.err.empty() ? fmt("%u sessions, the second at %u", r.sessions,
+          r.sessionAt.size() > 1 ? r.sessionAt[1] : 0) : r.err);
+    std::string nos;
+    for (uint16_t n : r.sessionNo) nos += fmt("%u ", n);
+    check(r.sessionNo == std::vector<uint16_t>({1, 2, 3, 4, 5}), "numbered 1 to 5", nos);
+    bool midSector = false;                           // the case a sector's first record alone got wrong
+    for (size_t i = 2; i + 1 < r.sessionAt.size(); i++)
+        midSector |= r.sessionAt[i] % 4096 && r.sessionAt[i + 1] / 4096 == r.sessionAt[i] / 4096;
+    check(midSector, "(one begun mid-sector, the next in the same sector)");
+    check(first == 2 && r.frames.size() > 2 && r.frames[1].d[0] == 0x11 && second > 5000,
+          "the earlier frames, then this drive's", fmt("%zu + %zu", first, second));
+    commonChecks();
+}
+
+/** Stopped, it stays: a boot neither records nor formats; given back from
+ *  the portal, the partition is the drive logs' again and they record. */
+static void scRawRecStoppedKept() {
+    storedConfig(R"({"log_on":true,"log_hz":10,"log_ids":[268,269]})");
+    craftRecording(true);
+    boot();
+    runUntil(15);
+    check(recState() == RR_STOPPED && simfs::logsWrittenBytes == 0, "a stopped recording is not added to");
+    check(simfs::logsFormats == 0 && !anyLogsFile(), "nor formatted, nor logged into");
+    check(rawRecSize() == 4096 + 256, "offered for download as it was", fmt("%u bytes", rawRecSize()));
+    char why[120] = "";
+    check(rawRecRelease(why, sizeof why), "given back to the drive logs", why);
+    check(recState() == RR_OFF && simfs::logsFormats == 1, "formatted for them");
+    runUntil(40);
+    LogFileInfo li[4];
+    check(driveLogList(li, 4) >= 1, "drive logs again", fmt("%zu", driveLogList(li, 4)));
+    commonChecks();
+}
+
+/** A partition that fills: the recording ends at its last page, whole, and
+ *  what waited for it (a save) happens. */
+static void scRawRecFull() {
+    simfs::logsBytes = 72 * 1024;
+    sim::speedOverride = [](double) { return 0.0; };
+    boot();
+    runUntil(5);
+    char why[120] = "";
+    check(rawRecArm(why, sizeof why) && recWait(RR_RECORDING, 10), "armed", why);
+    sim::speedOverride = nullptr;
+    const int saves = simfs::renames;
+    Cfg.requestSave();
+    check(recWait(RR_FULL, 120), "full", fmt("after %.0f s", tNow()));
+    runUntil(tNow() + 2);
+    const uint64_t written = simfs::logsWrittenBytes;
+    runUntil(tNow() + 10);
+    check(simfs::logsWrittenBytes == written, "nothing written after it is full");
+    const RecDecoded r = decodeRec(simfs::logsRawBytes());
+    check(r.err.empty() && r.dataBytes == 68 * 1024, "every page of it readable",
+          r.err.empty() ? fmt("%u bytes, %zu frames", r.dataBytes, r.frames.size()) : r.err);
+    check(simfs::flashWriteViolations == 0, "no page written twice");
+    check(simfs::renames > saves, "the save that waited is done");
+    commonChecks();
+}
+
+/** No log space on the older partition table; and never while moving (the
+ *  erase leaves the master deaf for up to a minute). */
+static void scRawRecRefused() {
+    simfs::logsPartition = false;
+    sim::speedOverride = [](double) { return 60.0; };
+    boot();
+    runUntil(10);
+    char why[160] = "";
+    const RawRecState st = recState();
+    bool armed = rawRecArm(why, sizeof why);
+    check(st == RR_NONE && !armed && std::strstr(why, "partition table"), "no partition: refused", why);
+    simfs::logsPartition = true;                      // a USB upload later: the partition there
+    rawRecBegin();                                    // (twice: one task all the same)
+    armed = rawRecArm(why, sizeof why);
+    check(recState() == RR_OFF && !armed && std::strstr(why, "moving"), "refused while moving", why);
+    check(simfs::logsErasedBytes == 0, "nothing erased");
+    commonChecks();
+}
+
+/** Frames the controller had to drop (its queue overflowing behind a long
+ *  stall) are in the recording as such, where they happened. */
+static void scRawRecLostMarked() {
+    sim::speedOverride = [](double) { return 0.0; };
+    boot();
+    runUntil(5);
+    char why[120] = "";
+    check(rawRecArm(why, sizeof why) && recWait(RR_RECORDING, 10), "armed", why);
+    twai_status_info_t s0;
+    twai_get_status_info(&s0);
+    sim::faults.rxStallEveryMs = 4000;
+    sim::faults.rxStallMs = 300;                      // ~360 frames for a 64-frame queue
+    runUntil(tNow() + 20);
+    sim::faults.rxStallEveryMs = 0;
+    runUntil(tNow() + 2);
+    twai_status_info_t s1;
+    twai_get_status_info(&s1);
+    rawRecStop();
+    const uint32_t dropped = (s1.rx_missed_count + s1.rx_overrun_count) - (s0.rx_missed_count + s0.rx_overrun_count);
+    const RecDecoded r = decodeRec(simfs::logsRawBytes());
+    check(dropped > 100 && r.err.empty() && r.lostCtrl == dropped && r.lostBuf == 0,
+          "every dropped frame counted in it", fmt("%u dropped, %u in the recording", dropped, r.lostCtrl));
+    commonChecks();
+}
+
 static const Scenario SCENARIOS[] = {
     {"auto", scAuto, 0}, {"silent", scSilent, 0}, {"mode_switch", scModeSwitch, 0},
     {"guard", scGuard, 0}, {"guard_off", scGuardOff, 0}, {"idle_errors", scIdleErrors, 0},
@@ -4718,6 +5113,9 @@ static const Scenario SCENARIOS[] = {
     {"drive_log_full", scDriveLogFull, 0},
     {"log_own_partition", scLogOwnPartition, 0}, {"log_own_full", scLogOwnFull, 0},
     {"log_old_table", scLogOldTable, 0}, {"log_move_old", scLogMoveOld, 0},
+    {"rawrec_roundtrip", scRawRecRoundtrip, 0}, {"rawrec_resume", scRawRecResume, 0},
+    {"rawrec_stopped_kept", scRawRecStoppedKept, 0}, {"rawrec_full", scRawRecFull, 0},
+    {"rawrec_refused", scRawRecRefused, 0}, {"rawrec_lost_marked", scRawRecLostMarked, 0},
     {"log_move_cut", scLogMoveCut, 0}, {"log_move_fails", scLogMoveFails, 0},
     {"fw_update", scFwUpdate, 0}, {"fw_update_moving", scFwUpdateMoving, 0},
     {"fw_update_wrong_image", scFwUpdateWrongImage, 0}, {"fw_update_cut", scFwUpdateCut, 0},

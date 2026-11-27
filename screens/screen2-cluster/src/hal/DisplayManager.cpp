@@ -152,7 +152,7 @@ void DisplayManager::begin() {
     // Backlight. Arduino_GFX has no light driver, so LEDC is driven directly.
     ledcSetup(BL_LEDC_CHANNEL, LCD_BL_PWM_FREQ, BL_LEDC_BITS);
     ledcAttachPin(PIN_LCD_BL, BL_LEDC_CHANNEL);
-    setBrightness(BRIGHTNESS_DAY);
+    setBrightness(Config.backlightLevel(false));   // Config.begin() came first
     setCalibration(Config.colorGainR(), Config.colorGainG(), Config.colorGainB());
 
     lv_init();

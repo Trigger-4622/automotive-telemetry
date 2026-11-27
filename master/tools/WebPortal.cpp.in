@@ -20,6 +20,7 @@
 #include "DiagCodes.h"
 #include "FwUpdate.h"
 #include "DriveLog.h"
+#include "RawRec.h"
 #include "Learner.h"
 #include "MasterConfig.h"
 #include "MasterTelemetry.h"
@@ -608,6 +609,7 @@ void WebPortal::setupRoutes() {
         doc["own"]     = st.own;
         doc["part_kb"] = st.partKb;
         doc["note"]    = st.note;
+        doc["raw"]     = rawRecOwnsPartition();
         JsonArray fa = doc["files"].to<JsonArray>();
         for (size_t i = 0; i < n; i++) {
             JsonObject o = fa.add<JsonObject>();
@@ -640,6 +642,67 @@ void WebPortal::setupRoutes() {
         else s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
     });
     s_server.on("/api/log/clear", HTTP_POST, []() { driveLogDeleteAll(); sendOk(); });
+
+    /*
+     * The raw bus recording (RawRec): every frame to the logs partition, for
+     * analysis off the car (master/tools/canrec.py makes a candump log of the
+     * download). Arming erases the partition, drive logs and all.
+     */
+    s_server.on("/api/rawrec", HTTP_GET, []() {
+        static const char *const STATE[] = {"none", "off", "erasing", "recording", "full", "stopped"};
+        RawRecStatus st;
+        rawRecStatus(st);
+        JsonDocument d;
+        d["state"]   = STATE[st.state < 6 ? st.state : 0];
+        d["used"]    = st.used;
+        d["cap"]     = st.cap;
+        d["frames"]  = st.frames;
+        d["tx"]      = st.txFrames;
+        d["lost"]    = st.lost;
+        d["session"] = st.session;
+        d["rate"]    = st.rate;
+        d["erase"]   = st.erasePct;
+        d["size"]    = rawRecSize();
+        d["note"]    = st.note;
+        sendJson(d);
+    });
+    s_server.on("/api/rawrec/arm", HTTP_POST, []() {
+        char why[120] = "";
+        if (rawRecArm(why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = why;
+        sendJson(d, 409);
+    });
+    s_server.on("/api/rawrec/stop", HTTP_POST, []() { rawRecStop(); sendOk(); });
+    s_server.on("/api/rawrec/release", HTTP_POST, []() {
+        char why[120] = "";
+        if (rawRecRelease(why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = why;
+        sendJson(d, 409);
+    });
+    // The header sector and every record so far, read 2 KB at a time (from
+    // the heap for the length of the download).
+    s_server.on("/api/rawrec/file", HTTP_GET, []() {
+        rawRecFlush();
+        const uint32_t size = rawRecSize();
+        uint8_t *buf = size ? (uint8_t *)malloc(2048) : nullptr;
+        if (!buf) {
+            s_server.send(size ? 503 : 404, "application/json",
+                          size ? "{\"error\":\"no memory for the download\"}" : "{\"error\":\"no recording\"}");
+            return;
+        }
+        s_server.sendHeader("Content-Disposition", "attachment; filename=\"canrec.bin\"");
+        s_server.setContentLength(size);
+        s_server.send(200, "application/octet-stream", "");
+        WiFiClient client = s_server.client();
+        for (uint32_t at = 0; at < size && client.connected();) {
+            const size_t n = size - at < 2048 ? size - at : 2048;
+            if (!rawRecRead(at, buf, n) || client.write(buf, n) != n) break;
+            at += n;
+        }
+        free(buf);
+    });
 
     s_server.on("/api/evlog/clear", HTTP_POST, []() { masterEventLogClear(); sendOk(); });
 

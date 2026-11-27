@@ -27,9 +27,12 @@ trouble codes (shown with their meaning in its portal and on the screens'
 check-engine card, with a Clear button in the portal), the VIN and calibration
 ID (what RomRaider's definitions are listed by), counts down to the next oil
 change from the odometer, records chosen values to its flash at up to 20 Hz
-(downloaded from the portal as CSV), and gives the screens lateral and
-longitudinal G for a G-meter. The screens time 0-100 km/h, 80-120 km/h and the
-quarter mile themselves.
+(downloaded from the portal as CSV) - or, for analysis off the car, every
+frame on the bus (`master/tools/canrec.py` makes a candump log of it) - and
+gives the screens lateral and longitudinal G for a G-meter. The screens time
+0-100 km/h, 80-120 km/h and the quarter mile themselves, show the steering
+wheel by themselves in reverse, and take their day and night backlight from
+the studio.
 
 ## Build and flash
 

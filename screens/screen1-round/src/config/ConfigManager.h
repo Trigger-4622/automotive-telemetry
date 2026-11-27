@@ -177,9 +177,27 @@ public:
     const char *dayBg()    { return _layout["global"]["day_bg"]   | "#101418"; }
     /** @return Night-mode screen background, "#RRGGBB". */
     const char *nightBg()  { return _layout["global"]["night_bg"] | "#000000"; }
+    /** @return The backlight in day mode [%, 2-100]. */
+    uint8_t brightnessDay() {
+        const int v = _layout["global"]["brightness_day"] | BRIGHTNESS_DAY_PCT;
+        return (uint8_t)pctOf(v);
+    }
+    /** @return The backlight in night mode [%, 2-100]. */
+    uint8_t brightnessNight() {
+        const int v = _layout["global"]["brightness_night"] | BRIGHTNESS_NIGHT_PCT;
+        return (uint8_t)pctOf(v);
+    }
+    /** @return The backlight's level (0-255) for day or night mode. */
+    uint8_t backlightLevel(bool night) { return levelOf(night ? brightnessNight() : brightnessDay()); }
+    /** @return A percentage as the backlight's level, 0-255. */
+    static uint8_t levelOf(int pct) { return (uint8_t)((pctOf(pct) * 255 + 50) / 100); }
     /** @} */
 
 private:
+    /** A backlight percentage, 2-100: never quite off (the screen is how the
+     *  settings are reached), never more than full. */
+    static int pctOf(int v) { return v < 2 ? 2 : v > 100 ? 100 : v; }
+
     /**
      * @brief Parse `/layout.json` into @ref _layout.
      * @return false when the file is missing, malformed, or has no screens.

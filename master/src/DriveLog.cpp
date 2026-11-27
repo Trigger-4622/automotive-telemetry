@@ -14,6 +14,7 @@
 
 #include "MasterConfig.h"
 #include "MasterTelemetry.h"
+#include "RawRec.h"
 
 static constexpr const char *DIR      = "/log";
 static constexpr size_t   BUF_BYTES   = 4096;     /**< Written when this full…  */
@@ -37,6 +38,9 @@ static constexpr size_t      OWN_RESERVE   = 32 * 1024;  /**< LittleFS's working
 static fs::LittleFSFS  s_logFs;
 static fs::LittleFSFS *s_fs  = &LittleFS;  /**< The logs' file system (one of the two). */
 static bool            s_own = false;      /**< On their own partition.                 */
+/** A raw bus recording has the logs partition (RawRec.h): the logger is off,
+ *  and nothing here touches a file system until it is given back. */
+static volatile bool   s_off = false;
 
 static size_t   reserve()  { return s_own ? OWN_RESERVE : RESERVE; }
 /** @brief The space the logs may take: log_max_kb, and on the settings
@@ -257,7 +261,7 @@ static void moveOldLogsLocked() {
 static void logTask(void *) {
     masterWatchStack("drivelog");
     xSemaphoreTake(s_mx, portMAX_DELAY);
-    moveOldLogsLocked();
+    if (!s_off) moveOldLogsLocked();
     xSemaphoreGive(s_mx);
     uint32_t session = 0;
     bool wasAlive = false;
@@ -269,6 +273,10 @@ static void logTask(void *) {
         wasAlive = alive;
 
         xSemaphoreTake(s_mx, portMAX_DELAY);
+        if (s_off) {
+            xSemaphoreGive(s_mx);
+            continue;
+        }
         if (!Cfg.logOn || !alive) {
             closeLocked(!Cfg.logOn ? "switched off" : "the car went off");
         } else {
@@ -309,6 +317,14 @@ static void logTask(void *) {
  * formats only a partition it found and could not mount.
  */
 static void mountOwn() {
+    if (rawRecOwnsPartition()) {
+        // A raw recording: mounted, LittleFS would find no file system there
+        // and format it - the recording gone.
+        s_off = true;
+        s_own = true;
+        log_i("log: drive logs off - a raw bus recording has the logs partition");
+        return;
+    }
     bool ok = false;
     for (int i = 0; i < 3 && !ok; i++) ok = s_logFs.begin(false, LOG_MOUNT, 4, LOG_LABEL);
     if (!ok) {
@@ -331,10 +347,10 @@ void driveLogBegin() {
     xTaskCreatePinnedToCore(logTask, "drivelog", 6144, nullptr, 2, nullptr, 0);
 }
 
-File driveLogOpen(const char *path) { return s_fs->open(path, "r"); }
+File driveLogOpen(const char *path) { return s_off ? File() : s_fs->open(path, "r"); }
 
 size_t driveLogList(LogFileInfo *out, size_t max) {
-    if (!s_mx) return 0;
+    if (!s_mx || s_off) return 0;
     xSemaphoreTake(s_mx, portMAX_DELAY);
     std::vector<Entry> v = scan();
     size_t n = 0;
@@ -365,7 +381,7 @@ size_t driveLogList(LogFileInfo *out, size_t max) {
 }
 
 bool driveLogPath(const char *name, char *path, size_t cap) {
-    if (!plainName(name)) return false;
+    if (s_off || !plainName(name)) return false;
     snprintf(path, cap, "%s/%s", DIR, name);
     return s_fs->exists(path);
 }
@@ -373,7 +389,7 @@ bool driveLogPath(const char *name, char *path, size_t cap) {
 void driveLogFlush() {
     if (!s_mx) return;
     xSemaphoreTake(s_mx, portMAX_DELAY);
-    flushLocked();
+    if (!s_off) flushLocked();
     xSemaphoreGive(s_mx);
 }
 
@@ -391,6 +407,7 @@ bool driveLogDelete(const char *name) {
 void driveLogDeleteAll() {
     if (!s_mx) return;
     xSemaphoreTake(s_mx, portMAX_DELAY);
+    if (s_off) { xSemaphoreGive(s_mx); return; }
     closeLocked("deleted");
     for (const auto &e : scan()) {
         char p[24];
@@ -406,6 +423,11 @@ void driveLogStatus(DriveLogStatus &out) {
     out.on = Cfg.logOn;
     out.capKb = capBytes() / 1024;
     out.own = s_own;
+    if (s_off) {
+        out.capKb = 0;
+        strlcpy(out.note, "off: a raw bus recording has the log space (Bus tab)", sizeof out.note);
+        return;
+    }
     out.partKb = (uint32_t)(s_fs->totalBytes() / 1024);
     if (!s_mx) return;
     xSemaphoreTake(s_mx, portMAX_DELAY);
@@ -417,5 +439,37 @@ void driveLogStatus(DriveLogStatus &out) {
     out.freeKb = total > used ? (uint32_t)((total - used) / 1024) : 0;
     out.flushes = s_flushes;
     strlcpy(out.note, s_note, sizeof out.note);
+    xSemaphoreGive(s_mx);
+}
+
+void driveLogRelease() {
+    if (!s_mx) return;
+    xSemaphoreTake(s_mx, portMAX_DELAY);
+    if (!s_off) {
+        closeLocked("a raw recording takes the log space");
+        if (s_fs == &s_logFs) s_logFs.end();
+        s_off = true;
+        log_i("log: drive logs off - the logs partition goes to a raw bus recording");
+    }
+    xSemaphoreGive(s_mx);
+}
+
+void driveLogReclaim() {
+    if (!s_mx) return;
+    xSemaphoreTake(s_mx, portMAX_DELAY);
+    if (s_off) {
+        masterBusStall();                    // the format writes the flash
+        if (s_logFs.begin(true, LOG_MOUNT, 4, LOG_LABEL)) {
+            s_fs = &s_logFs;
+            s_own = true;
+            s_off = false;
+            s_full = false;
+            s_note[0] = '\0';
+            log_i("log: the logs partition is the drive logs' again (%u KB)",
+                  (unsigned)(s_logFs.totalBytes() / 1024));
+        } else {
+            log_e("log: the logs partition would not format - drive logs stay off");
+        }
+    }
     xSemaphoreGive(s_mx);
 }

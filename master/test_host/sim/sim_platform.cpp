@@ -14,9 +14,11 @@
 
 #include "Arduino.h"
 #include "LittleFS.h"
+#include <algorithm>
 #include <cstring>
 #include "Update.h"
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "MasterPacket.h"
 #include "WebPortal.h"
 #include "WiFi.h"
@@ -318,6 +320,13 @@ bool   logsBlank = true;                       // as it is after the update: nev
 int    logsMountFails = 0;
 int    logsFormats = 0;
 size_t logsBytes = 8192 * 1024;
+std::vector<uint8_t> logsRaw;
+int    flashWriteViolations = 0;
+uint64_t logsErasedBytes = 0, logsWrittenBytes = 0;
+std::vector<uint8_t> &logsRawBytes() {
+    if (logsRaw.size() != logsBytes) logsRaw.assign(logsBytes, 0xFF);
+    return logsRaw;
+}
 std::string logKey(const std::string &path) { return "@logs" + path; }
 size_t usedBytesOf(const std::string &prefix) {
     size_t n = 2 * 4096;                       // superblocks
@@ -359,6 +368,11 @@ bool LittleFSFS::begin(bool formatOnFail, const char *, uint8_t, const char *lab
         for (auto it = simfs::files.begin(); it != simfs::files.end();)
             it = it->first.compare(0, 5, "@logs") == 0 ? simfs::files.erase(it) : std::next(it);
         simfs::logsBlank = false;
+        {   // its superblock, where a raw recording's header would be
+            std::vector<uint8_t> &raw = simfs::logsRawBytes();
+            std::fill(raw.begin(), raw.begin() + 8192, 0xFF);
+            std::memcpy(raw.data() + 8, "littlefs", 8);
+        }
         return true;
     }
     _pfx.clear();
@@ -513,3 +527,48 @@ WebPortal Portal;
 void WebPortal::begin() { _running = true; }
 void WebPortal::loop() {}
 void WebPortal::setupRoutes() {}
+
+/* ═══════════════════════ raw partition access ═══════════════════════════ */
+
+static esp_partition_t s_logsPart = {"logs", 0x800000, 0};
+
+const esp_partition_t *esp_partition_find_first(esp_partition_type_t, esp_partition_subtype_t,
+                                                const char *label) {
+    if (!label || std::strcmp(label, "logs") || !simfs::logsPartition) return nullptr;
+    s_logsPart.size = (uint32_t)simfs::logsBytes;
+    return &s_logsPart;
+}
+
+esp_err_t esp_partition_read(const esp_partition_t *p, size_t off, void *dst, size_t n) {
+    if (p != &s_logsPart || off + n > simfs::logsBytes) return ESP_ERR_INVALID_ARG;
+    std::memcpy(dst, simfs::logsRawBytes().data() + off, n);
+    return ESP_OK;
+}
+
+esp_err_t esp_partition_write(const esp_partition_t *p, size_t off, const void *src, size_t n) {
+    if (p != &s_logsPart || off + n > simfs::logsBytes) return ESP_ERR_INVALID_ARG;
+    std::vector<uint8_t> &raw = simfs::logsRawBytes();
+    const uint8_t *s = (const uint8_t *)src;
+    for (size_t i = 0; i < n; i++) {
+        if ((raw[off + i] & s[i]) != s[i]) simfs::flashWriteViolations++;
+        raw[off + i] &= s[i];
+    }
+    simfs::logsWrittenBytes += n;
+    return ESP_OK;
+}
+
+esp_err_t esp_partition_erase_range(const esp_partition_t *p, size_t off, size_t n) {
+    if (p != &s_logsPart || off % 4096 || n % 4096 || off + n > simfs::logsBytes) return ESP_ERR_INVALID_ARG;
+    std::vector<uint8_t> &raw = simfs::logsRawBytes();
+    std::fill(raw.begin() + off, raw.begin() + off + n, 0xFF);
+    simfs::logsErasedBytes += n;
+    if (off < 8192) {
+        // LittleFS's superblocks are gone: it has nothing to mount there now.
+        simfs::logsBlank = true;
+        for (auto it = simfs::files.begin(); it != simfs::files.end();)
+            it = it->first.compare(0, 5, "@logs") == 0 ? simfs::files.erase(it) : std::next(it);
+        for (auto it = simfs::dirs.begin(); it != simfs::dirs.end();)
+            it = it->compare(0, 5, "@logs") == 0 ? simfs::dirs.erase(it) : std::next(it);
+    }
+    return ESP_OK;
+}

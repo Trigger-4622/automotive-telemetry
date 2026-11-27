@@ -127,8 +127,10 @@
 #define UI_UPDATE_PERIOD_MS       30   /**< Gauge value/lerp update cadence   */
 #define UI_SWEEP_UP_MS           700   /**< Boot needle sweep: min → max      */
 #define UI_SWEEP_DOWN_MS         500   /**< Boot needle sweep: max → min      */
-#define BRIGHTNESS_DAY           255   /**< Backlight level, day mode (0-255) */
-#define BRIGHTNESS_NIGHT          70   /**< Backlight level, night mode       */
+/* The backlight in day and night mode [% of full]: the defaults of the
+ * layout's global.brightness_day / brightness_night (Gauge Studio, Settings). */
+#define BRIGHTNESS_DAY_PCT       100
+#define BRIGHTNESS_NIGHT_PCT      27   /* 70 of 255 before it was a setting */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  CONFIGURATION ACCESS POINT (Gauge Studio)

@@ -26,6 +26,7 @@ python master/test_qemu/run.py --ota                # ...a Wi-Fi firmware update
 python master/test_qemu/run.py --settings cfg.json --upload   # ...the portal's settings upload at falling free heap, now and as it was
 python master/tools/build_portal.py           # after editing master/tools/portal_page.html or WebPortal.cpp.in
 python master/tools/known_catalogue.py        # after adding metric IDs to MasterPacket.h
+python master/tools/canrec.py canrec.bin [--events]   # a raw bus recording (portal Bus tab) -> candump log
 ```
 
 The harnesses are the only way to exercise the firmware's logic without
@@ -309,7 +310,9 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   car config (~20 KB of JSON, ~30 KB in ArduinoJson; 35 KB for the car's
   45 signals); out of memory it used to write the truncated document as a
   valid file (learned signals gone), now it writes nothing
-  (`config_save_out_of_memory`). A settings upload (the page's Save and
+  (`config_save_out_of_memory`). The raw recorder takes 16 KB while it
+  records: carried on at boot, before the learner sizes its tables; armed
+  from the portal, out of that reserve. A settings upload (the page's Save and
   Upload, POST `/api/config`, sent as a form's file) goes to the flash as it
   arrives (`/cfg_upload.json`) and is parsed from there, its document freed
   before the save's (`MasterConfig::applyFile`, `config_upload_file`): held
@@ -480,7 +483,7 @@ before, once confirmed. The screens flash both arrows while `METRIC_ID_HAZARD`
 is on - following each side's own bit when it flashes, in step by themselves
 when it does not (`lamp_hazard_switch`).
 
-## Codes, oil change, G-meter, drive log, timers
+## Codes, oil change, G-meter, drive log, raw recording, timers, parking, backlight
 
 - **Trouble codes** (`master/src/DiagCodes.*`): services 03/07/0A from the
   ECM (0x7E0) and TCM (0x7E1, through 0x7DF with flow control to 0x7E1 if it
@@ -516,7 +519,35 @@ when it does not (`lamp_hazard_switch`).
   settings saves (`log_old_table`, `drive_log_full`). Oldest deleted first
   (one open for a download will not delete and is passed over), 4 KB writes
   announced with `masterBusStall()`; the portal converts to CSV (`tlgToCsv`).
-  The QEMU test has a 1.9 MB `logs` partition (8 MB with `--ota`).
+  The QEMU test has a 1.9 MB `logs` partition (8 MB with `--ota`). Off while
+  a raw recording has the partition (below).
+- **Raw bus recording** (master, `master/src/RawRec.*`; portal Bus tab, Raw
+  recording; `/api/rawrec`, `/arm`, `/stop`, `/release`, `/file`): every frame
+  received and every one the master sends (`masterTransmit`) to the `logs`
+  partition, for analysis off the car; `master/tools/canrec.py` turns the
+  download into a candump log (the master's frames on `tx0`) and lists the
+  identifiers, losses and events. Arming erases the whole 8 MB - the drive
+  logs with it - and is refused while moving (each 64 KB erase holds the CAN
+  interrupt off; `masterBusStall()` before each); drive logging is off while
+  the recorder has the partition (`driveLogRelease`/`driveLogReclaim`; a boot
+  then never mounts or formats it). Recording only programs 256-byte pages,
+  from a 12 KB ring, in its own task (started before `learnerBegin()`; ring
+  and the 224-entry index from the heap, 16 KB, only while it records):
+  records never cross a page, a sync record starts every 4 KB sector, a
+  frame is stored as the bytes that changed since its identifier's last (the
+  master's own too: 6.2 bytes a frame in the simulator, about 20 minutes of
+  this car's ~1,250 frames/s), the controller's drops and the ring's are
+  recorded where they happened, and so are the evidence log's events. It
+  goes on across sleeps and restarts, each a new session after the last
+  page, until stopped (a byte in the header), full, or given back. Meanwhile
+  what the master saves by itself (`Cfg.serviceSave()`, `evService()`) waits
+  - a sector erase would cost frames - until the recording ends or the next
+  sleep or restart; a Save from the portal is made at once. The format is at
+  the top of RawRec.h. Scenarios `rawrec_*`; run.py checks canrec.py against
+  the firmware's own reading of `rawrec_roundtrip`'s recording, frame for
+  frame. Not tried on the board: the frames a page program costs (the
+  simulator has no flash timing), the erase's minute, the download over the
+  AP.
 - **Firmware update over Wi-Fi** (master only, `master/src/FwUpdate.*`;
   portal Settings > Device, `/api/update`): the upload goes into the spare
   app slot (app0/app1; a USB upload always writes app0 and resets otadata to
@@ -541,7 +572,26 @@ when it does not (`lamp_hazard_switch`).
   the AP, the frames each flash write costs.
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
-  stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once.
+  stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once,
+  version 4 the `park` screen.
+- **Parking screen** (screens, `park`; `parkBuild`/`parkUpdate` in the shared
+  DriveViews): the steering wheel turned as the driver has it (`metric_id`,
+  default the steering angle 0x1006, ISO 8855: positive to the left), an arc
+  from straight ahead to full lock either way (`steer_max`, 540), the angle
+  and LEFT or RIGHT, STRAIGHT in green within `straight_deg` (10). With
+  `auto_reverse` (on) reverse - `METRIC_ID_REVERSE` or the lever's R - brings
+  the first such screen up, and it goes back to the screen before
+  `PARK_BACK_MS` (10 s) after reverse ends - not while shuffling R-D-R - or
+  at once above `PARK_BACK_KMH` (15 km/h); a swipe meanwhile keeps the
+  driver's screen (`park_screen`, `park_auto_reverse`, `park_auto_off`).
+  Layout version 4 adds it once, before `diag` (`migrate_v3_layout`). LVGL
+  heap: 2.3 KB on the round board, 2.8 KB on the cluster.
+- **Backlight** (screens): `global.brightness_day` and `brightness_night`, in
+  percent, held to 2-100 (never quite off: the screen is how its settings are
+  reached); defaults 100 and 27 (round) / 31 (cluster), the old fixed 70 and
+  80 of 255 (`BRIGHTNESS_*_PCT` in HardwareConfig.h,
+  `ConfigManager::backlightLevel`). The studio's sliders show a level on the
+  display as they move (POST `/api/backlight`, not stored; `backlight_levels`).
 
 ## Open items
 

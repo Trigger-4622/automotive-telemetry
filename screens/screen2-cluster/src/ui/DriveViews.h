@@ -1,7 +1,8 @@
 /**
  * @file DriveViews.h
- * @brief Two driving screens: the G-meter (a friction-circle dot) and the
- *        performance timers (0-100, 80-120, quarter mile).
+ * @brief Three driving screens: the G-meter (a friction-circle dot), the
+ *        performance timers (0-100, 80-120, quarter mile) and the parking
+ *        screen (the steering wheel as the driver has it turned).
  *
  * Shared by both displays (identical, scripts/check_sync.py): each lays out
  * in whatever area its UIBuilder gives it - the round board's circle, the
@@ -60,3 +61,35 @@ void perfBuild(PerfView &v, lv_obj_t *parent, int w, int h);
  * @param speedKnown A speed is arriving at all.
  */
 void perfUpdate(PerfView &v, const PerfTimer &p, uint32_t masterNow, bool speedKnown);
+
+/** @brief The parking screen's widgets and what they show now. */
+struct ParkView {
+    uint16_t  metric = 0;              /**< The steering angle's metric.        */
+    lv_obj_t *rim = nullptr, *lock = nullptr;
+    lv_obj_t *line[4] = {};            /**< Three spokes, then the top stripe.  */
+    lv_point_t *pts = nullptr;         /**< Their ends (LVGL keeps the address). */
+    lv_obj_t *value = nullptr, *word = nullptr;
+    int       cx = 0, cy = 0, r = 0;   /**< The wheel, in the parent.           */
+    int       hub = 0;                 /**< Where the spokes start.             */
+    float     steerMax = 540;          /**< Full lock, either way [deg].        */
+    float     straight = 10;           /**< "Straight" within this [deg].       */
+    int16_t   lastDeg = INT16_MIN;
+    int8_t    lastSide = 2;            /**< 1 left, -1 right, 0 straight.       */
+    bool      lastOk = true;
+    char      lastValue[12] = "", lastWord[24] = "";
+};
+
+/**
+ * @brief Build the parking screen in @p parent (w x h px): the steering wheel,
+ *        turned as the driver has it, an arc from straight ahead to full lock,
+ *        the angle, and which way - or STRAIGHT, in green, within
+ *        @p straightDeg of the centre.
+ * @param steerMax Full lock either way [deg] (the arc's ends).
+ */
+void parkBuild(ParkView &v, lv_obj_t *parent, int w, int h, float steerMax, float straightDeg);
+/**
+ * @brief Turn the wheel. ISO 8855 signs, as the master sends the angle:
+ *        positive is to the left (the wheel turns anticlockwise).
+ * @param ok Whether the angle is known; if not, "--" and no wheel position.
+ */
+void parkUpdate(ParkView &v, float deg, bool ok);

@@ -186,7 +186,7 @@ for (const r of rows) {
   for (const v of d)
     ok(typeof v === 'number' ? Math.abs(v - r.def) < 1e-9 : v === r.def,
        `row ${r.k}: the page's default ${JSON.stringify(r.def)} is not the firmware's ${JSON.stringify(v)}`);
-  const kinds = { boolean: ['check'], number: ['num', 'gain'], string: ['text', 'select', 'color'] };
+  const kinds = { boolean: ['check'], number: ['num', 'gain', 'level'], string: ['text', 'select', 'color'] };
   ok((kinds[typeof r.def] || []).includes(r.kind), `row ${r.k}: a ${typeof r.def} shown as "${r.kind}"`);
   if (r.kind === 'select') ok(r.opts.some(o => o[0] === r.def), `row ${r.k}: its default is not one of its options`);
 }
@@ -219,7 +219,8 @@ const literal = (src, k) => src.includes('"' + k + '"');
 const BUILD = {
   arc_gauge: ['buildArcGauge'], meter_gauge: ['buildMeterGauge'], quad: ['buildQuad'],
   text_list: ['buildTextList'], bars: ['buildBars'], cluster: ['buildCluster'], chart: ['buildChart'],
-  dash: ['buildDash', 'dashPart'], gmeter: ['buildGMeter'], perf: ['buildPerf'], diag: ['buildDiag'],
+  dash: ['buildDash', 'dashPart'], gmeter: ['buildGMeter'], perf: ['buildPerf'], park: ['buildPark'],
+  diag: ['buildDiag'],
 };
 const COMMON = ['UIBuilder::buildScreen', 'UIBuilder::applyBackground', 'UIBuilder::parseCommon',
                 'UIBuilder::parseThreshold', 'screenTitle'];

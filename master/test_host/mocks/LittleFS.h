@@ -37,6 +37,14 @@ extern bool   logsBlank;         ///< Never formatted: the first boot after the 
 extern int    logsMountFails;    ///< Mounts that fail before one works.
 extern int    logsFormats;       ///< Formats of it - each erases every log.
 extern size_t logsBytes;         ///< Its size (8 MB).
+/** Its bytes, as esp_partition_* sees them (allocated on first use, erased:
+ *  0xFF). Only the raw recorder writes them; LittleFS's files stay in the map
+ *  above, and its format leaves a superblock mark at offset 0. */
+extern std::vector<uint8_t> logsRaw;
+std::vector<uint8_t> &logsRawBytes();
+extern int    flashWriteViolations;   ///< Writes that would have set a cleared bit.
+extern uint64_t logsErasedBytes;      ///< Erased through esp_partition_erase_range.
+extern uint64_t logsWrittenBytes;     ///< Written through esp_partition_write.
 std::string logKey(const std::string &path);   ///< "/log/00001.tlg" there.
 size_t usedBytesOf(const std::string &prefix); ///< "" = the settings partition.
 /** @} */
@@ -73,6 +81,7 @@ public:
      *  "logs" the drive logs' own (see simfs::logsPartition). */
     bool begin(bool formatOnFail = false, const char *basePath = "/littlefs",
                uint8_t maxOpenFiles = 10, const char *partitionLabel = "spiffs");
+    void end() {}
     File open(const char *path, const char *mode = "r");
     bool exists(const char *path);
     bool remove(const char *path);

@@ -68,11 +68,12 @@ in USB still enters the ROM bootloader.
 
 Gauge Studio has five tabs. **Screens**: add, order and edit screens (the dash,
 arc gauges, needle tachometers, 2/4-way splits, text lists, trend charts, the
-G-meter, the performance timers, diagnostics) with a live circular preview -
+G-meter, the performance timers, the parking screen, diagnostics) with a live circular preview -
 each type offers only what it draws, and its background (texture, gradient,
 image, bezel). **Lamps**: the warning lamps and their strip. **Watchdog**:
-values guarded on every screen. **Settings**: display, alerts, the master and
-network, the side button - each setting in one place. **Device**: the
+values guarded on every screen. **Settings**: display (with the backlight by
+day and at night, shown on the display as its slider moves), alerts, the
+master and network, the side button - each setting in one place. **Device**: the
 display's figures, live telemetry, background images (LVGL `.bin`) and the
 layout file, to keep a copy or open one. Save sends the layout as a file,
 which the display writes to flash as it arrives and only then reads.
@@ -83,6 +84,11 @@ friction circle (up speeding up, down braking, left in a left-hand bend; rim
 display, from the master's speed on the master's clock: stand still for half a
 second to arm a standing start; 80-120 times itself whenever the speed passes
 80 on the way up. Layout version 3 adds both to an existing layout once.
+`park` shows the steering wheel as it is turned, an arc from straight ahead to
+full lock (`steer_max`) and STRAIGHT in green within `straight_deg` of the
+centre; in reverse it comes up by itself and goes back 10 s after reverse ends,
+or at once above 15 km/h - unless you swipe meanwhile (`auto_reverse` false
+leaves the screens alone). Layout version 4 adds it once.
 
 **Trouble codes and the oil change.** The check-engine card names the codes the
 master read (`P1718 TCM 2/2`, then what it means), one every 3 s; with the

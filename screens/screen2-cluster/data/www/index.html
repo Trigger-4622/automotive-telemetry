@@ -424,6 +424,9 @@ const SETTINGS=[
  {sec:'display',k:'global.swipe_anim_ms',t:'Changing screen takes (ms)',kind:'num',def:180,a:'min="0" step="10"'},
  {sec:'display',k:'global.day_bg',t:'Day background',kind:'color',def:'#101418'},
  {sec:'display',k:'global.night_bg',t:'Night background',kind:'color',def:'#000000'},
+ {sec:'display',k:'global.brightness_day',t:'Backlight by day',kind:'level',def:100},
+ {sec:'display',k:'global.brightness_night',t:'Backlight at night',kind:'level',def:B(27,31),
+  hint:'A slider shows its level on the display as it moves; Save keeps it. Night is when the master says the lights are on - or a swipe up on the display forces day or night.'},
  {sec:'alerts',k:'global.gauge_alarm_colors',t:'<b>Let a gauge itself turn yellow / red</b>',kind:'check',def:true,
   hint:'At the colour levels set for it on the Screens tab: the arc, needle or value is recoloured in place and nothing is drawn on top.'},
  {sec:'alerts',k:'global.alert_ack_ms',t:'A tap mutes an alert for (ms)',kind:'num',def:30000,a:'min="0" step="1000"'},
@@ -504,6 +507,11 @@ const TYPES_ALL={
            add:{metric_id:'0x0104',label:'NEW',units:'%',decimals:0,color:'#69F0AE'}}}),
  gmeter:{t:'G-meter',legend:'Dial',x:[['max_g','Rim (g)','num',1,'min="0.1" step="0.1"']],
   hint:'A dot for the car\'s acceleration: up speeding up, down braking, left in a left-hand bend; the inner ring is half the rim. Lateral and longitudinal G come from the master: taught from the stability unit\'s frame (its Signals tab, <b>A corner or a hard stop</b>), or worked out from the speed and the yaw rate.'},
+ park:{t:'Parking - the steering wheel',legend:'Wheel',x:[['metric_id','Steering angle','metric','0x1006'],
+  ['steer_max','Full lock, either way (°)','num',540,'min="90" max="1080"'],
+  ['straight_deg','STRAIGHT within (°)','num',10,'min="0" max="90"'],
+  ['auto_reverse','Comes up by itself in reverse','check',true]],
+  hint:'The steering wheel as it is turned, an arc from straight ahead to full lock either way, and <b>STRAIGHT</b> in green when the wheels are. In reverse it comes up by itself and goes back to the screen before 10 s after reverse ends, or at once above 15 km/h; a swipe meanwhile keeps the screen you chose. The angle is the master\'s steering angle (0x1006, positive to the left), taught or mapped on its Signals tab.'},
  perf:{t:'Performance timers',
   hint:'0-100 km/h, 80-120 km/h and the quarter mile, timed on this display from the master\'s speed (and RPM). Stand still for half a second to arm a standing start; 80-120 times itself whenever the speed passes 80 on the way up. The best times last until the display is switched off.'},
  diag:{t:'Diagnostics',
@@ -562,7 +570,7 @@ const TEXTURES=[['none','none'],['carbon','carbon fibre (tile)'],['mesh','mesh (
 const BG=[['texture','Texture','select','none',TEXTURES],['texture_opa','Texture strength (0-255)','num',255,'min="0" max="255"'],
   ['background_asset','Image file','asset',''],['bg_grad.from','Gradient from (top)','color','#101418'],
   ['bg_grad.to','Gradient to (bottom)','color','#05080B']];
-const bezelDefault=type=>!['diag','chart','dash','gmeter','perf'].includes(type);
+const bezelDefault=type=>!['diag','chart','dash','gmeter','perf','park'].includes(type);
 const BEZEL=B([['dial_face','A bezel ring round the edge','check']],[]);
 /* Keys no firmware reads any more, dropped from a layout as it is loaded:
    the cluster's touch orientation switches, which only ever moved where a
@@ -696,6 +704,11 @@ function rowHtml(r,i){
       <input type="range" id="${id}" min="0.5" max="1.5" step="0.01" value="${n}"
         style="accent-color:${r.col}" oninput="setRow(${i},this)">${hint}</label>`;
   }
+  if(r.kind==='level'){
+    const n=Math.round(Number(v)||r.def);
+    return `<label class="f wide">${r.t}<span id="${id}_v" style="float:right;color:var(--text)">${n} %</span>
+      <input type="range" id="${id}" min="2" max="100" step="1" value="${n}" oninput="setRow(${i},this)">${hint}</label>`;
+  }
   let ctl;
   if(r.kind==='select'){
     const known=r.opts.some(o=>o[0]===String(v));
@@ -721,6 +734,10 @@ function setRow(i,el){
     const l=$('#'+el.id+'_v');if(l)l.textContent=(+el.value).toFixed(2);
     clearTimeout(calibTimer);calibTimer=setTimeout(calibPush,80);
   }
+  if(r.kind==='level'){
+    const l=$('#'+el.id+'_v');if(l)l.textContent=Math.round(+el.value)+' %';
+    clearTimeout(lightTimer);lightTimer=setTimeout(()=>lightPush(+el.value),80);
+  }
   if(r.after)r.after();
 }
 /* Show which master is actually transmitting, so the filter can be set
@@ -741,6 +758,13 @@ function useHeardMac(){
 }
 /* Colour calibration (the cluster): pushed to the panel on every slider move
    so it tracks the control, kept only by Save; a restart undoes the rest. */
+/* The backlight, live on the display while its slider moves (not stored). */
+let lightTimer=null;
+async function lightPush(pct){
+  if(demoLayout)return;
+  try{await req('/api/backlight',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({pct:Math.round(pct)})},4000);}catch(e){}
+}
 async function calibPush(){
   const g=glob(),note=$('#calibNote');
   try{
@@ -1771,6 +1795,24 @@ function draw(){
     x.fillStyle=PV.text;x.font='600 30px system-ui';
     x.fillText((lat>0?'L ':'R ')+Math.abs(lat).toFixed(2),tx,H/2-36);
     x.fillText((lon>0?'ACC ':'BRK ')+Math.abs(lon).toFixed(2),tx,H/2+26);
+  }else if(s.type==='park'){
+    // parkBuild: wheel and lock arc on the left, the angle to their right.
+    const R=(H-48)/2,px=R+40,py=H/2+4,r=Math.round(R*0.7),mx=s.steer_max||540,a=Math.round(Math.sin(frac*6.3)*mx*0.6);
+    const st=Math.abs(a)<=(s.straight_deg??10),col=st?'#69F0AE':PV.accent,f=Math.max(-1,Math.min(1,a/mx));
+    x.lineCap='butt';x.lineWidth=8;x.strokeStyle=PV.edge;x.beginPath();x.arc(px,py,R-4,135*D2R,405*D2R);x.stroke();
+    x.strokeStyle=col;x.beginPath();
+    if(f>0)x.arc(px,py,R-4,(270-135*f)*D2R,270*D2R);else x.arc(px,py,R-4,270*D2R,(270-135*f)*D2R);x.stroke();
+    x.strokeStyle=PV.line;x.lineWidth=12;x.beginPath();x.arc(px,py,r-6,0,7);x.stroke();
+    x.fillStyle=PV.line;x.beginPath();x.arc(px,py,16,0,7);x.fill();
+    const line=(at,r0,r1)=>{const q=(at-a)*D2R;x.beginPath();
+      x.moveTo(px+r0*Math.sin(q),py-r0*Math.cos(q));x.lineTo(px+r1*Math.sin(q),py-r1*Math.cos(q));x.stroke();};
+    x.lineCap='round';x.lineWidth=10;[-90,90,180].forEach(at=>line(at,16,r-4));
+    x.strokeStyle=col;x.lineWidth=8;line(0,r-16,r+2);x.lineCap='butt';
+    const tx=px+R+36;
+    pvCaption(x,'STEERING',tx,H/2-78);
+    pvText(x,Math.abs(a)+'°',tx,H/2-60,'600 46px system-ui',st?'#69F0AE':PV.text);
+    pvText(x,st?'STRAIGHT':a>0?'◀ LEFT':'RIGHT ▶',tx,H/2+2,'20px system-ui',st?'#69F0AE':PV.textDim);
+    pvText(x,'LOCK '+Math.round(mx)+'° EACH WAY',tx,H/2+40,'12px system-ui',PV.dim);
   }else if(s.type==='perf'){
     x.textAlign='center';x.fillStyle=PV.accent;x.font='12px system-ui';x.fillText('PERFORMANCE',cx,24);
     [['0-100','9.30s'],['80-120','3.75s'],['1/4 MI','16.87s']].forEach(([n,t],i)=>{

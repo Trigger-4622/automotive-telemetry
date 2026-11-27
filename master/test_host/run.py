@@ -25,7 +25,7 @@ BUILD = os.path.join(HERE, "build")
 EXE = os.path.join(BUILD, "sim.exe" if os.name == "nt" else "sim")
 
 SOURCES = [os.path.join(ROOT, "src", f) for f in ("main.cpp", "Ssm2.cpp", "Learner.cpp", "MasterConfig.cpp", "DiagCodes.cpp", "DriveLog.cpp",
-                                                   "FwUpdate.cpp")]
+                                                   "FwUpdate.cpp", "RawRec.cpp")]
 SOURCES += sorted(glob.glob(os.path.join(HERE, "sim", "*.cpp")))
 SOURCES += sorted(glob.glob(os.path.join(HERE, "tests", "*.cpp")))
 
@@ -89,6 +89,31 @@ def scenarios(env):
     return [l.strip() for l in r.stdout.splitlines()[1:] if l.strip()]
 
 
+CANREC = os.path.join(ROOT, "tools", "canrec.py")
+RAWREC = os.path.join(BUILD, "rawrec")
+
+
+def canrec_check():
+    """rawrec_roundtrip leaves its recording (build/rawrec.bin) and the candump
+    log its own decoder made of it: master/tools/canrec.py, the tool the owner
+    runs on a download, must turn the recording into the same log."""
+    out = RAWREC + "_tool.log"
+    r = subprocess.run([sys.executable, CANREC, RAWREC + ".bin", "-o", out, "-q"],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        return False, "canrec.py failed: " + (r.stderr or r.stdout).strip()
+    with open(out) as f:
+        got = f.read().splitlines()
+    with open(RAWREC + "_expected.log") as f:
+        want = f.read().splitlines()
+    for i, (g, w) in enumerate(zip(got, want)):
+        if g != w:
+            return False, "line %d: %r, expected %r" % (i + 1, g, w)
+    if len(got) != len(want):
+        return False, "%d lines, expected %d" % (len(got), len(want))
+    return True, "%d lines alike" % len(got)
+
+
 def run_one(name, env, verbose, config=None):
     """Run one scenario; @p config, when given, is the DEVICE_CONFIG for it and
     part of its label."""
@@ -97,6 +122,11 @@ def run_one(name, env, verbose, config=None):
     if config:
         env = dict(env, DEVICE_CONFIG=config)
         name = "%s[%s]" % (name, os.path.splitext(os.path.basename(config))[0])
+    if name == "rawrec_roundtrip":
+        env = dict(env, RAWREC_OUT=RAWREC)
+        for f in (RAWREC + ".bin", RAWREC + "_expected.log"):
+            if os.path.exists(f):
+                os.remove(f)
     try:
         r = subprocess.run(args, capture_output=not verbose, text=True, env=env, timeout=600)
     except subprocess.TimeoutExpired:
@@ -110,6 +140,10 @@ def run_one(name, env, verbose, config=None):
         if why is None and code & 0xFFFFFFFF == 0xC0000005:
             why = "access violation (crash)"
         out += f"\n*** exited with {code:#x}: {why or 'abnormal exit'}"
+    if name == "rawrec_roundtrip" and code == 0:
+        ok, what = canrec_check()
+        out += "\n  %s canrec.py reads the recording as the firmware wrote it   %s" % ("ok  " if ok else "FAIL", what)
+        code = 0 if ok else 1
     return name, code, out, time.time() - t
 
 
