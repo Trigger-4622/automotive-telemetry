@@ -24,6 +24,8 @@ namespace sim {
 EcuConfig ecu;
 BusFaults faults;
 std::vector<TxRecord> transmitted;
+bool keepDelivered = false;
+std::vector<TxRecord> delivered;
 uint64_t obdRequests = 0, ssmRequests = 0, ssmReadsWithBad = 0;
 int reinstalls = 0, bugUninstallWhileWaiting = 0;
 uint64_t deadBusTxUs = 0;
@@ -297,6 +299,7 @@ static void deliver(const twai_message_t &m) {
     }
     if (C.rx.size() >= C.rxLen) { C.rxMissed++; raiseAlert(TWAI_ALERT_RX_QUEUE_FULL); return; }
     C.rx.push_back(m);
+    if (sim::keepDelivered) sim::delivered.push_back({simrtos::nowUs(), m});
     simrtos::notify(&C.rxw);
 }
 

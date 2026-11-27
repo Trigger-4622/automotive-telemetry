@@ -274,7 +274,7 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     // The dash draws its own tach arc where the bezel ring would be.
     const bool listLike = !strcmp(type, "diag") || !strcmp(type, "chart") ||
                           !strcmp(type, "dash") || !strcmp(type, "gmeter") ||
-                          !strcmp(type, "perf");
+                          !strcmp(type, "perf") || !strcmp(type, "park");
     if (cfg["dial_face"] | !listLike) addDialFace(sd.root);
 
     if      (!strcmp(type, "arc_gauge"))   buildArcGauge(sd, cfg);
@@ -286,6 +286,7 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     else if (!strcmp(type, "dash"))        buildDash(sd, cfg);
     else if (!strcmp(type, "gmeter"))      buildGMeter(sd, cfg);
     else if (!strcmp(type, "perf"))        buildPerf(sd);
+    else if (!strcmp(type, "park"))        buildPark(sd, cfg);
     else if (!strcmp(type, "diag"))      { buildDiag(sd); _diagIndex = _screens.size() - 1; }
     else                                   buildArcGauge(sd, cfg);   // fallback
 
@@ -293,8 +294,10 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     sd.linkIcon = makeLabel(sd.root, LV_SYMBOL_WIFI, &lv_font_montserrat_14,
                             lv_palette_main(LV_PALETTE_RED),
                             LV_ALIGN_TOP_MID, 0, 10);
-    // Inside the dash's tach arc rather than on top of it.
+    // Inside the dash's tach arc rather than on top of it, and inside the
+    // parking screen's lock arc.
     if (sd.dash >= 0) lv_obj_align(sd.linkIcon, LV_ALIGN_TOP_MID, 0, 16);
+    if (sd.park >= 0) lv_obj_align(sd.linkIcon, LV_ALIGN_TOP_MID, 0, 22);
     lv_obj_add_flag(sd.linkIcon, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -1079,6 +1082,39 @@ void UIBuilder::buildPerf(ScreenDef &sd) {
     perfBuild(_perfViews.back(), sd.root, LCD_WIDTH, LCD_HEIGHT);
 }
 
+void UIBuilder::buildPark(ScreenDef &sd, JsonObject cfg) {
+    _parks.emplace_back();
+    sd.park = (int)_parks.size() - 1;
+    ParkView &v = _parks.back();
+    v.metric = cfg["metric_id"].isNull() ? (uint16_t)METRIC_ID_STEERING_ANGLE
+                                         : parseMetricId(cfg["metric_id"]);
+    parkBuild(v, sd.root, LCD_WIDTH, LCD_HEIGHT, cfg["steer_max"] | 540.0f,
+              cfg["straight_deg"] | 10.0f);
+    if ((cfg["auto_reverse"] | true) && _parkAuto.screen < 0)
+        _parkAuto.screen = (int)_screens.size() - 1;
+}
+
+void UIBuilder::parkAuto(bool reverse, uint32_t now) {
+    ParkAuto &p = _parkAuto;
+    if (p.screen < 0 || _configActive) return;
+    if (reverse && !p.reverse && (int)_active != p.screen) {
+        p.back  = _active;
+        p.shown = true;
+        loadScreen((size_t)p.screen, true);
+    }
+    if (!reverse && p.reverse) p.outMs = now;
+    p.reverse = reverse;
+    if (!p.shown || reverse) return;
+    // Elapsed time, unsigned (right across the millis() wrap).
+    MetricSample sp;
+    const bool away = Telemetry.peek(METRIC_ID_SPEED, sp) && (sp.flags & METRIC_FLAG_VALID) &&
+                      !sp.stale && sp.raw > PARK_BACK_KMH;
+    if (away || now - p.outMs >= PARK_BACK_MS) {
+        p.shown = false;
+        if ((int)_active == p.screen && p.back < _screens.size()) loadScreen(p.back, false);
+    }
+}
+
 void UIBuilder::updateDrive(uint32_t now, float lerp) {
     // Every new speed sample goes to the timers, on the master's clock.
     float v;
@@ -1102,6 +1138,12 @@ void UIBuilder::updateDrive(uint32_t now, float lerp) {
         const bool lonOk = sampleOnce(METRIC_ID_LON_ACCEL, lerp, lo) &&
                            (lo.flags & METRIC_FLAG_VALID) && !lo.stale;
         gmeterUpdate(_gmeters[sd.gmeter], la.value, latOk, lo.value, lonOk);
+    }
+    if (sd.park >= 0) {
+        ParkView &pv = _parks[sd.park];
+        MetricSample st{};
+        const bool ok = sampleOnce(pv.metric, lerp, st) && (st.flags & METRIC_FLAG_VALID) && !st.stale;
+        parkUpdate(pv, st.value, ok);
     }
 }
 
@@ -1183,6 +1225,9 @@ void UIBuilder::tick() {
         if (Telemetry.linkUp()) lv_obj_add_flag(icon, LV_OBJ_FLAG_HIDDEN);
         else                    lv_obj_clear_flag(icon, LV_OBJ_FLAG_HIDDEN);
     }
+
+    // Last: a screen change starts its slide, and the ticks wait for it.
+    parkAuto(reverse || lever == 'R', now);
 }
 
 bool UIBuilder::sampleOnce(uint16_t id, float lerp, MetricSample &s) {
@@ -2081,11 +2126,13 @@ void UIBuilder::loadScreen(size_t idx, bool forward) {
 
 void UIBuilder::nextScreen() {
     if (_configActive || _screens.size() < 2) return;
+    _parkAuto.shown = false;                 // the driver chose: it stays
     loadScreen((_active + 1) % _screens.size(), true);
 }
 
 void UIBuilder::prevScreen() {
     if (_configActive || _screens.size() < 2) return;
+    _parkAuto.shown = false;
     loadScreen((_active + _screens.size() - 1) % _screens.size(), false);
 }
 
@@ -2210,7 +2257,7 @@ void UIBuilder::applyNight(bool night) {
                                        : lv_color_hex(UI_BG_DAY));
     for (auto &sd : _screens)
         if (sd.root) lv_obj_set_style_bg_color(sd.root, bg, 0);
-    Display.setBrightness(night ? BRIGHTNESS_NIGHT : BRIGHTNESS_DAY);
+    Display.setBrightness(Config.backlightLevel(night));
 }
 
 /* ---- config-mode screen --------------------------------------------------- */

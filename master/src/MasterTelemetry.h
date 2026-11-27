@@ -304,6 +304,8 @@ bool masterPidSupported(uint8_t pid);
 
 /** @brief Count one frame this node put on the bus. */
 void masterCountTx();
+/** @brief The controller is listen-only now (it sends nothing, ACKs nothing). */
+bool masterListenOnly();
 
 /**
  * @brief Hand one frame to the controller - the only way the master

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "DNSServer.h"
+#include "DisplayManager.h"
 #include "FS.h"
 #include "LittleFS.h"
 #include "WebServer.h"
@@ -144,6 +145,15 @@ static bool alertIsLamp(const char *key) {
 static bool hidden(lv_obj_t *o) { return lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN); }
 
 static void engineOn() { car.set(METRIC_ID_RPM, 850); car.set(METRIC_ID_SPEED, 0); }
+
+/** The parking screen kept from coming up by itself in reverse: for checks of
+ *  another screen's readouts while the car is in reverse. */
+static JsonDocument noParkAuto() {
+    JsonDocument d = shippedLayout();
+    for (JsonObject sc : d["screens"].as<JsonArray>())
+        if (!strcmp(sc["type"] | "", "park")) sc["auto_reverse"] = false;
+    return d;
+}
 
 /* ───────────────────────────── scenarios ───────────────────────────────── */
 
@@ -458,15 +468,15 @@ SCENARIO(migrate_v1_layout) {
     const size_t before = s.size();
     boot(d);
 
-    CHECK((Config.layout()["version"] | 0) == 3, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 4, "version not bumped");
     CHECK(Config.layout()["screens"].size() == before + 1, "dash not added");
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "dash not first");
     CHECK(Config.layout()["warnings"].is<JsonObject>(), "warnings block not added");
     CHECK(UI._screens[0].dash == 0, "dash screen not built");
-    // Saved, so the next boot sees version 3 already.
+    // Saved, so the next boot sees version 4 already.
     JsonDocument saved;
     deserializeJson(saved, hostfs::files["/layout.json"]);
-    CHECK((saved["version"] | 0) == 3, "migration not saved");
+    CHECK((saved["version"] | 0) == 4, "migration not saved");
     CHECK(!hostfs::files.count("/layout.tmp"), "temporary file left behind");
 
     // The user deletes the dash; a reboot must not bring it back.
@@ -491,8 +501,9 @@ SCENARIO(default_layout) {
     UI.begin();
     run(500);
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "default has no dash");
-    CHECK((Config.layout()["version"] | 0) == 3, "default is not version 3");
-    CHECK(UI._screens.size() == 5, "default built %zu screens", UI._screens.size());
+    CHECK((Config.layout()["version"] | 0) == 4, "default is not version 4");
+    CHECK(UI._screens.size() == 6, "default built %zu screens", UI._screens.size());
+    CHECK(screenOf("park") >= 0 && UI._screens[screenOf("park")].park >= 0, "default has no parking screen");
     shot("default_dash");
 }
 
@@ -983,11 +994,13 @@ SCENARIO(ack_second_fault) {
     CHECK(UI._alertKey == METRIC_ID_BATT_VOLTAGE, "new battery fault muted by an old tap");
 }
 
-/* Gear letters, and the reverse switch winning over the gear value. */
+/* Gear letters, and the reverse switch winning over the gear value (on the
+ * dash: the parking screen stays where it is in reverse). */
 SCENARIO(gear_display) {
     engineOn();
     car.set(METRIC_ID_GEAR, 3);
-    boot();
+    JsonDocument d = noParkAuto();
+    boot(d);
     gotoType("dash");
     GaugeBinding *g = nullptr;
     for (auto &b : UI._screens[UI._active].bindings)
@@ -1016,7 +1029,8 @@ SCENARIO(gear_display) {
 SCENARIO(gear_lever) {
     engineOn();
     car.set(METRIC_ID_GEAR_LEVER, 'P');
-    boot();
+    JsonDocument d = noParkAuto();
+    boot(d);
     gotoType("dash");
     GaugeBinding *g = nullptr;
     for (auto &b : UI._screens[UI._active].bindings)
@@ -1419,7 +1433,7 @@ SCENARIO(migrate_v2_layout) {
     const size_t before = s.size();
     boot(d);
     JsonArray now = Config.layout()["screens"].as<JsonArray>();
-    CHECK((Config.layout()["version"] | 0) == 3, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 4, "version not bumped");
     CHECK(now.size() == before + 2, "screens: %zu, want %zu", now.size(), before + 2);
     const int g = screenOf("gmeter"), p = screenOf("perf"), dg = screenOf("diag");
     CHECK(g >= 0 && p == g + 1 && dg == p + 1, "G-meter %d, timers %d, diagnostics %d", g, p, dg);
@@ -1565,6 +1579,206 @@ SCENARIO(gmeter_screen) {
     const int x2 = lv_obj_get_x(g.dot) + 8;
     CHECK(x2 >= g.cx - g.r - 1 && x2 <= g.cx - g.r + 3, "dot not held at the rim: %d (rim %d)", x2, g.cx - g.r);
     for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* ───────────────────────────── parking screen ──────────────────────────── */
+
+static std::string text(lv_obj_t *l) { return lv_label_get_text(l); }
+/** Where the wheel's top stripe points: its outer end, from the centre [deg,
+ *  clockwise from twelve o'clock]. */
+static float stripeAt(const ParkView &v) {
+    const lv_point_t *p = v.pts + 6;
+    const float x = lv_obj_get_x(v.line[3]) + p[1].x - v.cx, y = lv_obj_get_y(v.line[3]) + p[1].y - v.cy;
+    return atan2f(x, -y) * 57.29578f;
+}
+
+/* The wheel turns as the driver has it: 125 degrees to the left puts the
+ * stripe at the top of the rim 125 degrees anticlockwise, the arc runs from
+ * the top to the left, and the angle reads 125 - LEFT; within straight_deg
+ * of the centre it says STRAIGHT, in green. No angle from the master: "--". */
+SCENARIO(park_screen) {
+    engineOn();
+    boot();
+    gotoType("park");
+    run(800);
+    CHECK(screenOf("park") >= 0 && (int)UI._active == screenOf("park"), "no parking screen in the shipped layout");
+    const ParkView &v = UI._parks[0];
+    CHECK(v.metric == METRIC_ID_STEERING_ANGLE && v.steerMax == 540 && v.straight == 10,
+          "the shipped layout's parking screen: metric %04X, lock %.0f, straight %.0f",
+          v.metric, v.steerMax, v.straight);
+    CHECK(text(v.value) == "--" && text(v.word) == "NO STEERING ANGLE" && hidden(v.line[3]),
+          "no angle: '%s' '%s'", text(v.value).c_str(), text(v.word).c_str());
+    shot("park_no_angle");
+
+    car.set(METRIC_ID_STEERING_ANGLE, 4);
+    run(2500);
+    CHECK(text(v.value) == "4\xC2\xB0" && text(v.word) == "STRAIGHT", "4 deg: '%s' '%s'",
+          text(v.value).c_str(), text(v.word).c_str());
+    CHECK(lv_obj_get_style_text_color(v.word, 0).full == lv_color_hex(UI_OK).full, "STRAIGHT not in green");
+    CHECK(fabsf(stripeAt(v) + 4) < 2.5f, "stripe at %.1f deg, want -4", stripeAt(v));
+    shot("park_straight");
+
+    car.set(METRIC_ID_STEERING_ANGLE, 125);
+    run(2500);
+    CHECK(text(v.value) == "125\xC2\xB0" && text(v.word).find("LEFT") != std::string::npos,
+          "125 deg: '%s' '%s'", text(v.value).c_str(), text(v.word).c_str());
+    CHECK(fabsf(stripeAt(v) + 125) < 2.5f, "stripe at %.1f deg, want -125", stripeAt(v));
+    CHECK(lv_arc_get_value(v.lock) == -125, "lock arc at %d, want -125", lv_arc_get_value(v.lock));
+    CHECK(lv_obj_get_style_text_color(v.word, 0).full != lv_color_hex(UI_OK).full, "turned, still green");
+    shot("park_left");
+
+    car.set(METRIC_ID_STEERING_ANGLE, -600);               // past full lock
+    run(3000);
+    CHECK(text(v.value) == "600\xC2\xB0" && text(v.word).find("RIGHT") != std::string::npos,
+          "-600 deg: '%s' '%s'", text(v.value).c_str(), text(v.word).c_str());
+    CHECK(lv_arc_get_value(v.lock) == 540, "the lock arc not held at full lock: %d", lv_arc_get_value(v.lock));
+    CHECK(fabsf(stripeAt(v) - 240) < 2.5f || fabsf(stripeAt(v) + 120) < 2.5f,
+          "stripe at %.1f deg, want 600 clockwise (240 = -120)", stripeAt(v));
+    shot("park_right_full");
+
+    car.drop(METRIC_ID_STEERING_ANGLE);                    // the angle goes stale
+    run(3000);
+    CHECK(text(v.value) == "--" && hidden(v.line[0]), "a stale angle still shown: '%s'", text(v.value).c_str());
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* Reverse brings the parking screen up by itself, wherever the driver was;
+ * out of reverse it goes back to that screen 10 s later - not while shuffling
+ * between R and D - or at once driving off above 15 km/h. A swipe meanwhile
+ * is the driver's choice and stays. The lever's R does it too. */
+SCENARIO(park_auto_reverse) {
+    engineOn();
+    car.set(METRIC_ID_STEERING_ANGLE, -30);
+    boot();
+    const int park = screenOf("park"), start = 1;
+    gotoScreen(start);
+    CHECK((int)UI._active == start, "not on screen %d", start);
+    car.set(METRIC_ID_REVERSE, 1);
+    run(800);
+    CHECK((int)UI._active == park, "reverse: on screen %zu, want the parking screen %d", UI._active, park);
+    car.set(METRIC_ID_REVERSE, 0);                         // R - D - R while parking
+    run(4000);
+    CHECK((int)UI._active == park, "went back 4 s after reverse");
+    car.set(METRIC_ID_REVERSE, 1);
+    run(3000);
+    car.set(METRIC_ID_REVERSE, 0);
+    run(8000);
+    CHECK((int)UI._active == park, "went back 8 s after the second reverse");
+    run(3000);
+    CHECK((int)UI._active == start, "not back on screen %d 11 s after reverse: %zu", start, UI._active);
+
+    // Driving off: back at once.
+    car.set(METRIC_ID_REVERSE, 1);
+    run(800);
+    CHECK((int)UI._active == park, "second time: not shown");
+    car.set(METRIC_ID_REVERSE, 0);
+    car.set(METRIC_ID_SPEED, 20);
+    run(1200);
+    CHECK((int)UI._active == start, "driving off at 20 km/h: still on %zu", UI._active);
+    car.set(METRIC_ID_SPEED, 0);
+
+    // A swipe while it is up: the driver's screen stays.
+    car.set(METRIC_ID_REVERSE, 1);
+    run(800);
+    UI.nextScreen();
+    run(600);
+    const size_t chosen = UI._active;
+    car.set(METRIC_ID_REVERSE, 0);
+    run(12000);
+    CHECK(UI._active == chosen && (int)chosen != park, "the swiped-to screen %zu did not stay: %zu", chosen, UI._active);
+
+    // Already on it by hand: reverse ending does not take it away.
+    gotoScreen(park);
+    car.set(METRIC_ID_REVERSE, 1);
+    run(800);
+    car.set(METRIC_ID_REVERSE, 0);
+    run(12000);
+    CHECK((int)UI._active == park, "chosen by hand, it was taken away");
+
+    // The gear lever's R (no reverse switch on the bus) does it too.
+    gotoScreen(start);
+    car.drop(METRIC_ID_REVERSE);
+    car.set(METRIC_ID_GEAR_LEVER, 'R');
+    run(800);
+    CHECK((int)UI._active == park, "the lever's R did not bring it up");
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    run(11000);
+    CHECK((int)UI._active == start, "not back after the lever left R: %zu", UI._active);
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* Switched off on the screen (auto_reverse false), reverse leaves the display
+ * alone. */
+SCENARIO(park_auto_off) {
+    JsonDocument d = noParkAuto();
+    engineOn();
+    boot(d);
+    gotoScreen(1);
+    car.set(METRIC_ID_REVERSE, 1);
+    run(1500);
+    CHECK(UI._active == 1, "auto_reverse false, and reverse changed the screen: %zu", UI._active);
+}
+
+/* A version 3 layout - the owner's displays - gains the parking screen once,
+ * before diagnostics; deleted in the studio, it stays deleted. */
+SCENARIO(migrate_v3_layout) {
+    JsonDocument d = shippedLayout();
+    d["version"] = 3;
+    JsonArray s = d["screens"].as<JsonArray>();
+    for (size_t i = s.size(); i-- > 0;)
+        if (!strcmp(s[i]["type"] | "", "park")) s.remove(i);
+    const size_t before = s.size();
+    boot(d);
+    JsonArray now = Config.layout()["screens"].as<JsonArray>();
+    CHECK((Config.layout()["version"] | 0) == 4, "version not bumped");
+    CHECK(now.size() == before + 1, "screens: %zu, want %zu", now.size(), before + 1);
+    const int k = screenOf("park"), dg = screenOf("diag");
+    CHECK(k >= 0 && dg == k + 1, "parking %d, diagnostics %d", k, dg);
+    CHECK(k >= 0 && UI._screens[k].park >= 0 && UI._parkAuto.screen == k, "not built");
+    CHECK(screenOf("gmeter") >= 0 && screenOf("perf") >= 0, "the version 3 screens went");
+    now.remove((size_t)k);
+    Config.persistLayout();
+    Config.begin();
+    CHECK(Config.layout()["screens"].size() == before, "came back after being deleted");
+    CHECK(!Config.migrateLayout(), "migration ran twice");
+}
+
+/* ─────────────────────────────── backlight ─────────────────────────────── */
+
+/* The backlight by day and at night is the layout's (Gauge Studio, Settings),
+ * in percent: 60 % by day is 153 of 255, 10 % at night 26. Out of range it is
+ * held to 2-100 % - never quite off, since the screen is how the settings are
+ * reached. The studio's slider shows a level live without storing it. */
+SCENARIO(backlight_levels) {
+    JsonDocument d = shippedLayout();
+    d["global"]["brightness_day"] = 60;
+    d["global"]["brightness_night"] = 10;
+    boot(d);
+    CHECK(Display.brightness == 153, "day: %u, want 153 (60 %%)", Display.brightness);
+    UI.cycleNightOverride();                     // automatic -> day
+    UI.cycleNightOverride();                     // day -> night
+    run(500);
+    CHECK(Display.brightness == 26, "night: %u, want 26 (10 %%)", Display.brightness);
+    UI.cycleNightOverride();                     // night -> automatic: day again
+    run(500);
+    CHECK(Display.brightness == 153, "back to day: %u", Display.brightness);
+
+    Config._layout["global"]["brightness_day"] = 0;
+    Config._layout["global"]["brightness_night"] = 250;
+    CHECK(Config.backlightLevel(false) == 5 && Config.backlightLevel(true) == 255,
+          "0 %% and 250 %% held to 2 and 100: %u %u", Config.backlightLevel(false), Config.backlightLevel(true));
+    Config._layout["global"].remove("brightness_day");
+    Config._layout["global"].remove("brightness_night");
+    CHECK(Config.backlightLevel(false) == 255 && Config.backlightLevel(true) == (ROUND ? 69 : 79),
+          "the defaults: day %u, night %u", Config.backlightLevel(false), Config.backlightLevel(true));
+
+    Config.enterConfigMode();
+    Config._server.request(HTTP_POST, "/api/backlight", "{\"pct\":40}");
+    CHECK(Config._server.code == 200 && Display.brightness == 102, "the studio's slider at 40 %%: %d, %u",
+          Config._server.code, Display.brightness);
+    CHECK(Config._layout["global"]["brightness_day"].isNull(), "a slider's level was stored");
+    Config._server.request(HTTP_POST, "/api/backlight", "{\"level\":40}");
+    CHECK(Config._server.code == 400 && Display.brightness == 102, "a body without pct: %d", Config._server.code);
 }
 
 /* ─────────────────────────────── main ──────────────────────────────────── */

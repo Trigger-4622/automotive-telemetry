@@ -12,6 +12,7 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 
+#include "DisplayManager.h"
 #include "HardwareConfig.h"
 #include "MasterPacket.h"
 #include "TelemetryStore.h"
@@ -37,7 +38,7 @@ static constexpr const char *FS_PARTITION_LABEL = "spiffs";
  * (e.g. first flash without `pio run -t uploadfs`). The full annotated
  * example lives in data/layout.json. */
 static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
-  "version": 3,
+  "version": 4,
   "global": { "smoothing_alpha": 0.35, "lerp_speed": 0.18,
               "stale_timeout_ms": 1500, "swipe_anim_ms": 250,
               "day_bg": "#101418", "night_bg": "#000000" },
@@ -57,6 +58,7 @@ static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
                       "overlay_text": "SHIFT!" } } },
     { "id": "gmeter", "type": "gmeter", "label": "G", "max_g": 1.0 },
     { "id": "perf", "type": "perf", "label": "PERF" },
+    { "id": "park", "type": "park", "label": "PARK" },
     { "id": "diag", "type": "diag" }
   ]
 })JSON";
@@ -136,7 +138,7 @@ void ConfigManager::begin() {
         }
     }
     if (migrateLayout()) {
-        log_i("layout: updated to version 3 (warning lamps, dash, G-meter, timers)");
+        log_i("layout: updated to version 4 (warning lamps, dash, G-meter, timers, parking)");
         persistLayout();
     }
 }
@@ -203,17 +205,20 @@ bool ConfigManager::persistLayout() {
 
 bool ConfigManager::migrateLayout() {
     const int version = _layout["version"] | 1;
-    if (version >= 3) return false;
+    if (version >= 4) return false;
     if (version < 2) migrateToV2();
 
-    // Version 3: the G-meter and the performance timers, once, before the
-    // diagnostics screen. Deleted in the studio, they stay deleted.
-    bool hasG = false, hasP = false;
+    // Version 3: the G-meter and the performance timers; version 4: the
+    // parking screen. Each once, before the diagnostics screen; deleted in
+    // the studio, they stay deleted.
+    bool hasG = false, hasP = false, hasPark = false;
     for (JsonObject s : _layout["screens"].as<JsonArray>()) {
         hasG |= !strcmp(s["type"] | "", "gmeter");
         hasP |= !strcmp(s["type"] | "", "perf");
+        hasPark |= !strcmp(s["type"] | "", "park");
     }
-    if (!hasG || !hasP) {
+    if (version >= 3) hasG = hasP = true;          // already offered once
+    if (!hasG || !hasP || !hasPark) {
         JsonDocument old;
         old.set(_layout["screens"]);
         JsonArray screens = _layout["screens"].to<JsonArray>();
@@ -229,6 +234,10 @@ bool ConfigManager::migrateLayout() {
                 JsonObject p = screens.add<JsonObject>();
                 p["id"] = "perf"; p["type"] = "perf"; p["label"] = "PERF";
             }
+            if (!hasPark) {
+                JsonObject k = screens.add<JsonObject>();
+                k["id"] = "park"; k["type"] = "park"; k["label"] = "PARK";
+            }
         };
         for (JsonVariantConst v : old.as<JsonArrayConst>()) {
             if (!strcmp(v["type"] | "", "diag")) addNew();
@@ -236,7 +245,7 @@ bool ConfigManager::migrateLayout() {
         }
         addNew();
     }
-    _layout["version"] = 3;
+    _layout["version"] = 4;
     return true;
 }
 
@@ -569,6 +578,20 @@ void ConfigManager::setupRoutes() {
         name.replace("/", "");
         if (name.length() && LittleFS.remove("/assets/" + name)) sendJsonOk();
         else _server.send(404, "application/json", "{\"error\":\"not found\"}");
+    });
+
+    /* The backlight, live while a slider moves in the studio: not stored -
+     * the layout's Save does that - and the configured day or night level is
+     * back at the next switch between them, or a restart. */
+    _server.on("/api/backlight", HTTP_POST, [this]() {
+        JsonDocument body;
+        const int pct = deserializeJson(body, _server.arg("plain")) ? -1 : (body["pct"] | -1);
+        if (pct < 0) {
+            _server.send(400, "application/json", "{\"error\":\"bad json\"}");
+            return;
+        }
+        Display.setBrightness(levelOf(pct));
+        sendJsonOk();
     });
 
     // ---- actions ----------------------------------------------------------

@@ -189,6 +189,15 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
    bus-off and sleep. Clear it before a test drive, read it after.</p>
   <p class="say" id="evSay"></p>
   <div class="wrap"><table><thead><tr><th>Uptime</th><th>Event</th><th>Detail</th><th>Master was</th></tr></thead><tbody id="evTab"></tbody></table></div></div>
+ <div class="card"><h2>Raw recording <small id="rrSub"></small></h2>
+  <p class="say" style="margin:0 0 8px">Every frame on the bus, and the master's own requests, to the 8 MB log space: a recording for
+   analysis off the car (<b>canrec.py</b>, in the firmware's tools folder, turns the download into a candump log). Starting it
+   <b>erases the log space, every drive log with it</b> - up to a minute, with the car standing. It then records whenever the car
+   is on, across sleeps and restarts, until you stop it or the space is full. Meanwhile drive logging is off, and what the master
+   saves by itself (learned values, the evidence log) waits for the end, or for a sleep.</p>
+  <div class="bar" id="rrBarBox" hidden><i id="rrBar" style="width:0"></i></div>
+  <p class="say" id="rrSay" style="margin:8px 0"></p>
+  <div class="row" id="rrBtns"></div></div>
 </section>
 
 <!-- Car: what the car says - trouble codes, oil change, drive logs, its computer -->
@@ -306,8 +315,8 @@ async function req(u,o,ms){
 /* One request of each kind at a time: a poll still waiting is not joined by
    the next one, so a slow moment cannot pile up into a slow minute. */
 const BUSY={};
-/* A firmware upload in progress: nothing else is polled (the master serves one
-   connection at a time, and the upload holds it). */
+/* A firmware upload, or a raw recording's download, in progress: nothing else
+   is polled (the master serves one connection at a time, and it holds it). */
 let UPD=false;
 async function solo(k,fn){if(BUSY[k])return;BUSY[k]=1;try{await fn()}finally{BUSY[k]=0}}
 async function post(u,msg,then){try{await req(u,{method:'POST'},8000);toast(msg);if(then)setTimeout(then,500)}catch(e){toast('Failed')}}
@@ -325,7 +334,7 @@ function go(t){if(!TABS.includes(t))t='home';TAB=t;
  TABS.forEach(x=>$('#t-'+x).hidden=x!==t);
  try{history.replaceState(null,'','#'+t)}catch(e){}
  if(t==='home'&&L)renderHome();if(t==='sig'){renderSources();if(L)renderLearn()}
- if(t==='bus'){pollBus();pollEvlog()}if(t==='car'){pollCodes();pollLogs()}
+ if(t==='bus'){pollBus();pollEvlog();pollRaw()}if(t==='car'){pollCodes();pollLogs()}
  if(t==='set'){fwInfo();if(ADV_ON&&LOADED&&!JSON_ED)jsonShow()}}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
@@ -1432,6 +1441,61 @@ async function pollEvlogOnce(){
  if(!s)s=`<span class="ok">${boots.length} boot${boots.length===1?'':'s'}, no brown-out, no guard trip, no bus-off</span> — if the lamp still came on, the master was not the one disturbing the bus.`;
  $('#evSay').innerHTML=s}
 
+/* ───────────── the raw recording (Bus tab) ───────────── */
+let RR=null;
+function pollRaw(){return solo('rr',pollRawOnce)}
+async function pollRawOnce(){
+ if(TAB!=='bus'||TEACH||UPD)return;
+ try{RR=await req('/api/rawrec',null,5000)}catch(e){return}
+ renderRaw()}
+function renderRaw(){
+ const d=RR;if(!d)return;
+ const st=d.state,has=['recording','full','stopped'].includes(st),left=d.rate&&d.cap>d.used?(d.cap-d.used)/d.rate:0;
+ $('#rrSub').textContent=has?`${kb(d.used)} of ${kb(d.cap)}`+(st==='recording'&&left?` · about ${dur(left)} of bus left`:''):'';
+ $('#rrBarBox').hidden=!(has||st==='erasing');
+ $('#rrBar').style.width=(st==='erasing'?d.erase:d.cap?100*d.used/d.cap:0).toFixed(1)+'%';
+ const counts=`${d.frames} frames since the master started (${d.tx} of them its own)`+
+  (d.lost?`, <span class="warn">${d.lost} lost</span>`:', none lost')+(d.rate?` · ${kb(d.rate*60)} a minute`:'');
+ $('#rrSay').innerHTML=
+  st==='none'?'<span class="warn">This master\'s partition table has no log space</span>: a USB upload of this firmware adds it.':
+  st==='off'?'Not recording: the log space is the drive logs\'.':
+  st==='erasing'?`Erasing the log space: ${d.erase} %…`:
+  st==='recording'?`<span class="ok">● Recording</span> whenever the car is on, session ${d.session}: ${counts}.`:
+  `<span class="warn">${esc((d.note||st).replace(/^./,c=>c.toUpperCase()))}</span>`+(d.size>4096?` · ${kb(d.size)} to download.`:'.')+
+   (d.frames?`<br>${counts}.`:'');
+ const b=(t,f,c)=>`<button class="b${c?' '+c:''}" onclick="${f}">${t}</button>`;
+ $('#rrBtns').innerHTML=st==='off'?b('Start recording…','rawArm()','p'):
+  st==='recording'?b('Stop','rawStop()','d')+b('Download so far','rawGet()'):
+  st==='full'||st==='stopped'?b('Download','rawGet()','p')+b('Record again…','rawArm()')+b('Back to drive logs…','rawRelease()','d'):''}
+async function rawAct(u,msg){
+ try{const r=await fetch(u,{method:'POST'}),j=await r.json();toast(r.ok?msg:j.error||'Failed')}catch(e){toast('Failed')}
+ setTimeout(pollRaw,500)}
+function rawArm(){
+ if(confirm('Erase the log space - every drive log in it - and record everything on the bus?\n\nThe erase takes up to a minute and '+
+  'needs the car standing: the master hears little of the bus meanwhile. The recording then runs whenever the car is on, until '+
+  'you stop it or the 8 MB are full (roughly 20 minutes of this car\'s bus).'))rawAct('/api/rawrec/arm','Erasing the log space…')}
+function rawStop(){if(confirm('Stop the raw recording? It stays on the master for download until you record again.'))rawAct('/api/rawrec/stop','Stopped')}
+function rawRelease(){if(confirm('Erase the raw recording and give the log space back to the drive logs?'))rawAct('/api/rawrec/release','Drive logs back')}
+/* The download, read here as it comes (up to 8 MB over the master's Wi-Fi,
+   half a minute or more), with nothing else polled meanwhile. */
+async function rawGet(){
+ if(UPD)return;
+ UPD=true;
+ const c=new AbortController();let stall=setTimeout(()=>c.abort(),15000);
+ try{const r=await fetch('/api/rawrec/file',{signal:c.signal});
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const total=+r.headers.get('Content-Length')||0,rd=r.body.getReader(),parts=[];let got=0,shown=0;
+  for(;;){const {done,value}=await rd.read();if(done)break;
+   clearTimeout(stall);stall=setTimeout(()=>c.abort(),15000);
+   parts.push(value);got+=value.length;
+   if(Date.now()-shown>300){shown=Date.now();$('#rrSay').textContent=`Downloading… ${kb(got)}${total?' of '+kb(total):''}`}}
+  if(total&&got!==total)throw new Error('cut off');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(parts,{type:'application/octet-stream'}));
+  a.download='canrec-'+new Date().toISOString().slice(0,16).replace(/[-:]/g,'').replace('T','-')+'.bin';a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);toast('Downloaded')}
+ catch(e){toast('Download failed')}
+ finally{clearTimeout(stall);UPD=false;pollRaw()}}
+
 /* ───────────── the Car tab: trouble codes, the engine computer, oil change, drive logs ───────────── */
 const KIND=['stored','pending','permanent'],MOD=['Engine','Transmission'],LIST_SAY=['not asked yet','answered','no reply','not kept'];
 let CODES=null,LOGS=null;
@@ -1479,8 +1543,9 @@ async function pollLogsOnce(){
  if(TAB!=='car'||TEACH||UPD)return;
  try{LOGS=await req('/api/logs',null,5000)}catch(e){return}
  const d=LOGS;
- $('#lgSub').textContent=`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on ${d.own?'the logs partition':'the settings partition (older partition table)'}`;
- $('#lgSay').innerHTML=!d.on?'Recording is off: switch it on below, under Recording.':
+ $('#lgSub').textContent=d.raw?'':`${d.used_kb} of ${d.cap_kb} KB used · ${d.free_kb} KB free on ${d.own?'the logs partition':'the settings partition (older partition table)'}`;
+ $('#lgSay').innerHTML=d.raw?'<span class="warn">Off while a raw bus recording has the log space</span> (Bus tab: Raw recording).':
+  !d.on?'Recording is off: switch it on below, under Recording.':
   d.rec?`<span class="ok">Recording <b>${esc(d.file)}</b></span>: ${d.rows} rows so far.`:
   d.note?`<span class="warn">${esc(d.note)}</span>`:'Recording starts when the car comes on.';
  $('#lgTab').innerHTML=d.files.length?d.files.slice().reverse().map(f=>`<tr><td class="mono">${esc(f.name.replace('.tlg',''))}${f.rec?' <span class="ok">● now</span>':''}</td>
@@ -1571,6 +1636,6 @@ function fwWait(old,done){const t0=Date.now();
 renderSettings();
 try{advShow(localStorage.getItem('advOn')==='1')}catch(e){}
 go(location.hash.slice(1));
-load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);
+load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);setInterval(pollRaw,2000);
 setInterval(pollCodes,3000);setInterval(pollLogs,3000);
 </script></body></html>

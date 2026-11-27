@@ -66,8 +66,9 @@ public:
 
     /**
      * @brief Set the backlight level.
-     * @param level 0 (off) to 255 (full). Driven by day/night switching —
-     *              see @ref BRIGHTNESS_DAY and @ref BRIGHTNESS_NIGHT.
+     * @param level 0 (off) to 255 (full). Driven by day/night switching:
+     *              the layout's brightness_day and brightness_night
+     *              (ConfigManager::backlightLevel).
      */
     void setBrightness(uint8_t level);
 

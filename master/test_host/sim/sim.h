@@ -169,6 +169,10 @@ extern std::vector<std::string> tasksCreated;
 /* ── observations ───────────────────────────────────────────────────────── */
 struct TxRecord { uint64_t tUs; twai_message_t msg; };
 extern std::vector<TxRecord> transmitted;      ///< Every frame the master sent.
+/** Every frame put into the master's receive queue, when keepDelivered is
+ *  set (a test that compares a raw recording with the bus). */
+extern bool keepDelivered;
+extern std::vector<TxRecord> delivered;
 extern uint64_t obdRequests, ssmRequests;      ///< Requests the ECU received.
 extern uint64_t ssmReadsWithBad;               ///< SSM reads refused for the bad address.
 

@@ -5,6 +5,8 @@
  */
 #include "DisplayManager.h"
 
+#include "ConfigManager.h"
+
 #include <LittleFS.h>
 
 DisplayManager Display;
@@ -36,7 +38,7 @@ void DisplayManager::flushCb(lv_disp_drv_t *drv, const lv_area_t *area,
 
 void DisplayManager::begin() {
     _gfx.init();
-    _gfx.setBrightness(BRIGHTNESS_DAY);
+    _gfx.setBrightness(Config.backlightLevel(false));   // Config.begin() came first
     _gfx.startWrite();   // display owns the SPI bus — hold CS for DMA overlap
 
     lv_init();

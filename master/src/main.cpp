@@ -53,6 +53,7 @@
 #include "DiagCodes.h"
 #include "FwUpdate.h"
 #include "DriveLog.h"
+#include "RawRec.h"
 #include "WebPortal.h"
 
 /**
@@ -193,6 +194,7 @@ static void evLog(uint8_t type, uint16_t a = 0, uint16_t b = 0) {
     if (s_evCount < EV_MAX) s_evCount++;
     s_evDirty = true;
     portEXIT_CRITICAL(&s_evMux);
+    rawRecEvent(type, a, b);         // in a raw recording too, where it happened
 }
 
 /** Load the ring from flash at boot, oldest first, so history survives a reset. */
@@ -2428,9 +2430,14 @@ bool masterTransmit(const twai_message_t &msg, uint32_t waitMs) {
     const bool ok = s_txLive && !s_twaiSilentNow && diagGuardOk() &&
                     twai_transmit(&msg, pdMS_TO_TICKS(waitMs)) == ESP_OK;
     xSemaphoreGive(s_twaiReg);
-    if (ok) masterCountTx();
+    if (ok) {
+        masterCountTx();
+        rawRecTx(msg);               // the controller does not receive its own
+    }
     return ok;
 }
+
+bool masterListenOnly() { return s_twaiSilentNow; }
 
 /**
  * @brief Espressif's listen-only erratum - fixed here, because the Arduino core
@@ -2587,6 +2594,7 @@ static void twaiRxTask(void *) {
         // but carries no data (the driver zeroes it). Nothing below may read
         // past data[8], and a remote frame is bus activity, not values.
         if (msg.data_length_code > 8) msg.data_length_code = 8;
+        rawRecRx(msg);                       // every frame, before anything is made of it
         const bool remote = msg.rtr;
         if (remote) msg.data_length_code = 0;
         s_canFramesRx++;
@@ -3041,7 +3049,11 @@ static void busGuardTask(void *) {
         // Frames dropped for a full queue or FIFO: the master was deaf to them,
         // and the ones it kept were late.
         const uint32_t dropped = st.rx_missed_count + st.rx_overrun_count;
-        if (dropped != lastDropped) { lastDropped = dropped; masterBusStall(); }
+        if (dropped != lastDropped) {
+            if (dropped > lastDropped) rawRecLost(dropped - lastDropped);   // (a reinstall resets them)
+            lastDropped = dropped;
+            masterBusStall();
+        }
 
         const uint32_t delta = st.bus_error_count - lastErrCount;
         lastErrCount = st.bus_error_count;
@@ -3210,6 +3222,7 @@ static void enterDeepSleep() {
 
     // Leave the bus and the radio cleanly rather than mid-transfer.
     canShutdown();
+    rawRecFlush();                   // a raw recording's last frames, now that no more come
     esp_now_deinit();
     WiFi.mode(WIFI_OFF);
 
@@ -3575,6 +3588,7 @@ void masterBeforeRestart() {
     // when the portal is used. The latch is the RTC pad hold, which a software
     // restart leaves in place. Opt out with tx_hold, as for sleep.
     canShutdown();
+    rawRecFlush();                   // a raw recording's last frames
     if (Cfg.txRecessiveHold) gpio_hold_en((gpio_num_t)CAN_TX_GPIO);
 }
 
@@ -3796,6 +3810,9 @@ void setup() {
     xTaskCreatePinnedToCore(busGuardTask,    "busguard",  4096, nullptr,  9, &s_tasks[4].h, 1);
     ssm2Begin();
     codesBegin();
+    // The raw recorder first: a recording on the log partition keeps the
+    // drive logs off it (they would format it).
+    rawRecBegin();
     driveLogBegin();
     // Last: the learner sizes its tables to the heap free now, keeping 95 KB
     // for Wi-Fi, the portal and its saves. Anything started after it would
@@ -3937,8 +3954,14 @@ void loop() {
     Portal.loop();
     fwUpdateTick(!Cfg.portalOn || Portal.running());
     if (Cfg.radioDbm != s_radioDbmApplied) applyRadioPower();
-    Cfg.serviceSave();
-    evService();
+    // A save or the evidence log written now would hold the CAN interrupt off
+    // for a block erase - frames a raw recording would lose. They wait for the
+    // recording to end (a sleep or a restart writes them first). A save asked
+    // for from the portal is done at once all the same.
+    if (!rawRecActive()) {
+        Cfg.serviceSave();
+        evService();
+    }
     portalRescueCheck();
     delay(10);
 }

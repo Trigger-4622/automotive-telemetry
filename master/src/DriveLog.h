@@ -72,3 +72,12 @@ bool driveLogDelete(const char *name);
 /** @brief Delete every file. */
 void driveLogDeleteAll();
 void driveLogStatus(DriveLogStatus &out);
+/**
+ * @brief Let go of the logs partition for a raw bus recording (RawRec.h):
+ *        the drive being written closes, the file system is unmounted, and
+ *        the logger stays off until driveLogReclaim(). A master that boots
+ *        with a recording on the partition never mounts it.
+ */
+void driveLogRelease();
+/** @brief The partition back from the recorder: formatted, mounted, logging. */
+void driveLogReclaim();

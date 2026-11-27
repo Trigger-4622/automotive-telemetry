@@ -1,6 +1,7 @@
 /**
  * @file DriveViews.cpp
- * @brief The G-meter and the performance timers - see DriveViews.h.
+ * @brief The G-meter, the performance timers and the parking screen - see
+ *        DriveViews.h.
  */
 #include "DriveViews.h"
 
@@ -198,5 +199,146 @@ void perfUpdate(PerfView &v, const PerfTimer &p, uint32_t masterNow, bool speedK
     if (c != v.lastStatusColor) {
         v.lastStatusColor = c;
         lv_obj_set_style_text_color(v.status, lv_color_hex(c), 0);
+    }
+}
+
+/* ═════════════════════════════ parking screen ════════════════════════════ */
+
+/** The spokes' places on the wheel, clockwise from twelve o'clock [deg]; the
+ *  last is the stripe at the top of the rim. */
+static const float SPOKE_AT[4] = { -90, 90, 180, 0 };
+
+/** Put line @p i of the wheel at its place with the wheel turned @p deg. */
+static void parkLine(ParkView &v, int i, float deg) {
+    const float a = (SPOKE_AT[i] - deg) * 0.017453293f;          // to radians
+    const bool stripe = i == 3;
+    const float r0 = stripe ? v.r - 16 : v.hub, r1 = stripe ? v.r + 2 : v.r - 4;
+    const float s = sinf(a), c = cosf(a);
+    const int x0 = (int)lroundf(v.cx + r0 * s), y0 = (int)lroundf(v.cy - r0 * c);
+    const int x1 = (int)lroundf(v.cx + r1 * s), y1 = (int)lroundf(v.cy - r1 * c);
+    // The object spans only the line, so a turn redraws only around it.
+    const int pad = 6, ox = (x0 < x1 ? x0 : x1) - pad, oy = (y0 < y1 ? y0 : y1) - pad;
+    lv_point_t *p = v.pts + 2 * i;
+    p[0].x = (lv_coord_t)(x0 - ox); p[0].y = (lv_coord_t)(y0 - oy);
+    p[1].x = (lv_coord_t)(x1 - ox); p[1].y = (lv_coord_t)(y1 - oy);
+    lv_obj_set_pos(v.line[i], ox, oy);
+    lv_line_set_points(v.line[i], p, 2);
+}
+
+void parkBuild(ParkView &v, lv_obj_t *parent, int w, int h, float steerMax, float straightDeg) {
+    v.steerMax = steerMax >= 30 ? steerMax : 540;
+    v.straight = straightDeg >= 0 ? straightDeg : 10;
+    const bool wide = w > h * 1.4f;
+    // Round: the wheel in the middle, the angle in it, the arc round it with
+    // its gap at the bottom for the word. Landscape: wheel and arc on the
+    // left, the angle and the word to their right.
+    const int R = wide ? (h - 48) / 2 : (int)(w * 0.45f);     // the arc
+    v.cx = wide ? R + 40 : w / 2;
+    v.cy = wide ? h / 2 + 4 : h / 2 - 6;
+    v.r  = wide ? (int)(R * 0.70f) : (int)(R * 0.69f);
+    v.hub = wide ? 16 : 44;
+
+    // From straight ahead (the top) to full lock either way: the arc's ends.
+    v.lock = lv_arc_create(parent);
+    lv_obj_remove_style(v.lock, nullptr, LV_PART_KNOB);
+    lv_obj_clear_flag(v.lock, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(v.lock, 2 * R, 2 * R);
+    lv_obj_set_pos(v.lock, v.cx - R, v.cy - R);
+    lv_arc_set_bg_angles(v.lock, 135, 45);
+    lv_arc_set_mode(v.lock, LV_ARC_MODE_SYMMETRICAL);
+    const int16_t lim = (int16_t)lroundf(v.steerMax);
+    lv_arc_set_range(v.lock, -lim, lim);
+    lv_arc_set_value(v.lock, 0);
+    lv_obj_set_style_arc_width(v.lock, 8, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(v.lock, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(v.lock, lv_color_hex(UI_LINE_SOFT), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(v.lock, lv_color_hex(UI_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(v.lock, false, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(v.lock, false, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_all(v.lock, 0, 0);
+    lv_obj_set_style_bg_opa(v.lock, LV_OPA_TRANSP, 0);
+
+    // The wheel: its rim, three spokes and the stripe at its top.
+    v.rim = shape(parent, 2 * v.r, 2 * v.r);
+    lv_obj_set_pos(v.rim, v.cx - v.r, v.cy - v.r);
+    lv_obj_set_style_radius(v.rim, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(v.rim, wide ? 12 : 10, 0);
+    lv_obj_set_style_border_color(v.rim, lv_color_hex(UI_LINE), 0);
+    lv_obj_set_style_border_opa(v.rim, LV_OPA_COVER, 0);
+    if (wide) {
+        lv_obj_t *hub = shape(parent, 2 * v.hub, 2 * v.hub);
+        lv_obj_set_pos(hub, v.cx - v.hub, v.cy - v.hub);
+        lv_obj_set_style_radius(hub, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(hub, lv_color_hex(UI_LINE), 0);
+        lv_obj_set_style_bg_opa(hub, LV_OPA_COVER, 0);
+    }
+    v.pts = (lv_point_t *)lv_mem_alloc(sizeof(lv_point_t) * 8);   // for good, as the screen
+    if (v.pts) memset(v.pts, 0, sizeof(lv_point_t) * 8);
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *l = lv_line_create(parent);
+        lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_line_width(l, i == 3 ? 8 : (wide ? 10 : 8), 0);
+        lv_obj_set_style_line_rounded(l, true, 0);
+        lv_obj_set_style_line_color(l, lv_color_hex(i == 3 ? UI_ACCENT : UI_LINE), 0);
+        v.line[i] = l;
+        if (v.pts) parkLine(v, i, 0);
+    }
+
+    if (wide) {
+        const int x = v.cx + R + 36;
+        label(parent, "STEERING", &lv_font_montserrat_12, UI_MUTED, LV_ALIGN_TOP_LEFT, x, h / 2 - 78);
+        v.value = label(parent, "--", &lv_font_montserrat_48, UI_TEXT, LV_ALIGN_TOP_LEFT, x, h / 2 - 60);
+        v.word  = label(parent, "", &lv_font_montserrat_20, UI_MUTED, LV_ALIGN_TOP_LEFT, x, h / 2 + 2);
+        char t[24];
+        snprintf(t, sizeof t, "LOCK %d\xC2\xB0 EACH WAY", (int)lim);
+        label(parent, t, &lv_font_montserrat_12, UI_DIM, LV_ALIGN_TOP_LEFT, x, h / 2 + 40);
+    } else {
+        v.value = label(parent, "--", &lv_font_montserrat_32, UI_TEXT, LV_ALIGN_CENTER, 0, v.cy - h / 2 - 2);
+        v.word  = label(parent, "", &lv_font_montserrat_14, UI_MUTED, LV_ALIGN_TOP_MID, 0, v.cy + R - 12);
+    }
+    v.lastOk = true;
+    parkUpdate(v, 0, false);
+}
+
+void parkUpdate(ParkView &v, float deg, bool ok) {
+    if (!v.rim) return;
+    if (ok != v.lastOk) {
+        v.lastOk = ok;
+        for (lv_obj_t *l : v.line) {
+            if (ok) lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
+            else    lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (!ok) {
+            lv_arc_set_value(v.lock, 0);
+            setText(v.value, v.lastValue, sizeof v.lastValue, "--");
+            setText(v.word, v.lastWord, sizeof v.lastWord, "NO STEERING ANGLE");
+            lv_obj_set_style_text_color(v.word, lv_color_hex(UI_DIM), 0);
+            lv_obj_set_style_text_color(v.value, lv_color_hex(UI_TEXT), 0);
+            v.lastDeg = INT16_MIN;
+            v.lastSide = 2;
+        }
+    }
+    if (!ok) return;
+    if (!(deg > -3600 && deg < 3600)) deg = deg > 0 ? 3600 : -3600;   // and NaN
+    const int16_t d = (int16_t)lroundf(deg);
+    if (d != v.lastDeg) {
+        v.lastDeg = d;
+        if (v.pts) for (int i = 0; i < 4; i++) parkLine(v, i, (float)d);
+        const float lim = v.steerMax;
+        lv_arc_set_value(v.lock, (int16_t)lroundf(-d > lim ? lim : -d < -lim ? -lim : -d));
+        char t[12];
+        snprintf(t, sizeof t, "%d\xC2\xB0", d < 0 ? -d : d);
+        setText(v.value, v.lastValue, sizeof v.lastValue, t);
+    }
+    const int8_t side = fabsf(deg) <= v.straight ? 0 : deg > 0 ? 1 : -1;
+    if (side != v.lastSide) {
+        v.lastSide = side;
+        const uint32_t c = side ? UI_ACCENT : UI_OK;
+        setText(v.word, v.lastWord, sizeof v.lastWord,
+                side > 0 ? LV_SYMBOL_LEFT " LEFT" : side < 0 ? "RIGHT " LV_SYMBOL_RIGHT : "STRAIGHT");
+        lv_obj_set_style_text_color(v.word, lv_color_hex(side ? UI_TEXT_DIM : UI_OK), 0);
+        lv_obj_set_style_text_color(v.value, lv_color_hex(side ? UI_TEXT : UI_OK), 0);
+        lv_obj_set_style_line_color(v.line[3], lv_color_hex(c), 0);
+        lv_obj_set_style_arc_color(v.lock, lv_color_hex(c), LV_PART_INDICATOR);
     }
 }
