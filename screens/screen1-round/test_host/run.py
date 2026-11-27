@@ -4,11 +4,13 @@
     python test_host/run.py                  # build, run every scenario
     python test_host/run.py lamp_seatbelt    # just these
     python test_host/run.py lamp_mil_once -v # one scenario, full firmware log
+    python test_host/run.py studio_page      # just the studio page's checks (Node, no build)
 
 The real src/ui, src/telemetry/TelemetryStore.cpp and src/config sources are
 compiled unmodified against the mocks in test_host/mocks and linked with the
 real LVGL from .pio/libdeps, drawing into a framebuffer. Screenshots land in
-test_host/shots/. Undefined behaviour traps (UBSan, trap mode), the standard
+test_host/shots/. Every run also checks the Gauge Studio page against this
+firmware (studio_tests.js, in Node), reported as "studio_page". Undefined behaviour traps (UBSan, trap mode), the standard
 library checks its bounds, and an LVGL allocation failure aborts instead of
 hanging as it would on the device.
 
@@ -194,9 +196,32 @@ def build():
     return env
 
 
+STUDIO_TESTS = os.path.join(HERE, "studio_tests.js")
+
+
+def run_studio():
+    """The studio page against this firmware, in Node (studio_tests.js):
+    reported like a scenario, as "studio_page". Node.js is part of the test
+    setup, like g++ - a missing one fails the run rather than skipping it."""
+    t = time.time()
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        return 1, "node not found - the studio page's tests need Node.js on the PATH", 0.0
+    r = subprocess.run([node, STUDIO_TESTS], capture_output=True, text=True, timeout=300)
+    return r.returncode, (r.stdout or "") + (r.stderr or ""), time.time() - t
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     verbose = "-v" in sys.argv
+    studio = not args or "studio_page" in args       # every scenario, or named
+    args = [a for a in args if a != "studio_page"]
+    if studio and not args and "studio_page" in sys.argv:
+        code, out, dt = run_studio()                # just the page's tests: no build needed
+        print("%-4s %-32s %5.1fs" % ("ok" if code == 0 else "FAIL", "studio_page", dt))
+        if out and (verbose or code):
+            print(out.rstrip())
+        sys.exit(1 if code else 0)
     env = build()
     board = os.path.basename(ROOT)
     shots = os.path.join(SHOTS)
@@ -224,8 +249,17 @@ def main():
                 print("    crashed (exit %d) - debug with: gdb --args %s %s" % (r.returncode, EXE, n))
             if not ok:
                 failed.append(n)
+    total = len(todo)
+    if studio:
+        code, out, dt = run_studio()
+        print("%-4s %-32s %5.1fs" % ("ok" if code == 0 else "FAIL", "studio_page", dt))
+        if out and (verbose or code):
+            print(out.rstrip())
+        total += 1
+        if code:
+            failed.append("studio_page")
     print("\n%s: %d/%d scenarios passed in %.0fs; screenshots in %s" % (
-        board, len(todo) - len(failed), len(todo), time.time() - t0, shots))
+        board, total - len(failed), total, time.time() - t0, shots))
     sys.exit(1 if failed else 0)
 
 

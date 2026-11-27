@@ -17,7 +17,9 @@
  *
  * REST API (all JSON unless noted):
  *   GET  /api/layout       current layout.json
- *   POST /api/layout       replace layout.json (validated before saving)
+ *   POST /api/layout       replace layout.json: a form's file (the studio) or
+ *                          a bare JSON body, written to flash as it arrives,
+ *                          then checked and applied (applyLayoutFile)
  *   GET  /api/live         live metric snapshot (id, value, peak, flags, age)
  *   GET  /api/info         firmware/FS/link info
  *   GET  /api/assets       list of files in /assets
@@ -168,26 +170,6 @@ public:
     float colorGainB() { return _layout["global"]["color_gain_b"] | 1.0f; }
     /** @} */
 
-    /** @name Touch controller coordinate range
-     *  The frame the GT911 reports in, which is NOT the display's once the
-     *  panel is bonded rotated. Runtime-settable so the extents can be read
-     *  off the diagnostics screen and corrected without a rebuild.
-     *  @{ */
-    int touchNativeW() { return _layout["global"]["touch_native_w"] | TOUCH_NATIVE_W; }
-    int touchNativeH() { return _layout["global"]["touch_native_h"] | TOUCH_NATIVE_H; }
-    /** @} */
-
-    /** @name Touch orientation
-     *  Overridable at runtime because a touch panel bonded 90 degrees out
-     *  turns every horizontal swipe into a vertical one - taps still work,
-     *  which is what makes it so easy to misread as "swipes are unreliable".
-     *  The DIAGNOSTICS screen shows raw coordinates so you can see it.
-     *  @{ */
-    bool touchSwapXY()  { return _layout["global"]["touch_swap_xy"]  | (bool)TOUCH_SWAP_XY;  }
-    bool touchInvertX() { return _layout["global"]["touch_invert_x"] | (bool)TOUCH_INVERT_X; }
-    bool touchInvertY() { return _layout["global"]["touch_invert_y"] | (bool)TOUCH_INVERT_Y; }
-    /** @} */
-
     /** @return Side-button GPIO. Identify yours with the diagnostics scan. */
     int      buttonGpio()  { return _layout["global"]["button_gpio"] | PIN_BUTTON; }
     /** @return true to run the button discovery scan (see ButtonManager). */
@@ -263,14 +245,6 @@ private:
      */
     bool persistLayout();
 
-    /**
-     * @brief Write layout text exactly as received, with the same care.
-     * @param body JSON text, already validated.
-     * @return false when nothing was written.
-     */
-    bool writeLayoutText(const String &body);
-    /** @brief The same, from a buffer (a layout re-serialised on the device). */
-    bool writeLayoutText(const char *text, size_t len);
 
     /**
      * @brief Finish an atomic write: check its length, then rename it in.
@@ -302,6 +276,39 @@ private:
     void setupRoutes();
 
     /**
+     * @brief Apply a layout the studio uploaded, from the flash, and keep it.
+     *
+     * The upload is written to @p path as it arrives (layoutChunk) and parsed
+     * from there into the place of the layout in memory, which is let go
+     * first. Held in memory - the server keeps a request's body twice while
+     * reading it, the handler took a third copy, and the parsed layout was
+     * copied once more beside the one in use - a whole layout did not fit in
+     * what the ESP32-C3 has left with its access point up, nor in the
+     * cluster's internal RAM beside its draw buffers: "Save failed". The
+     * device's touch calibration stands over the upload's; a layout that will
+     * not parse, has no screens, or will not fit on the flash changes nothing,
+     * and the stored one is put back in memory.
+     * @param path Where the upload is; removed either way.
+     * @param why  Filled with the reason when it returns false.
+     * @param code Filled with the HTTP status for that reason.
+     * @return true when the layout is applied and stored.
+     */
+    bool applyLayoutFile(const char *path, char *why, size_t whyLen, int &code);
+
+    /** @brief One piece of a layout upload, to the flash (POST /api/layout). */
+    void layoutChunk(uint8_t phase, const uint8_t *buf, size_t n);
+
+    /** @brief The stored layout back in memory, after an upload that failed. */
+    void restoreStoredLayout();
+
+    /**
+     * @brief Rename a complete file over the layout: atomically where LittleFS
+     *        allows, else the old one is removed first.
+     * @return false when the old layout was kept.
+     */
+    bool commitLayoutFrom(const char *src);
+
+    /**
      * @brief Multipart upload handler for `POST /api/asset`.
      *
      * Reduces the client filename to a basename and strips ".." before
@@ -319,6 +326,10 @@ private:
     WebServer _server{80};   /**< Gauge Studio HTTP server.                 */
     DNSServer _dns;          /**< Captive-portal DNS; answers everything.   */
     File      _uploadFile;   /**< Destination of an in-flight asset upload. */
+    File      _layoutUp;     /**< Destination of an in-flight layout upload. */
+    size_t    _layoutUpBytes = 0;   /**< ...its bytes so far.                */
+    /** Where a layout upload stands: see layoutChunk(). */
+    enum : uint8_t { UP_NONE, UP_WRITING, UP_STORED, UP_TOO_BIG, UP_FAILED } _layoutUpState = UP_NONE;
     String    _uploadPath;   /**< ...and its path, to remove a partial one.  */
     /** Why the last upload failed, for its reply; nullptr when it did not.
      *  "no file" until an upload starts: a POST without one is refused. */

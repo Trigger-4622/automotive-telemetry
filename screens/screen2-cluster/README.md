@@ -61,12 +61,13 @@ pio run -t upload
 
 No filesystem upload: the Gauge Studio page is compiled into the firmware,
 and a first boot writes a built-in layout by itself. For the full example,
-paste `data/layout.json` into the studio's **Raw JSON** tab and Save.
+open `data/layout.json` in the studio's **Device** tab (Layout file, "Open a
+file…") and Save.
 
 > **Never run `pio run -t uploadfs` on a display in use.** It replaces the
 > whole LittleFS partition - the layout, the uploaded backgrounds and (on the
 > cluster) the touch calibration with it. Upload backgrounds from the studio's
-> **Assets** tab instead.
+> **Device** tab instead.
 
 ## Board gotchas worth knowing
 

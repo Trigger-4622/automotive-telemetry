@@ -1,5 +1,5 @@
 {
-  "_doc": "Dash cluster layout schema v1 — 480x272 LANDSCAPE. Keys starting with '_' are documentation only. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; upload with 'pio run -t uploadfs' or POST /api/layout. This is the SAME schema as the 1.28in round display, plus the landscape-only screen types 'cluster' and 'bars' and a wider grid — a layout written for the round board loads here unchanged, it just will not use the extra room.",
+  "_doc": "Dash cluster layout schema v1 — 480x272 LANDSCAPE. Keys starting with '_' are documentation only. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; or POST it to /api/layout - never 'pio run -t uploadfs', which replaces the layout and the touch calibration stored on the display. This is the SAME schema as the 1.28in round display, plus the landscape-only screen types 'cluster' and 'bars' and a wider grid — a layout written for the round board loads here unchanged, it just will not use the extra room.",
   "version": 3,
 
   "global": {
@@ -17,19 +17,13 @@
     "gauge_alarm_colors": true,
 
     "_doc_button": "button_gpio: the side button's pin (BOOT is GPIO0 on this board). While button_discovery is true the firmware records each candidate pin's resting level at boot and reports any that DEVIATES, naming it on screen. Set button_discovery false once the pin is known.",
-    "_doc_panel": "bgr_order: leave false unless the DIAGNOSTICS colour strip shows R and B exchanged (the R patch looking blue). touch_swap_xy / touch_invert_x / touch_invert_y correct a touch panel bonded out of alignment - if taps land fine but horizontal swipes do nothing, watch the DIAGNOSTICS Touch readout while dragging left-to-right: if the SECOND number moves instead of the first, set touch_swap_xy true.",
+    "_doc_panel": "bgr_order: leave false unless the DIAGNOSTICS colour strip shows R and B exchanged (the R patch looking blue). Touch needs no setting here: swipes and taps run on the calibration the studio's 'Calibrate touch' measures (stored as touch_cal).",
     "_doc_calib": "color_gain_r/g/b scale each RGB565 channel on the way to the panel, 1.0 = untouched. Dial these from the Settings tab while watching the screen; the DIAGNOSTICS colour strip is the reference. This corrects a panel's colour cast, which no amount of channel-order swapping can fix.",
     "color_gain_r": 1.0,
     "color_gain_g": 1.0,
     "color_gain_b": 1.0,
 
     "bgr_order": false,
-    "_doc_touch_native": "touch_native_w/h are the coordinate range the GT911 reports in ITS OWN frame, which is not the display's once the panel is bonded rotated. Get them from the DIAGNOSTICS Touch row: drag a finger into all four corners and read the 'max' pair. Wrong values do not stop touch working - they make one axis dominate the other, so swipes fire in one direction only.",
-    "touch_native_w": 480,
-    "touch_native_h": 272,
-    "touch_swap_xy": true,
-    "touch_invert_x": false,
-    "touch_invert_y": false,
 
     "button_gpio": 0,
     "button_discovery": true,
