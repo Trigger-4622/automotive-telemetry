@@ -24,12 +24,13 @@ pio run -t upload
 
 No filesystem upload: the Gauge Studio page is compiled into the firmware,
 and a first boot writes a built-in layout by itself. For the full example,
-paste `data/layout.json` into the studio's **Raw JSON** tab and Save.
+open `data/layout.json` in the studio's **Device** tab (Layout file, "Open a
+file…") and Save.
 
 > **Never run `pio run -t uploadfs` on a display in use.** It replaces the
 > whole LittleFS partition - the layout, the uploaded backgrounds and (on the
 > cluster) the touch calibration with it. Upload backgrounds from the studio's
-> **Assets** tab instead.
+> **Device** tab instead.
 
 Serial console runs on the board's native USB-C (115200).
 
@@ -58,18 +59,23 @@ Serial console runs on the board's native USB-C (115200).
 **If the side button does nothing**, it is on a different GPIO than assumed.
 Swipe to the **DIAGNOSTICS** screen and watch the `GPIO` row while holding the
 button — it lists the candidate pins live, e.g. `9H 8H 20H 21H`. The one that
-flips to `L` is your button. Put that number in `global.button_gpio` in
-layout.json (or the studio's Raw JSON tab) and reboot; no rebuild needed.
+flips to `L` is your button. Put that number in the studio's Settings tab
+(Side button GPIO), save and restart; no rebuild needed.
 
 The default is GPIO9, the ESP32-C3 download strap. The strap is only read while
 the chip resets, so it is free as a runtime input, and holding it while plugging
 in USB still enters the ROM bootloader.
 
-Gauge Studio lets you add/edit screens (arc gauges, needle tachometers, 2/4-way
-splits, text lists, trend charts, the G-meter, the performance timers,
-diagnostics), map any metric ID, tune
-colors/angles/thresholds with a live circular preview, upload background images
-(LVGL `.bin`), and save the layout to the device.
+Gauge Studio has five tabs. **Screens**: add, order and edit screens (the dash,
+arc gauges, needle tachometers, 2/4-way splits, text lists, trend charts, the
+G-meter, the performance timers, diagnostics) with a live circular preview -
+each type offers only what it draws, and its background (texture, gradient,
+image, bezel). **Lamps**: the warning lamps and their strip. **Watchdog**:
+values guarded on every screen. **Settings**: display, alerts, the master and
+network, the side button - each setting in one place. **Device**: the
+display's figures, live telemetry, background images (LVGL `.bin`) and the
+layout file, to keep a copy or open one. Save sends the layout as a file,
+which the display writes to flash as it arrives and only then reads.
 
 **Driving screens.** `gmeter` draws the car's acceleration as a dot in a
 friction circle (up speeding up, down braking, left in a left-hand bend; rim

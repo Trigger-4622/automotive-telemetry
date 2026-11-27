@@ -22,6 +22,7 @@ Debug a crash with `gdb --args test_host/build/ui.exe <scenario>`.
 | `host/lvgl_host.cpp` | Framebuffer display, PNG writer, the simulated master, virtual time |
 | `host/lv_budget.cpp` | What the LVGL heap would hold **on the ESP32** — see below |
 | `tests/ui_tests.cpp` | The scenarios |
+| `studio_tests.js` | The Gauge Studio page (`data/www/index.html`) against this firmware, in Node: every setting of the layout's global, network, watchdog and warnings blocks one row of the page's `SETTINGS`, with the firmware's default; every key the screen editor writes read by `UIBuilder.cpp` where that screen type is built, and its number defaults the firmware's; the page's shared script the same on both boards. Run with every scenario as `studio_page`, or alone: `python test_host/run.py studio_page` |
 
 ## LVGL heap on the device
 
@@ -33,7 +34,7 @@ LVGL object and adds up the blocks it owns using the **32-bit** struct sizes
 (`host/lv_sizes.c`, compiled with `-m32`), rounded the way LVGL's TLSF allocator
 rounds on the ESP32. `boot_all_screens` prints the estimate per screen and fails
 when less than 8 KB would be left. The firmware also logs the real figure at
-boot, and the studio's System tab shows it.
+boot, and the studio's Device tab shows it.
 
 What it cannot show: real touch, real panel timing, and the radio. Those need
 the car.

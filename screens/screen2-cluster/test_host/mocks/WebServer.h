@@ -18,6 +18,15 @@
 enum HTTPMethod { HTTP_ANY, HTTP_GET, HTTP_POST, HTTP_PUT, HTTP_DELETE };
 enum HTTPUploadStatus { UPLOAD_FILE_START, UPLOAD_FILE_WRITE, UPLOAD_FILE_END,
                         UPLOAD_FILE_ABORTED };
+enum HTTPRawStatus { RAW_START, RAW_WRITE, RAW_END, RAW_ABORTED };
+
+/** A bare request body, handed over as the real server does: 1436 bytes at a
+ *  time to a route that has an upload handler. */
+struct HTTPRaw {
+    HTTPRawStatus status = RAW_START;
+    size_t  totalSize = 0, currentSize = 0;
+    uint8_t buf[1436] = {};
+};
 
 struct HTTPUpload {
     HTTPUploadStatus status = UPLOAD_FILE_START;
@@ -40,8 +49,23 @@ public:
         auto it = args_.find(name);
         return it == args_.end() ? String() : String(it->second);
     }
+    bool hasArg(const char *name) { return args_.count(name) > 0; }
     String uri() { return String(uri_); }
     HTTPUpload &upload() { return upload_; }
+    HTTPRaw &raw() { return raw_; }
+    /** Only the headers asked for here are kept, as on the device. */
+    void collectHeaders(const char *keys[], size_t n) {
+        collect_.clear();
+        for (size_t i = 0; i < n; i++) collect_.push_back(keys[i]);
+    }
+    String header(const char *name) {
+        for (auto &k : collect_)
+            if (k == name) {
+                auto it = reqHeaders_.find(name);
+                return it == reqHeaders_.end() ? String() : String(it->second);
+            }
+        return String();
+    }
 
     void sendHeader(const String &k, const String &v, bool = false) {
         headers[k.str()] = v.str();
@@ -60,12 +84,34 @@ public:
         return s.size();
     }
 
-    /** Harness: run the handler for one request, as the network would. */
+    /** Harness: run the handler for one request, as the network would. A
+     *  POST to a route with an upload handler arrives the way the real server
+     *  hands a bare JSON body over to one: in pieces (raw), never as "plain". */
     bool request(HTTPMethod m, const std::string &uri, const std::string &plain = "") {
         code = 0; body.clear(); headers.clear(); contentType.clear();
-        uri_ = uri; args_.clear(); args_["plain"] = plain;
-        for (auto &r : routes_)
-            if (r.uri == uri && (r.m == m || r.m == HTTP_ANY)) { r.h(); return true; }
+        uri_ = uri; args_.clear(); reqHeaders_.clear();
+        for (auto &r : routes_) {
+            if (r.uri != uri || !(r.m == m || r.m == HTTP_ANY)) continue;
+            if (m == HTTP_POST && r.up) {
+                reqHeaders_["Content-Type"] = "application/json";
+                raw_ = HTTPRaw();
+                raw_.status = RAW_START;
+                r.up();
+                for (size_t at = 0; at < plain.size(); at += sizeof raw_.buf) {
+                    raw_.currentSize = std::min(sizeof raw_.buf, plain.size() - at);
+                    memcpy(raw_.buf, plain.data() + at, raw_.currentSize);
+                    raw_.totalSize += raw_.currentSize;
+                    raw_.status = RAW_WRITE;
+                    r.up();
+                }
+                raw_.status = RAW_END;
+                r.up();
+            } else {
+                args_["plain"] = plain;
+            }
+            r.h();
+            return true;
+        }
         if (notFound_) notFound_();
         return false;
     }
@@ -76,7 +122,8 @@ public:
     bool upload(const std::string &uri, const std::string &filename,
                 const std::string &data, bool abort = false) {
         code = 0; body.clear(); headers.clear(); contentType.clear();
-        uri_ = uri; args_.clear();
+        uri_ = uri; args_.clear(); reqHeaders_.clear();
+        reqHeaders_["Content-Type"] = "multipart/form-data; boundary=harness";
         for (auto &r : routes_) {
             if (r.uri != uri || r.m != HTTP_POST || !r.up) continue;
             upload_ = HTTPUpload();
@@ -107,6 +154,8 @@ private:
     std::vector<Route> routes_;
     Handler notFound_;
     std::string uri_;
-    std::map<std::string, std::string> args_;
+    std::map<std::string, std::string> args_, reqHeaders_;
+    std::vector<std::string> collect_;
     HTTPUpload upload_;
+    HTTPRaw raw_;
 };

@@ -2558,7 +2558,7 @@ void UIBuilder::updateDiag() {
     // Touching opposite corners shows whether TOUCH_NATIVE_W/H are right.
     // raw / mapped / largest-raw-seen / last gesture. Drag into all four
     // corners and "max" gives the controller's true range, which is what
-    // touch_native_w and touch_native_h must be set to.
+    // TOUCH_NATIVE_W and TOUCH_NATIVE_H (HardwareConfig.h) must be set to.
     snprintf(t, sizeof(t), "r%d,%d  %d,%d  max%d,%d %s",
              Touch.ctrlX(), Touch.ctrlY(), Touch.rawX(), Touch.rawY(),
              Touch.seenMaxX(), Touch.seenMaxY(), Touch.lastGesture());

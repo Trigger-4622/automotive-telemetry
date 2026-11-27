@@ -496,6 +496,73 @@ SCENARIO(default_layout) {
     shot("default_dash");
 }
 
+/*
+ * The studio's Save, as the page sends it: the whole layout as a form's file.
+ * It used to be held in memory - by the server twice while reading it, by the
+ * handler a third time, and parsed twice beside the layout in use - which the
+ * ESP32-C3 cannot hold with its access point up: "Save failed" on the car
+ * (2026-11-27). It goes to the flash as it arrives now, and is parsed into
+ * the place of the old layout. Whatever is wrong with an upload, the stored
+ * layout and the one in memory stay as they were.
+ */
+SCENARIO(studio_save_streamed) {
+    hostfs::files["/layout.up"] = "{\"screens\":[";        // a power cut mid-upload
+    boot();
+    CHECK(!hostfs::files.count("/layout.up"), "a leftover upload is removed at boot");
+    Config.enterConfigMode();
+    const size_t screens = Config.layout()["screens"].as<JsonArray>().size();
+
+    JsonDocument d = shippedLayout();
+    d["global"]["alert_ack_ms"] = 4321;
+    std::string body;
+    serializeJson(d, body);
+    Config._server.upload("/api/layout", "layout.json", body);
+    CHECK(Config._server.code == 200, "saved as a form's file (%d %s)", Config._server.code,
+          Config._server.body.c_str());
+    CHECK(hostfs::files["/layout.json"] == body, "stored exactly as sent (%zu of %zu bytes)",
+          hostfs::files["/layout.json"].size(), body.size());
+    CHECK((Config.layout()["global"]["alert_ack_ms"] | 0) == 4321, "and in use in memory");
+    CHECK(!hostfs::files.count("/layout.up"), "the upload is not left behind");
+    const std::string good = hostfs::files["/layout.json"];
+
+    // Cut short (the phone gave up part way): refused, nothing changed.
+    Config._server.upload("/api/layout", "layout.json", body.substr(0, body.size() / 2));
+    CHECK(Config._server.code == 400 &&
+          Config._server.body.find("invalid layout") != std::string::npos,
+          "a layout cut short is refused, saying why (%d %s)", Config._server.code,
+          Config._server.body.c_str());
+    CHECK(hostfs::files["/layout.json"] == good, "the stored layout is untouched");
+    CHECK((Config.layout()["global"]["alert_ack_ms"] | 0) == 4321 &&
+          Config.layout()["screens"].as<JsonArray>().size() == screens,
+          "and the one in memory is the stored one again");
+    CHECK(!hostfs::files.count("/layout.up"), "the refused upload is removed");
+
+    // The phone went away mid-upload: the server never calls the handler.
+    Config._server.upload("/api/layout", "layout.json", body, true);
+    CHECK(!hostfs::files.count("/layout.up") && hostfs::files["/layout.json"] == good,
+          "an aborted upload leaves nothing and changes nothing");
+
+    // Far bigger than any layout: refused without filling the flash.
+    std::string huge = "{\"screens\":[{\"type\":\"diag\"}],\"pad\":\"";
+    huge.append(140 * 1024, 'x');
+    huge += "\"}";
+    Config._server.upload("/api/layout", "layout.json", huge);
+    CHECK(Config._server.code == 400 && Config._server.body.find("too big") != std::string::npos,
+          "a 140 KB upload is refused as too big (%d %s)", Config._server.code,
+          Config._server.body.c_str());
+    CHECK(hostfs::files["/layout.json"] == good && !hostfs::files.count("/layout.up"),
+          "and nothing is kept of it");
+
+    // The flash full while the upload arrives.
+    hostfs::writeBudget = 500;
+    Config._server.upload("/api/layout", "layout.json", body);
+    hostfs::writeBudget = -1;
+    CHECK(Config._server.code == 500 && Config._server.body.find("could not store") != std::string::npos,
+          "flash full: refused, saying so (%d %s)", Config._server.code, Config._server.body.c_str());
+    CHECK(hostfs::files["/layout.json"] == good && !hostfs::files.count("/layout.up"),
+          "the stored layout is untouched");
+}
+
 /* Saving a layout: a short write keeps the old file, a layer that will not
  * rename over a file still saves, and an interrupted save is recovered. */
 SCENARIO(layout_persistence) {

@@ -1,5 +1,5 @@
 {
-  "_doc": "Telemetry Display layout schema v1. Keys starting with '_' are documentation only — the firmware ignores them. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; upload with 'pio run -t uploadfs' or POST /api/layout.",
+  "_doc": "Telemetry Display layout schema v1. Keys starting with '_' are documentation only — the firmware ignores them. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; or POST it to /api/layout - never 'pio run -t uploadfs', which replaces the layout and the touch calibration stored on the display.",
   "version": 3,
 
   "global": {

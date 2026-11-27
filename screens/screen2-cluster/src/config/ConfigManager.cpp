@@ -10,7 +10,6 @@
 #include <lvgl.h>
 
 #include <LittleFS.h>
-#include <string>
 #include <WiFi.h>
 
 #include "DisplayManager.h"
@@ -26,6 +25,10 @@ static constexpr const char *LAYOUT_PATH = "/layout.json";
 static constexpr const char *LAYOUT_TMP  = "/layout.tmp";
 /** Where a layout that would not load is kept, rather than overwritten. */
 static constexpr const char *LAYOUT_BAD  = "/layout.bad";
+/** Where a layout the studio uploads is written while it arrives. */
+static constexpr const char *LAYOUT_UP   = "/layout.up";
+/** Far above any layout (the shipped example: 15 KB as the studio sends it). */
+static constexpr size_t LAYOUT_UP_MAX    = 128 * 1024;
 
 /** Filesystem partition label. MUST match the Name column of the filesystem
  *  row in partitions_custom.csv — Arduino's LittleFS locates its partition by
@@ -112,6 +115,8 @@ void ConfigManager::begin() {
           (unsigned)STUDIO_HTML_GZ_LEN);
 
     if (!LittleFS.exists("/assets")) LittleFS.mkdir("/assets");
+    // An upload a power cut stopped half way: never applied, only in the way.
+    if (LittleFS.exists(LAYOUT_UP)) LittleFS.remove(LAYOUT_UP);
 
     if (!loadLayout()) {
         // Kept, not overwritten: a layout that will not load may only be cut
@@ -191,12 +196,16 @@ bool ConfigManager::commitLayoutTmp(size_t written, size_t expected) {
         LittleFS.remove(LAYOUT_TMP);
         return false;
     }
+    return commitLayoutFrom(LAYOUT_TMP);
+}
+
+bool ConfigManager::commitLayoutFrom(const char *src) {
     // LittleFS renames over an existing file atomically; removing the old
     // one first would open a window with no layout at all. The remove is only
     // the fallback for a layer that refuses to overwrite.
-    if (!LittleFS.rename(LAYOUT_TMP, LAYOUT_PATH)) {
+    if (!LittleFS.rename(src, LAYOUT_PATH)) {
         LittleFS.remove(LAYOUT_PATH);
-        if (!LittleFS.rename(LAYOUT_TMP, LAYOUT_PATH)) {
+        if (!LittleFS.rename(src, LAYOUT_PATH)) {
             log_e("layout: rename failed, layout not saved");
             return false;
         }
@@ -211,22 +220,6 @@ bool ConfigManager::persistLayout() {
     const size_t written  = serializeJsonPretty(_layout, f);
     f.close();
     return commitLayoutTmp(written, expected);
-}
-
-bool ConfigManager::writeLayoutText(const String &body) {
-    File f = LittleFS.open(LAYOUT_TMP, "w");
-    if (!f) return false;
-    const size_t written = f.print(body);
-    f.close();
-    return commitLayoutTmp(written, body.length());
-}
-
-bool ConfigManager::writeLayoutText(const char *text, size_t len) {
-    File f = LittleFS.open(LAYOUT_TMP, "w");
-    if (!f) return false;
-    const size_t written = f.write(reinterpret_cast<const uint8_t *>(text), len);
-    f.close();
-    return commitLayoutTmp(written, len);
 }
 
 bool ConfigManager::migrateLayout() {
@@ -297,6 +290,102 @@ void ConfigManager::writeDefaultLayout() {
     f.close();
 }
 
+/* ─────────────────────────── layout upload ─────────────────────────────── */
+
+void ConfigManager::layoutChunk(uint8_t phase, const uint8_t *buf, size_t n) {
+    switch (phase) {
+    case 0:                                         // a new upload
+        if (_layoutUp) _layoutUp.close();
+        _layoutUp      = LittleFS.open(LAYOUT_UP, "w");
+        _layoutUpBytes = 0;
+        _layoutUpState = _layoutUp ? UP_WRITING : UP_FAILED;
+        break;
+    case 1:                                         // the next piece
+        if (_layoutUpState != UP_WRITING || !n) break;
+        if (_layoutUpBytes + n > LAYOUT_UP_MAX) {
+            _layoutUpState = UP_TOO_BIG;
+            _layoutUp.close();
+            break;
+        }
+        if (_layoutUp.write(buf, n) != n) {         // flash full
+            _layoutUpState = UP_FAILED;
+            _layoutUp.close();
+            break;
+        }
+        _layoutUpBytes += n;
+        break;
+    case 2:                                         // all of it
+        if (_layoutUpState == UP_WRITING) {
+            _layoutUp.close();
+            _layoutUpState = UP_STORED;
+        }
+        break;
+    default:                                        // the phone went away
+        if (_layoutUp) _layoutUp.close();
+        LittleFS.remove(LAYOUT_UP);
+        _layoutUpState = UP_NONE;
+        break;
+    }
+}
+
+void ConfigManager::restoreStoredLayout() {
+    _layout.clear();
+    if (!loadLayoutFrom(LAYOUT_PATH)) deserializeJson(_layout, DEFAULT_LAYOUT);
+}
+
+bool ConfigManager::applyLayoutFile(const char *path, char *why, size_t whyLen, int &code) {
+    /*
+     * The touch calibration is measured on the device and written straight to
+     * flash (saveTouchCal). A page that loaded the layout before that sends
+     * the old one back with its next Save: the device's stands. A copy of it
+     * is all that is kept of the layout in memory, which goes next - the new
+     * one is parsed into its place, so the two are never held together.
+     * Nothing reads it meanwhile: the portal runs in the loop, as the UI does.
+     */
+    JsonDocument cal;
+    cal.set(_layout["global"]["touch_cal"]);
+    _layout.clear();
+
+    DeserializationError err = DeserializationError::InvalidInput;
+    File f = LittleFS.open(path, "r");
+    if (f) {
+        err = deserializeJson(_layout, f);
+        f.close();
+    }
+    // No screens at all is refused too: the next boot would reject it and put
+    // the built-in layout - and no touch calibration - in its place.
+    if (err || !_layout["screens"].is<JsonArray>() ||
+        _layout["screens"].as<JsonArray>().size() == 0) {
+        if (err == DeserializationError::NoMemory)
+            snprintf(why, whyLen, "out of memory reading it (%u bytes free) - nothing changed",
+                     (unsigned)ESP.getFreeHeap());
+        else
+            snprintf(why, whyLen, "invalid layout: %s - nothing changed",
+                     err ? err.c_str() : "no screens");
+        code = 400;
+        LittleFS.remove(path);
+        restoreStoredLayout();
+        return false;
+    }
+
+    bool stored;
+    if (!cal.isNull() && _layout["global"]["touch_cal"] != cal) {
+        _layout["global"]["touch_cal"] = cal;
+        LittleFS.remove(path);
+        stored = persistLayout();
+    } else {
+        stored = commitLayoutFrom(path);            // the upload itself, as sent
+    }
+    if (!stored) {
+        snprintf(why, whyLen, "the flash would not take it - the stored layout is kept");
+        code = 500;
+        LittleFS.remove(path);
+        restoreStoredLayout();
+        return false;
+    }
+    return true;
+}
+
 /* ───────────────────────────── config mode ──────────────────────────────── */
 
 void ConfigManager::enterConfigMode() {
@@ -349,6 +438,9 @@ static const char *mimeFor(const String &path) {
 }
 
 void ConfigManager::setupRoutes() {
+    static const char *HEADERS[] = {"Content-Type"};   // which body an upload is
+    _server.collectHeaders(HEADERS, 1);
+
     // ---- Gauge Studio SPA -------------------------------------------------
     _server.on("/", HTTP_GET, [this]() {
         // Compiled in, gzipped: every browser accepts gzip, and it is a
@@ -368,37 +460,45 @@ void ConfigManager::setupRoutes() {
         f.close();
     });
 
+    /*
+     * A layout in: the studio's Save. Written to the flash as it arrives (the
+     * page sends it as a form's file; a bare JSON body works too) and applied
+     * from there - see applyLayoutFile for why it is never held in memory.
+     */
     _server.on("/api/layout", HTTP_POST, [this]() {
-        const String &body = _server.arg("plain");
-        JsonDocument probe;                       // validate before persisting
-        DeserializationError err = deserializeJson(probe, body);
-        // No screens at all is refused too: the next boot would reject it and
-        // put the built-in layout - and no touch calibration - in its place.
-        if (err || !probe["screens"].is<JsonArray>() ||
-            probe["screens"].as<JsonArray>().size() == 0) {
-            _server.send(400, "application/json",
-                         String("{\"error\":\"invalid layout: ") +
-                         (err ? err.c_str() : "no screens") + "\"}");
-            return;
+        char why[112] = "";
+        int  code = 400;
+        bool ok   = false;
+        if (_layoutUpState == UP_STORED) {
+            ok = applyLayoutFile(LAYOUT_UP, why, sizeof why, code);
+        } else {
+            code = _layoutUpState == UP_FAILED ? 500 : 400;
+            snprintf(why, sizeof why, "%s - nothing changed",
+                     _layoutUpState == UP_TOO_BIG ? "too big for a layout"
+                     : _layoutUpState == UP_FAILED ? "the display could not store it (flash full?)"
+                                                   : "no layout in the request");
+            LittleFS.remove(LAYOUT_UP);
         }
-        /*
-         * The touch calibration is measured on the device and written straight
-         * to flash (saveTouchCal). A page that loaded the layout before that
-         * sends the old one back with its next Save: the device's stands.
-         */
-        std::string merged;
-        JsonVariantConst mine = _layout["global"]["touch_cal"];
-        if (!mine.isNull() && probe["global"]["touch_cal"] != mine) {
-            probe["global"]["touch_cal"] = mine;
-            serializeJsonPretty(probe, merged);
+        _layoutUpState = UP_NONE;
+        if (ok) { sendJsonOk(); return; }      // in memory now; the screens on reboot
+        log_w("studio: layout not saved: %s", why);
+        JsonDocument d;
+        d["error"] = why;
+        String out;
+        serializeJson(d, out);
+        _server.send(code, "application/json", out);
+    }, [this]() {
+        // The server keeps a form's file and a bare body apart, and says which
+        // only in the content type.
+        if (_server.header("Content-Type").startsWith("multipart/")) {
+            HTTPUpload &u = _server.upload();
+            layoutChunk(u.status == UPLOAD_FILE_START ? 0 : u.status == UPLOAD_FILE_WRITE ? 1
+                        : u.status == UPLOAD_FILE_END ? 2 : 3, u.buf, u.currentSize);
+        } else {
+            HTTPRaw &r = _server.raw();
+            layoutChunk(r.status == RAW_START ? 0 : r.status == RAW_WRITE ? 1
+                        : r.status == RAW_END ? 2 : 3, r.buf, r.currentSize);
         }
-        if (!(merged.empty() ? writeLayoutText(body)
-                             : writeLayoutText(merged.c_str(), merged.size()))) {
-            _server.send(500, "application/json", "{\"error\":\"fs write\"}");
-            return;
-        }
-        _layout = probe;                          // hot-swap in RAM; UI rebuild
-        sendJsonOk();                             // happens on reboot
     });
 
     // ---- live telemetry (for the studio's live preview) -------------------

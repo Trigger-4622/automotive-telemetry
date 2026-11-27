@@ -17,6 +17,7 @@ python scripts/check_sync.py                  # just the copies-and-generated-fi
 python master/test_host/run.py [scenario] [-v]                 # master in a simulated car (device_config: every fixture)
 python master/test_host/run.py portal_teach                    # the portal's teach-by-doing analysis, in Node
 python screens/screen1-round/test_host/run.py [scenario]       # screen renders -> test_host/shots/*.png
+python screens/screen1-round/test_host/run.py studio_page      # the studio page against the firmware, in Node
 python3 -m platformio run -d master           # firmware build (also screens/screen1-round, screens/screen2-cluster); `pio run -d ...` on the owner's PC
 python master/test_qemu/run.py [--readers] [--extra-ids 45] [--seconds 600]   # the real master firmware in Espressif's QEMU (needs $QEMU_ESP32S3; not in test_all)
 python master/test_qemu/run.py --replay drive.log [--settings cfg.json]   # ...fed a recorded candump log (a real Subaru's: test_qemu/README.md)
@@ -96,6 +97,18 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 - Copied into the studio page by hand: the lamp symbols (`ICONS` in
   `data/www/index.html` = `tools/telltale_icons.json`), and its preview's
   colours (`PV`, `TONES`) must all be `Palette.h` colours.
+- The studio page (`test_host/studio_tests.js`, the `studio_page` scenario,
+  not check_sync): its script between `@shared-begin` and `@shared-end` is the
+  same on both screens - BOARD decides what differs, and only the preview
+  drawing after it is each board's own. Every setting the firmware reads from
+  the layout's global, network, watchdog and warnings blocks is one row of the
+  page's `SETTINGS`, once, with the firmware's default (the old page had the
+  watchdog's pop-up switch on two tabs, the cluster's button on GPIO 9 and
+  defaults the firmware never used). The screen editor (`TYPES`,
+  `DASH_PARTS`, `BG`) offers per board and type only what that screen draws:
+  every key it writes must be read where UIBuilder.cpp builds that type, and
+  its number defaults are the firmware's. A new layout key gets a row or a
+  field there and nowhere else.
 
 ## Platform traps
 
@@ -116,7 +129,23 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
 - Cluster: `board_build.arduino.memory_type = qio_opi` and
   `board_upload.flash_size = 4MB` are required (wrong ones boot-loop); the
   GT911 is mounted 90 degrees out and gestures run on measured axes
-  (`TouchCal`), not a coordinate mapping.
+  (`TouchCal`), not a coordinate mapping. The layout's `touch_swap_xy`,
+  `touch_invert_x/y` and `touch_native_w/h` are no longer read (they only
+  moved the point LVGL is given, which no widget uses, and the diagnostics
+  readout); the studio drops them from a layout it loads.
+- **A screen's layout save** ("the screens won't save settings", 2026-11-27):
+  the studio's Save is a form's file, POST `/api/layout`, written to the flash
+  as it arrives (`/layout.up`) and parsed from there into the place of the
+  layout in memory, which is let go first (`ConfigManager::applyLayoutFile`,
+  `studio_save_streamed`); then renamed over `/layout.json`. Held in memory
+  the body was there three times (the server's buffer, its String, the
+  handler's copy) beside a probe document and a by-value copy of it: about
+  70 KB above the stored layout for the example one (32-bit model), more than
+  the C3 has left with its AP up and tight in the cluster's internal RAM -
+  now about 1.5 KB. A layout that will not parse or has no screens, or a
+  flash that will not take it, changes nothing and puts the stored layout
+  back; the page shows the display's reason. The device's `touch_cal` stands
+  over the upload's. A bare JSON body (curl) streams the same way.
 - Master bus rules: only the TWAI RX task may reinstall or uninstall the
   driver; everything that transmits goes through `diagGuardOk()` /
   `diagBusLock()` and hands its frame over with `masterTransmit()` (under

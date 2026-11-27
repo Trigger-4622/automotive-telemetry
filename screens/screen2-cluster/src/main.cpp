@@ -118,9 +118,13 @@ void setup() {
     cbs.onTap        = onTap;
     cbs.onHold       = onHold;
     cbs.onRawDrag    = onRawDrag;
-    Touch.begin(cbs, Config.touchCal(), Config.touchSwapXY(),
-                Config.touchInvertX(), Config.touchInvertY(),
-                Config.touchNativeW(), Config.touchNativeH());
+    // Swipes, taps and holds run on the measured calibration (touch_cal, the
+    // studio's "Calibrate touch"). The orientation constants only map the
+    // point LVGL is given - no widget takes a touch by position - and the
+    // DIAGNOSTICS readout; the layout's old touch_swap_xy, touch_invert_x/y
+    // and touch_native_w/h switches are no longer read.
+    Touch.begin(cbs, Config.touchCal(), TOUCH_SWAP_XY, TOUCH_INVERT_X,
+                TOUCH_INVERT_Y, TOUCH_NATIVE_W, TOUCH_NATIVE_H);
 
     // Side BOOT button mirrors the two most useful touch actions, so the
     // display stays usable with gloves on.

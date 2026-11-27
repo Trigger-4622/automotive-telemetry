@@ -26,14 +26,15 @@ header h1 span{color:var(--accent)}
 #devStatus{margin-left:auto;font-size:12px;color:var(--muted)}
 #devStatus.up{color:var(--ok)}
 nav{display:flex;gap:4px;padding:10px 18px;background:var(--panel2);
-    border-bottom:1px solid var(--line)}
+    border-bottom:1px solid var(--line);overflow-x:auto}
 nav button{background:none;border:1px solid transparent;color:var(--muted);
-    padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px}
+    padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px;flex:none}
 nav button.active{background:var(--panel);color:var(--accent);
     border-color:var(--line)}
 main{padding:18px;max-width:1100px;margin:0 auto}
 .cols{display:grid;grid-template-columns:220px 1fr 300px;gap:16px}
 @media(max-width:900px){.cols{grid-template-columns:1fr}}
+@media(max-width:560px){main{padding:12px}nav{padding:8px 12px}}
 .card{background:var(--panel);border:1px solid var(--line);
       border-radius:12px;padding:14px}
 .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;
@@ -57,8 +58,13 @@ label.f input,label.f select{display:block;width:100%;margin-top:3px;
     padding:7px 9px;border-radius:8px;font-size:13px}
 label.f input[type=color]{padding:2px;height:34px}
 label.f input[type=checkbox]{display:inline;width:auto}
+label.f .hint{display:block;margin-top:3px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 10px}
+/* A settings block: fields side by side as the width allows, switches and
+   sliders across the whole row. */
+.rows{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:0 12px}
+.rows label.f.wide{grid-column:1/-1}
 fieldset{border:1px solid var(--line);border-radius:10px;padding:10px;
     margin:12px 0}
 legend{font-size:11px;color:var(--muted);padding:0 6px;
@@ -73,6 +79,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left}
 th{color:var(--muted);font-weight:500;font-size:11px;
    text-transform:uppercase;letter-spacing:.06em}
+.scroll{overflow-x:auto}
 textarea{width:100%;min-height:420px;background:var(--panel2);
     border:1px solid var(--line);border-radius:10px;color:var(--text);
     font:12px/1.5 ui-monospace,Consolas,monospace;padding:12px}
@@ -83,7 +90,7 @@ label.f select option{background:var(--panel);color:var(--text)}
 select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
 #toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);
     background:var(--panel);border:1px solid var(--accent);padding:9px 18px;
-    border-radius:10px;display:none;z-index:9}
+    border-radius:10px;display:none;z-index:9;max-width:calc(100% - 32px)}
 .hint{font-size:12px;color:var(--muted);margin-top:8px}
 </style>
 </head>
@@ -94,12 +101,10 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
 </header>
 <nav>
   <button data-tab="screens" class="active">Screens</button>
+  <button data-tab="lamps">Lamps</button>
   <button data-tab="watchdog">Watchdog</button>
-  <button data-tab="warnings">Warnings</button>
   <button data-tab="settings">Settings</button>
-  <button data-tab="assets">Assets</button>
-  <button data-tab="system">System</button>
-  <button data-tab="json">Raw JSON</button>
+  <button data-tab="device">Device</button>
 </nav>
 <main>
   <section id="tab-screens">
@@ -122,36 +127,10 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
         <div class="hint">Drag to simulate the metric value</div>
       </div>
     </div>
+    <datalist id="assetList"></datalist>
   </section>
 
-  <section id="tab-watchdog" hidden>
-    <div class="card">
-      <h2>Watchdog &mdash; guarded metrics</h2>
-      <p class="hint">The guard list. Anything here is monitored
-      <b>whether or not a screen shows it</b>. When a value crosses a limit,
-      a warning triangle pops up over whichever screen is showing, naming the
-      metric, its value and the limit it broke. Tap the display to acknowledge
-      and mute that one fault; an escalation to critical or a second fault
-      re-arms it straight away.</p>
-      <label class="f" style="margin-top:10px">
-        <input type="checkbox" id="wdEnabled" onchange="wdToggle(this)">
-        Watchdog armed
-      </label>
-      <label class="f">
-        <input type="checkbox" id="wdShowPopup" onchange="wSet('show_popup',this)">
-        Draw the pop-up over the screen
-        <span class="hint" style="display:block">Uncheck to police everything
-        silently. Same switch as on the Settings tab.</span>
-      </label>
-      <div class="btnrow">
-        <button class="b" onclick="wdAdd()">＋ Guard a metric</button>
-      </div>
-    </div>
-    <br>
-    <div id="wdList"></div>
-  </section>
-
-  <section id="tab-warnings" hidden>
+  <section id="tab-lamps" hidden>
     <div class="card">
       <h2>Warning lamps</h2>
       <p class="hint">The car's own telltales &mdash; check engine, seat belt,
@@ -160,25 +139,7 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
       strip over the other screens, and the serious ones can pop up the alert
       card. A lamp whose signal the master never sends simply stays dark, so
       leaving one on costs nothing. Tap the display to dismiss a pop-up.</p>
-      <div class="grid2" style="margin-top:10px">
-        <label class="f"><input type="checkbox" id="wnEnabled"
-          onchange="wnSet('enabled',this);renderWarnings()"> <b>Warning lamps on</b></label>
-        <label class="f"><input type="checkbox" id="wnPopups"
-          onchange="wnSet('popups',this)"> Lamps may pop up the alert card</label>
-        <label class="f"><input type="checkbox" id="wnStrip"
-          onchange="wnSet('strip',this)"> Lamp strip over the screens</label>
-        <label class="f">Strip position<select id="wnPos"
-          onchange="wnSet('strip_position',this)">
-          <option value="bottom">bottom</option><option value="top">top</option>
-          </select></label>
-        <label class="f">Strip behaviour<select id="wnMode"
-          onchange="wnSet('strip_mode',this)">
-          <option value="peek">show new lamps, then fold to the fault</option>
-          <option value="always">show every lit lamp all the time</option>
-          </select></label>
-        <label class="f">Seconds a new lamp stays on the strip<input type="number"
-          id="wnPeek" min="0" max="60" data-num="1" onchange="wnSet('peek_secs',this)"></label>
-      </div>
+      <div class="rows" id="set-lamps" style="margin-top:10px"></div>
       <p class="hint">Folded, the strip keeps only the most urgent red or amber
       lamp (with "+N" for the rest) so it never sits over your data for long.
       Indicators keep it open while they flash; high beam, cruise and lights go
@@ -192,141 +153,93 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
     <div id="wnList"></div>
   </section>
 
+  <section id="tab-watchdog" hidden>
+    <div class="card">
+      <h2>Watchdog &mdash; guarded metrics</h2>
+      <p class="hint">The guard list. Anything here is monitored
+      <b>whether or not a screen shows it</b>. When a value crosses a limit,
+      a warning triangle pops up over whichever screen is showing, naming the
+      metric, its value and the limit it broke. Tap the display to acknowledge
+      and mute that one fault; an escalation to critical or a second fault
+      re-arms it straight away.</p>
+      <div class="rows" id="set-watchdog" style="margin-top:10px"></div>
+      <div class="btnrow">
+        <button class="b" onclick="wdAdd()">＋ Guard a metric</button>
+      </div>
+    </div>
+    <br>
+    <div id="wdList"></div>
+  </section>
+
   <section id="tab-settings" hidden>
     <div class="card">
-      <h2>What happens when something is wrong</h2>
-      <p class="hint">Two independent things, so you can have either, both or
-      neither.</p>
-      <label class="f"><input type="checkbox" id="setShowPopup"
-        onchange="wSet('show_popup',this)">
-        <b>Draw the warning pop-up over the screen</b>
-        <span class="hint" style="display:block">The card with the warning
-        triangle that appears on top of whatever screen you are on. Uncheck and
-        nothing is ever drawn over the dial &mdash; metrics are still policed,
-        and individual metrics can be silenced on their own in the Watchdog
-        tab.</span></label>
-      <label class="f"><input type="checkbox" id="setAlarmColors"
-        onchange="gSet('gauge_alarm_colors',this)">
-        <b>Let the gauge itself turn yellow / red</b>
-        <span class="hint" style="display:block">Recolours the arc, needle or
-        cell in place. Nothing is drawn on top. Individual levels can be
-        removed per gauge on the Screens tab.</span></label>
+      <h2>Display</h2>
+      <div class="rows" id="set-display"></div>
+      <p class="hint">LVGL's own default easing is <b>linear</b>, which is what
+      makes a slide feel mechanical; easing is what makes it read as smooth.</p>
     </div>
     <br>
     <div class="card">
-      <h2>Swipe animation</h2>
-      <div class="grid3">
-        <label class="f">Style
-          <select id="setSwipeAnim" onchange="gSet('swipe_anim',this)">
-            <option value="over">over &mdash; incoming slides on top</option>
-            <option value="move">move &mdash; both slide</option>
-            <option value="fade">fade</option>
-            <option value="none">none &mdash; instant</option>
-          </select></label>
-        <label class="f">Easing
-          <select id="setSwipeEasing" onchange="gSet('swipe_easing',this)">
-            <option value="ease_out">ease out (recommended)</option>
-            <option value="ease_in_out">ease in-out</option>
-            <option value="ease_in">ease in</option>
-            <option value="overshoot">overshoot</option>
-            <option value="bounce">bounce</option>
-            <option value="linear">linear</option>
-          </select></label>
-        <label class="f">Duration (ms)
-          <input type="number" id="setSwipeMs" data-num="1"
-            onchange="gSet('swipe_anim_ms',this)"></label>
-      </div>
-      <p class="hint">LVGL's own default is <b>linear</b>, which is what makes a
-      slide feel mechanical. Easing is what makes it read as smooth.</p>
+      <h2>Alerts</h2>
+      <div class="rows" id="set-alerts"></div>
+      <p class="hint">The warning card itself - what is guarded, and whether it
+      may be drawn over the screen - is on the <b>Watchdog</b> tab.</p>
     </div>
     <br>
     <div class="card">
-      <h2>Master &amp; ESP-NOW network</h2>
-      <p class="hint">Read once at boot &mdash; <b>reboot to apply</b>.</p>
-      <div class="grid2">
-        <label class="f">ESP-NOW channel (1&ndash;13)
-          <input type="number" min="1" max="13" id="setChannel" data-num="1"
-            onchange="nSet('wifi_channel',this)"></label>
-        <label class="f">Accept only this master (MAC)
-          <input id="setMasterMac" placeholder="blank = any master"
-            onchange="nSet('master_mac',this)"></label>
-      </div>
-      <div class="btnrow">
+      <h2>Master &amp; network</h2>
+      <p class="hint">Read once at boot &mdash; <b>save and restart to apply</b>.</p>
+      <div class="rows" id="set-network" style="margin-top:8px"></div>
+      <div class="btnrow" style="margin-top:0">
         <button class="b" onclick="useHeardMac()">Use the master I can hear</button>
-        <span id="heardMac" class="hint" style="align-self:center"></span>
+        <span id="heardMac" class="hint" style="align-self:center;margin:0"></span>
       </div>
       <p class="hint"><b>The channel must match the master exactly.</b> A
-      mismatch produces silence rather than an error, which is a miserable
-      thing to debug &mdash; if the link is down, check this first. A MAC
-      filter only matters when more than one master is in range, since
-      ESP-NOW broadcasts carry no notion of which network they belong to. The
-      master sends from another address with its own Wi-Fi switched off at
-      boot &mdash; set the filter again after changing that.</p>
-      <div class="grid2">
-        <label class="f">Config AP name
-          <input id="setApSsid" maxlength="32" onchange="nSet('ap_ssid',this)"></label>
-        <label class="f">Config AP password
-          <input id="setApPass" maxlength="63" placeholder="under 8 chars = open network"
-            onchange="nSet('ap_password',this)"></label>
-      </div>
-      <p class="hint">WPA2 needs at least 8 characters; anything shorter leaves
-      the portal open. Changing these changes the network you are currently
-      connected to &mdash; you will have to rejoin after the reboot.</p>
+      mismatch produces silence rather than an error &mdash; if the link is
+      down, check this first. A MAC filter only matters when more than one
+      master is in range. The master sends from another address with its own
+      Wi-Fi switched off at boot &mdash; set the filter again after changing
+      that.</p>
+      <p class="hint">WPA2 needs at least 8 characters: anything shorter leaves
+      this network open. Changing the name or password changes the network you
+      are on now &mdash; join it again after the restart.</p>
     </div>
     <br>
     <div class="card">
-      <h2>Alerts &amp; input</h2>
-      <div class="grid2">
-        <label class="f">Mute an acknowledged alert for (ms)
-          <input type="number" id="setAckMs" data-num="1"
-            onchange="gSet('alert_ack_ms',this)"></label>
-        <label class="f">Side button GPIO
-          <input type="number" id="setButtonGpio" data-num="1"
-            onchange="gSet('button_gpio',this)"></label>
-      </div>
+      <h2>Side button</h2>
+      <div class="rows" id="set-button"></div>
       <p class="hint">If the button does nothing, open the DIAGNOSTICS screen on
-      the device, hold the button, and watch the GPIO row &mdash; the pin that
+      the display, hold the button, and watch the GPIO row &mdash; the pin that
       reads <b>L</b> is the one to put here.</p>
-    </div>
-    <br>
-    <div class="card">
-      <h2>Smoothing &amp; colours</h2>
-      <div class="grid3">
-        <label class="f">Smoothing (EMA alpha)
-          <input type="number" step="any" id="setAlpha" data-num="1"
-            onchange="gSet('smoothing_alpha',this)"></label>
-        <label class="f">Needle glide (lerp)
-          <input type="number" step="any" id="setLerp" data-num="1"
-            onchange="gSet('lerp_speed',this)"></label>
-        <label class="f">Stale timeout (ms)
-          <input type="number" id="setStale" data-num="1"
-            onchange="gSet('stale_timeout_ms',this)"></label>
-      </div>
-      <div class="grid2">
-        <label class="f">Day background
-          <input type="color" id="setDayBg" onchange="gSet('day_bg',this)"></label>
-        <label class="f">Night background
-          <input type="color" id="setNightBg" onchange="gSet('night_bg',this)"></label>
-      </div>
-      <p class="hint">Higher alpha = snappier but noisier. Lower = smoother but
-      laggier.</p>
     </div>
   </section>
 
-  <section id="tab-assets" hidden>
+  <section id="tab-device" hidden>
     <div class="card">
-      <h2>Asset Uploader</h2>
-      <p class="hint">Upload LVGL <b>.bin</b> images for gauge backgrounds
-      (240&times;240), then reference them in a screen as
-      <code>/assets/name.bin</code>. Convert with the LVGL online image
-      converter using <b>CF_TRUE_COLOR</b>, <b>binary</b> output and
-      <b>RGB565 Swap</b> &mdash; the firmware runs with
-      <code>LV_COLOR_16_SWAP&nbsp;=&nbsp;1</code>, so an unswapped image comes
-      out with red and blue channels mangled. The bundled backgrounds were
-      made by <code>tools/make_assets.py</code>.</p>
-      <p class="hint">Backgrounds are streamed from flash on every repaint, so
-      prefer them on cell/text screens; on a screen with a sweeping needle they
-      cost frame rate.</p>
+      <h2>This display</h2>
+      <table id="infoTable"><tbody></tbody></table>
+      <div class="btnrow">
+        <button class="b" onclick="resetPeaks()">Reset peak values</button>
+        <button class="b danger" onclick="reboot()">Restart the display</button>
+      </div>
+    </div>
+    <br>
+    <div class="card">
+      <h2>Live telemetry (last received from the master)</h2>
+      <div class="scroll"><table id="liveTable"><thead><tr><th>Metric</th><th>ID</th><th>Value</th>
+      <th>Peak</th><th>Flags</th><th>Age</th></tr></thead><tbody></tbody>
+      </table></div>
+    </div>
+    <br>
+    <div class="card">
+      <h2>Background images</h2>
+      <p class="hint">LVGL <b>.bin</b> images (240&times;240), chosen per screen
+      under Background on the Screens tab as <code>/assets/name.bin</code>.
+      Convert with the LVGL online image converter using <b>CF_TRUE_COLOR</b>,
+      <b>binary</b> output and <b>RGB565 Swap</b> &mdash; the firmware runs
+      with <code>LV_COLOR_16_SWAP&nbsp;=&nbsp;1</code>, so an unswapped image
+      comes out with red and blue mangled. The built-in textures need no
+      upload.</p>
       <div class="btnrow">
         <input type="file" id="assetFile">
         <button class="b primary" onclick="uploadAsset()">Upload</button>
@@ -334,46 +247,42 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
       <table id="assetTable"><thead><tr><th>File</th><th>Size</th><th></th>
       </tr></thead><tbody></tbody></table>
     </div>
-  </section>
-
-  <section id="tab-system" hidden>
-    <div class="card">
-      <h2>Device</h2>
-      <table id="infoTable"><tbody></tbody></table>
-      <div class="btnrow">
-        <button class="b" onclick="resetPeaks()">Reset peak values</button>
-        <button class="b danger" onclick="reboot()">Reboot device</button>
-      </div>
-    </div>
     <br>
     <div class="card">
-      <h2>Live Telemetry (last received from Master)</h2>
-      <table id="liveTable"><thead><tr><th>Metric</th><th>ID</th><th>Value</th>
-      <th>Peak</th><th>Flags</th><th>Age</th></tr></thead><tbody></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="tab-json" hidden>
-    <div class="card">
-      <h2>layout.json</h2>
+      <h2>Layout file</h2>
+      <p class="hint">Everything above, as the display stores it. Edit it here
+      and apply it to the editor, keep a copy, or open one kept earlier; then
+      save it to the display. The display keeps its own touch calibration
+      whatever the file says.</p>
       <textarea id="jsonEd" spellcheck="false"></textarea>
       <div class="btnrow">
-        <button class="b primary" onclick="applyJson()">Apply to editor</button>
+        <button class="b primary" onclick="applyJson()">Apply to the editor</button>
+        <button class="b" onclick="downloadLayout()">Download layout.json</button>
+        <button class="b" onclick="$('#layoutFile').click()">Open a file…</button>
+        <input type="file" id="layoutFile" accept=".json,application/json" hidden
+          onchange="openLayout(this)">
       </div>
     </div>
   </section>
 </main>
 
 <div class="savebar">
-  <button class="b" onclick="saveLayout(false)">💾 Save to device</button>
-  <button class="b primary" onclick="saveLayout(true)">Save &amp; Reboot
+  <button class="b" onclick="saveLayout(false)">💾 Save to display</button>
+  <button class="b primary" onclick="saveLayout(true)">Save &amp; restart
   (apply)</button>
 </div>
 <div id="toast"></div>
 
 <script>
 'use strict';
+/* Which board this studio configures: the screen types, the defaults, the
+   dash's parts and the preview's geometry. */
+const BOARD = 'round';
+/* @shared-begin ═════════════════════════════════════════════════════════════
+   From here to @shared-end the script is the same in both screens' studio
+   pages (test_host/studio_tests.js compares them): what differs between the
+   boards is decided by BOARD, above. The preview drawing below it is each
+   board's own. */
 /* ───────────────────────── metric registry (mirror of MasterPacket.h) ──── */
 const KNOWN = {
  '0x0101':'MIL lamp','0x0103':'Fuel system status','0x0104':'Engine load %',
@@ -462,11 +371,197 @@ const KNOWN = {
  '0x300D':'Custom 13','0x300E':'Custom 14','0x300F':'Custom 15',
  '0x3010':'Custom 16'
 };
-let layout=null, sel=0, cellSel=0, liveTimer=null;
+
+/* @core-begin: what the page is built from. Nothing here touches the page,
+   so test_host/studio_tests.js loads it in Node and checks it against the
+   firmware. */
+/* The value for this board. */
+const B=(round,cluster)=>BOARD==='cluster'?cluster:round;
+const clone=o=>JSON.parse(JSON.stringify(o));
+
+/* ── Settings: every setting in the layout's global, network, watchdog and
+   warnings blocks is one row here, shown in exactly one place - the
+   Settings tab, or the Lamps or Watchdog tab it belongs to. def is what the
+   firmware uses when the layout has none (a number field emptied goes back
+   to it); studio_tests.js checks the keys and the defaults against
+   ConfigManager.h, UIBuilder.cpp and Telltales.cpp. */
+const SETTINGS=[
+ {sec:'display',k:'global.smoothing_alpha',t:'Smoothing (EMA alpha, 0-1)',kind:'num',def:0.35,a:'min="0" max="1"',
+  hint:'Higher is snappier but noisier, lower smoother but slower.'},
+ {sec:'display',k:'global.lerp_speed',t:'Needle glide (0.01-1)',kind:'num',def:0.18,a:'min="0.01" max="1"',
+  hint:'How far a needle moves toward its value each frame.'},
+ {sec:'display',k:'global.stale_timeout_ms',t:'Show "--" after no data for (ms)',kind:'num',def:1500,a:'min="0" step="100"'},
+ {sec:'display',k:'global.swipe_anim',t:'Changing screen',kind:'select',def:'over',
+  opts:[['over','the new one slides over'],['move','both slide'],['fade','fade'],['none','at once']]},
+ {sec:'display',k:'global.swipe_easing',t:'Easing',kind:'select',def:'ease_out',
+  opts:[['ease_out','ease out (recommended)'],['ease_in_out','ease in-out'],['ease_in','ease in'],
+        ['overshoot','overshoot'],['bounce','bounce'],['linear','linear']]},
+ {sec:'display',k:'global.swipe_anim_ms',t:'Changing screen takes (ms)',kind:'num',def:180,a:'min="0" step="10"'},
+ {sec:'display',k:'global.day_bg',t:'Day background',kind:'color',def:'#101418'},
+ {sec:'display',k:'global.night_bg',t:'Night background',kind:'color',def:'#000000'},
+ {sec:'alerts',k:'global.gauge_alarm_colors',t:'<b>Let a gauge itself turn yellow / red</b>',kind:'check',def:true,
+  hint:'At the colour levels set for it on the Screens tab: the arc, needle or value is recoloured in place and nothing is drawn on top.'},
+ {sec:'alerts',k:'global.alert_ack_ms',t:'A tap mutes an alert for (ms)',kind:'num',def:30000,a:'min="0" step="1000"'},
+ {sec:'network',k:'network.wifi_channel',t:'ESP-NOW channel (1-13)',kind:'num',def:1,a:'min="1" max="13"'},
+ {sec:'network',k:'network.master_mac',t:'Accept only this master (MAC)',kind:'text',def:'',a:'placeholder="blank = any master"'},
+ {sec:'network',k:'network.ap_ssid',t:'Name of this settings network',kind:'text',
+  def:B('Telemetry-Gauge-Config','Telemetry-Dash-Config'),a:'maxlength="32"'},
+ {sec:'network',k:'network.ap_password',t:'Its password',kind:'text',def:'',
+  a:'maxlength="63" placeholder="under 8 characters = open network"'},
+ {sec:'button',k:'global.button_gpio',t:'Side button GPIO',kind:'num',def:B(9,0),a:B('min="0" max="21"','min="0" max="48"')},
+ {sec:'button',k:'global.button_discovery',t:'Look for the button at boot',kind:'check',def:true,
+  hint:'Notes every candidate pin\'s level at boot and names one that differs on the screen. Switch it off once the pin is known.'},
+ {sec:'panel',only:'cluster',k:'global.color_gain_r',t:'Red',kind:'gain',def:1,col:'#ff6b6b'},
+ {sec:'panel',only:'cluster',k:'global.color_gain_g',t:'Green',kind:'gain',def:1,col:'#51d88a'},
+ {sec:'panel',only:'cluster',k:'global.color_gain_b',t:'Blue',kind:'gain',def:1,col:'#5aa9ff'},
+ {sec:'panel',only:'cluster',k:'global.bgr_order',t:'<b>BGR colour order</b> (after a restart)',kind:'check',def:false,
+  hint:'Only if the R patch of the DIAGNOSTICS colour strip looks blue and the B patch red. A panel that pushes every patch toward one hue has a colour cast: use the sliders.'},
+ {sec:'watchdog',k:'watchdog.enabled',t:'<b>Watchdog armed</b>',kind:'check',def:true},
+ {sec:'watchdog',k:'watchdog.show_popup',t:'Draw the warning over the screen',kind:'check',def:true,
+  hint:'Off, everything is still watched, silently: nothing is drawn over the dial. One metric can be silenced on its own below, and one screen on the Screens tab.'},
+ {sec:'watchdog',only:'cluster',k:'watchdog.alert_style',t:'The warning is',kind:'select',def:'bar',
+  opts:[['bar','a bar across the top'],['card','a card in the middle']]},
+ {sec:'lamps',k:'warnings.enabled',t:'<b>Warning lamps on</b>',kind:'check',def:true,after:()=>renderWarnings()},
+ {sec:'lamps',k:'warnings.popups',t:'Lamps may pop up the alert card',kind:'check',def:true},
+ {sec:'lamps',k:'warnings.strip',t:'Lamp strip over the screens',kind:'check',def:true},
+ {sec:'lamps',k:'warnings.strip_position',t:'Strip position',kind:'select',def:'bottom',opts:[['bottom','bottom'],['top','top']]},
+ {sec:'lamps',k:'warnings.strip_mode',t:'Strip behaviour',kind:'select',def:B('peek','always'),
+  opts:[['peek','show new lamps, then fold to the fault'],['always','show every lit lamp all the time']]},
+ {sec:'lamps',k:'warnings.peek_secs',t:'A new lamp stays on the strip for (s)',kind:'num',def:6,a:'min="0" max="60"'},
+];
+const SET=SETTINGS.filter(r=>!r.only||r.only===BOARD);
+
+/* ── The screen editor: what each screen type draws on this board, and so
+   all the editor offers. A key the firmware does not read here - or reads
+   and never shows - has no field (studio_tests.js checks every key against
+   UIBuilder.cpp). A field: [key, label, kind, default, input attributes or,
+   for a select, its options]; kinds: metric, text, num, color, check,
+   select, asset. A key starting "/" is the screen's own, not the part's. */
+const F={metric:['metric_id','Metric','metric',''],label:['label','Label','text',''],
+  units:['units','Units','text',''],decimals:['decimals','Decimals','num',0,'min="0" max="3"'],
+  min:['min','Min','num',0],max:['max','Max','num',100]};
+const GAUGE='metric label units decimals min max', READOUT='metric label units decimals';
+const colorF=(t,d)=>['color',t,'color',d];
+const NUMERALS=[['major_tick_every','Numeral every','num',''],['tick_label_div','Numeral ÷','num',1]];
+const FACE=B([],[['dial_face','Carbon dial face','check',true]]);
+/* A list: k is its key in the screen, at most max items, add is a new one. */
+const TYPES_ALL={
+ dash:{t:'Dash - a small instrument cluster',dash:1},
+ cluster:{only:'cluster',t:'Cluster - dial, big readout, side values',parts:[
+  {k:'dial',t:'Dial (needle)',f:GAUGE,thr:1,
+   x:NUMERALS.concat([colorF('Needle colour','#FF2D16'),['dial_face','Carbon dial face','check',true]])},
+  {k:'main',t:'Main readout',f:READOUT,thr:1,x:[colorF('Colour','#E0F2F7')]},
+  {k:'side',t:'Side values',max:4,f:READOUT,thr:1,x:[colorF('Colour','#E0F2F7')],
+   add:{metric_id:'0x0105',label:'NEW',units:'',decimals:0}}]},
+ bars:{only:'cluster',t:'Bars - up to six bar gauges',title:1,
+  list:{k:'rows',t:'Bar',max:6,min:1,f:GAUGE,thr:1,x:[colorF('Bar colour','#00E5FF')],
+   add:{metric_id:'0x010C',label:'New',units:'',decimals:0,min:0,max:100}}},
+ arc_gauge:{t:'Arc gauge',f:GAUGE,thr:1,x:[['arc.start_angle','Start angle','num',135],
+  ['arc.end_angle','End angle','num',45],['arc.width','Arc width','num',B(18,14)],
+  ['arc.color','Colour','color','#00E5FF'],['arc.bg_color','Track colour','color','#1A2A33'],
+  ['value_font','Value size (px)','num',48],['arc.rounded','Rounded ends','check',B(true,false)]].concat(FACE)},
+ meter_gauge:{t:'Needle dial',f:GAUGE,thr:1,x:[['arc.start_angle','Start angle','num',135],
+  ['arc.end_angle','End angle','num',45],['arc.color','Needle colour','color',B('#00E5FF','#FF2D16')],
+  ['value_font','Value size (px)','num',B(32,40)]].concat(NUMERALS,FACE)},
+ quad:{t:B('Cells - two or four values','Grid - up to eight values'),title:B(0,1),
+  list:{k:'cells',t:'Cell',max:B(4,8),min:1,f:READOUT,thr:1,x:[colorF('Colour','#E0F2F7')],
+   add:{metric_id:'0x010C',label:'NEW',units:'',decimals:0}}},
+ text_list:{t:'List of values',title:1,
+  list:{k:'rows',t:'Row',max:B(5,10),min:1,f:READOUT,thr:1,x:[colorF('Value colour','#E0F2F7')],
+   add:{metric_id:'0x010C',label:'New',units:'',decimals:0,min:0,max:100}}},
+ chart:B({t:'Trend',f:GAUGE,thr:1,x:[['points','Points','num',60,'min="10" max="120"'],
+          ['sample_ms','Sample every (ms)','num',1000,'min="20"'],colorF('Line colour','#00E5FF')]},
+         {t:'Trend',x:[['label','Title','text',''],['points','Points','num',120,'min="10" max="240"'],
+          ['sample_ms','Sample every (ms)','num',1000,'min="20"'],['min','Y min','num',0],['max','Y max','num',100]],
+          single:{f:'metric units decimals',thr:1,x:[colorF('Line colour','#00E5FF')]},
+          series:{k:'series',t:'Trace',max:4,min:0,drop:1,f:READOUT,thr:1,
+           x:[['color','Trace colour','color',(o,i)=>['#00E5FF','#00E5FF','#69F0AE','#40C4FF'][i%4]]],
+           add:{metric_id:'0x0104',label:'NEW',units:'%',decimals:0,color:'#69F0AE'}}}),
+ gmeter:{t:'G-meter',legend:'Dial',x:[['max_g','Rim (g)','num',1,'min="0.1" step="0.1"']],
+  hint:'A dot for the car\'s acceleration: up speeding up, down braking, left in a left-hand bend; the inner ring is half the rim. Lateral and longitudinal G come from the master: taught from the stability unit\'s frame (its Signals tab, <b>A corner or a hard stop</b>), or worked out from the speed and the yaw rate.'},
+ perf:{t:'Performance timers',
+  hint:'0-100 km/h, 80-120 km/h and the quarter mile, timed on this display from the master\'s speed (and RPM). Stand still for half a second to arm a standing start; 80-120 times itself whenever the speed passes 80 on the way up. The best times last until the display is switched off.'},
+ diag:{t:'Diagnostics',
+  hint:'The link, memory and a live GPIO scan: hold the side button and the pin that reads <b>L</b> is the one to set as the side button on the Settings tab.'+
+   B('',' Also the touch readout and the colour strip the Panel settings are checked against.')},
+};
+const TYPES=Object.fromEntries(Object.entries(TYPES_ALL).filter(([k,v])=>!v.only||v.only===BOARD));
+/* The dash: each part may be switched off (false). DASH_DEF is what a part
+   gets when switched on, DASH_BASE the firmware's defaults for what a part
+   leaves out. */
+const DASH_DEF = {
+  tach:  {metric_id:'0x010C',label:'RPM',max:8000,redline:6500},
+  speed: {metric_id:'0x010D',units:'km/h',max:260},
+  gear:  {metric_id:'0x1005'},
+  fuel:  {metric_id:'0x012F',units:'%',
+          thresholds:{warning:{value:12,hysteresis:3,direction:'below'}}},
+  temp:  {metric_id:'0x0105',min:40,max:130,
+          thresholds:{warning:{value:105,hysteresis:3},critical:{value:110,hysteresis:3}}},
+  info:  [{metric_id:'0x0142',label:'BATT',units:'V',decimals:1},
+          {metric_id:'0x015C',label:'OIL',units:'°C'},
+          {metric_id:'0x010F',label:'IAT',units:'°C'},
+          {metric_id:'0x1001',label:'BOOST',units:'bar',decimals:2}],
+  shift_light: {rpm:6500,start:5000},
+};
+const DASH_BASE = {
+  tach:{label:'RPM',units:'',min:0,max:8000,decimals:0},
+  speed:{label:'',units:'km/h',min:0,max:260,decimals:0},
+  gear:{label:'GEAR',units:'',min:-1,max:6,decimals:0},
+  fuel:{label:'',units:'%',min:0,max:100,decimals:0},
+  temp:{label:'',units:'°C',min:40,max:130,decimals:0},
+};
+const LEVEL=B('metric units decimals','metric units decimals min max');
+const DASH_PARTS=[
+ {k:'tach',t:'Tachometer',f:B('metric min max','metric label min max'),thr:1,
+  x:[colorF(B('Colour','Needle colour'),B('#00E5FF','#FF2D16')),['redline','Red band from (rpm)','num','']]
+    .concat(B([],[['major_tick_every','Numeral every','num',''],['tick_label_div','Numeral ÷','num','']])),
+  hint:B('The red band starts at the shift light\'s rpm unless set here.',
+         'The red band starts at the shift light\'s rpm unless set here, and is drawn only while the tach has no colour levels of its own. Numerals default to every eighth of the scale, in thousands.')},
+ {k:'speed',t:'Speed',f:'metric units decimals',thr:1,x:[colorF('Colour','#E0F2F7')]},
+ {k:'gear',t:'Gear',f:'metric',x:[colorF('Colour','#00E5FF')],
+  hint:'Shows R, N, the gear number or the lever\'s letter. Where the bus has a reverse signal (0x1208) it wins over the gear value.'},
+ {k:'fuel',t:'Fuel',f:LEVEL,thr:1,x:[colorF('Colour',B('#E0F2F7','#00E5FF'))]},
+ {k:'temp',t:'Coolant temperature',f:LEVEL,thr:1,x:[colorF('Colour',B('#E0F2F7','#00E5FF'))]},
+ {k:'info',only:'cluster',t:'Bottom readouts',max:4,min:0,f:READOUT,thr:1,x:[colorF('Colour','#E0F2F7')],
+  add:{metric_id:'0x0104',label:'LOAD',units:'%'}},
+ {k:'shift_light',t:'Shift light',x:[['rpm','Shift at (rpm)','num',6500],['start','First LED at (rpm)','num',o=>((o&&o.rpm)||6500)-1500]],
+  hint:'Five LEDs fill green, amber, red between the two, then all flash red at the shift point, and the gear flashes with them.'},
+ {k:'lamps',t:'Warning lamps',flag:1,x:B([['/ghost_lamps','Show the indicator arrows dimly while off','check',true]],[]),
+  hint:'Which lamps exist, what lights them and whether they pop up is set on the <b>Lamps</b> tab.'+
+   B(' On the round screen only the lit lamps show, in the gap under the arc.',' Unlit indicator arrows show dimly.')},
+].filter(p=>!p.only||p.only===BOARD);
+/* Every screen's background (applyBackground in UIBuilder.cpp), and on the
+   round board its bezel - on by default for the dial-like types. */
+const TEXTURES=[['none','none'],['carbon','carbon fibre (tile)'],['mesh','mesh (tile)'],
+  ['gt','GT pattern (tile)'],['gt_dial','GT dial face (whole screen)']];
+const BG=[['texture','Texture','select','none',TEXTURES],['texture_opa','Texture strength (0-255)','num',255,'min="0" max="255"'],
+  ['background_asset','Image file','asset',''],['bg_grad.from','Gradient from (top)','color','#101418'],
+  ['bg_grad.to','Gradient to (bottom)','color','#05080B']];
+const bezelDefault=type=>!['diag','chart','dash','gmeter','perf'].includes(type);
+const BEZEL=B([['dial_face','A bezel ring round the edge','check']],[]);
+/* Keys no firmware reads any more, dropped from a layout as it is loaded:
+   the cluster's touch orientation switches, which only ever moved where a
+   tap landed - gestures run on the measured calibration (touch_cal). */
+const GONE={global:['touch_swap_xy','touch_invert_x','touch_invert_y','touch_native_w',
+  'touch_native_h','_doc_touch_native']};
+function cleanLayout(l){
+  let n=0;
+  for(const [blk,keys] of Object.entries(GONE)){
+    const o=l&&l[blk];
+    if(!o||typeof o!=='object')continue;
+    for(const k of keys)if(k in o){delete o[k];n++;}
+  }
+  return n;
+}
+/* @core-end */
+
+let layout=null, sel=0, cellSel=0, partSel='', curTab='screens', pollTok=0,
+    calibTimer=null, saving=false, demoLayout=false;
 
 const $=q=>document.querySelector(q);
-const toast=m=>{const t=$('#toast');t.textContent=m;t.style.display='block';
-  clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',2200);};
+/* A message across the top; one saying what went wrong stays to be read. */
+const toast=(m,long)=>{const t=$('#toast');t.textContent=m;t.style.display='block';
+  clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',long?7000:2200);};
 const scr=()=>layout&&layout.screens[sel];
 /* Text for innerHTML and attribute values: a label with a quote or a "<" in
    it must neither end the attribute nor start a tag. */
@@ -477,7 +572,7 @@ const esc = v => String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
    the preview - instead of a 0 nobody typed. */
 function fieldVal(el){
   if(el.type==='checkbox')return el.checked;
-  if(el.type==='number'||el.dataset.num==='1'){
+  if(el.type==='number'||el.type==='range'||el.dataset.num==='1'){
     if(String(el.value).trim()==='')return undefined;
     const v=parseFloat(el.value);return isFinite(v)?v:undefined;
   }
@@ -490,104 +585,163 @@ async function replyError(r){
   const t=await r.text().catch(()=>'');
   try{return JSON.parse(t).error||t||('HTTP '+r.status);}catch(e){return t||('HTTP '+r.status);}
 }
+/* A request with a deadline. The display serves one connection at a time,
+   and waits up to five seconds on one a browser opened ahead of need, so a
+   reply that never comes has to end in a message. */
+async function req(url,opt,ms){
+  const c=new AbortController(),t=setTimeout(()=>c.abort(),ms||8000);
+  try{return await fetch(url,Object.assign({signal:c.signal},opt||{}));}
+  finally{clearTimeout(t);}
+}
+/* Why a request failed, in words. */
+function failText(e){
+  return e&&e.name==='AbortError'?'the display did not answer':
+         e instanceof TypeError?'the display is not reachable':String((e&&e.message)||e);
+}
 
 /* ─────────────────────────────── bootstrap ─────────────────────────────── */
-/* True while the page shows the demo layout because the display's own could
-   not be read: saving it would replace every screen on the display. */
-let demoLayout=false;
 async function boot(){
   // The display answers one request at a time, so one that fails may only
   // have met a busy moment: ask again before calling it offline.
   for(let i=0;i<3&&!layout;i++){
     if(i)await new Promise(ok=>setTimeout(ok,600));
     try{
-      const r=await fetch('/api/layout');
+      const r=await req('/api/layout');
       const j=r.ok?await r.json():null;
       if(j&&typeof j==='object'&&!Array.isArray(j))layout=j;
     }catch(e){}
   }
   if(layout){
-    $('#devStatus').textContent='device connected';
+    $('#devStatus').textContent='display connected';
     $('#devStatus').classList.add('up');
   }else{
+    // Saving this would replace every screen on the display: saveLayout asks.
     demoLayout=true;
     $('#devStatus').textContent='offline (demo layout)';
     layout={version:1,global:{},screens:[{id:'demo',type:'arc_gauge',
       metric_id:'0x010C',label:'RPM',units:'rpm',decimals:0,min:0,max:8000,
-      arc:{start_angle:135,end_angle:45,width:18,color:'#00E5FF'}}]};
+      arc:{start_angle:135,end_angle:45,color:'#00E5FF'}}]};
   }
   if(!Array.isArray(layout.screens))layout.screens=[];
+  cleanLayout(layout);
   renderAll();
+  if(!demoLayout)loadAssets(true);
 }
-function renderAll(){renderList();renderEditor();draw();$('#jsonEd').value=
-  JSON.stringify(layout,null,2);}
+function renderAll(){renderList();renderEditor();draw();renderTab();}
 
 /* ─────────────────────────────── tabs ──────────────────────────────────── */
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('nav button').forEach(x=>
-    x.classList.toggle('active',x===b));
-  ['screens','watchdog','warnings','settings','assets','system','json'].forEach(t=>
-    $('#tab-'+t).hidden=(t!==b.dataset.tab));
-  clearInterval(liveTimer);
-  if(b.dataset.tab==='system'){pollSystem();liveTimer=setInterval(pollSystem,1000);}
-  if(b.dataset.tab==='assets')loadAssets();
-  if(b.dataset.tab==='watchdog')renderWatchdog();
-  if(b.dataset.tab==='warnings')renderWarnings();
-  if(b.dataset.tab==='settings')renderSettings();
-  if(b.dataset.tab==='json')$('#jsonEd').value=JSON.stringify(layout,null,2);
-});
+const TABS=['screens','lamps','watchdog','settings','device'];
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+function showTab(t){
+  curTab=t;
+  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('active',x.dataset.tab===t));
+  TABS.forEach(n=>$('#tab-'+n).hidden=(n!==t));
+  stopPoll();
+  renderTab();
+  if(t==='device'){loadAssets();poll();}
+  if(t==='settings')heardMac();
+}
+/* What the open tab shows of the layout, drawn again. */
+function renderTab(){
+  if(curTab==='lamps'){renderSet('lamps');renderWarnings();}
+  if(curTab==='watchdog'){renderSet('watchdog');renderWatchdog();}
+  if(curTab==='settings')['display','alerts','network','button','panel'].forEach(renderSet);
+  if(curTab==='device')$('#jsonEd').value=JSON.stringify(layout,null,2);
+}
 
-/* ───────────────────────────── settings tab ────────────────────────────── */
+/* ─────────────────────────────── settings ──────────────────────────────── */
 function glob(){ if(!layout.global)layout.global={}; return layout.global; }
 function net(){ if(!layout.network)layout.network={}; return layout.network; }
-function gSet(key,el){ putVal(glob(),key,fieldVal(el)); }
-function nSet(key,el){ putVal(net(),key,fieldVal(el)); }
-function wSet(key,el){ putVal(wd(),key,fieldVal(el)); }
-/* Copy the MAC we are actually receiving from into the peer filter. */
+function setBlock(blk){
+  if(blk==='watchdog')return wd();
+  if(blk==='warnings')return warn();
+  if(!layout[blk]||typeof layout[blk]!=='object'||Array.isArray(layout[blk]))layout[blk]={};
+  return layout[blk];
+}
+function setValue(r){const [blk,key]=r.k.split('.');const v=setBlock(blk)[key];return v===undefined?r.def:v;}
+function rowHtml(r,i){
+  const v=setValue(r),id='set_'+r.k.replace('.','_'),on=`onchange="setRow(${i},this)"`;
+  const hint=r.hint?`<span class="hint">${r.hint}</span>`:'';
+  if(r.kind==='check')
+    return `<label class="f wide"><input type="checkbox" id="${id}" ${v?'checked':''} ${on}> ${r.t}${hint}</label>`;
+  if(r.kind==='gain'){
+    const n=Number(v)||1;
+    return `<label class="f wide"><span style="color:${r.col}">${r.t}</span>
+      <span id="${id}_v" style="float:right;color:var(--text)">${n.toFixed(2)}</span>
+      <input type="range" id="${id}" min="0.5" max="1.5" step="0.01" value="${n}"
+        style="accent-color:${r.col}" oninput="setRow(${i},this)">${hint}</label>`;
+  }
+  let ctl;
+  if(r.kind==='select'){
+    const known=r.opts.some(o=>o[0]===String(v));
+    ctl=`<select id="${id}" ${on}>${known?'':`<option value="${esc(v)}" selected>${esc(v)}</option>`}${
+      r.opts.map(([o,t])=>`<option value="${o}" ${String(v)===o?'selected':''}>${t}</option>`).join('')}</select>`;
+  }else if(r.kind==='num'){
+    ctl=`<input type="number" ${/step=/.test(r.a||'')?'':'step="any"'} id="${id}" value="${esc(v)}" data-num="1"
+      placeholder="${esc(r.def)}" ${r.a||''} ${on}>`;
+  }else{
+    ctl=`<input type="${r.kind==='color'?'color':'text'}" id="${id}" value="${esc(v)}" ${r.a||''} ${on}>`;
+  }
+  return `<label class="f">${r.t}${ctl}${hint}</label>`;
+}
+/* One section's rows, into its #set-<section>. */
+function renderSet(sec){
+  const host=$('#set-'+sec);if(!host)return;
+  host.innerHTML=SET.map((r,i)=>r.sec===sec?rowHtml(r,i):'').join('');
+}
+function setRow(i,el){
+  const r=SET[i],[blk,key]=r.k.split('.');
+  putVal(setBlock(blk),key,fieldVal(el));
+  if(r.kind==='gain'){
+    const l=$('#'+el.id+'_v');if(l)l.textContent=(+el.value).toFixed(2);
+    clearTimeout(calibTimer);calibTimer=setTimeout(calibPush,80);
+  }
+  if(r.after)r.after();
+}
+/* Show which master is actually transmitting, so the filter can be set
+   without going and looking the MAC up on the master itself. */
+function heardMac(){
+  const el=$('#heardMac');if(!el)return;
+  req('/api/info',{},5000).then(r=>r.json()).then(i=>{
+    el.dataset.mac=i.peer_mac||'';
+    el.textContent=i.peer_mac?('hearing '+i.peer_mac):'no master heard yet';
+  }).catch(()=>{el.textContent='display not reachable';});
+}
 function useHeardMac(){
   const m=$('#heardMac').dataset.mac||'';
   if(!m)return toast('No master heard yet');
   net().master_mac=m;
-  $('#setMasterMac').value=m;
+  renderSet('network');
   toast('Filter set to '+m);
 }
-function renderSettings(){
-  const g=glob(),n=net();
-  const set=(id,val)=>{const e=$(id);if(e)e.value=val;};
-  $('#setAlarmColors').checked = g.gauge_alarm_colors!==false;
-  $('#setShowPopup').checked   = wd().show_popup!==false;
-  set('#setChannel',   n.wifi_channel ?? 1);
-  set('#setMasterMac', n.master_mac ?? '');
-  set('#setApSsid',    n.ap_ssid ?? 'Telemetry-Gauge-Config');
-  set('#setApPass',    n.ap_password ?? '');
-  // Show which master is actually transmitting, so the filter can be set
-  // without going and looking the MAC up on the master itself.
-  fetch('/api/info').then(r=>r.json()).then(i=>{
-    const el=$('#heardMac');
-    el.dataset.mac=i.peer_mac||'';
-    el.textContent=i.peer_mac?('hearing '+i.peer_mac):'no master heard yet';
-  }).catch(()=>{
-    const el=$('#heardMac');el.textContent='device offline';
-  });
-  set('#setSwipeAnim',   g.swipe_anim   ?? 'over');
-  set('#setSwipeEasing', g.swipe_easing ?? 'ease_out');
-  set('#setSwipeMs',     g.swipe_anim_ms ?? 240);
-  set('#setAckMs',       g.alert_ack_ms ?? 30000);
-  set('#setButtonGpio',  g.button_gpio  ?? 9);
-  set('#setAlpha',       g.smoothing_alpha ?? 0.35);
-  set('#setLerp',        g.lerp_speed   ?? 0.18);
-  set('#setStale',       g.stale_timeout_ms ?? 1500);
-  set('#setDayBg',       g.day_bg   ?? '#101418');
-  set('#setNightBg',     g.night_bg ?? '#000000');
+/* Colour calibration (the cluster): pushed to the panel on every slider move
+   so it tracks the control, kept only by Save; a restart undoes the rest. */
+async function calibPush(){
+  const g=glob(),note=$('#calibNote');
+  try{
+    const r=await req('/api/calib',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({r:g.color_gain_r??1,g:g.color_gain_g??1,b:g.color_gain_b??1})},4000);
+    if(note)note.textContent=r.ok?'live on the panel':'the display refused it';
+  }catch(e){if(note)note.textContent=failText(e);}
+}
+function calibReset(){
+  ['color_gain_r','color_gain_g','color_gain_b'].forEach(k=>glob()[k]=1);
+  renderSet('panel');calibPush();
+}
+async function touchCal(){
+  try{
+    const r=await req('/api/touchcal',{method:'POST'},5000);
+    toast(r.ok?'Look at the display and follow the prompts'
+              :'Calibration not started: '+await replyError(r),!r.ok);
+  }catch(e){toast('Calibration not started: '+failText(e),1);}
 }
 
 /* ───────────────────────────── watchdog tab ────────────────────────────── */
 function wd(){
-  if(!layout.watchdog)layout.watchdog={enabled:true,items:[]};
+  if(!layout.watchdog||typeof layout.watchdog!=='object')layout.watchdog={enabled:true,items:[]};
   if(!Array.isArray(layout.watchdog.items))layout.watchdog.items=[];
   return layout.watchdog;
 }
-function wdToggle(el){wd().enabled=el.checked;}
 function wdAdd(){
   wd().items.push({metric_id:'0x0105',label:'COOLANT',units:'°C',decimals:0,
     warning:{value:105,hysteresis:3,direction:'above',color:'#FFC400'}});
@@ -644,7 +798,7 @@ function wdSummary(it){
   if(it.warning)p.push(`warn ${it.warning.direction==='below'?'<':'>'} ${it.warning.value}`);
   if(it.critical)p.push(`crit ${it.critical.direction==='below'?'<':'>'} ${it.critical.value}`);
   if(it.popup===false)p.push('silent');
-  return p.join('  ·  ')||'no limits set';
+  return p.join('  •  ')||'no limits set';
 }
 function renderWatchdogSummaries(){
   wd().items.forEach((it,i)=>{
@@ -653,8 +807,6 @@ function renderWatchdogSummaries(){
   });
 }
 function renderWatchdog(){
-  $('#wdEnabled').checked=wd().enabled!==false;
-  $('#wdShowPopup').checked=wd().show_popup!==false;
   const host=$('#wdList');host.innerHTML='';
   if(!wd().items.length){
     host.innerHTML='<div class="card"><p class="hint">Nothing guarded yet. '+
@@ -704,19 +856,18 @@ function renderList(){
     const d=document.createElement('div');
     if(i===sel)d.classList.add('sel');
     d.innerHTML=`<span>${esc(s.id||('screen '+(i+1)))}</span><small>${esc(s.type)}</small>`;
-    d.onclick=()=>{sel=i;cellSel=0;renderList();renderEditor();draw();};
+    d.onclick=()=>{sel=i;cellSel=0;partSel='';renderList();renderEditor();draw();};
     el.appendChild(d);
   });
 }
 function addScreen(){
   layout.screens.push({id:'new_'+(layout.screens.length+1),type:'arc_gauge',
     metric_id:'0x010C',label:'LABEL',units:'',decimals:0,min:0,max:100,
-    arc:{start_angle:135,end_angle:45,width:18,color:'#00E5FF',
-         bg_color:'#1A2A33',rounded:true}});
-  sel=layout.screens.length-1;renderAll();
+    arc:{start_angle:135,end_angle:45,color:'#00E5FF'}});
+  sel=layout.screens.length-1;cellSel=0;partSel='';renderAll();
 }
 function delScreen(){if(layout.screens.length<=1)return toast('Keep at least one screen');
-  layout.screens.splice(sel,1);sel=Math.max(0,sel-1);renderAll();}
+  layout.screens.splice(sel,1);sel=Math.max(0,sel-1);cellSel=0;partSel='';renderAll();}
 function moveScreen(d){const j=sel+d;
   if(j<0||j>=layout.screens.length)return;
   [layout.screens[sel],layout.screens[j]]=[layout.screens[j],layout.screens[sel]];
@@ -732,14 +883,22 @@ function metricSel(path,val){
     `<option value="${k}" ${k===val?'selected':''}>${k} — ${v}</option>`).join('');
   return `<select oninput="setVal('${path}',this)">
           ${KNOWN[val]?'':`<option value="${esc(val)}" selected>${esc(val||'choose…')}</option>`}${o}</select>`;}
-
+/* The value at a dotted path in the selected screen ("" is the screen). */
+function getS(path){
+  let o=scr();
+  if(path)for(const k of path.split('.')){
+    if(o==null||typeof o!=='object')return undefined;
+    o=o[isNaN(+k)?k:+k];
+  }
+  return o;
+}
 /* Resolve "a.b.2.c" paths into layout.screens[sel] and coerce types. */
 function setVal(path,el){
   const v=fieldVal(el);
   const seg=path.split('.');let o=scr();
   for(let i=0;i<seg.length-1;i++){
     const k=isNaN(+seg[i])?seg[i]:+seg[i];
-    if(o[k]==null)o[k]=isNaN(+seg[i+1])?{}:[];
+    if(o[k]==null||typeof o[k]!=='object')o[k]=isNaN(+seg[i+1])?{}:[];
     o=o[k];
   }
   const last=seg[seg.length-1];
@@ -747,22 +906,31 @@ function setVal(path,el){
   if(path==='type'){normalizeType();renderEditor();}
   renderList();draw();
 }
+/* Give a freshly switched screen what its type reads, so the editor and the
+   preview have something to work with at once. */
 function normalizeType(){
   const s=scr();
+  cellSel=0;partSel='';
   if(s.type==='dash')dashDefaults(s);
   if((s.type==='quad'||s.type==='split')&&!Array.isArray(s.cells))
-    s.cells=[{metric_id:'0x0142',label:'BATT',units:'V',decimals:1,min:8,max:16}];
-  if(s.type==='text_list'&&!Array.isArray(s.rows))
-    s.rows=[{metric_id:'0x0105',label:'Coolant',units:'°C',decimals:0}];
+    s.cells=[{metric_id:'0x0142',label:'BATT',units:'V',decimals:1}];
+  if((s.type==='text_list'||s.type==='bars')&&!Array.isArray(s.rows))
+    s.rows=[{metric_id:'0x0105',label:'Coolant',units:'°C',decimals:0,min:40,max:130}];
+  if(s.type==='cluster'){
+    if(!s.dial||typeof s.dial!=='object')s.dial={metric_id:'0x010C',label:'RPM',units:'rpm',decimals:0,
+      min:0,max:8000,major_tick_every:1000,tick_label_div:1000,color:'#FF2D16'};
+    if(!s.main||typeof s.main!=='object')s.main={metric_id:'0x010D',label:'SPEED',units:'km/h',
+      decimals:0,color:'#E0F2F7'};
+    if(!Array.isArray(s.side))s.side=[];
+  }
 }
-
 /* Resolve a dotted path inside the selected screen to {parent, key},
    creating intermediate objects/arrays as needed. */
 function scrPathParent(path){
   const seg=path.split('.');let o=scr();
   for(let i=0;i<seg.length-1;i++){
     const k=isNaN(+seg[i])?seg[i]:+seg[i];
-    if(o[k]==null)o[k]=isNaN(+seg[i+1])?{}:[];
+    if(o[k]==null||typeof o[k]!=='object')o[k]=isNaN(+seg[i+1])?{}:[];
     o=o[k];
   }
   const last=seg[seg.length-1];
@@ -776,7 +944,6 @@ function gaugeTier(base,tier,on){
   else delete parent[key];
   renderEditor();draw();
 }
-
 /* Gauge colour tiers. These ONLY recolour the widget — they never pop
    anything up. Pop-ups come from the Watchdog tab, which is also where the
    headline text lives. */
@@ -786,7 +953,7 @@ function thrFields(base,tier,t){
   return `<fieldset><legend>
       <input type="checkbox" ${on?'checked':''}
         onchange="gaugeTier('${base}','${tier}',this.checked)">
-      ${critical?'Turn the gauge red':'Turn the gauge yellow'}</legend>
+      ${critical?'Turn it red':'Turn it yellow'}</legend>
     ${on?`<div class="grid3">
       ${fld('Value',inp(p+'.value',t.value??'','number','step="any" data-num="1"'))}
       ${fld('Hysteresis',inp(p+'.hysteresis',t.hysteresis??0,'number','step="any" data-num="1"'))}
@@ -796,123 +963,169 @@ function thrFields(base,tier,t){
         </select>`)}
       </div>
       ${fld('Color',inp(p+'.color',t.color||(critical?'#FF1744':'#FFC400'),'color'))}`
-      :`<p class="hint">Off &mdash; the gauge keeps its normal colour at this
-        level.</p>`}
+      :`<p class="hint">Off &mdash; keeps its normal colour at this level.</p>`}
     </fieldset>`;
 }
-
-function metricFields(prefix,o){
-  return `<div class="grid2">
-    ${fld('Metric',metricSel(prefix+'metric_id',o.metric_id||''))}
-    ${fld('Label',inp(prefix+'label',o.label||''))}
-    ${fld('Units',inp(prefix+'units',o.units||''))}
-    ${fld('Decimals',inp(prefix+'decimals',o.decimals??0,'number','min="0" max="3" data-num="1"'))}
-    ${fld('Min',inp(prefix+'min',o.min??0,'number','step="any" data-num="1"'))}
-    ${fld('Max',inp(prefix+'max',o.max??100,'number','step="any" data-num="1"'))}
-    </div>
-    <p class="hint">These two only change the gauge's colour. To make something
-    <b>pop up over any screen</b>, add the metric on the
-    <b>Watchdog</b> tab &mdash; that is also where the headline text lives.</p>
-    ${thrFields(prefix+'thresholds','warning',(o.thresholds||{}).warning)}
-    ${thrFields(prefix+'thresholds','critical',(o.thresholds||{}).critical)}`;
+/* One editor field (see F above). pre is the path of the object it belongs
+   to: "" for the screen, "cells.2." for a cell. defs stand over the field's
+   own defaults (a dash part's). */
+function fieldHtml(pre,f,defs){
+  const [key,label,kind,def0,attr]=f;
+  const path=key[0]==='/'?key.slice(1):pre+key;
+  const cur=getS(path);
+  let def=typeof def0==='function'?def0(getS(pre.replace(/\.$/,'')),cellSel):def0;
+  if(defs&&defs[key]!==undefined)def=defs[key];
+  const v=cur===undefined?def:cur;
+  switch(kind){
+    case 'metric':return fld(label,metricSel(path,v||''));
+    case 'num':{
+      const a=(attr||'')+(/step=/.test(attr||'')?'':' step="any"')+
+              (def!==''&&def!=null?` placeholder="${esc(def)}"`:'');
+      return fld(label,inp(path,v??'','number','data-num="1"'+a));}
+    case 'color':return fld(label,inp(path,/^#[0-9a-f]{6}$/i.test(String(v))?v:'#000000','color'));
+    case 'check':return `<label class="f"><input type="checkbox" ${v?'checked':''}
+      onchange="setVal('${path}',this)"> ${label}</label>`;
+    case 'select':{
+      const opts=attr||[],known=opts.some(o=>o[0]===String(v));
+      return fld(label,`<select oninput="setVal('${path}',this)">${known?'':
+        `<option value="${esc(v)}" selected>${esc(v)} (not known here)</option>`}${
+        opts.map(([o,t])=>`<option value="${o}" ${String(v)===o?'selected':''}>${t}</option>`).join('')}</select>`);}
+    case 'asset':return fld(label,inp(path,v??'','text','list="assetList" placeholder="none"'));
+    default:return fld(label,inp(path,v??''));
+  }
 }
-
+/* The fields of one reading or part, then its colour levels. */
+function specHtml(pre,spec,defs){
+  const fs=(typeof spec.f==='string'?spec.f.split(' ').filter(Boolean).map(n=>F[n]):(spec.f||[]))
+           .concat(spec.x||[]);
+  const boxes=fs.filter(f=>f[2]==='check'),rest=fs.filter(f=>f[2]!=='check');
+  let h=rest.length?`<div class="grid2">${rest.map(f=>fieldHtml(pre,f,defs)).join('')}</div>`:'';
+  h+=boxes.map(f=>fieldHtml(pre,f,defs)).join('');
+  if(spec.thr){
+    const t=getS(pre+'thresholds')||{};
+    h+='<p class="hint">Colour levels only recolour this reading. A warning over any '+
+       'screen is set on the <b>Watchdog</b> tab.</p>'+
+       thrFields(pre+'thresholds','warning',t.warning)+
+       thrFields(pre+'thresholds','critical',t.critical);
+  }
+  return h;
+}
+/* A list of readings (cells, rows, traces, side values): pick one, add one,
+   remove one. */
+function listHtml(L){
+  const arr=Array.isArray(getS(L.k))?getS(L.k):[];
+  cellSel=Math.max(0,Math.min(cellSel,arr.length-1));
+  let h=`<fieldset><legend>${L.t}s (up to ${L.max})</legend><div class="btnrow">`;
+  if(arr.length)h+=`<select onchange="cellSel=+this.value;renderEditor();draw()">${arr.map((c,i)=>
+    `<option value="${i}" ${i===cellSel?'selected':''}>${L.t} ${i+1}: ${
+      esc((c&&c.label)||KNOWN[c&&c.metric_id]||'?')}</option>`).join('')}</select>`;
+  if(arr.length<L.max)h+=`<button class="b" onclick="listAdd('${L.k}')">＋ Add</button>`;
+  if(arr.length>(L.min||0))h+=`<button class="b danger" onclick="listDel('${L.k}')">✕ Remove</button>`;
+  h+='</div>';
+  h+=arr.length?specHtml(`${L.k}.${cellSel}.`,L):'<p class="hint">None.</p>';
+  return h+'</fieldset>';
+}
+function listSpec(k){
+  const sp=typeSpec(scr().type);
+  return [sp.list,sp.series].concat(sp.parts||[],sp.dash?DASH_PARTS:[])
+    .find(L=>L&&L.k===k&&L.max);
+}
+function listAdd(k){
+  const L=listSpec(k),s=scr();if(!L)return;
+  if(!Array.isArray(s[k]))s[k]=[];
+  if(s[k].length>=L.max)return;
+  s[k].push(clone(L.add));cellSel=s[k].length-1;renderEditor();draw();
+}
+function listDel(k){
+  const L=listSpec(k),s=scr();if(!L||!Array.isArray(s[k]))return;
+  if(s[k].length<=(L.min||0))return;
+  s[k].splice(cellSel,1);cellSel=0;
+  if(!s[k].length&&L.drop)delete s[k];
+  renderEditor();draw();
+}
+/* A screen built of parts - the cluster screen, the dash: pick one. On the
+   dash each part can be switched off. */
+function partsHtml(s,parts,dash){
+  if(!parts.some(p=>p.k===partSel))partSel=parts[0].k;
+  const p=parts.find(q=>q.k===partSel),off=dash&&s[p.k]===false;
+  let h=`<fieldset><legend>Part</legend><div class="btnrow">
+    <select onchange="partSel=this.value;cellSel=0;renderEditor();draw()">${parts.map(q=>
+      `<option value="${q.k}" ${q===p?'selected':''}>${q.t}${dash&&s[q.k]===false?' (off)':''}</option>`).join('')}
+    </select></div>`;
+  if(dash)h+=`<label class="f" style="margin-top:8px"><input type="checkbox" ${off?'':'checked'}
+      onchange="dashToggle('${p.k}',this.checked)"> Show this part</label>`;
+  if(off)return h+'<p class="hint">Switched off &mdash; not drawn at all.</p></fieldset>';
+  h+=p.max?listHtml(p):specHtml(p.flag?'':p.k+'.',p,dash?DASH_BASE[p.k]:null);
+  if(p.hint)h+=`<p class="hint">${p.hint}</p>`;
+  return h+'</fieldset>';
+}
+function typeSpec(t){return TYPES[t==='split'?'quad':t]||Object.assign({unknown:1},TYPES.arc_gauge);}
+function typeSel(t){
+  const ks=Object.keys(TYPES);
+  return `<select oninput="setVal('type',this)">${ks.includes(t)?'':
+    `<option value="${esc(t)}" selected>${t==='split'?TYPES.quad.t:esc(t)}</option>`}${
+    ks.map(k=>`<option value="${k}" ${k===t?'selected':''}>${TYPES[k].t}</option>`).join('')}</select>`;
+}
+function chartWindow(s){
+  return `Visible window = points &times; sample time (${(chartPoints(s)*(s.sample_ms??1000)/1000).toFixed(0)} s).`+
+    (BOARD==='cluster'?' All traces share the one Y range, so only overlay values on a comparable scale.':'');
+}
+function toSeries(){
+  const s=scr();
+  s.series=[{metric_id:s.metric_id||'0x0104',label:s.label||'TRACE 1',units:s.units||'',
+             decimals:s.decimals||0,color:s.color||'#00E5FF'}];
+  cellSel=0;renderEditor();draw();
+}
 function renderEditor(){
   const s=scr();if(!s){$('#editor').innerHTML='';return;}
+  const sp=typeSpec(s.type);
   let h=`<div class="grid2">
     ${fld('Screen ID',inp('id',s.id||''))}
-    ${fld('Type',`<select oninput="setVal('type',this)">
-      ${['dash','arc_gauge','meter_gauge','quad','text_list','chart','gmeter','perf','diag'].map(t=>
-      `<option ${s.type===t?'selected':''}>${t}</option>`).join('')}</select>`)}
+    ${fld('Type',typeSel(s.type))}
     </div>`;
-  if(s.type==='diag'){$('#editor').innerHTML=h+
-    '<p class="hint">Diagnostics screen has no configurable metrics. It also '+
-    'shows a live GPIO scan &mdash; hold the side button and the pin that '+
-    'reads <b>L</b> is the one to set as <code>global.button_gpio</code>.</p>'+
-    popupFieldForScreen(s);
-    return;}
-  if(s.type==='gmeter'){$('#editor').innerHTML=h+
-    `<div class="grid2">${fld('Rim (g)',inp('max_g',s.max_g??1,'number','data-num="1" step="0.1"'))}</div>`+
-    '<p class="hint">A dot for the car\'s acceleration: up speeding up, down braking, left in a '+
-    'left-hand bend; the inner ring is half the rim. Lateral and longitudinal G come from the '+
-    'master: taught from the stability unit\'s frame (its Bus tab, <b>A corner or a hard stop</b>), '+
-    'or worked out from the speed and the yaw rate.</p>'+popupFieldForScreen(s);
-    return;}
-  if(s.type==='perf'){$('#editor').innerHTML=h+
-    '<p class="hint">0-100 km/h, 80-120 km/h and the quarter mile, timed on this display from '+
-    'the master\'s speed (and RPM). Stand still for half a second to arm a standing start; '+
-    '80-120 times itself whenever the speed passes 80 on the way up. The best times last until '+
-    'the display is switched off.</p>'+popupFieldForScreen(s);
-    return;}
-  if(s.type==='dash'){$('#editor').innerHTML=h+dashEditor(s)+popupFieldForScreen(s);
-    return;}
-
-  if(s.type==='quad'||s.type==='split'){
-    const cells=s.cells||[];cellSel=Math.min(cellSel,cells.length-1);
-    h+=`<fieldset><legend>Cells (2 or 4)</legend><div class="btnrow">
-      <select onchange="cellSel=+this.value;renderEditor();draw()">
-      ${cells.map((c,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
-        Cell ${i+1}: ${esc(c.label||'?')}</option>`).join('')}</select>
-      <button class="b" onclick="if((scr().cells||[]).length<4){scr().cells.push(
-        {metric_id:'0x010C',label:'NEW',units:'',decimals:0,min:0,max:100});
-        cellSel=scr().cells.length-1;renderEditor();draw();}">＋</button>
-      <button class="b danger" onclick="if(scr().cells.length>1){
-        scr().cells.splice(cellSel,1);cellSel=0;renderEditor();draw();}">✕</button>
-      </div>`;
-    h+=metricFields(`cells.${cellSel}.`,cells[cellSel]||{});
-    h+=fld('Cell color',inp(`cells.${cellSel}.color`,
-        (cells[cellSel]||{}).color||'#E0F2F7','color'))+'</fieldset>';
-  }else if(s.type==='text_list'){
-    const rows=s.rows||[];cellSel=Math.min(cellSel,rows.length-1);
-    h+=fld('Screen title',inp('label',s.label||''));
-    h+=`<fieldset><legend>Rows (max 5)</legend><div class="btnrow">
-      <select onchange="cellSel=+this.value;renderEditor();draw()">
-      ${rows.map((c,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
-        Row ${i+1}: ${esc(c.label||'?')}</option>`).join('')}</select>
-      <button class="b" onclick="if((scr().rows||[]).length<5){scr().rows.push(
-        {metric_id:'0x010C',label:'New',units:'',decimals:0});
-        cellSel=scr().rows.length-1;renderEditor();draw();}">＋</button>
-      <button class="b danger" onclick="if(scr().rows.length>1){
-        scr().rows.splice(cellSel,1);cellSel=0;renderEditor();draw();}">✕</button>
-      </div>`;
-    h+=metricFields(`rows.${cellSel}.`,rows[cellSel]||{})+'</fieldset>';
-  }else if(s.type==='chart'){
-    h+=metricFields('',s);
-    h+=`<fieldset><legend>Trend</legend><div class="grid3">
-      ${fld('Points',inp('points',s.points??60,'number','data-num="1"'))}
-      ${fld('Sample ms',inp('sample_ms',s.sample_ms??1000,'number','data-num="1"'))}
-      ${fld('Line color',inp('color',s.color||'#00E5FF','color'))}
-      </div><p class="hint">Visible window = points &times; sample ms
-      (${(chartPoints(s)*(s.sample_ms??1000)/1000).toFixed(0)} s).</p>
-      </fieldset>`;
-  }else{ // arc_gauge / meter_gauge
-    h+=metricFields('',s);
-    const a=s.arc||{};
-    h+=`<fieldset><legend>Gauge geometry &amp; colors</legend><div class="grid3">
-      ${fld('Start angle',inp('arc.start_angle',a.start_angle??135,'number','data-num="1"'))}
-      ${fld('End angle',inp('arc.end_angle',a.end_angle??45,'number','data-num="1"'))}
-      ${fld('Arc width',inp('arc.width',a.width??18,'number','data-num="1"'))}
-      </div><div class="grid3">
-      ${fld('Color',inp('arc.color',a.color||'#00E5FF','color'))}
-      ${fld('Track color',inp('arc.bg_color',a.bg_color||'#1A2A33','color'))}
-      ${fld('Value font px',inp('value_font',s.value_font??(s.type==='arc_gauge'?48:32),'number','data-num="1"'))}
-      </div>`;
-    if(s.type==='meter_gauge')h+=`<div class="grid2">
-      ${fld('Major tick every',inp('major_tick_every',s.major_tick_every??'','number','step="any" data-num="1"'))}
-      ${fld('Tick label ÷',inp('tick_label_div',s.tick_label_div??1,'number','step="any" data-num="1"'))}
-      </div>`;
-    h+=fld('Background asset (optional, e.g. /assets/bg.bin)',
-           inp('background_asset',s.background_asset||''))+'</fieldset>';
+  if(sp.unknown)h+=`<p class="hint">This display does not know the type "${esc(s.type)}"
+    and draws an arc gauge in its place.</p>`;
+  if(sp.title)h+=fld('Title',inp('label',s.label||'','text',
+    BOARD==='cluster'?'placeholder="blank = the screen ID, in capitals"':''));
+  if(sp.dash){dashDefaults(s);h+=partsHtml(s,DASH_PARTS,true);}
+  else if(sp.parts)h+=partsHtml(s,sp.parts,false);
+  else if(sp.list)h+=listHtml(sp.list);
+  else if(sp.series){
+    h+=`<fieldset><legend>Trend</legend>${specHtml('',{x:sp.x})}<p class="hint">${chartWindow(s)}</p></fieldset>`;
+    if(Array.isArray(s.series)&&s.series.length)h+=listHtml(sp.series);
+    else h+=`<fieldset><legend>Trace</legend>${specHtml('',sp.single)}
+      <div class="btnrow"><button class="b" onclick="toSeries()">Overlay more traces</button></div></fieldset>`;
+  }else if(sp.f||sp.x){
+    h+=`<fieldset><legend>${sp.legend||'Reading'}</legend>${specHtml('',sp)}${
+      s.type==='chart'?`<p class="hint">${chartWindow(s)}</p>`:''}</fieldset>`;
   }
-  h+=popupFieldForScreen(s);
+  if(sp.hint)h+=`<p class="hint">${sp.hint}</p>`;
+  h+=bgHtml(s)+telltaleFieldForScreen(s)+popupFieldForScreen(s);
   $('#editor').innerHTML=h;
 }
-
+function bgHtml(s){
+  const g=s.bg_grad&&typeof s.bg_grad==='object';
+  const f=k=>fieldHtml('',BG.find(b=>b[0]===k));
+  let h=`<fieldset><legend>Background</legend><div class="grid2">${f('texture')}${f('texture_opa')}</div>
+    ${f('background_asset')}
+    <label class="f"><input type="checkbox" ${g?'checked':''} onchange="gradToggle(this.checked)">
+      A gradient instead of the plain background</label>`;
+  if(g)h+=`<div class="grid2">${f('bg_grad.from')}${f('bg_grad.to')}</div>`;
+  for(const f of BEZEL)h+=fieldHtml('',f.concat([bezelDefault(s.type)]));
+  return h+`<p class="hint">A gradient costs nothing and a texture little. An image file is read
+    from flash on every repaint, which slows a screen with a moving needle; upload them on the
+    <b>Device</b> tab.</p></fieldset>`;
+}
+function gradToggle(on){
+  const s=scr();
+  if(on)s.bg_grad={from:glob().day_bg||'#101418',to:'#05080B'};else delete s.bg_grad;
+  renderEditor();draw();
+}
 /* Per-screen pop-up switch. Offered on every screen type, because "keep this
    particular dial unobstructed" is a property of the screen, not of the
    metric on it. */
 function popupFieldForScreen(s){
-  return telltaleFieldForScreen(s)+`<fieldset><legend>Pop-up alerts on this screen</legend>
+  return `<fieldset><legend>Pop-up alerts on this screen</legend>
     <label class="f"><input type="checkbox" ${s.show_popup!==false?'checked':''}
       onchange="setVal('show_popup',this)">
       Allow the warning card to cover this screen
@@ -921,7 +1134,387 @@ function popupFieldForScreen(s){
       nothing is just drawn on top while you are on this screen.</span>
     </label></fieldset>`;
 }
+function telltaleFieldForScreen(s){
+  if(s.type==='dash')return '';
+  const def=!(BOARD==='cluster'&&s.type==='diag');
+  return `<fieldset><legend>Warning lamps on this screen</legend>
+    <label class="f"><input type="checkbox" ${(s.show_telltales??def)?'checked':''}
+      onchange="setVal('show_telltales',this)">
+      Show the strip of lit warning lamps over this screen
+      <span class="hint" style="display:block">The way the car's own cluster
+      keeps its lamps visible whatever else it shows. Hidden when nothing is
+      lit.</span></label></fieldset>`;
+}
+function dashDefaults(s){
+  ['tach','speed','gear','fuel','temp','shift_light'].forEach(p=>{
+    if(s[p]===undefined||s[p]===true)s[p]=clone(DASH_DEF[p]);});
+  if(BOARD==='cluster'&&(s.info===undefined||s.info===true))s.info=clone(DASH_DEF.info);
+  if(s.lamps===undefined)s.lamps=true;
+}
+function dashToggle(p,on){
+  const s=scr();
+  s[p]=on?(p==='lamps'?true:clone(DASH_DEF[p])):false;
+  renderEditor();draw();
+}
 
+/* ───────────────────────────── preview: shared ─────────────────────────── */
+/* A dial's scale as the firmware builds it (UIBuilder.cpp: dialScale on the
+   cluster, buildMeterGauge on the round board): LVGL's meter spreads n ticks
+   evenly - never more than 41, however fine the spacing asked for - and every
+   per-th one is major, labelled with the line's value in whole meter units,
+   divided back for display. q is each tick's value, text its label. */
+function dialTicks(min,max,every,div){
+  if(!(max>min))max=min+1;
+  const span=max-min,big=Math.max(Math.abs(min),Math.abs(max));
+  let unit=1;while(span*unit<200&&big*unit*10<=1e8&&unit<10000)unit*=10;
+  if(!(every>0))every=span/8;
+  let per=4;const count=()=>Math.min(1000,Math.round(span/(every/per))+1);
+  let n=count();while(n>41&&per>1){per/=2;n=count();}
+  n=Math.max(2,Math.min(41,n||2));
+  const whole=v=>Math.sign(v)*Math.round(Math.abs(v));      // lroundf
+  const lo=whole(min*unit),hi=whole(max*unit),d=unit*(div>1?div:1),out=[];
+  for(let i=0;i<n;i++){
+    const u=Math.trunc(i*(hi-lo)/(n-1))+lo,major=i%per===0;
+    let text='';
+    if(major){
+      const v=u/d;
+      text=d<=1?String(u):Math.abs(v-Math.round(v))<0.005?String(Math.round(v))
+          :Math.abs(v*10-Math.round(v*10))<0.05?v.toFixed(1):v.toFixed(2);
+    }
+    out.push({q:u/unit,major,text});
+  }
+  return {min,max,ticks:out};
+}
+/* A trend's point count as the firmware clamps it. */
+function chartPoints(s){
+  const [def,most]=BOARD==='cluster'?[120,240]:[60,120];
+  return Math.max(10,Math.min(most,Math.trunc(Number(s.points??def))||10));
+}
+function state(o,v){
+  if(!o||!o.thresholds)return'ok';
+  // A tier without a value trips at 0, as the firmware reads it.
+  const t=o.thresholds,hit=(th)=>th&&
+    (th.direction==='below'?v<=(th.value??0):v>=(th.value??0));
+  return hit(t.critical)?'crit':hit(t.warning)?'warn':'ok';
+}
+/* A screen's background fill: its gradient if it has one, else base. */
+function pvGrad(x,s,y0,y1,base){
+  const g=s&&s.bg_grad;
+  if(!g||typeof g!=='object')return base;
+  const lg=x.createLinearGradient(0,y0,0,y1);
+  lg.addColorStop(0,g.from||base);lg.addColorStop(1,g.to||'#05080B');
+  return lg;
+}
+function dayBg(){return (layout&&layout.global&&layout.global.day_bg)||'#101418';}
+
+/* ───────────────────────────── persistence ─────────────────────────────── */
+/* Sent as a form's file: the display writes it to flash as it arrives and
+   reads it from there (ConfigManager::applyLayoutFile). */
+async function saveLayout(rebootAfter){
+  if(saving)return;
+  if(demoLayout&&!confirm('The display\'s own layout could not be read, so this is '+
+      'the demo one. Saving it replaces every screen on the display. Save anyway?'))
+    return;
+  saving=true;stopPoll();
+  const body=new FormData();
+  body.append('layout',new Blob([JSON.stringify(layout)],{type:'application/json'}),'layout.json');
+  let ok=false;
+  try{
+    const r=await req('/api/layout',{method:'POST',body},20000);
+    if(!r.ok)throw new Error(await replyError(r));
+    ok=true;demoLayout=false;
+    toast('Layout saved ✔');
+  }catch(e){toast('Not saved: '+failText(e),1);}
+  saving=false;
+  if(ok&&rebootAfter){
+    // The display restarts as it answers, which may cut the reply short.
+    try{await req('/api/reboot',{method:'POST'},4000);}catch(e){}
+    toast('Restarting — reconnect to the display network');
+    return;
+  }
+  if(curTab==='device')poll();
+}
+function applyJson(){
+  let j;
+  try{j=JSON.parse($('#jsonEd').value);}
+  catch(e){return toast('JSON error: '+e.message,1);}
+  if(!j||typeof j!=='object'||Array.isArray(j)||!Array.isArray(j.screens)||!j.screens.length)
+    return toast('Not applied: a layout needs a "screens" list with at least one screen',1);
+  cleanLayout(j);
+  layout=j;sel=0;cellSel=0;partSel='';demoLayout=false;renderAll();
+  toast('Applied — remember to Save');
+}
+function downloadLayout(){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(layout,null,2)],{type:'application/json'}));
+  a.download='layout.json';document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+}
+function openLayout(el){
+  const f=el.files[0];el.value='';if(!f)return;
+  f.text().then(t=>{$('#jsonEd').value=t;applyJson();})
+   .catch(()=>toast('That file could not be read',1));
+}
+
+/* ───────────────────────────── device tab ──────────────────────────────── */
+async function loadAssets(quiet){
+  try{
+    const d=await (await req('/api/assets',{},6000)).json();
+    const names=(d.assets||[]).map(a=>a.name);
+    $('#assetList').innerHTML=names.map(n=>`<option value="/assets/${esc(n)}">`).join('');
+    $('#assetTable tbody').innerHTML=(d.assets||[]).map(a=>
+      `<tr><td>/assets/${esc(a.name)}</td><td>${(a.size/1024).toFixed(1)} KB</td>
+        <td><button class="b danger" data-name="${esc(a.name)}"
+          onclick="delAsset(this.dataset.name)">✕</button></td></tr>`).join('')||
+      '<tr><td colspan="3" class="hint">No images uploaded.</td></tr>';
+  }catch(e){if(!quiet)toast('Image list: '+failText(e));}
+}
+async function uploadAsset(){
+  const f=$('#assetFile').files[0];if(!f)return toast('Choose a file first');
+  const fd=new FormData();fd.append('file',f);
+  try{
+    const r=await req('/api/asset',{method:'POST',body:fd},60000);
+    toast(r.ok?'Uploaded ✔':'Upload failed: '+await replyError(r),!r.ok);
+  }catch(e){toast('Upload failed: '+failText(e),1);}
+  loadAssets();
+}
+async function delAsset(n){
+  if(!confirm('Delete /assets/'+n+'? A screen that shows it goes without.'))return;
+  try{
+    const r=await req('/api/asset/delete?name='+encodeURIComponent(n),{method:'POST'});
+    if(!r.ok)toast('Delete failed: '+await replyError(r),1);
+  }catch(e){toast('Delete failed: '+failText(e),1);}
+  loadAssets();
+}
+/* The Device tab's figures, once a second - one request at a time. */
+function stopPoll(){pollTok++;}
+async function poll(tok){
+  if(tok===undefined)tok=++pollTok;
+  await pollDevice();
+  if(tok===pollTok&&curTab==='device'&&!saving)setTimeout(()=>poll(tok),1000);
+}
+async function pollDevice(){
+  try{
+    const info=await (await req('/api/info',{},4000)).json();
+    $('#infoTable tbody').innerHTML=Object.entries({
+      'Firmware':info.firmware,'Protocol':'v'+info.proto,
+      'ESP-NOW channel':info.channel,
+      'Free heap':(info.heap_free/1024).toFixed(0)+' KB',
+      'Filesystem':(info.fs_used/1024).toFixed(0)+' / '+
+                   (info.fs_total/1024).toFixed(0)+' KB',
+      'Uptime':info.uptime_s+' s',
+      'Display memory (LVGL)':info.lvgl_total?(info.lvgl_used/1024).toFixed(1)+' / '+
+                   (info.lvgl_total/1024).toFixed(0)+' KB':'—'
+    }).map(([k,v])=>`<tr><th>${k}</th><td>${esc(v)}</td></tr>`).join('');
+    const live=await (await req('/api/live',{},4000)).json();
+    $('#liveTable tbody').innerHTML=(live.metrics||[]).map(m=>{
+      const fl=[m.flags&1?'V':'',m.flags&2?'W':'',m.flags&4?'C':'',
+                m.flags&8?'N':''].join('');
+      return `<tr><td>${KNOWN[m.id]||'—'}</td><td>${esc(m.id)}</td>
+        <td>${(+m.value).toFixed(2)}</td><td>${(+m.peak).toFixed(2)}</td>
+        <td>${fl}</td><td>${esc(m.age_ms)} ms</td></tr>`;
+    }).join('')||'<tr><td colspan="6">No telemetry received — Master silent '+
+      'while display is in config mode (ESP-NOW paused).</td></tr>';
+  }catch(e){/* device busy */}
+}
+async function resetPeaks(){
+  try{const r=await req('/api/peaks/reset',{method:'POST'});
+    toast(r.ok?'Peaks reset':'Reset failed: '+await replyError(r),!r.ok);}
+  catch(e){toast('Reset failed: '+failText(e),1);}}
+async function reboot(){
+  // The display restarts as it answers, which may cut the reply short.
+  try{await req('/api/reboot',{method:'POST'},4000);}catch(e){}
+  toast('Restarting…');}
+
+/* ─────────────────────────── warning lamps ─────────────────────────────── */
+/* Symbols: the same shapes the firmware draws (tools/make_icons.py). Cuts are
+   painted in the page background, as the firmware's transparency shows. */
+const ICONS = {"mil":"<rect x=\"5.5\" y=\"8.5\" width=\"12.5\" height=\"10.5\" rx=\"1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"8\" y=\"4.5\" width=\"7\" height=\"2\" fill=\"currentColor\"/><line x1=\"11.5\" y1=\"6.5\" x2=\"11.5\" y2=\"8.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.2\" y1=\"11\" x2=\"2.2\" y2=\"17\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.2\" y1=\"14\" x2=\"5.5\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"18\" y1=\"11.5\" x2=\"21.5\" y2=\"9\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"21.5\" y1=\"9\" x2=\"21.5\" y2=\"18.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"21.5\" y1=\"18.5\" x2=\"18\" y2=\"16\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","seatbelt":"<circle cx=\"12\" cy=\"4.2\" r=\"2.9\" fill=\"currentColor\"/><polygon points=\"7.4,8.8 16.6,8.8 18.2,13 17.4,21.8 6.6,21.8 5.8,13\" fill=\"currentColor\"/><line x1=\"18.6\" y1=\"7.4\" x2=\"7\" y2=\"22.8\" stroke=\"var(--iconbg,#0b1014)\" stroke-width=\"3.6\" stroke-linecap=\"round\"/><line x1=\"17\" y1=\"9.2\" x2=\"8.6\" y2=\"20.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>","door":"<rect x=\"8\" y=\"2\" width=\"9.5\" height=\"20\" rx=\"3\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><line x1=\"10\" y1=\"7\" x2=\"15.5\" y2=\"7\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"10\" y1=\"17.5\" x2=\"15.5\" y2=\"17.5\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><rect x=\"7\" y=\"9.2\" width=\"2.4\" height=\"5\" fill=\"var(--iconbg,#0b1014)\"/><line x1=\"8.2\" y1=\"9.4\" x2=\"3\" y2=\"14.2\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","park":"<circle cx=\"12\" cy=\"12\" r=\"7.2\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\"/><line x1=\"10.3\" y1=\"8.4\" x2=\"10.3\" y2=\"15.8\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"10.3\" y1=\"8.4\" x2=\"12.2\" y2=\"8.4\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"10.3\" y1=\"12.6\" x2=\"12.2\" y2=\"12.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M12.2 8.4A2.1 2.1 0 0 1 12.2 12.6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M4.5 19.5A10.6 10.6 0 0 1 4.5 4.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M19.5 4.5A10.6 10.6 0 0 1 19.5 19.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>","turn_l":"<polygon points=\"1.5,12 10,3.8 10,8.6 21.5,8.6 21.5,15.4 10,15.4 10,20.2\" fill=\"currentColor\"/>","turn_r":"<polygon points=\"22.5,12 14,3.8 14,8.6 2.5,8.6 2.5,15.4 14,15.4 14,20.2\" fill=\"currentColor\"/>","high_beam":"<line x1=\"13.5\" y1=\"5\" x2=\"13.5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M13.5 5A7 7 0 0 1 13.5 19\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"6.5\" x2=\"10\" y2=\"6.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"10\" x2=\"10\" y2=\"10\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"14\" x2=\"10\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"17.5\" x2=\"10\" y2=\"17.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","lights":"<line x1=\"13.5\" y1=\"5\" x2=\"13.5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M13.5 5A7 7 0 0 1 13.5 19\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"9.5\" x2=\"10\" y2=\"7\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"13.5\" x2=\"10\" y2=\"11\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"17.5\" x2=\"10\" y2=\"15\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","cruise":"<path d=\"M5.92 19.58A8.6 8.6 0 1 1 18.08 19.58\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"12\" y1=\"13.5\" x2=\"16.8\" y2=\"8.6\" stroke=\"currentColor\" stroke-width=\"2.1\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"13.5\" r=\"2.2\" fill=\"currentColor\"/><line x1=\"12\" y1=\"19.5\" x2=\"12\" y2=\"22.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"22.5\" x2=\"16\" y2=\"22.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","fuel":"<rect x=\"4\" y=\"4.5\" width=\"9.5\" height=\"16\" rx=\"1.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"6.5\" y=\"7\" width=\"4.5\" height=\"3.8\" fill=\"currentColor\"/><line x1=\"2.5\" y1=\"21.2\" x2=\"15\" y2=\"21.2\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"13.5\" y1=\"8\" x2=\"16.4\" y2=\"8\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"16.4\" y1=\"8\" x2=\"19.2\" y2=\"10.8\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"19.2\" y1=\"10.8\" x2=\"19.2\" y2=\"17.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"19.2\" y1=\"17.6\" x2=\"17.2\" y2=\"17.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>","battery":"<rect x=\"2.5\" y=\"7\" width=\"19\" height=\"12.5\" rx=\"1.2\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"5\" y=\"4.3\" width=\"4.4\" height=\"2.7\" fill=\"currentColor\"/><rect x=\"14.6\" y=\"4.3\" width=\"4.4\" height=\"2.7\" fill=\"currentColor\"/><line x1=\"5.8\" y1=\"13.2\" x2=\"9.8\" y2=\"13.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"14.2\" y1=\"13.2\" x2=\"18.2\" y2=\"13.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"16.2\" y1=\"11.2\" x2=\"16.2\" y2=\"15.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/>","oil":"<polygon points=\"4.5,11.2 14.6,11.2 16.4,13.6 16.4,17.2 4.5,17.2\" fill=\"currentColor\"/><rect x=\"8\" y=\"8.4\" width=\"3\" height=\"2.8\" fill=\"currentColor\"/><line x1=\"6.5\" y1=\"8.2\" x2=\"12.5\" y2=\"8.2\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"15.8\" y1=\"13\" x2=\"21.4\" y2=\"9.6\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\"/><path d=\"M4.5 16.8A2.6 2.6 0 0 1 4.5 11.6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><circle cx=\"21.2\" cy=\"15.2\" r=\"1.45\" fill=\"currentColor\"/><polygon points=\"21.2,12.2 19.9,14.9 22.5,14.9\" fill=\"currentColor\"/>","coolant":"<line x1=\"12\" y1=\"3.2\" x2=\"12\" y2=\"13\" stroke=\"currentColor\" stroke-width=\"3.2\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"15\" r=\"3.1\" fill=\"currentColor\"/><line x1=\"14.8\" y1=\"4.6\" x2=\"17.4\" y2=\"4.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"14.8\" y1=\"7.6\" x2=\"17.4\" y2=\"7.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"14.8\" y1=\"10.6\" x2=\"17.4\" y2=\"10.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"20.2\" x2=\"5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"5\" y1=\"19\" x2=\"8\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"20.2\" x2=\"9.8\" y2=\"19.5\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"14.2\" y1=\"19.5\" x2=\"16\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"16\" y1=\"20.2\" x2=\"19\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"19\" y1=\"19\" x2=\"22\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"23\" x2=\"5\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"5\" y1=\"21.8\" x2=\"8\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"23\" x2=\"11\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"11\" y1=\"21.8\" x2=\"14\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"14\" y1=\"23\" x2=\"17\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"17\" y1=\"21.8\" x2=\"20\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"20\" y1=\"23\" x2=\"22\" y2=\"22.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>","knock":"<polygon points=\"14,1.5 5,13.5 11,13.5 8.5,22.5 19.5,9 13.2,9 16,1.5\" fill=\"currentColor\"/>","warn":"<polygon points=\"12,2.2 23,21.2 1,21.2\" fill=\"currentColor\"/><line x1=\"12\" y1=\"8.6\" x2=\"12\" y2=\"14.4\" stroke=\"var(--iconbg,#0b1014)\" stroke-width=\"2.4\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"17.6\" r=\"1.5\" fill=\"var(--iconbg,#0b1014)\"/>","service":"<line x1=\"4.2\" y1=\"19.8\" x2=\"13\" y2=\"11\" stroke=\"currentColor\" stroke-width=\"3.6\" stroke-linecap=\"round\"/><circle cx=\"16.2\" cy=\"7.8\" r=\"5.4\" fill=\"currentColor\"/><polygon points=\"15.4,8.6 17.4,0.6 23.6,6.8\" fill=\"var(--iconbg,#0b1014)\"/><circle cx=\"16.2\" cy=\"7.8\" r=\"2\" fill=\"var(--iconbg,#0b1014)\"/>"};
+const TONES = {red:'#FF1744',amber:'#FFC400',green:'#00E676',blue:'#448AFF'};
+/* Mirror of the built-in lamp table in src/ui/Telltales.cpp: the defaults the
+   firmware applies before this layout's overrides. Only what differs from
+   these is saved, so a default improved in a later firmware still reaches
+   every lamp you did not touch. */
+const LAMP_BASE = {enabled:true,strip:true,metric_id:'',rule:'on',threshold:0,
+  hysteresis:0,engine:false,critical:false,popup:'off',popup_speed:0,
+  blink_speed:-1,popup_secs:0,debounce_ms:0,hold_ms:0,title:'',detail:'',
+  units:'',decimals:0,tone:'amber',icon:'warn'};
+const LAMPS = [
+ {key:'mil',title:'CHECK ENGINE',detail:'ENGINE FAULT STORED',icon:'mil',tone:'amber',
+  metric_id:'0x0101',popup:'once',popup_secs:10,units:'CODES'},
+ {key:'codes',title:'TROUBLE CODES',detail:'READ BY THE MASTER',icon:'mil',tone:'amber',
+  metric_id:'0x0400',rule:'above',threshold:0.5,popup:'once',popup_secs:12,strip:false},
+ {key:'service',title:'OIL CHANGE DUE',detail:'BOOK THE SERVICE',icon:'service',tone:'amber',
+  metric_id:'0x1F10',rule:'below',threshold:500,hysteresis:50,popup:'once',popup_secs:10,units:'km'},
+ {key:'oil',title:'OIL PRESSURE',detail:'STOP THE ENGINE SAFELY',icon:'oil',tone:'red',
+  metric_id:'0x1003',rule:'below',threshold:0.5,hysteresis:0.2,engine:true,
+  critical:true,popup:'repeat',debounce_ms:1000,units:'bar',decimals:1},
+ {key:'charging',title:'CHARGING',detail:'ALTERNATOR NOT CHARGING',icon:'battery',
+  tone:'red',metric_id:'0x0142',rule:'below',threshold:12,hysteresis:0.5,engine:true,
+  popup:'once',debounce_ms:5000,units:'V',decimals:1},
+ {key:'coolant_hot',title:'ENGINE HOT',detail:'EASE OFF, CHECK COOLANT',icon:'coolant',
+  tone:'red',metric_id:'0x0105',rule:'above',threshold:110,hysteresis:3,critical:true,
+  popup:'repeat',debounce_ms:2000,units:'°C'},
+ {key:'coolant_cold',title:'ENGINE COLD',detail:'GO EASY UNTIL IT WARMS UP',
+  icon:'coolant',tone:'blue',metric_id:'0x0105',rule:'below',threshold:45,
+  hysteresis:3,units:'°C'},
+ {key:'seatbelt',title:'FASTEN SEAT BELT',detail:'DRIVER BELT NOT FASTENED',
+  icon:'seatbelt',tone:'red',metric_id:'0x1206',popup:'repeat',popup_speed:10,
+  blink_speed:10},
+ {key:'door',title:'DOOR OPEN',detail:'CLOSE ALL DOORS',icon:'door',tone:'red',
+  metric_id:'0x1204',critical:true,popup:'repeat',popup_speed:5,blink_speed:5},
+ {key:'parking_brake',title:'PARKING BRAKE',detail:'RELEASE THE PARKING BRAKE',
+  icon:'park',tone:'red',metric_id:'0x1205',critical:true,popup:'repeat',
+  popup_speed:5,blink_speed:5},
+ {key:'low_fuel',title:'LOW FUEL',detail:'REFUEL SOON',icon:'fuel',tone:'amber',
+  metric_id:'0x012F',rule:'below',threshold:12,hysteresis:3,popup:'once',
+  popup_secs:8,debounce_ms:10000,units:'%'},
+ {key:'knock',title:'KNOCK',detail:'ECU IS PULLING TIMING',icon:'knock',tone:'amber',
+  metric_id:'0x2001',rule:'below',threshold:-3,hysteresis:0.5,hold_ms:3000,
+  units:'°',decimals:1},
+ {key:'high_beam',title:'HIGH BEAM',icon:'high_beam',tone:'blue',metric_id:'0x1203'},
+ {key:'lights',title:'LIGHTS ON',icon:'lights',tone:'green',metric_id:'0x2108',strip:false},
+ {key:'cruise',title:'CRUISE',icon:'cruise',tone:'green',metric_id:'0x1207'},
+ {key:'turn_left',title:'LEFT INDICATOR',icon:'turn_l',tone:'green',metric_id:'0x1201',
+  hold_ms:1000,turn:true},
+ {key:'turn_right',title:'RIGHT INDICATOR',icon:'turn_r',tone:'green',metric_id:'0x1202',
+  hold_ms:1000,turn:true},
+ {key:'custom_1',title:'CUSTOM 1',enabled:false},
+ {key:'custom_2',title:'CUSTOM 2',enabled:false},
+ {key:'custom_3',title:'CUSTOM 3',enabled:false},
+];
+const LAMP_NUM = ['threshold','hysteresis','debounce_ms','hold_ms','popup_speed',
+                  'popup_secs','blink_speed','decimals'];
+const openLamps = new Set();
+
+function warn(){
+  if(!layout.warnings||typeof layout.warnings!=='object')
+    layout.warnings={enabled:layout.warnings!==false,lamps:{}};
+  const w=layout.warnings;
+  if(!w.lamps||typeof w.lamps!=='object'||Array.isArray(w.lamps))w.lamps={};
+  return w;
+}
+function lampDefault(key){
+  return Object.assign({},LAMP_BASE,LAMPS.find(l=>l.key===key)||{});
+}
+/* Effective settings: the default, then this layout's override. A lamp can
+   also be switched off with a bare `false`, as the firmware accepts. */
+function lampEff(key){
+  const o=warn().lamps[key];
+  return Object.assign(lampDefault(key),typeof o==='boolean'?{enabled:o}:(o||{}));
+}
+function lampSet(key,field,el){
+  let v=el.type==='checkbox'?el.checked:el.value;
+  // An emptied number is the lamp's default again.
+  if(LAMP_NUM.includes(field)){v=parseFloat(v);if(!isFinite(v))v=lampDefault(key)[field];}
+  const L=warn().lamps;
+  if(typeof L[key]==='boolean')L[key]={enabled:L[key]};
+  if(!L[key])L[key]={};
+  if(v===lampDefault(key)[field])delete L[key][field];else L[key][field]=v;
+  if(!Object.keys(L[key]).length)delete L[key];
+  renderWarnings();
+}
+function lampReset(key){delete warn().lamps[key];renderWarnings();}
+function lampOpen(key,open){open?openLamps.add(key):openLamps.delete(key);}
+function iconSvg(name,color,size){
+  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}"
+    style="color:${color};--iconbg:var(--panel);flex:none">${ICONS[name]||''}</svg>`;
+}
+function lampSummary(e){
+  if(!e.metric_id)return 'no signal chosen &mdash; pick one under Settings';
+  const when={on:'on',off:'off',above:'&ge; '+e.threshold,
+              below:'&le; '+e.threshold}[e.rule]||e.rule;
+  const p=[`${KNOWN[e.metric_id]||e.metric_id} ${when}`];
+  if(e.engine)p.push('engine running');
+  if(e.popup!=='off')p.push((e.popup==='once'?'pops up once':'pops up until tapped')+
+    (e.popup_speed>0?' above '+e.popup_speed+' km/h':''));
+  if(e.blink_speed>=0)p.push('flashes'+(e.blink_speed>0?' above '+e.blink_speed+' km/h':''));
+  if(!e.strip)p.push('dash only');
+  return p.join(' &bull; ');
+}
+function lampCard(key){
+  const e=lampEff(key),changed=warn().lamps[key]!==undefined;
+  const col=e.enabled?(TONES[e.tone]||TONES.amber):'#3A4650';
+  const opt=(v,cur,t)=>`<option value="${esc(v)}" ${String(cur)===String(v)?'selected':''}>${t??v}</option>`;
+  const num=(f,step)=>`<input type="number" step="${step||'any'}" value="${e[f]}"
+    onchange="lampSet('${key}','${f}',this)">`;
+  const txt=(f,max)=>`<input value="${esc(e[f])}" maxlength="${max}"
+    onchange="lampSet('${key}','${f}',this)">`;
+  return `<div class="card" style="margin-bottom:10px">
+    <div style="display:flex;align-items:center;gap:12px">
+      ${iconSvg(e.icon,col,30)}
+      <div><b style="color:${e.enabled?'var(--text)':'var(--muted)'}">${esc(e.title)}</b>
+        <div class="hint" style="margin:0">${e.enabled?lampSummary(e):'off'}</div></div>
+      <label class="f" style="margin:0 0 0 auto;white-space:nowrap">
+        <input type="checkbox" ${e.enabled?'checked':''}
+          onchange="lampSet('${key}','enabled',this)"> On</label>
+      ${changed?`<button class="b" onclick="lampReset('${key}')">Defaults</button>`:''}
+    </div>
+    <details ${openLamps.has(key)?'open':''} ontoggle="lampOpen('${key}',this.open)">
+      <summary class="hint" style="cursor:pointer">Settings</summary>
+      <div class="grid3" style="margin-top:8px">
+        ${fld('Signal',`<select onchange="lampSet('${key}','metric_id',this)">
+          ${opt('',e.metric_id,'none')}
+          ${Object.entries(KNOWN).map(([k,v])=>opt(k,e.metric_id,k+' — '+v)).join('')}
+          </select>`)}
+        ${fld('Lights when',`<select onchange="lampSet('${key}','rule',this)">
+          ${opt('on',e.rule,'signal is on')}${opt('off',e.rule,'signal is off')}
+          ${opt('above',e.rule,'value &ge; limit')}${opt('below',e.rule,'value &le; limit')}
+          </select>`)}
+        ${fld('Limit',num('threshold'))}
+        ${fld('Hysteresis',num('hysteresis'))}
+        ${fld('Must hold for (ms)',num('debounce_ms',1))}
+        ${fld('Stays lit after (ms)',num('hold_ms',1))}
+        ${fld('Pop-up',`<select onchange="lampSet('${key}','popup',this)">
+          ${opt('off',e.popup,'never')}${opt('once',e.popup,'once each time it lights')}
+          ${opt('repeat',e.popup,'until tapped, then again')}</select>`)}
+        ${fld('Pop up only above (km/h)',num('popup_speed'))}
+        ${fld('Pop-up hides after (s, 0 = tap)',num('popup_secs',1))}
+        ${fld('Flash above (km/h, &minus;1 never)',num('blink_speed'))}
+        ${fld('Colour',`<select onchange="lampSet('${key}','tone',this)">
+          ${['red','amber','green','blue'].map(t=>opt(t,e.tone)).join('')}</select>`)}
+        ${fld('Symbol',`<select onchange="lampSet('${key}','icon',this)">
+          ${Object.keys(ICONS).map(t=>opt(t,e.icon)).join('')}</select>`)}
+      </div>
+      <div class="grid3">
+        <label class="f"><input type="checkbox" ${e.engine?'checked':''}
+          onchange="lampSet('${key}','engine',this)"> Only with the engine running</label>
+        <label class="f"><input type="checkbox" ${e.critical?'checked':''}
+          onchange="lampSet('${key}','critical',this)"> Critical (pulsing pop-up)</label>
+        <label class="f"><input type="checkbox" ${e.strip?'checked':''}
+          onchange="lampSet('${key}','strip',this)"> On the strip over screens</label>
+      </div>
+      <div class="grid3">
+        ${fld('Title',txt('title',23))}
+        ${fld('Advice line',txt('detail',35))}
+        ${fld('Units',txt('units',6))}
+      </div>
+    </details></div>`;
+}
+function renderWarnings(){
+  $('#wnList').innerHTML=(warn().enabled===false?'<div class="card" style="margin-bottom:10px">'+
+    '<p class="hint" style="margin:0">Warning lamps are switched off above: none of these is '+
+    'shown or pops up until they are on again.</p></div>':'')+
+    LAMPS.map(l=>lampCard(l.key)).join('');
+}
+
+/* Canvas copies of the symbols, per colour; the preview redraws as they load. */
+const _lampImgs={};
+function drawLamp(x,name,color,px,py){
+  const k=name+color;let im=_lampImgs[k];
+  if(!im){
+    im=new Image();im.onload=()=>draw();
+    im.src='data:image/svg+xml,'+encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24"
+        height="24" color="${color}">${(ICONS[name]||'')
+        .replace(/var\(--iconbg,#0b1014\)/g,'#101418')}</svg>`);
+    _lampImgs[k]=im;
+  }
+  if(im.complete&&im.naturalWidth)x.drawImage(im,px,py,24,24);
+}
+/* @shared-end ════════════════════════════════════════════════════════════ */
+
+/* @board-begin: this board's preview drawing ══════════════════════════ */
 /* ───────────────────────────── canvas preview ──────────────────────────── */
 $('#sim').oninput=draw;
 const D2R=Math.PI/180;
@@ -931,7 +1524,14 @@ function draw(){
     x.clearRect(0,0,c.width,c.height);drawDash(s,x,$('#sim').value/1000);return;}
   const cx=130,cy=130,frac=$('#sim').value/1000;
   x.clearRect(0,0,260,260);
-  x.fillStyle='#101418';x.beginPath();x.arc(cx,cy,128,0,7);x.fill();
+  x.fillStyle=pvGrad(x,s,2,258,dayBg());x.beginPath();x.arc(cx,cy,128,0,7);x.fill();
+  // The bezel (addDialFace): two hairline rings and twelve rim ticks.
+  if(s.dial_face??bezelDefault(s.type)){
+    x.lineWidth=2;x.strokeStyle='#2A3A44';x.beginPath();x.arc(cx,cy,118,0,7);x.stroke();
+    x.lineWidth=1;x.strokeStyle='#1A2A33';x.beginPath();x.arc(cx,cy,98.5,0,7);x.stroke();
+    x.fillStyle='#2A3A44';
+    for(let i=0;i<12;i++){x.beginPath();x.arc(cx+Math.cos(i*30*D2R)*107,cy+Math.sin(i*30*D2R)*107,1.2,0,7);x.fill();}
+  }
 
   const obj=(s.type==='quad'||s.type==='split')?(s.cells||[])[cellSel]:
             (s.type==='text_list')?(s.rows||[])[cellSel]:s;
@@ -945,10 +1545,10 @@ function draw(){
   if(s.type==='arc_gauge'||s.type==='meter_gauge'){
     const a=s.arc||{},st=(a.start_angle??135),en=(a.end_angle??45);
     const sweep=((en-st)%360+360)%360||270,w=a.width??18;
-    // track
-    x.lineWidth=w;x.lineCap='round';x.strokeStyle=a.bg_color||'#1A2A33';
-    x.beginPath();x.arc(cx,cy,112-w/2,st*D2R,(st+sweep)*D2R);x.stroke();
     if(s.type==='arc_gauge'){
+      // track, then the value: the firmware's lv_arc (a needle dial has neither)
+      x.lineWidth=w;x.lineCap=a.rounded===false?'butt':'round';x.strokeStyle=a.bg_color||'#1A2A33';
+      x.beginPath();x.arc(cx,cy,112-w/2,st*D2R,(st+sweep)*D2R);x.stroke();
       x.strokeStyle=color;x.beginPath();
       x.arc(cx,cy,112-w/2,st*D2R,(st+sweep*frac)*D2R);x.stroke();
     }else{
@@ -1101,435 +1701,6 @@ function draw(){
     x.fillText(headline,cx-38,cy+30);
   }
 }
-/* A dial's scale as the firmware builds it (UIBuilder.cpp: dialScale on the
-   cluster, buildMeterGauge on the round board): LVGL's meter spreads n ticks
-   evenly - never more than 41, however fine the spacing asked for - and every
-   per-th one is major, labelled with the line's value in whole meter units,
-   divided back for display. q is each tick's value, text its label. */
-function dialTicks(min,max,every,div){
-  if(!(max>min))max=min+1;
-  const span=max-min,big=Math.max(Math.abs(min),Math.abs(max));
-  let unit=1;while(span*unit<200&&big*unit*10<=1e8&&unit<10000)unit*=10;
-  if(!(every>0))every=span/8;
-  let per=4;const count=()=>Math.min(1000,Math.round(span/(every/per))+1);
-  let n=count();while(n>41&&per>1){per/=2;n=count();}
-  n=Math.max(2,Math.min(41,n||2));
-  const whole=v=>Math.sign(v)*Math.round(Math.abs(v));      // lroundf
-  const lo=whole(min*unit),hi=whole(max*unit),d=unit*(div>1?div:1),out=[];
-  for(let i=0;i<n;i++){
-    const u=Math.trunc(i*(hi-lo)/(n-1))+lo,major=i%per===0;
-    let text='';
-    if(major){
-      const v=u/d;
-      text=d<=1?String(u):Math.abs(v-Math.round(v))<0.005?String(Math.round(v))
-          :Math.abs(v*10-Math.round(v*10))<0.05?v.toFixed(1):v.toFixed(2);
-    }
-    out.push({q:u/unit,major,text});
-  }
-  return {min,max,ticks:out};
-}
-/* A trend's point count as the firmware clamps it. */
-function chartPoints(s){
-  const [def,most]=BOARD==='cluster'?[120,240]:[60,120];
-  return Math.max(10,Math.min(most,Math.trunc(Number(s.points??def))||10));
-}
-function state(o,v){
-  if(!o||!o.thresholds)return'ok';
-  // A tier without a value trips at 0, as the firmware reads it.
-  const t=o.thresholds,hit=(th)=>th&&
-    (th.direction==='below'?v<=(th.value??0):v>=(th.value??0));
-  return hit(t.critical)?'crit':hit(t.warning)?'warn':'ok';
-}
-
-/* ───────────────────────────── persistence ─────────────────────────────── */
-async function saveLayout(rebootAfter){
-  if(demoLayout&&!confirm('The display\'s own layout could not be read, so this is '+
-      'the demo one. Saving it replaces every screen on the display. Save anyway?'))
-    return;
-  try{
-    const r=await fetch('/api/layout',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(layout)});
-    if(!r.ok)throw new Error(await replyError(r));
-    demoLayout=false;
-    toast('Layout saved ✔');
-  }catch(e){toast('Save failed: '+e.message);return;}
-  if(rebootAfter){
-    // The display restarts as it answers, which may cut the reply short.
-    try{await fetch('/api/reboot',{method:'POST'});}catch(e){}
-    toast('Rebooting — reconnect to the display network');
-  }
-}
-function applyJson(){
-  let j;
-  try{j=JSON.parse($('#jsonEd').value);}
-  catch(e){return toast('JSON error: '+e.message);}
-  if(!j||typeof j!=='object'||Array.isArray(j)||!Array.isArray(j.screens)||!j.screens.length)
-    return toast('Not applied: a layout needs a "screens" list with at least one screen');
-  layout=j;sel=0;cellSel=0;demoLayout=false;renderAll();
-  toast('Applied — remember to Save');
-}
-
-/* ───────────────────────────── assets ──────────────────────────────────── */
-async function loadAssets(){
-  try{
-    const d=await fetch('/api/assets').then(r=>r.json());
-    const tb=$('#assetTable tbody');tb.innerHTML='';
-    (d.assets||[]).forEach(a=>{
-      const tr=document.createElement('tr');
-      tr.innerHTML=`<td>/assets/${esc(a.name)}</td><td>${(a.size/1024).toFixed(1)} KB</td>
-        <td><button class="b danger" data-name="${esc(a.name)}"
-          onclick="delAsset(this.dataset.name)">✕</button></td>`;
-      tb.appendChild(tr);
-    });
-  }catch(e){toast('Asset list failed');}
-}
-async function uploadAsset(){
-  const f=$('#assetFile').files[0];if(!f)return toast('Choose a file first');
-  const fd=new FormData();fd.append('file',f);
-  try{
-    const r=await fetch('/api/asset',{method:'POST',body:fd});
-    toast(r.ok?'Uploaded ✔':'Upload failed: '+await replyError(r));
-  }catch(e){toast('Upload failed: device not reachable');}
-  loadAssets();
-}
-async function delAsset(n){
-  if(!confirm('Delete /assets/'+n+'? A screen that shows it goes without.'))return;
-  try{
-    const r=await fetch('/api/asset/delete?name='+encodeURIComponent(n),{method:'POST'});
-    if(!r.ok)toast('Delete failed: '+await replyError(r));
-  }catch(e){toast('Delete failed: device not reachable');}
-  loadAssets();
-}
-
-/* ───────────────────────────── system tab ──────────────────────────────── */
-async function pollSystem(){
-  try{
-    const info=await fetch('/api/info').then(r=>r.json());
-    $('#infoTable tbody').innerHTML=Object.entries({
-      'Firmware':info.firmware,'Protocol':'v'+info.proto,
-      'ESP-NOW channel':info.channel,
-      'Free heap':(info.heap_free/1024).toFixed(0)+' KB',
-      'Filesystem':(info.fs_used/1024).toFixed(0)+' / '+
-                   (info.fs_total/1024).toFixed(0)+' KB',
-      'Uptime':info.uptime_s+' s',
-      'Display memory (LVGL)':info.lvgl_total?(info.lvgl_used/1024).toFixed(1)+' / '+
-                   (info.lvgl_total/1024).toFixed(0)+' KB':'—'
-    }).map(([k,v])=>`<tr><th>${k}</th><td>${v}</td></tr>`).join('');
-    const live=await fetch('/api/live').then(r=>r.json());
-    $('#liveTable tbody').innerHTML=(live.metrics||[]).map(m=>{
-      const fl=[m.flags&1?'V':'',m.flags&2?'W':'',m.flags&4?'C':'',
-                m.flags&8?'N':''].join('');
-      return `<tr><td>${KNOWN[m.id]||'—'}</td><td>${m.id}</td>
-        <td>${(+m.value).toFixed(2)}</td><td>${(+m.peak).toFixed(2)}</td>
-        <td>${fl}</td><td>${m.age_ms} ms</td></tr>`;
-    }).join('')||'<tr><td colspan="6">No telemetry received — Master silent '+
-      'while display is in config mode (ESP-NOW paused).</td></tr>';
-  }catch(e){/* device busy */}
-}
-async function resetPeaks(){
-  try{const r=await fetch('/api/peaks/reset',{method:'POST'});
-    toast(r.ok?'Peaks reset':'Reset failed: '+await replyError(r));}
-  catch(e){toast('Device not reachable');}}
-async function reboot(){
-  // The display restarts as it answers, which may cut the reply short.
-  try{await fetch('/api/reboot',{method:'POST'});}catch(e){}
-  toast('Rebooting…');}
-
-/* Which board this studio configures: decides the dash preview's geometry
-   and which dash parts exist. */
-const BOARD = 'round';
-/* ─────────────────────────── warning lamps ─────────────────────────────── */
-/* Symbols: the same shapes the firmware draws (tools/make_icons.py). Cuts are
-   painted in the page background, as the firmware's transparency shows. */
-const ICONS = {"mil":"<rect x=\"5.5\" y=\"8.5\" width=\"12.5\" height=\"10.5\" rx=\"1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"8\" y=\"4.5\" width=\"7\" height=\"2\" fill=\"currentColor\"/><line x1=\"11.5\" y1=\"6.5\" x2=\"11.5\" y2=\"8.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.2\" y1=\"11\" x2=\"2.2\" y2=\"17\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.2\" y1=\"14\" x2=\"5.5\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"18\" y1=\"11.5\" x2=\"21.5\" y2=\"9\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"21.5\" y1=\"9\" x2=\"21.5\" y2=\"18.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"21.5\" y1=\"18.5\" x2=\"18\" y2=\"16\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","seatbelt":"<circle cx=\"12\" cy=\"4.2\" r=\"2.9\" fill=\"currentColor\"/><polygon points=\"7.4,8.8 16.6,8.8 18.2,13 17.4,21.8 6.6,21.8 5.8,13\" fill=\"currentColor\"/><line x1=\"18.6\" y1=\"7.4\" x2=\"7\" y2=\"22.8\" stroke=\"var(--iconbg,#0b1014)\" stroke-width=\"3.6\" stroke-linecap=\"round\"/><line x1=\"17\" y1=\"9.2\" x2=\"8.6\" y2=\"20.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>","door":"<rect x=\"8\" y=\"2\" width=\"9.5\" height=\"20\" rx=\"3\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><line x1=\"10\" y1=\"7\" x2=\"15.5\" y2=\"7\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"10\" y1=\"17.5\" x2=\"15.5\" y2=\"17.5\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><rect x=\"7\" y=\"9.2\" width=\"2.4\" height=\"5\" fill=\"var(--iconbg,#0b1014)\"/><line x1=\"8.2\" y1=\"9.4\" x2=\"3\" y2=\"14.2\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","park":"<circle cx=\"12\" cy=\"12\" r=\"7.2\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\"/><line x1=\"10.3\" y1=\"8.4\" x2=\"10.3\" y2=\"15.8\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"10.3\" y1=\"8.4\" x2=\"12.2\" y2=\"8.4\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"10.3\" y1=\"12.6\" x2=\"12.2\" y2=\"12.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M12.2 8.4A2.1 2.1 0 0 1 12.2 12.6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M4.5 19.5A10.6 10.6 0 0 1 4.5 4.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><path d=\"M19.5 4.5A10.6 10.6 0 0 1 19.5 19.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>","turn_l":"<polygon points=\"1.5,12 10,3.8 10,8.6 21.5,8.6 21.5,15.4 10,15.4 10,20.2\" fill=\"currentColor\"/>","turn_r":"<polygon points=\"22.5,12 14,3.8 14,8.6 2.5,8.6 2.5,15.4 14,15.4 14,20.2\" fill=\"currentColor\"/>","high_beam":"<line x1=\"13.5\" y1=\"5\" x2=\"13.5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M13.5 5A7 7 0 0 1 13.5 19\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"6.5\" x2=\"10\" y2=\"6.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"10\" x2=\"10\" y2=\"10\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"14\" x2=\"10\" y2=\"14\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"17.5\" x2=\"10\" y2=\"17.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","lights":"<line x1=\"13.5\" y1=\"5\" x2=\"13.5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><path d=\"M13.5 5A7 7 0 0 1 13.5 19\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"9.5\" x2=\"10\" y2=\"7\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"13.5\" x2=\"10\" y2=\"11\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"2.5\" y1=\"17.5\" x2=\"10\" y2=\"15\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","cruise":"<path d=\"M5.92 19.58A8.6 8.6 0 1 1 18.08 19.58\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"12\" y1=\"13.5\" x2=\"16.8\" y2=\"8.6\" stroke=\"currentColor\" stroke-width=\"2.1\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"13.5\" r=\"2.2\" fill=\"currentColor\"/><line x1=\"12\" y1=\"19.5\" x2=\"12\" y2=\"22.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"22.5\" x2=\"16\" y2=\"22.5\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>","fuel":"<rect x=\"4\" y=\"4.5\" width=\"9.5\" height=\"16\" rx=\"1.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"6.5\" y=\"7\" width=\"4.5\" height=\"3.8\" fill=\"currentColor\"/><line x1=\"2.5\" y1=\"21.2\" x2=\"15\" y2=\"21.2\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/><line x1=\"13.5\" y1=\"8\" x2=\"16.4\" y2=\"8\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"16.4\" y1=\"8\" x2=\"19.2\" y2=\"10.8\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"19.2\" y1=\"10.8\" x2=\"19.2\" y2=\"17.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><line x1=\"19.2\" y1=\"17.6\" x2=\"17.2\" y2=\"17.6\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>","battery":"<rect x=\"2.5\" y=\"7\" width=\"19\" height=\"12.5\" rx=\"1.2\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><rect x=\"5\" y=\"4.3\" width=\"4.4\" height=\"2.7\" fill=\"currentColor\"/><rect x=\"14.6\" y=\"4.3\" width=\"4.4\" height=\"2.7\" fill=\"currentColor\"/><line x1=\"5.8\" y1=\"13.2\" x2=\"9.8\" y2=\"13.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"14.2\" y1=\"13.2\" x2=\"18.2\" y2=\"13.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/><line x1=\"16.2\" y1=\"11.2\" x2=\"16.2\" y2=\"15.2\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"/>","oil":"<polygon points=\"4.5,11.2 14.6,11.2 16.4,13.6 16.4,17.2 4.5,17.2\" fill=\"currentColor\"/><rect x=\"8\" y=\"8.4\" width=\"3\" height=\"2.8\" fill=\"currentColor\"/><line x1=\"6.5\" y1=\"8.2\" x2=\"12.5\" y2=\"8.2\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"15.8\" y1=\"13\" x2=\"21.4\" y2=\"9.6\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\"/><path d=\"M4.5 16.8A2.6 2.6 0 0 1 4.5 11.6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/><circle cx=\"21.2\" cy=\"15.2\" r=\"1.45\" fill=\"currentColor\"/><polygon points=\"21.2,12.2 19.9,14.9 22.5,14.9\" fill=\"currentColor\"/>","coolant":"<line x1=\"12\" y1=\"3.2\" x2=\"12\" y2=\"13\" stroke=\"currentColor\" stroke-width=\"3.2\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"15\" r=\"3.1\" fill=\"currentColor\"/><line x1=\"14.8\" y1=\"4.6\" x2=\"17.4\" y2=\"4.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"14.8\" y1=\"7.6\" x2=\"17.4\" y2=\"7.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"14.8\" y1=\"10.6\" x2=\"17.4\" y2=\"10.6\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"20.2\" x2=\"5\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"5\" y1=\"19\" x2=\"8\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"20.2\" x2=\"9.8\" y2=\"19.5\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"14.2\" y1=\"19.5\" x2=\"16\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"16\" y1=\"20.2\" x2=\"19\" y2=\"19\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"19\" y1=\"19\" x2=\"22\" y2=\"20.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"2\" y1=\"23\" x2=\"5\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"5\" y1=\"21.8\" x2=\"8\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"8\" y1=\"23\" x2=\"11\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"11\" y1=\"21.8\" x2=\"14\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"14\" y1=\"23\" x2=\"17\" y2=\"21.8\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"17\" y1=\"21.8\" x2=\"20\" y2=\"23\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/><line x1=\"20\" y1=\"23\" x2=\"22\" y2=\"22.2\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>","knock":"<polygon points=\"14,1.5 5,13.5 11,13.5 8.5,22.5 19.5,9 13.2,9 16,1.5\" fill=\"currentColor\"/>","warn":"<polygon points=\"12,2.2 23,21.2 1,21.2\" fill=\"currentColor\"/><line x1=\"12\" y1=\"8.6\" x2=\"12\" y2=\"14.4\" stroke=\"var(--iconbg,#0b1014)\" stroke-width=\"2.4\" stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"17.6\" r=\"1.5\" fill=\"var(--iconbg,#0b1014)\"/>","service":"<line x1=\"4.2\" y1=\"19.8\" x2=\"13\" y2=\"11\" stroke=\"currentColor\" stroke-width=\"3.6\" stroke-linecap=\"round\"/><circle cx=\"16.2\" cy=\"7.8\" r=\"5.4\" fill=\"currentColor\"/><polygon points=\"15.4,8.6 17.4,0.6 23.6,6.8\" fill=\"var(--iconbg,#0b1014)\"/><circle cx=\"16.2\" cy=\"7.8\" r=\"2\" fill=\"var(--iconbg,#0b1014)\"/>"};
-const TONES = {red:'#FF1744',amber:'#FFC400',green:'#00E676',blue:'#448AFF'};
-/* Mirror of the built-in lamp table in src/ui/Telltales.cpp: the defaults the
-   firmware applies before this layout's overrides. Only what differs from
-   these is saved, so a default improved in a later firmware still reaches
-   every lamp you did not touch. */
-const LAMP_BASE = {enabled:true,strip:true,metric_id:'',rule:'on',threshold:0,
-  hysteresis:0,engine:false,critical:false,popup:'off',popup_speed:0,
-  blink_speed:-1,popup_secs:0,debounce_ms:0,hold_ms:0,title:'',detail:'',
-  units:'',decimals:0,tone:'amber',icon:'warn'};
-const LAMPS = [
- {key:'mil',title:'CHECK ENGINE',detail:'ENGINE FAULT STORED',icon:'mil',tone:'amber',
-  metric_id:'0x0101',popup:'once',popup_secs:10,units:'CODES'},
- {key:'codes',title:'TROUBLE CODES',detail:'READ BY THE MASTER',icon:'mil',tone:'amber',
-  metric_id:'0x0400',rule:'above',threshold:0.5,popup:'once',popup_secs:12,strip:false},
- {key:'service',title:'OIL CHANGE DUE',detail:'BOOK THE SERVICE',icon:'service',tone:'amber',
-  metric_id:'0x1F10',rule:'below',threshold:500,hysteresis:50,popup:'once',popup_secs:10,units:'km'},
- {key:'oil',title:'OIL PRESSURE',detail:'STOP THE ENGINE SAFELY',icon:'oil',tone:'red',
-  metric_id:'0x1003',rule:'below',threshold:0.5,hysteresis:0.2,engine:true,
-  critical:true,popup:'repeat',debounce_ms:1000,units:'bar',decimals:1},
- {key:'charging',title:'CHARGING',detail:'ALTERNATOR NOT CHARGING',icon:'battery',
-  tone:'red',metric_id:'0x0142',rule:'below',threshold:12,hysteresis:0.5,engine:true,
-  popup:'once',debounce_ms:5000,units:'V',decimals:1},
- {key:'coolant_hot',title:'ENGINE HOT',detail:'EASE OFF, CHECK COOLANT',icon:'coolant',
-  tone:'red',metric_id:'0x0105',rule:'above',threshold:110,hysteresis:3,critical:true,
-  popup:'repeat',debounce_ms:2000,units:'°C'},
- {key:'coolant_cold',title:'ENGINE COLD',detail:'GO EASY UNTIL IT WARMS UP',
-  icon:'coolant',tone:'blue',metric_id:'0x0105',rule:'below',threshold:45,
-  hysteresis:3,units:'°C'},
- {key:'seatbelt',title:'FASTEN SEAT BELT',detail:'DRIVER BELT NOT FASTENED',
-  icon:'seatbelt',tone:'red',metric_id:'0x1206',popup:'repeat',popup_speed:10,
-  blink_speed:10},
- {key:'door',title:'DOOR OPEN',detail:'CLOSE ALL DOORS',icon:'door',tone:'red',
-  metric_id:'0x1204',critical:true,popup:'repeat',popup_speed:5,blink_speed:5},
- {key:'parking_brake',title:'PARKING BRAKE',detail:'RELEASE THE PARKING BRAKE',
-  icon:'park',tone:'red',metric_id:'0x1205',critical:true,popup:'repeat',
-  popup_speed:5,blink_speed:5},
- {key:'low_fuel',title:'LOW FUEL',detail:'REFUEL SOON',icon:'fuel',tone:'amber',
-  metric_id:'0x012F',rule:'below',threshold:12,hysteresis:3,popup:'once',
-  popup_secs:8,debounce_ms:10000,units:'%'},
- {key:'knock',title:'KNOCK',detail:'ECU IS PULLING TIMING',icon:'knock',tone:'amber',
-  metric_id:'0x2001',rule:'below',threshold:-3,hysteresis:0.5,hold_ms:3000,
-  units:'°',decimals:1},
- {key:'high_beam',title:'HIGH BEAM',icon:'high_beam',tone:'blue',metric_id:'0x1203'},
- {key:'lights',title:'LIGHTS ON',icon:'lights',tone:'green',metric_id:'0x2108',strip:false},
- {key:'cruise',title:'CRUISE',icon:'cruise',tone:'green',metric_id:'0x1207'},
- {key:'turn_left',title:'LEFT INDICATOR',icon:'turn_l',tone:'green',metric_id:'0x1201',
-  hold_ms:1000,turn:true},
- {key:'turn_right',title:'RIGHT INDICATOR',icon:'turn_r',tone:'green',metric_id:'0x1202',
-  hold_ms:1000,turn:true},
- {key:'custom_1',title:'CUSTOM 1',enabled:false},
- {key:'custom_2',title:'CUSTOM 2',enabled:false},
- {key:'custom_3',title:'CUSTOM 3',enabled:false},
-];
-const LAMP_NUM = ['threshold','hysteresis','debounce_ms','hold_ms','popup_speed',
-                  'popup_secs','blink_speed','decimals'];
-const openLamps = new Set();
-
-function warn(){
-  if(!layout.warnings||typeof layout.warnings!=='object')
-    layout.warnings={enabled:layout.warnings!==false,lamps:{}};
-  const w=layout.warnings;
-  if(!w.lamps||typeof w.lamps!=='object'||Array.isArray(w.lamps))w.lamps={};
-  return w;
-}
-function lampDefault(key){
-  return Object.assign({},LAMP_BASE,LAMPS.find(l=>l.key===key)||{});
-}
-/* Effective settings: the default, then this layout's override. A lamp can
-   also be switched off with a bare `false`, as the firmware accepts. */
-function lampEff(key){
-  const o=warn().lamps[key];
-  return Object.assign(lampDefault(key),typeof o==='boolean'?{enabled:o}:(o||{}));
-}
-function wnSet(k,el){ putVal(warn(),k,fieldVal(el)); }
-function lampSet(key,field,el){
-  let v=el.type==='checkbox'?el.checked:el.value;
-  // An emptied number is the lamp's default again.
-  if(LAMP_NUM.includes(field)){v=parseFloat(v);if(!isFinite(v))v=lampDefault(key)[field];}
-  const L=warn().lamps;
-  if(typeof L[key]==='boolean')L[key]={enabled:L[key]};
-  if(!L[key])L[key]={};
-  if(v===lampDefault(key)[field])delete L[key][field];else L[key][field]=v;
-  if(!Object.keys(L[key]).length)delete L[key];
-  renderWarnings();
-}
-function lampReset(key){delete warn().lamps[key];renderWarnings();}
-function lampOpen(key,open){open?openLamps.add(key):openLamps.delete(key);}
-function iconSvg(name,color,size){
-  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}"
-    style="color:${color};--iconbg:var(--panel);flex:none">${ICONS[name]||''}</svg>`;
-}
-function lampSummary(e){
-  if(!e.metric_id)return 'no signal chosen &mdash; pick one under Settings';
-  const when={on:'on',off:'off',above:'&ge; '+e.threshold,
-              below:'&le; '+e.threshold}[e.rule]||e.rule;
-  const p=[`${KNOWN[e.metric_id]||e.metric_id} ${when}`];
-  if(e.engine)p.push('engine running');
-  if(e.popup!=='off')p.push((e.popup==='once'?'pops up once':'pops up until tapped')+
-    (e.popup_speed>0?' above '+e.popup_speed+' km/h':''));
-  if(e.blink_speed>=0)p.push('flashes'+(e.blink_speed>0?' above '+e.blink_speed+' km/h':''));
-  if(!e.strip)p.push('dash only');
-  return p.join(' &middot; ');
-}
-function lampCard(key){
-  const e=lampEff(key),changed=warn().lamps[key]!==undefined;
-  const col=e.enabled?(TONES[e.tone]||TONES.amber):'#3A4650';
-  const opt=(v,cur,t)=>`<option value="${esc(v)}" ${String(cur)===String(v)?'selected':''}>${t??v}</option>`;
-  const num=(f,step)=>`<input type="number" step="${step||'any'}" value="${e[f]}"
-    onchange="lampSet('${key}','${f}',this)">`;
-  const txt=(f,max)=>`<input value="${esc(e[f])}" maxlength="${max}"
-    onchange="lampSet('${key}','${f}',this)">`;
-  return `<div class="card" style="margin-bottom:10px">
-    <div style="display:flex;align-items:center;gap:12px">
-      ${iconSvg(e.icon,col,30)}
-      <div><b style="color:${e.enabled?'var(--text)':'var(--muted)'}">${esc(e.title)}</b>
-        <div class="hint" style="margin:0">${e.enabled?lampSummary(e):'off'}</div></div>
-      <label class="f" style="margin:0 0 0 auto;white-space:nowrap">
-        <input type="checkbox" ${e.enabled?'checked':''}
-          onchange="lampSet('${key}','enabled',this)"> On</label>
-      ${changed?`<button class="b" onclick="lampReset('${key}')">Defaults</button>`:''}
-    </div>
-    <details ${openLamps.has(key)?'open':''} ontoggle="lampOpen('${key}',this.open)">
-      <summary class="hint" style="cursor:pointer">Settings</summary>
-      <div class="grid3" style="margin-top:8px">
-        ${fld('Signal',`<select onchange="lampSet('${key}','metric_id',this)">
-          ${opt('',e.metric_id,'none')}
-          ${Object.entries(KNOWN).map(([k,v])=>opt(k,e.metric_id,k+' — '+v)).join('')}
-          </select>`)}
-        ${fld('Lights when',`<select onchange="lampSet('${key}','rule',this)">
-          ${opt('on',e.rule,'signal is on')}${opt('off',e.rule,'signal is off')}
-          ${opt('above',e.rule,'value &ge; limit')}${opt('below',e.rule,'value &le; limit')}
-          </select>`)}
-        ${fld('Limit',num('threshold'))}
-        ${fld('Hysteresis',num('hysteresis'))}
-        ${fld('Must hold for (ms)',num('debounce_ms',1))}
-        ${fld('Stays lit after (ms)',num('hold_ms',1))}
-        ${fld('Pop-up',`<select onchange="lampSet('${key}','popup',this)">
-          ${opt('off',e.popup,'never')}${opt('once',e.popup,'once each time it lights')}
-          ${opt('repeat',e.popup,'until tapped, then again')}</select>`)}
-        ${fld('Pop up only above (km/h)',num('popup_speed'))}
-        ${fld('Pop-up hides after (s, 0 = tap)',num('popup_secs',1))}
-        ${fld('Flash above (km/h, &minus;1 never)',num('blink_speed'))}
-        ${fld('Colour',`<select onchange="lampSet('${key}','tone',this)">
-          ${['red','amber','green','blue'].map(t=>opt(t,e.tone)).join('')}</select>`)}
-        ${fld('Symbol',`<select onchange="lampSet('${key}','icon',this)">
-          ${Object.keys(ICONS).map(t=>opt(t,e.icon)).join('')}</select>`)}
-      </div>
-      <div class="grid3">
-        <label class="f"><input type="checkbox" ${e.engine?'checked':''}
-          onchange="lampSet('${key}','engine',this)"> Only with the engine running</label>
-        <label class="f"><input type="checkbox" ${e.critical?'checked':''}
-          onchange="lampSet('${key}','critical',this)"> Critical (pulsing pop-up)</label>
-        <label class="f"><input type="checkbox" ${e.strip?'checked':''}
-          onchange="lampSet('${key}','strip',this)"> On the strip over screens</label>
-      </div>
-      <div class="grid3">
-        ${fld('Title',txt('title',23))}
-        ${fld('Advice line',txt('detail',35))}
-        ${fld('Units',txt('units',6))}
-      </div>
-    </details></div>`;
-}
-function renderWarnings(){
-  const w=warn();
-  $('#wnEnabled').checked=w.enabled!==false;
-  $('#wnPopups').checked=w.popups!==false;
-  $('#wnStrip').checked=w.strip!==false;
-  $('#wnPos').value=w.strip_position==='top'?'top':'bottom';
-  $('#wnMode').value=(w.strip_mode??(BOARD==='cluster'?'always':'peek'))==='always'?'always':'peek';
-  $('#wnPeek').value=w.peek_secs??6;
-  $('#wnList').innerHTML=LAMPS.map(l=>lampCard(l.key)).join('');
-}
-
-/* Canvas copies of the symbols, per colour; the preview redraws as they load. */
-const _lampImgs={};
-function drawLamp(x,name,color,px,py){
-  const k=name+color;let im=_lampImgs[k];
-  if(!im){
-    im=new Image();im.onload=()=>draw();
-    im.src='data:image/svg+xml,'+encodeURIComponent(
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24"
-        height="24" color="${color}">${(ICONS[name]||'')
-        .replace(/var\(--iconbg,#0b1014\)/g,'#101418')}</svg>`);
-    _lampImgs[k]=im;
-  }
-  if(im.complete&&im.naturalWidth)x.drawImage(im,px,py,24,24);
-}
-
-/* ───────────────────────────── dash screen ─────────────────────────────── */
-const DASH_DEF = {
-  tach:  {metric_id:'0x010C',label:'RPM',max:8000,redline:6500},
-  speed: {metric_id:'0x010D',units:'km/h',max:260},
-  gear:  {metric_id:'0x1005'},
-  fuel:  {metric_id:'0x012F',units:'%',
-          thresholds:{warning:{value:12,hysteresis:3,direction:'below'}}},
-  temp:  {metric_id:'0x0105',min:40,max:130,
-          thresholds:{warning:{value:105,hysteresis:3},critical:{value:110,hysteresis:3}}},
-  info:  [{metric_id:'0x0142',label:'BATT',units:'V',decimals:1},
-          {metric_id:'0x015C',label:'OIL',units:'°C'},
-          {metric_id:'0x010F',label:'IAT',units:'°C'},
-          {metric_id:'0x1001',label:'BOOST',units:'bar',decimals:2}],
-  shift_light: {rpm:6500,start:5000},
-};
-/* Firmware defaults for fields a part may leave out. */
-const DASH_BASE = {
-  tach:{label:'RPM',units:'',min:0,max:8000,decimals:0},
-  speed:{label:'',units:'km/h',min:0,max:260,decimals:0},
-  gear:{label:'GEAR',units:'',min:-1,max:6,decimals:0},
-  fuel:{label:'',units:'%',min:0,max:100,decimals:0},
-  temp:{label:'',units:'°C',min:40,max:130,decimals:0},
-};
-const DASH_PARTS = [['tach','Tachometer'],['speed','Speed'],['gear','Gear'],
-  ['fuel','Fuel'],['temp','Coolant temperature'],['info','Bottom readouts'],
-  ['shift_light','Shift light'],['lamps','Warning lamps']];
-let dashSel='tach';
-const clone=o=>JSON.parse(JSON.stringify(o));
-function dashDefaults(s){
-  ['tach','speed','gear','fuel','temp','shift_light'].forEach(p=>{
-    if(s[p]===undefined||s[p]===true)s[p]=clone(DASH_DEF[p]);});
-  if(s.info===undefined||s.info===true)s.info=clone(DASH_DEF.info);
-  if(s.lamps===undefined)s.lamps=true;
-}
-function dashToggle(p,on){
-  const s=scr();
-  s[p]=on?(p==='lamps'?true:clone(DASH_DEF[p])):false;
-  renderEditor();draw();
-}
-function dashEditor(s){
-  dashDefaults(s);
-  const parts=DASH_PARTS.filter(p=>BOARD==='cluster'||p[0]!=='info');
-  if(!parts.some(p=>p[0]===dashSel))dashSel='tach';
-  const p=dashSel,v=s[p];
-  let h=`<fieldset><legend>Part</legend><div class="btnrow">
-    <select onchange="dashSel=this.value;cellSel=0;renderEditor();draw()">
-    ${parts.map(([k,t])=>`<option value="${k}" ${k===p?'selected':''}>${t}${
-      s[k]===false?' (off)':''}</option>`).join('')}</select></div>
-    <label class="f" style="margin-top:8px"><input type="checkbox" ${v!==false?'checked':''}
-      onchange="dashToggle('${p}',this.checked)"> Show this part</label>`;
-  if(v===false)return h+'<p class="hint">Switched off &mdash; not drawn at all.</p></fieldset>';
-  if(DASH_BASE[p]){
-    h+=metricFields(p+'.',Object.assign({},DASH_BASE[p],v));
-    h+=fld('Colour',inp(p+'.color',v.color||(p==='speed'?'#E0F2F7':'#00E5FF'),'color'));
-    if(p==='tach')h+=`<div class="grid3">
-      ${fld('Redline starts',inp('tach.redline',v.redline??'','number','step="any" data-num="1"'))}
-      ${fld('Numeral every',inp('tach.major_tick_every',v.major_tick_every??'','number','step="any" data-num="1"'))}
-      ${fld('Numeral ÷',inp('tach.tick_label_div',v.tick_label_div??'','number','step="any" data-num="1"'))}
-      </div><p class="hint">Numerals default to every eighth of the scale, in
-      thousands; the red band defaults to the shift light's rpm.</p>`;
-    if(p==='gear')h+=`<p class="hint">Shows R, N or the gear number. Where the
-      bus has a reverse signal (0x1208) it wins over the gear value.</p>`;
-  }else if(p==='info'){
-    const rows=s.info;cellSel=Math.min(cellSel,Math.max(rows.length-1,0));
-    h+=`<div class="btnrow"><select onchange="cellSel=+this.value;renderEditor();draw()">
-      ${rows.map((r,i)=>`<option value="${i}" ${i===cellSel?'selected':''}>
-        Readout ${i+1}: ${esc(r.label||'?')}</option>`).join('')}</select>
-      <button class="b" onclick="if(scr().info.length<4){scr().info.push(
-        {metric_id:'0x0104',label:'LOAD',units:'%'});cellSel=scr().info.length-1;
-        renderEditor();draw();}">＋</button>
-      <button class="b danger" onclick="scr().info.splice(cellSel,1);cellSel=0;
-        renderEditor();draw();">✕</button></div>`;
-    if(rows.length)h+=metricFields(`info.${cellSel}.`,rows[cellSel]);
-  }else if(p==='shift_light'){
-    h+=`<div class="grid2">
-      ${fld('Shift at (rpm)',inp('shift_light.rpm',v.rpm??6500,'number','data-num="1"'))}
-      ${fld('First LED at (rpm)',inp('shift_light.start',v.start??((v.rpm??6500)-1500),'number','data-num="1"'))}
-      </div><p class="hint">Five LEDs fill green, amber, red between the two,
-      then all flash red at the shift point, and the gear box flashes with them.</p>`;
-  }else if(p==='lamps'){
-    h+=`<label class="f"><input type="checkbox" ${s.ghost_lamps!==false?'checked':''}
-      onchange="setVal('ghost_lamps',this)"> Draw unlit lamps dimly</label>
-      <p class="hint">Which lamps exist, what lights them and whether they pop
-      up is set on the <b>Warnings</b> tab.${BOARD==='round'?' On the round '+
-      'screen only the lit lamps are shown, in the gap under the arc.':''}</p>`;
-  }
-  return h+'</fieldset>';
-}
-function telltaleFieldForScreen(s){
-  if(s.type==='dash')return '';
-  const def=!(BOARD==='cluster'&&s.type==='diag');
-  return `<fieldset><legend>Warning lamps on this screen</legend>
-    <label class="f"><input type="checkbox" ${(s.show_telltales??def)?'checked':''}
-      onchange="setVal('show_telltales',this)">
-      Show the strip of lit warning lamps over this screen
-      <span class="hint" style="display:block">The way the car's own cluster
-      keeps its lamps visible whatever else it shows. Hidden when nothing is
-      lit.</span></label></fieldset>`;
-}
 
 /* Preview: the dash as the firmware lays it out. The slider is engine speed;
    past half-way a few lamps light, to show where they go. */
@@ -1552,7 +1723,7 @@ function drawDash(s,x,frac){
     :{W:240,H:240,tcx:120,tcy:120,tR:109,tw:10,band:99.5,num:0,led:[90,34,13,8],
       gear:[98,46,44,36,8,28],speed:[120,88,48,138,12],turn:[[64,52],[152,52]]};
   if(BOARD==='round'){x.translate(10,10);x.beginPath();x.arc(120,120,120,0,7);x.clip();}
-  x.fillStyle='#101418';x.fillRect(0,0,G.W,G.H);
+  x.fillStyle=pvGrad(x,s,0,G.H,dayBg());x.fillRect(0,0,G.W,G.H);
 
   if(t){
     const ang=v=>(135+270*(v-tmin)/(tmax-tmin))*D2R;
@@ -1643,6 +1814,7 @@ function drawDash(s,x,frac){
   }
   x.restore();
 }
+/* @board-end */
 
 boot();
 </script>
