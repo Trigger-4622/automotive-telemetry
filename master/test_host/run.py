@@ -25,7 +25,7 @@ BUILD = os.path.join(HERE, "build")
 EXE = os.path.join(BUILD, "sim.exe" if os.name == "nt" else "sim")
 
 SOURCES = [os.path.join(ROOT, "src", f) for f in ("main.cpp", "Ssm2.cpp", "Learner.cpp", "MasterConfig.cpp", "DiagCodes.cpp", "DriveLog.cpp",
-                                                   "FwUpdate.cpp", "RawRec.cpp")]
+                                                   "FwUpdate.cpp", "RawRec.cpp", "BodyUnit.cpp")]
 SOURCES += sorted(glob.glob(os.path.join(HERE, "sim", "*.cpp")))
 SOURCES += sorted(glob.glob(os.path.join(HERE, "tests", "*.cpp")))
 

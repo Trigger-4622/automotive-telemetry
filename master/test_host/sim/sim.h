@@ -288,6 +288,20 @@ extern int  bugUninstallWhileWaiting;          ///< Uninstall with a task blocke
 /** Requests to the ISO-TP nodes: key (request ID << 8) | service. */
 extern std::map<uint32_t, int> isoRequests;
 extern int codesCleared;                       ///< Service 04 accepted.
+
+/** A body computer (BIU) on the bus, answering KWP2000 over ISO-TP as
+ *  FastECU found the 2005-09 cars' one on K-line: "3E" (present), "21 50"
+ *  (switches, 16 bytes) and "21 51" (lighting, 3 bytes). Off unless a
+ *  scenario switches it on. */
+struct BiuSim {
+    bool     enabled = false;
+    uint32_t req = 0x750, rsp = 0x758;
+    bool     doorDriver = false, doorPass = false, doorRL = false, doorRR = false;
+    bool     boot = false, lightsSw = false, handbrake = false;
+    int      reads = 0;                  ///< "21 50" and "21 51" answered.
+    std::vector<uint8_t> services;       ///< Every service byte it was sent.
+};
+extern BiuSim biu;
 /** Speed of the car in km/h at time t (seconds since start), replacing the
  *  built-in drive; nullptr = the built-in drive. */
 extern double (*speedOverride)(double t);

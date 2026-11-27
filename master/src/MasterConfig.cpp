@@ -613,6 +613,9 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["ecu_cal_id"]   = copied(ecuCalId);
     doc["vin"]          = copied(vin);
     doc["dtc_poll_s"]   = dtcPollS;
+    doc["biu_tx"]       = biuTx;
+    doc["biu_rx"]       = biuRx;
+    doc["biu_ms"]       = biuMs;
     doc["oil_every_km"] = oilEveryKm;
     doc["oil_at_km"]    = oilAtKm;
     doc["log_on"]       = logOn;
@@ -816,6 +819,9 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     if (v["vin"].is<const char *>())
         strlcpy(vin, v["vin"].as<const char *>(), sizeof(vin));
     dtcPollS   = (uint16_t)jint(v["dtc_poll_s"], dtcPollS, 0, 3600);
+    biuTx      = (uint16_t)jint(v["biu_tx"], biuTx, 0, 0x7FF);
+    biuRx      = (uint16_t)jint(v["biu_rx"], biuRx, 0, 0x7FF);
+    biuMs      = (uint16_t)jint(v["biu_ms"], biuMs, 100, 10000);
     oilEveryKm = (uint32_t)jint(v["oil_every_km"], (int)oilEveryKm, 500, 100000);
     oilAtKm    = jint(v["oil_at_km"], oilAtKm, -1, 9999999);
     logOn      = v["log_on"] | logOn;

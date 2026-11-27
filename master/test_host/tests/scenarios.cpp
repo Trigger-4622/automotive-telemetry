@@ -20,6 +20,7 @@
 #include "esp_ota_ops.h"
 #include "DriveLog.h"
 #include "RawRec.h"
+#include "BodyUnit.h"
 #include <array>
 #include "DtcText.h"
 #include "Learner.h"
@@ -5034,6 +5035,140 @@ static void scRawRecLostMarked() {
     commonChecks();
 }
 
+/* ───────────────────────── the car's other computers ───────────────────── */
+
+/** Run until the scan has finished (or @p maxS passes). */
+static bool scanDone(double maxS) {
+    const double until = tNow() + maxS;
+    BodyStatus st;
+    for (;;) {
+        bodyGetStatus(st);
+        if (!st.scanning && (st.scanned || st.scanNote[0])) return st.scanned;
+        if (tNow() >= until) return false;
+        runUntil(tNow() + 0.1);
+    }
+}
+/** Every request the master sent outside OBD-II's own addresses: its service
+ *  byte (single frames) - flow control left out. */
+static std::vector<uint8_t> servicesSentTo7xx() {
+    std::vector<uint8_t> out;
+    for (const auto &t : sim::transmitted) {
+        const twai_message_t &m = t.msg;
+        if (m.extd || m.identifier < 0x700 || m.identifier > 0x7F7 || m.identifier == 0x7DF ||
+            m.identifier == 0x7E0 || m.identifier == 0x7E1) continue;
+        const uint8_t pci = m.data[0] & 0xF0;
+        if (pci == 0x00) out.push_back(m.data[1]);
+        else if (pci != 0x30) out.push_back(0xFF);       // anything but a single frame or flow control
+    }
+    return out;
+}
+
+/**
+ * "Find the car's computers": standing still, every request ID from 0x700 to
+ * 0x7F7 is asked "3E 00" once, and every one that answers "21 50". The engine
+ * and transmission computers answer (with "not supported"), and the body
+ * computer at 0x750 answers both - flagged as one. Nothing but those two
+ * requests goes out, and the OBD-II poller keeps its turns meanwhile.
+ * Refused while moving.
+ */
+static void scBodyScan() {
+    sim::biu.enabled = true;
+    sim::speedOverride = [](double) { return 0.0; };
+    boot();
+    runUntil(15);
+    char why[96] = "";
+    const double tStart = tNow();
+    check(bodyRequestScan(why, sizeof why), "the scan starts", why);
+    const double t0 = tNow();
+    const bool done = scanDone(90);
+    check(done, "and finishes", fmt("in %.1f s", tNow() - t0));
+    BodyStatus st;
+    bodyGetStatus(st);
+    bool ecm = false, tcm = false, biu = false, extra = false;
+    for (size_t i = 0; i < st.found; i++) {
+        BodyFound f;
+        bodyFoundAt(i, f);
+        if (f.tx == 0x7E0) ecm = !f.biu;
+        else if (f.tx == 0x7E1) tcm = !f.biu;
+        else if (f.tx == 0x750) biu = f.biu && f.rx == 0x758 && f.biuLen == 16;
+        else extra = true;
+    }
+    check(ecm && biu && !extra, "the engine computer, and 0x750 as a body computer",
+          fmt("%u found%s", (unsigned)st.found, tcm ? " (and the transmission)" : ""));
+    const std::vector<uint8_t> svc = servicesSentTo7xx();
+    bool onlyReads = !svc.empty();
+    for (uint8_t b : svc) onlyReads &= b == 0x3E || b == 0x21;
+    check(onlyReads, "only 3E and 21 sent to the other addresses", fmt("%zu requests", svc.size()));
+    const uint64_t obd = txCount(isObdReq, tStart, tNow());
+    check(obd > (tNow() - tStart) * 10, "the OBD-II poller kept its turns",
+          fmt("%llu requests in %.0f s", (unsigned long long)obd, tNow() - tStart));
+    sim::speedOverride = [](double) { return 40.0; };
+    runUntil(tNow() + 3);
+    check(!bodyRequestScan(why, sizeof why) && std::strstr(why, "moving"), "refused while moving", why);
+    commonChecks();
+}
+
+/**
+ * The body computer read: its blocks land in the frame table as frames of
+ * their own, so a signal mapped on one - the driver's door, bit 8 of block
+ * 0x50 - publishes like one off the bus. They count no missed frames, and
+ * the raw recorder never sees them.
+ */
+static void scBodyReader() {
+    sim::biu.enabled = true;
+    const uint32_t id50 = BODY_PSEUDO_BASE | 0x5000;
+    storedConfig(fmt(R"({"biu_tx":1872,"biu_ms":500,"signals":[{"can_id":%u,"ext":true,"start":8,"len":1,"metric":%u,"mode":%d}]})",
+                     (unsigned)id50, (unsigned)METRIC_ID_DOOR_FL, (int)SIG_ON).c_str());
+    boot();
+    runUntil(20);
+    float v = -1; uint32_t age = 0; uint8_t src = 0;
+    check(metricLookup(METRIC_ID_DOOR_FL, v, age, src) && v == 0 && age < 2000, "the door, shut",
+          fmt("%.0f, %u ms old", v, (unsigned)age));
+    sim::biu.doorDriver = true;
+    runUntil(tNow() + 2);
+    check(metricLookup(METRIC_ID_DOOR_FL, v, age, src) && v == 1, "opened", fmt("%.0f", v));
+    sim::biu.doorDriver = false;
+    runUntil(tNow() + 2);
+    check(metricLookup(METRIC_ID_DOOR_FL, v, age, src) && v == 0, "shut again", fmt("%.0f", v));
+    BodyStatus st;
+    bodyGetStatus(st);
+    check(st.tx == 0x750 && st.rx == 0x758 && st.reads > 40 && st.blockLen[0] == 16 && st.blockLen[1] == 3,
+          "read every 500 ms, both blocks", fmt("%u reads, %u failed", (unsigned)st.reads, (unsigned)st.fails));
+    // In the frame table: 0x50 in two rows, 0x51 in one; no missed frames.
+    uint8_t order[128];
+    const size_t n = masterCensusOrder(order, sizeof order);
+    int rows = 0;
+    for (size_t i = 0; i < n; i++) {
+        CensusView c;
+        if (masterCensusRow(order[i], c) && bodyPseudoId(c.id, c.extd)) rows++;
+    }
+    check(rows == 3, "three rows in the frame table", fmt("%d", rows));
+    MissView mv[64];
+    const size_t nm = masterMissedIds(mv, 64);
+    bool pseudoListed = false;
+    for (size_t i = 0; i < nm; i++) pseudoListed |= bodyPseudoId(mv[i].id, mv[i].extd);
+    check(!pseudoListed, "never counted as missed frames");
+    // The body computer goes quiet: the reads slow to one every 10 s.
+    sim::biu.enabled = false;
+    runUntil(tNow() + 10);
+    const size_t sent0 = servicesSentTo7xx().size();
+    runUntil(tNow() + 30);
+    const size_t sent = servicesSentTo7xx().size() - sent0;
+    check(sent <= 8, "quiet, it is asked every 10 s", fmt("%zu requests in 30 s", sent));
+    commonChecks();
+}
+
+/** biu_tx 0 (the default): the body computer is never asked. */
+static void scBodyOff() {
+    sim::biu.enabled = true;
+    boot();
+    runUntil(40);
+    check(sim::biu.services.empty() && servicesSentTo7xx().empty(), "nothing sent to it",
+          fmt("%zu", sim::biu.services.size()));
+    commonChecks();
+}
+
+
 static const Scenario SCENARIOS[] = {
     {"auto", scAuto, 0}, {"silent", scSilent, 0}, {"mode_switch", scModeSwitch, 0},
     {"guard", scGuard, 0}, {"guard_off", scGuardOff, 0}, {"idle_errors", scIdleErrors, 0},
@@ -5122,6 +5257,7 @@ static const Scenario SCENARIOS[] = {
     {"fw_trial", scFwTrial, 0}, {"fw_trial_late_clock", scFwTrialLateClock, 0},
     {"fw_trial_sleep", scFwTrialSleep, 0}, {"fw_rolled_back", scFwRolledBack, 0},
     {"sleep_busy_bus_race", scSleepBusyBusRace, 0},
+    {"body_scan", scBodyScan, 0}, {"body_reader", scBodyReader, 0}, {"body_off", scBodyOff, 0},
 };
 
 static const Scenario *s_sc = nullptr;

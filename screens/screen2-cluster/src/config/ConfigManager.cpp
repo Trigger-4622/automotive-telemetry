@@ -39,7 +39,7 @@ static constexpr const char *FS_PARTITION_LABEL = "spiffs";
  * (e.g. first flash without `pio run -t uploadfs`). The full annotated
  * example lives in data/layout.json. */
 static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
-  "version": 5,
+  "version": 6,
   "global": { "smoothing_alpha": 0.35, "lerp_speed": 0.18,
               "stale_timeout_ms": 1500, "swipe_anim_ms": 250,
               "day_bg": "#101418", "night_bg": "#000000" },
@@ -62,6 +62,7 @@ static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
     { "id": "park", "type": "park", "label": "PARK",
       "show_when": [ { "gear": "R" } ], "back_after_s": 10,
       "back_now_when": [ { "metric_id": "0x010D", "op": ">", "value": 15 } ] },
+    { "id": "car", "type": "car", "label": "CAR" },
     { "id": "diag", "type": "diag" }
   ]
 })JSON";
@@ -141,8 +142,8 @@ void ConfigManager::begin() {
         }
     }
     if (migrateLayout()) {
-        log_i("layout: updated to version 5 (warning lamps, dash, G-meter, timers, parking, "
-              "screens that come up by themselves)");
+        log_i("layout: updated to version 6 (warning lamps, dash, G-meter, timers, parking, "
+              "screens that come up by themselves, the car from above)");
         persistLayout();
     }
 }
@@ -228,21 +229,27 @@ bool ConfigManager::persistLayout() {
 
 bool ConfigManager::migrateLayout() {
     const int version = _layout["version"] | 1;
-    if (version >= 5) return false;
+    if (version >= 6) return false;
     if (version < 2) migrateToV2();
 
     // Version 3: the G-meter and the performance timers; version 4: the
-    // parking screen. Each once, before the diagnostics screen; deleted in
-    // the studio, they stay deleted.
-    bool hasG = false, hasP = false, hasPark = false;
+    // parking screen; version 6: the car from above (on the round board -
+    // see below). Each once, before the diagnostics screen; deleted in the
+    // studio, they stay deleted.
+    bool hasG = false, hasP = false, hasPark = false, hasCar = false;
     for (JsonObject s : _layout["screens"].as<JsonArray>()) {
         hasG |= !strcmp(s["type"] | "", "gmeter");
         hasP |= !strcmp(s["type"] | "", "perf");
         hasPark |= !strcmp(s["type"] | "", "park");
+        hasCar |= !strcmp(s["type"] | "", "car");
     }
     if (version >= 3) hasG = hasP = true;          // already offered once
     if (version >= 4) hasPark = true;
-    if (!hasG || !hasP || !hasPark) {
+    // The car from above is offered, not added: with a layout like the
+    // example one (twelve screens) it would leave the LVGL heap under the 8 KB
+    // it needs at run time. The studio adds it in place of another screen.
+    hasCar = true;
+    if (!hasG || !hasP || !hasPark || !hasCar) {
         JsonDocument old;
         old.set(_layout["screens"]);
         JsonArray screens = _layout["screens"].to<JsonArray>();
@@ -261,6 +268,10 @@ bool ConfigManager::migrateLayout() {
             if (!hasPark) {
                 JsonObject k = screens.add<JsonObject>();
                 k["id"] = "park"; k["type"] = "park"; k["label"] = "PARK";
+            }
+            if (!hasCar) {                             // version 6: the car from above
+                JsonObject c = screens.add<JsonObject>();
+                c["id"] = "car"; c["type"] = "car"; c["label"] = "CAR";
             }
         };
         for (JsonVariantConst v : old.as<JsonArrayConst>()) {
@@ -286,7 +297,7 @@ bool ConfigManager::migrateLayout() {
         f["op"] = ">";
         f["value"] = 15;
     }
-    _layout["version"] = 5;
+    _layout["version"] = 6;
     return true;
 }
 

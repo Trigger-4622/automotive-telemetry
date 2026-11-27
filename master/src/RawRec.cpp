@@ -68,7 +68,7 @@ static volatile bool    s_armReq = false;
 static volatile uint8_t s_erasePct = 0;
 static char     s_note[64] = "";
 static uint32_t s_armMs = 0;
-static uint32_t s_rateBytes = 0, s_rateMs = 0, s_rate = 0, s_ratePos = 0;
+static uint32_t s_rateMs = 0, s_rate = 0, s_ratePos = 0;
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }

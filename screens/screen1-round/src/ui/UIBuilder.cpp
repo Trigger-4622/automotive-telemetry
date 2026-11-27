@@ -274,7 +274,8 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     // The dash draws its own tach arc where the bezel ring would be.
     const bool listLike = !strcmp(type, "diag") || !strcmp(type, "chart") ||
                           !strcmp(type, "dash") || !strcmp(type, "gmeter") ||
-                          !strcmp(type, "perf") || !strcmp(type, "park");
+                          !strcmp(type, "perf") || !strcmp(type, "park") ||
+                          !strcmp(type, "car");
     if (cfg["dial_face"] | !listLike) addDialFace(sd.root);
 
     if      (!strcmp(type, "arc_gauge"))   buildArcGauge(sd, cfg);
@@ -287,6 +288,7 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     else if (!strcmp(type, "gmeter"))      buildGMeter(sd, cfg);
     else if (!strcmp(type, "perf"))        buildPerf(sd);
     else if (!strcmp(type, "park"))        buildPark(sd, cfg);
+    else if (!strcmp(type, "car"))         buildCar(sd, cfg);
     else if (!strcmp(type, "diag"))      { buildDiag(sd); _diagIndex = _screens.size() - 1; }
     else                                   buildArcGauge(sd, cfg);   // fallback
 
@@ -1090,8 +1092,46 @@ void UIBuilder::buildPark(ScreenDef &sd, JsonObject cfg) {
     ParkView &v = _parks.back();
     v.metric = cfg["metric_id"].isNull() ? (uint16_t)METRIC_ID_STEERING_ANGLE
                                          : parseMetricId(cfg["metric_id"]);
+    CarGeom g;
+    g.ratio = cfg["steer_ratio"] | 15.0f;
+    g.wheelbase = (cfg["wheelbase_mm"] | 2750.0f) / 1000.0f;
     parkBuild(v, sd.root, LCD_WIDTH, LCD_HEIGHT, cfg["steer_max"] | 540.0f,
-              cfg["straight_deg"] | 10.0f);
+              cfg["straight_deg"] | 10.0f, !strcmp(cfg["view"] | "wheel", "path"), g);
+}
+
+void UIBuilder::buildCar(ScreenDef &sd, JsonObject cfg) {
+    _cars.emplace_back();
+    sd.car = (int)_cars.size() - 1;
+    CarGeom g;
+    g.ratio = cfg["steer_ratio"] | 15.0f;
+    g.wheelbase = (cfg["wheelbase_mm"] | 2750.0f) / 1000.0f;
+    g.path = cfg["path"] | true;
+    carScreenBuild(_cars.back(), sd.root, LCD_WIDTH, LCD_HEIGHT, g);
+}
+
+CarState UIBuilder::carState() {
+    CarState s;
+    auto flag = [](uint16_t id) -> int8_t {
+        MetricSample m;
+        if (!Telemetry.peek(id, m) || !(m.flags & METRIC_FLAG_VALID) || m.stale) return -1;
+        return m.raw >= 0.5f ? 1 : 0;
+    };
+    static const uint16_t DOORS[4] = {METRIC_ID_DOOR_FL, METRIC_ID_DOOR_FR, METRIC_ID_DOOR_RL,
+                                      METRIC_ID_DOOR_RR};
+    for (int i = 0; i < 4; i++) s.door[i] = flag(DOORS[i]);
+    s.anyDoor   = flag(METRIC_ID_DOOR_OPEN);
+    s.boot      = flag(METRIC_ID_TRUNK);
+    s.bonnet    = flag(METRIC_ID_HOOD);
+    s.lights    = flag(METRIC_ID_SW_LIGHTS);
+    s.highBeam  = flag(METRIC_ID_HIGH_BEAM);
+    s.handbrake = flag(METRIC_ID_HANDBRAKE);
+    // The indicators as the lamps show them (their flash, the hazard lights),
+    // or straight from the bus where the lamps are switched off.
+    const int l = _lamps.find("turn_left"), r = _lamps.find("turn_right");
+    s.turnL = l >= 0 && _lamps[(size_t)l].enabled ? _lamps[(size_t)l].on : flag(METRIC_ID_TURN_LEFT) == 1;
+    s.turnR = r >= 0 && _lamps[(size_t)r].enabled ? _lamps[(size_t)r].on : flag(METRIC_ID_TURN_RIGHT) == 1;
+    s.reverse = reverseEngaged() || gearLever() == 'R';
+    return s;
 }
 
 bool UIBuilder::condHolds(const ScreenCond &c) {
@@ -1146,7 +1186,19 @@ void UIBuilder::updateDrive(uint32_t now, float lerp) {
         ParkView &pv = _parks[sd.park];
         MetricSample st{};
         const bool ok = sampleOnce(pv.metric, lerp, st) && (st.flags & METRIC_FLAG_VALID) && !st.stale;
-        parkUpdate(pv, st.value, ok);
+        if (pv.pathView) {
+            const CarState cs = carState();
+            parkUpdate(pv, st.value, ok, &cs);
+        } else {
+            parkUpdate(pv, st.value, ok);
+        }
+    }
+    if (sd.car >= 0) {
+        CarState cs = carState();
+        MetricSample a{};
+        cs.angleOk = sampleOnce(METRIC_ID_STEERING_ANGLE, lerp, a) && (a.flags & METRIC_FLAG_VALID) && !a.stale;
+        cs.angle = a.value;
+        carScreenUpdate(_cars[sd.car], cs);
     }
 }
 

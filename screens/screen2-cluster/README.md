@@ -37,7 +37,14 @@ Shared with the round board: `arc_gauge`, `meter_gauge`, `quad`, `text_list`,
 - **`park`** — the steering wheel as it is turned, an arc from straight ahead
   to full lock (`steer_max`, 540) and the angle beside it, STRAIGHT in green
   within `straight_deg` (10). It ships with a rule that brings it up in
-  reverse (below).
+  reverse (below). With `view` "path" it shows the car from above instead,
+  with the lines its corners will take: ahead, or back in reverse, from the
+  steering angle over `steer_ratio` (15) and `wheelbase_mm` (2750).
+- **`car`** — the car from above: its doors (amber when open), boot and
+  bonnet, indicators, headlights and the path its corners will take, with
+  what is open listed beside it. Offered in the studio; layout version 6 adds
+  it to the round board's layout only: with it, this board's layout would
+  leave less than the 8 KB of LVGL heap kept spare (it costs about 6 KB).
 
 Layout version 3 adds the first two to an existing layout once, before `diag`,
 version 4 the parking screen; deleted in the studio, they stay deleted. The

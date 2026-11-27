@@ -471,7 +471,7 @@ SCENARIO(migrate_v1_layout) {
     const size_t before = s.size();
     boot(d);
 
-    CHECK((Config.layout()["version"] | 0) == 5, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
     CHECK(Config.layout()["screens"].size() == before + 1, "dash not added");
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "dash not first");
     CHECK(Config.layout()["warnings"].is<JsonObject>(), "warnings block not added");
@@ -479,7 +479,7 @@ SCENARIO(migrate_v1_layout) {
     // Saved, so the next boot sees version 4 already.
     JsonDocument saved;
     deserializeJson(saved, hostfs::files["/layout.json"]);
-    CHECK((saved["version"] | 0) == 5, "migration not saved");
+    CHECK((saved["version"] | 0) == 6, "migration not saved");
     CHECK(!hostfs::files.count("/layout.tmp"), "temporary file left behind");
 
     // The user deletes the dash; a reboot must not bring it back.
@@ -504,8 +504,9 @@ SCENARIO(default_layout) {
     UI.begin();
     run(500);
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "default has no dash");
-    CHECK((Config.layout()["version"] | 0) == 5, "default is not version 5");
-    CHECK(UI._screens.size() == 6, "default built %zu screens", UI._screens.size());
+    CHECK((Config.layout()["version"] | 0) == 6, "default is not version 6");
+    CHECK(UI._screens.size() == 7, "default built %zu screens", UI._screens.size());
+    CHECK(screenOf("car") >= 0 && UI._screens[screenOf("car")].car >= 0, "default has no car screen");
     CHECK(screenOf("park") >= 0 && UI._screens[screenOf("park")].park >= 0, "default has no parking screen");
     shot("default_dash");
 }
@@ -1436,7 +1437,7 @@ SCENARIO(migrate_v2_layout) {
     const size_t before = s.size();
     boot(d);
     JsonArray now = Config.layout()["screens"].as<JsonArray>();
-    CHECK((Config.layout()["version"] | 0) == 5, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
     CHECK(now.size() == before + 2, "screens: %zu, want %zu", now.size(), before + 2);
     const int g = screenOf("gmeter"), p = screenOf("perf"), dg = screenOf("diag");
     CHECK(g >= 0 && p == g + 1 && dg == p + 1, "G-meter %d, timers %d, diagnostics %d", g, p, dg);
@@ -1802,13 +1803,42 @@ SCENARIO(migrate_v4_layout) {
     off["id"] = "park2"; off["type"] = "park"; off["auto_reverse"] = false;
     boot(d);
     JsonArray now = Config.layout()["screens"].as<JsonArray>();
-    CHECK((Config.layout()["version"] | 0) == 5, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
     const int k = screenOf("park");
     JsonObject a = now[k], b = now[now.size() - 1];
     CHECK(!strcmp(a["show_when"][0]["gear"] | "", "R") && (a["back_after_s"] | 0) == 10 &&
           (a["back_now_when"][0]["value"] | 0) == 15, "the switch on: not the reverse rule");
     CHECK(b["show_when"].isNull() && b["auto_reverse"].isNull(), "the switch off: a rule, or the key left");
     CHECK(UI._auto.rules() == 1 && UI._auto._rules[0].screen == (size_t)k, "rules: %zu", UI._auto.rules());
+    CHECK(!Config.migrateLayout(), "migration ran twice");
+}
+
+/* A version 5 layout gains the car from above once, before diagnostics;
+ * deleted in the studio, it stays deleted. (The round board: the cluster's
+ * LVGL heap has no room for it beside a full layout.) */
+SCENARIO(migrate_v5_layout) {
+    JsonDocument d = shippedLayout();
+    d["version"] = 5;
+    JsonArray s = d["screens"].as<JsonArray>();
+    for (size_t i = s.size(); i-- > 0;)
+        if (!strcmp(s[i]["type"] | "", "car")) s.remove(i);
+    const size_t before = s.size();
+    boot(d);
+    JsonArray now = Config.layout()["screens"].as<JsonArray>();
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
+    if (!ROUND) {
+        // Offered in the studio, not added: no room for it in the LVGL heap
+        // beside a layout like the example one.
+        CHECK(now.size() == before && screenOf("car") < 0, "the cluster gained a car screen");
+        return;
+    }
+    CHECK(now.size() == before + 1, "screens: %zu, want %zu", now.size(), before + 1);
+    const int c = screenOf("car"), dg = screenOf("diag");
+    CHECK(c >= 0 && dg == c + 1 && UI._screens[c].car >= 0, "car %d, diagnostics %d", c, dg);
+    now.remove((size_t)c);
+    Config.persistLayout();
+    Config.begin();
+    CHECK(Config.layout()["screens"].size() == before, "came back after being deleted");
     CHECK(!Config.migrateLayout(), "migration ran twice");
 }
 
@@ -1823,7 +1853,7 @@ SCENARIO(migrate_v3_layout) {
     const size_t before = s.size();
     boot(d);
     JsonArray now = Config.layout()["screens"].as<JsonArray>();
-    CHECK((Config.layout()["version"] | 0) == 5, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
     CHECK(now.size() == before + 1, "screens: %zu, want %zu", now.size(), before + 1);
     const int k = screenOf("park"), dg = screenOf("diag");
     CHECK(k >= 0 && dg == k + 1, "parking %d, diagnostics %d", k, dg);
@@ -1835,6 +1865,122 @@ SCENARIO(migrate_v3_layout) {
     Config.begin();
     CHECK(Config.layout()["screens"].size() == before, "came back after being deleted");
     CHECK(!Config.migrateLayout(), "migration ran twice");
+}
+
+/** The car body's top and bottom edges on screen. */
+static int carYTop(const CarView &v) { return lv_obj_get_y(v.body); }
+static int carYBottom(const CarView &v) { return lv_obj_get_y(v.body) + lv_obj_get_height(v.body); }
+
+/* ──────────────────────────── the car from above ───────────────────────── */
+
+/** The shipped layout with a car-from-above screen at the front. */
+static JsonDocument withCarScreen(const char *extra = "{}") {
+    JsonDocument d = noAutoScreens();
+    JsonDocument c;
+    deserializeJson(c, extra);
+    JsonArray s = d["screens"].as<JsonArray>();
+    JsonDocument old;
+    old.set(s);
+    s.clear();
+    JsonObject car = s.add<JsonObject>();
+    car["id"] = "car"; car["type"] = "car";
+    for (JsonPairConst kv : c.as<JsonObjectConst>()) car[kv.key()] = kv.value();
+    for (JsonVariantConst v : old.as<JsonArrayConst>()) s.add(v);
+    return d;
+}
+/** Where a line's last point is, in its parent. */
+static void lineEnd(lv_obj_t *l, int &x, int &y) {
+    const lv_line_t *ln = (const lv_line_t *)l;
+    const lv_point_t &p = ln->point_array[ln->point_num - 1];
+    x = lv_obj_get_x(l) + p.x;
+    y = lv_obj_get_y(l) + p.y;
+}
+
+/* What is open, in amber, swung out; the rest shut, in grey; nothing known,
+ * said so. The indicators light their corners, the lights the headlamps. The
+ * path goes ahead in a drive gear and back in reverse, bending the way the
+ * wheel is turned. */
+SCENARIO(car_screen) {
+    engineOn();
+    JsonDocument d = withCarScreen();
+    boot(d);
+    gotoType("car");
+    run(500);
+    CHECK(UI._screens[UI._active].car == 0, "not on the car screen");
+    CarScreenView &v = UI._cars[0];
+    // Round: the line over the car; landscape: the doors' line of the rows,
+    // without its colour ("#RRGGBB OPEN#").
+    auto status = [&] {
+        if (v.status) return std::string(lv_label_get_text(v.status));
+        std::string t = lv_label_get_text(v.vals);
+        t = t.substr(0, t.find('\n'));
+        return t.size() > 9 ? t.substr(8, t.size() - 9) : t;
+    };
+    CHECK(status() == (ROUND ? "NO DOOR DATA" : "--"), "nothing known: '%s'", status().c_str());
+    CHECK(hidden(v.car.path[0]), "a path with no steering angle");
+    shot("car_nothing");
+
+    for (uint16_t id : {METRIC_ID_DOOR_FL, METRIC_ID_DOOR_FR, METRIC_ID_DOOR_RL, METRIC_ID_DOOR_RR,
+                        METRIC_ID_TRUNK, METRIC_ID_HOOD})
+        car.set(id, 0);
+    car.set(METRIC_ID_HANDBRAKE, 1);
+    run(500);
+    CHECK(ROUND ? status() == "ALL SHUT \xE2\x80\xA2 HANDBRAKE" : status() == "SHUT", "all shut: '%s'", status().c_str());
+    car.set(METRIC_ID_DOOR_FL, 1);
+    car.set(METRIC_ID_TRUNK, 1);
+    car.set(METRIC_ID_SW_LIGHTS, 1);
+    car.set(METRIC_ID_TURN_LEFT, 1);
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    car.set(METRIC_ID_STEERING_ANGLE, 270);
+    run(800);
+    CHECK(ROUND ? status() == "DOOR FL + BOOT" : status() == "FL", "front left and boot: '%s'", status().c_str());
+    CHECK(lv_obj_get_style_line_color(v.car.side[0], 0).full == lv_color_hex(UI_WARN).full &&
+          lv_obj_get_style_line_color(v.car.side[1], 0).full == lv_color_hex(UI_MUTED).full,
+          "front left amber, front right grey");
+    int x0, y0, x1, y1;
+    lineEnd(v.car.side[0], x0, y0);
+    CHECK(x0 < v.car.cx - (int)(0.89f * v.car.ppm) - 4, "the open door does not swing out: end x %d", x0);
+    CHECK(!hidden(v.car.head[0]) && !hidden(v.car.corner[0]), "lights or the left indicator not shown");
+    CHECK(!hidden(v.car.path[0]), "no path with the angle known");
+    lineEnd(v.car.path[0], x0, y0);
+    lineEnd(v.car.path[1], x1, y1);
+    CHECK(y0 < carYTop(v.car) && x0 < v.car.cx - (int)(0.89f * v.car.ppm),
+          "in D turned left, the path does not go ahead to the left: end %d,%d", x0, y0);
+    shot("car_open_left_ahead");
+
+    car.set(METRIC_ID_GEAR_LEVER, 'R');
+    car.set(METRIC_ID_STEERING_ANGLE, -270);
+    car.set(METRIC_ID_DOOR_FL, 0);
+    car.set(METRIC_ID_TRUNK, 0);
+    run(800);
+    lineEnd(v.car.path[1], x1, y1);
+    CHECK(y1 > carYBottom(v.car) && x1 > v.car.cx + (int)(0.89f * v.car.ppm),
+          "in R turned right, the path does not go back to the right: end %d,%d", x1, y1);
+    shot("car_reverse_right");
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* The parking screen's other view: the car from above and its path, with
+ * the angle beside it. */
+SCENARIO(park_path_view) {
+    engineOn();
+    JsonDocument d = noAutoScreens();
+    for (JsonObject sc : d["screens"].as<JsonArray>())
+        if (!strcmp(sc["type"] | "", "park")) sc["view"] = "path";
+    car.set(METRIC_ID_STEERING_ANGLE, 180);
+    car.set(METRIC_ID_REVERSE, 1);
+    boot(d);
+    gotoType("park");
+    run(800);
+    const ParkView &v = UI._parks[0];
+    CHECK(v.pathView && v.car.body && !v.lock, "not the path view");
+    CHECK(std::string(lv_label_get_text(v.value)) == "180\xC2\xB0", "angle '%s'", lv_label_get_text(v.value));
+    CHECK(!hidden(v.car.path[0]), "no path");
+    int x, y;
+    lineEnd(v.car.path[0], x, y);
+    CHECK(y > carYBottom(v.car) && x < v.car.cx, "in reverse turned left, the path does not go back to the left: %d,%d", x, y);
+    shot("park_path_view");
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
 }
 
 /* ─────────────────────────────── backlight ─────────────────────────────── */

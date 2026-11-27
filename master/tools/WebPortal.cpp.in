@@ -21,6 +21,7 @@
 #include "FwUpdate.h"
 #include "DriveLog.h"
 #include "RawRec.h"
+#include "BodyUnit.h"
 #include "Learner.h"
 #include "MasterConfig.h"
 #include "MasterTelemetry.h"
@@ -642,6 +643,55 @@ void WebPortal::setupRoutes() {
         else s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
     });
     s_server.on("/api/log/clear", HTTP_POST, []() { driveLogDeleteAll(); sendOk(); });
+
+    /*
+     * The car's other computers (BodyUnit): the scan of 0x700-0x7F7 and the
+     * body computer's blocks as the reader last had them.
+     */
+    s_server.on("/api/body", HTTP_GET, []() {
+        BodyStatus st;                         // ~230 B of the loop task's 12 KB, not static RAM
+        bodyGetStatus(st);
+        JsonDocument d;
+        d["scanning"] = st.scanning;
+        d["at"]       = st.at;
+        d["pct"]      = st.pct;
+        d["scanned"]  = st.scanned;
+        d["note"]     = st.scanNote;
+        JsonArray fa = d["found"].to<JsonArray>();
+        for (size_t i = 0; i < st.found; i++) {
+            BodyFound f;
+            if (!bodyFoundAt(i, f)) break;
+            JsonObject o = fa.add<JsonObject>();
+            o["tx"]  = f.tx;
+            o["rx"]  = f.rx;
+            o["biu"] = f.biu;
+            o["len"] = f.biuLen;
+            JsonArray r = o["reply"].to<JsonArray>();
+            for (uint8_t k = 0; k < f.replyLen; k++) r.add(f.reply[k]);
+        }
+        JsonArray oa = d["others"].to<JsonArray>();
+        for (uint8_t i = 0; i < st.otherN; i++) oa.add(st.others[i]);
+        JsonObject rd = d["reader"].to<JsonObject>();
+        rd["tx"]    = st.tx;
+        rd["rx"]    = st.rx;
+        rd["reads"] = st.reads;
+        rd["fails"] = st.fails;
+        if (st.ageMs != UINT32_MAX) rd["age"] = st.ageMs;
+        rd["note"]  = st.note;
+        JsonArray ba = rd["blocks"].to<JsonArray>();
+        for (int b = 0; b < 2; b++) {
+            JsonArray r = ba.add<JsonArray>();
+            for (uint8_t k = 0; k < st.blockLen[b]; k++) r.add(st.block[b][k]);
+        }
+        sendJson(d);
+    });
+    s_server.on("/api/body/scan", HTTP_POST, []() {
+        char why[96] = "";
+        if (bodyRequestScan(why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = why;
+        sendJson(d, 409);
+    });
 
     /*
      * The raw bus recording (RawRec): every frame to the logs partition, for

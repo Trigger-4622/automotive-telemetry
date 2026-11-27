@@ -411,6 +411,12 @@ public:
     /** Read the trouble codes this often while the car is on, seconds
      *  (0 = only when the portal asks). */
     uint16_t dtcPollS    = 60;
+    /** The body computer (BIU), read with "21 50" / "21 51" (BodyUnit.h):
+     *  its request ID (0 = not read), reply ID (0 = request + 8), and how
+     *  often [ms]. */
+    uint16_t biuTx       = 0;
+    uint16_t biuRx       = 0;
+    uint16_t biuMs       = 500;
     uint32_t oilEveryKm  = 7500;   /**< Oil change interval [km].           */
     /** Odometer at the last oil change [km]; -1 = not set: no reminder. */
     int32_t  oilAtKm     = -1;

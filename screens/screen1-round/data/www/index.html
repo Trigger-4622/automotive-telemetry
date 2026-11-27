@@ -486,8 +486,15 @@ const TYPES_ALL={
   hint:'A dot for the car\'s acceleration: up speeding up, down braking, left in a left-hand bend; the inner ring is half the rim. Lateral and longitudinal G come from the master: taught from the stability unit\'s frame (its Signals tab, <b>A corner or a hard stop</b>), or worked out from the speed and the yaw rate.'},
  park:{t:'Parking - the steering wheel',legend:'Wheel',x:[['metric_id','Steering angle','metric','0x1006'],
   ['steer_max','Full lock, either way (°)','num',540,'min="90" max="1080"'],
-  ['straight_deg','STRAIGHT within (°)','num',10,'min="0" max="90"']],
+  ['straight_deg','STRAIGHT within (°)','num',10,'min="0" max="90"'],
+  ['view','Show','select','wheel',[['wheel','the steering wheel'],['path','the car from above, with its path']]],
+  ['steer_ratio','Steering ratio (for the path)','num',15,'min="5" max="40" step="0.1"'],
+  ['wheelbase_mm','Wheelbase (mm, for the path)','num',2750,'min="1500" max="4000"']],
   hint:'The steering wheel as it is turned, an arc from straight ahead to full lock either way, and <b>STRAIGHT</b> in green when the wheels are. The angle is the master\'s steering angle (0x1006, positive to the left), taught or mapped on its Signals tab. To have it come up in reverse, give it the condition <b>Gear is R</b> under <b>Show this screen by itself</b>.'},
+ car:{t:'Car from above',legend:'Car',x:[['path','Draw the path it is about to take','check',true],
+  ['steer_ratio','Steering ratio','num',15,'min="5" max="40" step="0.1"'],
+  ['wheelbase_mm','Wheelbase (mm)','num',2750,'min="1500" max="4000"']],
+  hint:'The car seen from above: the doors swung out in amber when open, boot and bonnet, the indicators at the corners, the headlights, the front wheels turned by the steering and the path the corners will take - ahead in a drive gear, back in reverse (the steering ratio and wheelbase set its curve; the Legacy BM\'s by default). The doors come from the master\'s single-door signals (0x1210-0x1213), or from "a door is open" (0x1204) where those are not taught.'},
  perf:{t:'Performance timers',
   hint:'0-100 km/h, 80-120 km/h and the quarter mile, timed on this display from the master\'s speed (and RPM). Stand still for half a second to arm a standing start; 80-120 times itself whenever the speed passes 80 on the way up. The best times last until the display is switched off.'},
  diag:{t:'Diagnostics',
@@ -546,7 +553,7 @@ const TEXTURES=[['none','none'],['carbon','carbon fibre (tile)'],['mesh','mesh (
 const BG=[['texture','Texture','select','none',TEXTURES],['texture_opa','Texture strength (0-255)','num',255,'min="0" max="255"'],
   ['background_asset','Image file','asset',''],['bg_grad.from','Gradient from (top)','color','#101418'],
   ['bg_grad.to','Gradient to (bottom)','color','#05080B']];
-const bezelDefault=type=>!['diag','chart','dash','gmeter','perf','park'].includes(type);
+const bezelDefault=type=>!['diag','chart','dash','gmeter','perf','park','car'].includes(type);
 const BEZEL=B([['dial_face','A bezel ring round the edge','check']],[]);
 /* Keys no firmware reads any more, dropped from a layout as it is loaded:
    the cluster's touch orientation switches, which only ever moved where a
@@ -1590,6 +1597,32 @@ function drawLamp(x,name,color,px,py){
   }
   if(im.complete&&im.naturalWidth)x.drawImage(im,px,py,24,24);
 }
+/* The car from above (DriveViews.cpp carBuild): front up, its rear axle at
+   (cx,ay), ppm pixels a metre; the front wheels and the path from steering
+   angle a (+ left), back in reverse. The Legacy BM's measures. */
+function pvCar(x,s,cx,ay,ppm,a,rev,room){
+  const W=1.78,LEN=4.735,RO=1.035,TR=1.53,F=LEN-RO,wb=(s.wheelbase_mm||2750)/1000,ratio=s.steer_ratio||15;
+  const X=v=>cx+v*ppm,Y=v=>ay-v*ppm,rr=(X0,Y0,w,h,r)=>{x.beginPath();if(x.roundRect)x.roundRect(X0,Y0,w,h,r);else x.rect(X0,Y0,w,h);};
+  x.fillStyle='#0A1016';x.strokeStyle='#9AA7B0';x.lineWidth=2;rr(X(-W/2),Y(F),W*ppm,LEN*ppm,0.35*ppm);x.fill();x.stroke();
+  x.strokeStyle='#2A3A44';x.lineWidth=1;rr(X(-W/2+0.18),Y(0.86*wb),(W-0.36)*ppm,0.84*wb*ppm,0.25*ppm);x.stroke();
+  x.fillStyle='#5A6870';[-1,1].forEach(k=>x.fillRect(X(k*TR/2)-0.1*ppm,Y(0.31),0.2*ppm,0.62*ppm));
+  const road=a/ratio*Math.PI/180,sn=Math.sin(road)*0.31,cs=Math.cos(road)*0.31;
+  x.lineCap='round';x.strokeStyle='#C8D2D8';x.lineWidth=Math.max(4,0.2*ppm);
+  [-1,1].forEach(k=>{const xx=k*TR/2;x.beginPath();x.moveTo(X(xx+sn),Y(wb-cs));x.lineTo(X(xx-sn),Y(wb+cs));x.stroke();});
+  x.strokeStyle='#9AA7B0';x.lineWidth=4;                        // the doors, shut
+  [[-1,0.80,0.42],[1,0.80,0.42],[-1,0.42,0.08],[1,0.42,0.08]].forEach(([k,a1,a2])=>{
+    x.beginPath();x.moveTo(X(k*W/2),Y(a1*wb));x.lineTo(X(k*W/2),Y(a2*wb));x.stroke();});
+  if(s.path!==false&&room>0){
+    const t=Math.tan(road),dir=rev?-1:1,y0=rev?-RO:F,len=Math.min(s.type==='car'?1.5:3,room);
+    x.strokeStyle='#00E5FF';x.lineWidth=3;
+    [-1,1].forEach(k=>{const x0=k*W/2;x.beginPath();
+      for(let n=0;n<12;n++){const sa=dir*len*n/11;let px=x0,py=y0+sa;
+        if(Math.abs(t)>1e-4){const R=wb/t,c=-R,phi=sa/R,dx=x0-c;px=c+dx*Math.cos(phi)-y0*Math.sin(phi);py=dx*Math.sin(phi)+y0*Math.cos(phi);}
+        n?x.lineTo(X(px),Y(py)):x.moveTo(X(px),Y(py));}
+      x.stroke();});
+  }
+  x.lineCap='butt';
+}
 /* @shared-end ════════════════════════════════════════════════════════════ */
 
 /* @board-begin: this board's preview drawing ══════════════════════════ */
@@ -1721,6 +1754,16 @@ function draw(){
     x.textAlign='center';x.font='13px system-ui';x.fillText('G',cx,34);
     x.fillStyle='#C8D2D8';x.font='13px system-ui';
     x.fillText((lat>0?'L ':'R ')+Math.abs(lat).toFixed(2)+'   '+(lon>0?'ACC ':'BRK ')+Math.abs(lon).toFixed(2),cx,cy+56);
+  }else if(s.type==='car'){
+    const ppm=22,mid=126,ay=mid+(4.735/2-1.035)*ppm,a=Math.round(Math.sin(frac*6.3)*400),rev=frac>0.5;
+    pvCar(x,s,cx,ay,ppm,a,rev,rev?(248-(ay+1.035*ppm))/ppm:((ay-3.7*ppm)-52)/ppm);
+    x.textAlign='center';x.textBaseline='top';x.fillStyle='#69F0AE';x.font='13px system-ui';x.fillText('ALL SHUT',cx,28);x.textBaseline='alphabetic';
+  }else if(s.type==='park'&&s.view==='path'){
+    const ppm=20,ay=cy+(4.735/2-1.035)*ppm,a=Math.round(Math.sin(frac*6.3)*(s.steer_max||540)*0.6);
+    const st=Math.abs(a)<=(s.straight_deg??10);
+    pvCar(x,s,cx+12,ay,ppm,a,true,(248-(ay+1.035*ppm))/ppm);
+    x.textAlign='left';x.textBaseline='top';x.fillStyle=st?'#69F0AE':'#E0F2F7';x.font='600 26px system-ui';x.fillText(Math.abs(a)+'°',24,cy-26);
+    x.fillStyle=st?'#69F0AE':'#C8D2D8';x.font='12px system-ui';x.fillText(st?'STRAIGHT':a>0?'◀ LEFT':'RIGHT ▶',24,cy+8);x.textBaseline='alphabetic';
   }else if(s.type==='park'){
     // parkBuild: the wheel at the middle, 6 px up; the lock arc round it.
     const R=108,r=74,py=cy-6,mx=s.steer_max||540,a=Math.round(Math.sin(frac*6.3)*mx*0.6);

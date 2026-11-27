@@ -50,6 +50,7 @@
 #include "MasterTelemetry.h"
 #include "Learner.h"
 #include "Ssm2.h"
+#include "BodyUnit.h"
 #include "DiagCodes.h"
 #include "FwUpdate.h"
 #include "DriveLog.h"
@@ -757,7 +758,9 @@ static bool idPeriodic(const CanIdCount &c) {
 }
 /** Diagnostic requests and replies come when asked, not on a clock. */
 static bool idOnRequest(const CanIdCount &c) {
-    return !c.extd && c.id >= 0x7DF && c.id <= 0x7EF;
+    // Diagnostic answers, and the body computer's answers in the frame table
+    // (BodyUnit.h): they come when asked, not to a rhythm.
+    return (!c.extd && c.id >= 0x7DF && c.id <= 0x7EF) || bodyPseudoId(c.id, c.extd);
 }
 
 /** No car broadcast repeats faster than this. Frames of one ID closer than
@@ -2525,6 +2528,57 @@ static bool twaiGoLive(bool silent) {
 /* ═══════════════════════════ FreeRTOS tasks ══════════════════════════════ */
 
 /**
+ * @brief Every signal of the frame's identifier, decoded and published (or
+ *        compared, for one being verified). The receive task's - for a frame
+ *        off the bus and for the body computer's answers (BodyUnit.h) alike.
+ */
+static void decodeSignals(const twai_message_t &msg, uint32_t rxMs) {
+    /*
+     * The runtime table, not the compiled one. Editing a signal in the
+     * portal has to take effect on the next frame - the whole point is
+     * finding a value by trial while sitting in the car, and a rebuild
+     * between attempts would make that unusable.
+     */
+    refreshSignals();
+    for (size_t i = 0; i < s_sigs.size(); i++) {
+        const RtSignal &rs = s_sigs[i];
+        if (rs.mode == SIG_OFF || rs.mode == SIG_REJECTED) continue;
+        if (rs.canId != msg.identifier || rs.extended != (bool)msg.extd)
+            continue;
+        bool exact = true;
+        float val = decodeSignal(msg.data, msg.data_length_code, rs, &exact);
+        if (isnan(val)) continue;          // a table signal between positions
+        s_verify[i].seen = true;
+        s_verify[i].lastVal = val;
+        if (rs.publishes()) {
+            /*
+             * The lever's own position outranks a separate "reverse" bit.
+             * Such a bit was on in reverse the day it was mapped; it can
+             * be on for other reasons (the car's is, at speed in D), and
+             * the displays put Reverse before the lever's letter. While
+             * the lever itself reads another position, Reverse is off.
+             */
+            if (rs.metricId == METRIC_ID_GEAR_LEVER && exact) {
+                s_leverRead   = (char)lroundf(val);
+                s_leverReadMs = rxMs ? rxMs : 1;
+            } else if (rs.metricId == METRIC_ID_REVERSE && val >= 0.5f && s_leverReadMs &&
+                       rxMs - s_leverReadMs < LEVER_FRESH_MS && s_leverRead != 'R') {
+                val = 0;
+                if (!s_reverseTold) {
+                    s_reverseTold = true;
+                    log_w("signal '%s' (0x%03X bit %u) reads reverse while the gear lever reads %c - "
+                          "following the lever", rs.name, rs.canId, (unsigned)rs.startBit, s_leverRead);
+                }
+            }
+            publishMetric(rs.metricId, val, SRC_RAW);
+            recheckSample(i, val);
+        } else {
+            verifySample(i, val);
+        }
+    }
+}
+
+/**
  * @brief Blocking CAN receiver: diagnostic replies plus the raw signal table.
  *
  * Pinned to core 1 so CAN timing never contends with the Wi-Fi stack.
@@ -2572,6 +2626,12 @@ static void twaiRxTask(void *) {
             xSemaphoreGive(s_twaiCtl);
         }
         censusServiceReset();
+        // The body computer's answers, read by the codes task: into the frame
+        // table and through the signals like a frame (never the recording).
+        for (twai_message_t pm; bodyTakeFrame(pm);) {
+            censusAdd(pm);
+            decodeSignals(pm, millis());
+        }
         const esp_err_t rr = twai_receive(&msg, pdMS_TO_TICKS(200));
         if (rr == ESP_ERR_INVALID_STATE) {
             // No driver (install failed: memory, an interrupt, the timing).
@@ -2621,49 +2681,7 @@ static void twaiRxTask(void *) {
             continue;
         }
 
-        /*
-         * The runtime table, not the compiled one. Editing a signal in the
-         * portal has to take effect on the next frame - the whole point is
-         * finding a value by trial while sitting in the car, and a rebuild
-         * between attempts would make that unusable.
-         */
-        refreshSignals();
-        for (size_t i = 0; i < s_sigs.size(); i++) {
-            const RtSignal &rs = s_sigs[i];
-            if (rs.mode == SIG_OFF || rs.mode == SIG_REJECTED) continue;
-            if (rs.canId != msg.identifier || rs.extended != (bool)msg.extd)
-                continue;
-            bool exact = true;
-            float val = decodeSignal(msg.data, msg.data_length_code, rs, &exact);
-            if (isnan(val)) continue;          // a table signal between positions
-            s_verify[i].seen = true;
-            s_verify[i].lastVal = val;
-            if (rs.publishes()) {
-                /*
-                 * The lever's own position outranks a separate "reverse" bit.
-                 * Such a bit was on in reverse the day it was mapped; it can
-                 * be on for other reasons (the car's is, at speed in D), and
-                 * the displays put Reverse before the lever's letter. While
-                 * the lever itself reads another position, Reverse is off.
-                 */
-                if (rs.metricId == METRIC_ID_GEAR_LEVER && exact) {
-                    s_leverRead   = (char)lroundf(val);
-                    s_leverReadMs = rxMs ? rxMs : 1;
-                } else if (rs.metricId == METRIC_ID_REVERSE && val >= 0.5f && s_leverReadMs &&
-                           rxMs - s_leverReadMs < LEVER_FRESH_MS && s_leverRead != 'R') {
-                    val = 0;
-                    if (!s_reverseTold) {
-                        s_reverseTold = true;
-                        log_w("signal '%s' (0x%03X bit %u) reads reverse while the gear lever reads %c - "
-                              "following the lever", rs.name, rs.canId, (unsigned)rs.startBit, s_leverRead);
-                    }
-                }
-                publishMetric(rs.metricId, val, SRC_RAW);
-                recheckSample(i, val);
-            } else {
-                verifySample(i, val);
-            }
-        }
+        decodeSignals(msg, rxMs);
     }
 }
 
@@ -3810,6 +3828,7 @@ void setup() {
     xTaskCreatePinnedToCore(busGuardTask,    "busguard",  4096, nullptr,  9, &s_tasks[4].h, 1);
     ssm2Begin();
     codesBegin();
+    bodyBegin();                             // the queue the BIU's answers come by
     // The raw recorder first: a recording on the log partition keeps the
     // drive logs off it (they would format it).
     rawRecBegin();

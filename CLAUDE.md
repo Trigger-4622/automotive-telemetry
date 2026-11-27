@@ -172,8 +172,8 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   tasks run right after a clock reading, as a preemption or the other core).
 - **Asking the car** (`pacing_p2can*`, `obd_two_ecus`, `obd_pending`,
   `dtc_functional_fc`, `dtc_tcm_silent`): one request on the bus at a time,
-  whoever sends it - the OBD-II poller, SSM2 and the code reader all take
-  `diagBusLock()` - and the lock is kept until that request is settled:
+  whoever sends it - the OBD-II poller, SSM2, the code reader and the body
+  computer's scan and reader all take `diagBusLock()` - and the lock is kept until that request is settled:
   answered by every computer known to answer it, refused, or P2CAN since it
   went out (`obdAsk()`: the longer of `obd_to` and `obd_p2can`; "still
   working", 0x78, is waited on for up to 2 s). `obd_to` alone used to end the
@@ -483,7 +483,7 @@ before, once confirmed. The screens flash both arrows while `METRIC_ID_HAZARD`
 is on - following each side's own bit when it flashes, in step by themselves
 when it does not (`lamp_hazard_switch`).
 
-## Codes, oil change, G-meter, drive log, raw recording, timers, parking, backlight
+## Codes, oil change, G-meter, drive log, raw recording, body computer, timers, parking, car view, backlight
 
 - **Trouble codes** (`master/src/DiagCodes.*`): services 03/07/0A from the
   ECM (0x7E0) and TCM (0x7E1, through 0x7DF with flow control to 0x7E1 if it
@@ -548,6 +548,34 @@ when it does not (`lamp_hazard_switch`).
   frame. Not tried on the board: the frames a page program costs (the
   simulator has no flash timing), the erase's minute, the download over the
   AP.
+- **The car's other computers and the body computer** (master,
+  `master/src/BodyUnit.*`; portal Car tab, "Body computer"; `/api/body`,
+  `/api/body/scan`). No public source gives the 2010 Legacy's body computer
+  (BIU) a CAN address; what is known is FastECU's for the 2005-09 cars'
+  BIU over K-line (KWP2000 at 0x40: 21 50 its switches, 21 51 its lighting;
+  protocol facts only - FastECU is GPL-3, nothing of its code is here). The
+  scan, refused while moving, the bus quiet, listen-only or settling, sends
+  "3E 00" to every ID 0x700-0x7F7 but 0x7DF, a reply taken on the request +
+  8, then "21 50" to each that answered; "61 50 ..." marks a body computer
+  (`body_scan`: about 24 s on the simulator, the OBD-II poller keeping its
+  turns; only 3E and 21 ever go out). Other 0x7xx IDs the frame table gained
+  meanwhile are listed as replies on unexpected IDs. The reader (`biu_tx`,
+  `biu_rx` 0 = tx + 8, `biu_ms` 500; 0 = off, the default - `body_off`)
+  asks "21 50" and "21 51" in the codes task through `isoExchange()` (150 ms
+  wait each), slowing to every 10 s after five failures in a row, and puts
+  the answers in the frame table as extended IDs `BODY_PSEUDO_BASE` |
+  block << 8 | eight-byte part ("BIU 50 · 0-7" on the portal) through a queue
+  the RX task drains: a signal mapped on them publishes like a broadcast one
+  (`body_reader`: FastECU's driver's-door bit, block 50 bit 8, on DOOR_FL),
+  they are never missed frames (`idOnRequest`) or in the raw recording, and
+  teach by doing takes them in (other extended IDs it still leaves out); the
+  learner does not. The portal names FastECU's bits (doors 8-11, boot 12,
+  handbrake 32, light switch 4) as a place to start, with a Map button each.
+  Not tried on the car: whether its BIU is on this bus at all, its address,
+  and whether it answers KWP2000's 21 50 over CAN. If the scan finds none,
+  a raw recording while the owner's scan tool reads the BIU (master on
+  Silent) shows the tool's requests. Nothing is ever written to it (no
+  3B, 2F, 30 or 31 service - locking and unlocking are not implemented).
 - **Firmware update over Wi-Fi** (master only, `master/src/FwUpdate.*`;
   portal Settings > Device, `/api/update`): the upload goes into the spare
   app slot (app0/app1; a USB upload always writes app0 and resets otadata to
@@ -573,7 +601,8 @@ when it does not (`lamp_hazard_switch`).
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
   stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once,
-  version 4 the `park` screen, version 5 the rules below.
+  version 4 the `park` screen, version 5 the rules below, version 6 the `car`
+  screen (round board only).
 - **Parking screen** (screens, `park`; `parkBuild`/`parkUpdate` in the shared
   DriveViews): the steering wheel turned as the driver has it (`metric_id`,
   default the steering angle 0x1006, ISO 8855: positive to the left), an arc
@@ -583,7 +612,27 @@ when it does not (`lamp_hazard_switch`).
   with. Layout version 4 adds it once, before `diag` (`migrate_v3_layout`);
   version 5 turns that version's `auto_reverse` switch into the rule, or into
   nothing where it was off (`migrate_v4_layout`). LVGL heap: 2.3 KB on the
-  round board, 2.8 KB on the cluster.
+  round board, 2.8 KB on the cluster. `view` "path" shows the car from above
+  (below) in place of the wheel, its path drawn from the same angle
+  (`park_path_view`).
+- **The car from above** (screens, `car`; `carBuild`/`carUpdate` and
+  `carScreenBuild` in the shared DriveViews; studio type "Car from above"):
+  front up, the doors swung out in amber when open (FL FR RL RR, or "a door
+  open" when only that is known; faint when not known at all - never drawn
+  shut), boot and bonnet, the indicators at its corners (each side's lamp as
+  the display's `turn_left`/`turn_right` lamps have it), the headlights and
+  the front wheels turned by the steering, and what is open in words
+  ("ALL SHUT", "DOOR FL + BOOT"). The path its corners will take - ahead,
+  or back from the rear bumper in reverse (the switch or the lever's R) - is
+  the single-track model: road wheels at the steering angle over
+  `steer_ratio` (15), about a centre on the rear axle's line `wheelbase_mm`
+  (2750, the Legacy BM's) behind the front; `path` false leaves it out
+  (`car_screen`). Lines are `lv_line`s with their points on the heap (LVGL
+  keeps the pointer), each object moved to its line's bounding box. Layout
+  version 6 adds it once, before `diag`, on the round board only: on the
+  cluster it costs about 6 KB of LVGL heap and its layout would leave less
+  than the 8 KB kept spare - the studio offers it there, and a cluster layout
+  is migrated to version 6 without it (`migrate_v5_layout`).
 - **Screens that come up by themselves** (screens, shared `AutoScreen.*`;
   studio: "Show this screen by itself" on every screen): `show_when`, a list
   of conditions that must all hold - `{"gear":"R"}` (`"op":"!="` for "is

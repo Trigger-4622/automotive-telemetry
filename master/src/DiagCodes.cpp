@@ -3,6 +3,7 @@
  * @brief Trouble codes and identity over OBD-II - see DiagCodes.h.
  */
 #include "DiagCodes.h"
+#include "BodyUnit.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -336,6 +337,10 @@ static void codesTask(void *) {
     float    lastMil = -1, lastCount = -1;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(100));
+        // The scan for the car's computers and the body computer's reads
+        // (BodyUnit.h): this task's, so they cost no stack of their own. A
+        // quiet bus stops a scan there, and a read asks nothing then.
+        bodyStep();
         const uint32_t now = millis();
         // Car off: nothing asked, nothing published (the displays let the
         // codes go with everything else).

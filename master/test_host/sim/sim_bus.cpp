@@ -820,6 +820,8 @@ struct IsoNode {
     struct { std::vector<uint8_t> msg; size_t off = 0; uint8_t sn = 1; bool waitingFc = false; } tx;
 };
 static IsoNode s_ecmNode{"ECM", 0x7E0, 0x7E8}, s_tcmNode{"TCM", 0x7E1, 0x7E9};
+static IsoNode s_biuNode{"BIU", 0x750, 0x758};
+sim::BiuSim sim::biu;
 std::map<uint32_t, int> sim::isoRequests;
 int sim::codesCleared = 0;
 
@@ -966,9 +968,39 @@ static void obdIsoHandle(IsoNode &n, const std::vector<uint8_t> &req, bool funct
     refuse(0x11);                                       // service not supported
 }
 
+/** The body computer: present, and its switch and lighting blocks (bit
+ *  places as FastECU's table for the K-line BIU: byte 1 the doors and boot,
+ *  byte 4 bit 0 the parking brake, byte 0 bit 4 the lighting switch). */
+static void biuHandle(const std::vector<uint8_t> &req) {
+    sim::BiuSim &b = sim::biu;
+    b.services.push_back(req[0]);
+    const uint64_t at = simrtos::nowUs() + ecu.replyLatencyUs;
+    if (req[0] == 0x3E) { nodeSend(s_biuNode, {0x7E, 0x00}, at); return; }
+    if (req[0] == 0x21 && req.size() == 2 && req[1] == 0x50) {
+        std::vector<uint8_t> r = {0x61, 0x50};
+        std::vector<uint8_t> d(16, 0);
+        d[0] = (uint8_t)(b.lightsSw ? 0x10 : 0);
+        d[1] = (uint8_t)((b.doorDriver ? 1 : 0) | (b.doorPass ? 2 : 0) | (b.doorRR ? 4 : 0) |
+                         (b.doorRL ? 8 : 0) | (b.boot ? 0x10 : 0));
+        d[4] = (uint8_t)(b.handbrake ? 1 : 0);
+        d[5] = 0x40;                                      // something that never moves
+        r.insert(r.end(), d.begin(), d.end());
+        b.reads++;
+        nodeSend(s_biuNode, r, at);
+        return;
+    }
+    if (req[0] == 0x21 && req.size() == 2 && req[1] == 0x51) {
+        b.reads++;
+        nodeSend(s_biuNode, {0x61, 0x51, (uint8_t)(b.lightsSw ? 1 : 0), (uint8_t)(b.lightsSw ? 1 : 0), 0}, at);
+        return;
+    }
+    nodeSend(s_biuNode, {0x7F, req[0], 0x11}, at);       // service not supported
+}
+
 /** Does this node answer @p svc? */
 static void nodeHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functional) {
     if (req.empty()) return;
+    if (&n == &s_biuNode) { if (!functional) biuHandle(req); return; }
     const bool tcm = &n == &s_tcmNode;
     if (!tcm && (req[0] == 0xAA || req[0] == 0xA8)) {
         if (!functional && ecu.ssmEnabled) ssmHandle(req);
@@ -1096,6 +1128,10 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
         else if (m->identifier == 0x7E0) nodeFrame(s_ecmNode, *m, false);
         else if (m->identifier == 0x7E1) nodeFrame(s_tcmNode, *m, false);
         else { nodeFrame(s_ecmNode, *m, true); nodeFrame(s_tcmNode, *m, true); }
+    } else if (sim::biu.enabled && m->identifier == sim::biu.req) {
+        s_biuNode.reqId = sim::biu.req;
+        s_biuNode.rspId = sim::biu.rsp;
+        nodeFrame(s_biuNode, *m, false);
     }
     return ESP_OK;
 }

@@ -14,7 +14,10 @@
  *                  temperature, shift light and a row of warning lamps
  *   "gmeter"     — the G-meter: a friction-circle dot
  *   "perf"       — performance timers: 0-100, 80-120, quarter mile
- *   "park"       — parking: the steering wheel as it is turned
+ *   "park"       — parking: the steering wheel as it is turned (or, with
+ *                  "view": "path", the car from above and its path)
+ *   "car"        — the car from above: doors, boot, bonnet, lights,
+ *                  indicators, and the path it is about to take
  *
  * Any screen can come up by itself on conditions of its own (show_when, on the
  * gear, the speed or any metric) - see AutoScreen.h.
@@ -226,6 +229,7 @@ struct ScreenDef {
     int       gmeter   = -1;       /**< Index into the G-meter list, or -1.  */
     int       perf     = -1;       /**< Index into the timer list, or -1.    */
     int       park     = -1;       /**< Index into the parking list, or -1.  */
+    int       car      = -1;       /**< Index into the car-view list, or -1. */
     std::vector<GaugeBinding> bindings;  /**< Metrics rendered here.         */
 };
 
@@ -452,6 +456,10 @@ private:
     /** @brief The parking screen: the steering wheel (`"metric_id"`, the
      *         steering angle; `"steer_max"`, `"straight_deg"`). */
     void buildPark(ScreenDef &sd, JsonObject cfg);
+    /** @brief The car from above (`"path"`, `"steer_ratio"`, `"wheelbase_mm"`). */
+    void buildCar(ScreenDef &sd, JsonObject cfg);
+    /** @brief What the car from above shows now: doors, lamps, gear. */
+    CarState carState();
     /**
      * @brief Whether a screen's condition holds now (AutoScreen.h): the gear
      *        as the gear readout has it, or a metric the display has fresh.
@@ -668,6 +676,7 @@ private:
     std::vector<GMeterView> _gmeters;   /**< Every G-meter screen.           */
     std::vector<PerfView>   _perfViews; /**< Every timer screen.             */
     std::vector<ParkView>   _parks;     /**< Every parking screen.           */
+    std::vector<CarScreenView> _cars;   /**< Every car-from-above screen.    */
     AutoScreens             _auto;      /**< Screens that come up by themselves. */
     /** The performance timers: timed on this display from the master's
      *  speed, whichever screen is showing. */

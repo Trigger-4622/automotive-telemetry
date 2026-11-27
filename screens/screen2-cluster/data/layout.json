@@ -1,6 +1,6 @@
 {
   "_doc": "Dash cluster layout schema v1 — 480x272 LANDSCAPE. Keys starting with '_' are documentation only. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; or POST it to /api/layout - never 'pio run -t uploadfs', which replaces the layout and the touch calibration stored on the display. This is the SAME schema as the 1.28in round display, plus the landscape-only screen types 'cluster' and 'bars' and a wider grid — a layout written for the round board loads here unchanged, it just will not use the extra room.",
-  "version": 5,
+  "version": 6,
 
   "global": {
     "_doc": "smoothing_alpha: EMA coefficient 0-1 applied at packet rate (higher = snappier, lower = smoother). lerp_speed: fraction moved toward target per UI tick (needle glide). stale_timeout_ms: metric age before it renders as '--'.",

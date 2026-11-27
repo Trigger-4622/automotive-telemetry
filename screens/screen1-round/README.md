@@ -68,7 +68,7 @@ in USB still enters the ROM bootloader.
 
 Gauge Studio has five tabs. **Screens**: add, order and edit screens (the dash,
 arc gauges, needle tachometers, 2/4-way splits, text lists, trend charts, the
-G-meter, the performance timers, the parking screen, diagnostics) with a live circular preview -
+G-meter, the performance timers, the parking screen, the car from above, diagnostics) with a live circular preview -
 each type offers only what it draws, and its background (texture, gradient,
 image, bezel). **Lamps**: the warning lamps and their strip. **Watchdog**:
 values guarded on every screen. **Settings**: display (with the backlight by
@@ -86,7 +86,17 @@ second to arm a standing start; 80-120 times itself whenever the speed passes
 80 on the way up. Layout version 3 adds both to an existing layout once.
 `park` shows the steering wheel as it is turned, an arc from straight ahead to
 full lock (`steer_max`) and STRAIGHT in green within `straight_deg` of the
-centre. Layout version 4 adds it once.
+centre; with `view` "path" it shows the car from above instead, with the lines
+its corners will take. Layout version 4 adds it once.
+`car` shows the car from above, front up: the doors swung out in amber when
+open, boot and bonnet, the indicators at its corners, the headlights, the front
+wheels turned by the steering, and the path its corners will take - ahead, or
+back from the rear bumper in reverse - with what is open in words above it
+("ALL SHUT", "DOOR FL + BOOT"). The path is a single-track model: the road
+wheels turned by the steering angle over `steer_ratio` (15), about a centre on
+the rear axle's line `wheelbase_mm` (2750, the Legacy BM's) behind the front
+one. A door the master does not know is drawn faint, never as shut. Layout
+version 6 adds it once.
 
 **Screens that come up by themselves.** Any screen can have conditions of its
 own (studio: *Show this screen by itself*): the gear, the speed or any metric,

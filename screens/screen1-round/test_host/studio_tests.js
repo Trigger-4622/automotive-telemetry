@@ -221,6 +221,7 @@ const BUILD = {
   arc_gauge: ['buildArcGauge'], meter_gauge: ['buildMeterGauge'], quad: ['buildQuad'],
   text_list: ['buildTextList'], bars: ['buildBars'], cluster: ['buildCluster'], chart: ['buildChart'],
   dash: ['buildDash', 'dashPart'], gmeter: ['buildGMeter'], perf: ['buildPerf'], park: ['buildPark'],
+  car: ['buildCar'],
   diag: ['buildDiag'],
 };
 const COMMON = ['UIBuilder::buildScreen', 'UIBuilder::applyBackground', 'UIBuilder::parseCommon',

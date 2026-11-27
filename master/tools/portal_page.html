@@ -222,6 +222,17 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
    <div id="lgIds" class="row" style="margin-top:8px"></div>
    <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
+ <div class="card"><h2>Body computer <small id="bdSub"></small>
+   <button class="b" id="bdBtn" style="margin-left:auto" onclick="bodyScan()">Find the car's computers</button></h2>
+  <p class="say" style="margin:0 0 8px">The doors, the boot, the handbrake and the light switch as the body computer (BIU) knows
+   them - asked for, where the bus does not carry them. <b>Find the car's computers</b>, standing with the ignition on, asks every
+   diagnostic address from 0x700 to 0x7F7 "are you there" (3E) and each that answers for its first data block (21 50): only reads,
+   nothing in a computer changes. About half a minute, with the OBD-II requests going ahead of it.</p>
+  <div class="bar" id="bdBarBox" hidden><i id="bdBar" style="width:0"></i></div>
+  <div class="wrap"><table><thead><tr><th>Asked on</th><th>Answers on</th><th>What it said</th><th></th></tr></thead><tbody id="bdTab"></tbody></table></div>
+  <p class="say" id="bdSay" style="margin:8px 0 0"></p>
+  <div class="grp" style="margin-top:16px">Reading it</div>
+  <div id="bdRead"></div></div>
  <div class="card"><h2>Engine computer</h2>
   <p class="say" style="margin:0 0 8px">RomRaider lists its ROM definitions by the <b>calibration ID</b> (its "internal ID") and its
    logger definitions by the <b>ROM ID</b> SSM2 reports. If its definition files list this calibration ID, RomRaider can read and
@@ -294,6 +305,10 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 const META=/*META*/;
 const $=q=>document.querySelector(q);
 const hex=(n,w)=>'0x'+Number(n).toString(16).toUpperCase().padStart(w,'0');
+/* The body computer's answers are in the frame table as extended IDs of their
+   own (BodyUnit.h): BODY | block << 8 | which eight bytes of it. */
+const BODY=0x1F5B0000,isBody=id=>id>=BODY&&id<=BODY+0xFFFF;
+const canName=id=>isBody(id)?`BIU ${(id>>8&0xFF).toString(16).toUpperCase()} · ${(id&0xFF)*8}-${(id&0xFF)*8+7}`:hex(id,3);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const nm=id=>META[id]?META[id][0]:hex(id,4);
 const un=id=>META[id]?META[id][1]:'';
@@ -327,14 +342,15 @@ function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v);if(!v)return;
  $('#saveRb').hidden=!rb}
 /* Five tabs, each polling only what it shows (the master answers one request
    at a time): Home and Signals /api/live, Bus also /api/bus and the evidence
-   log, Car the codes and the drive logs, Settings the firmware once. */
+   log, Car the codes, the drive logs and the body computer, Settings the
+   firmware once. */
 const TABS=['home','sig','bus','car','set'];
 function go(t){if(!TABS.includes(t))t='home';TAB=t;
  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
  TABS.forEach(x=>$('#t-'+x).hidden=x!==t);
  try{history.replaceState(null,'','#'+t)}catch(e){}
  if(t==='home'&&L)renderHome();if(t==='sig'){renderSources();if(L)renderLearn()}
- if(t==='bus'){pollBus();pollEvlog();pollRaw()}if(t==='car'){pollCodes();pollLogs()}
+ if(t==='bus'){pollBus();pollEvlog();pollRaw()}if(t==='car'){pollCodes();pollLogs();pollBody()}
  if(t==='set'){fwInfo();if(ADV_ON&&LOADED&&!JSON_ED)jsonShow()}}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
@@ -469,7 +485,10 @@ const SET_ADV=[
   ['ssm_batch','Values per SSM2 request','num',[2,33],'2–33'],
   ['ssm_to','SSM2 reply timeout','num',[100,5000],'ms'],
   ['cover_ms','Skip a request while a better source is fresher than','num',[100,30000],'ms'],
-  ['dtc_poll_s','Read the trouble codes every','num',[0,3600],'s while the car is on · 0 = only when asked']]],
+  ['dtc_poll_s','Read the trouble codes every','num',[0,3600],'s while the car is on · 0 = only when asked'],
+  ['biu_tx','Body computer (BIU): its request ID','num',[0,2047],'decimal · 0 = not read · the Car tab\'s <b>Find the car\'s computers</b> fills it in'],
+  ['biu_rx','Body computer: its reply ID','num',[0,2047],'decimal · 0 = the request ID + 8'],
+  ['biu_ms','Read the body computer every','num',[100,10000],'ms']]],
  ['Learning',[
   ['learn_r2','Fit needed to call it a match','num',[0.5,0.99999,0.0001],'0.5–0.99999'],
   ['learn_min_n','Samples needed','num',[10,5000]],
@@ -552,11 +571,11 @@ function field(x){
  const on01=x.map&&x.bits&&(x.m>>8)===0x12&&x.map.every(p=>p[1]===0||p[1]===1);
  const tbl=on01?' • on when '+x.map.filter(p=>p[1]===1).map(p=>x.bits.map((b,i)=>`${b} ${(p[0]>>i)&1?'set':'clear'}`).join(', ')).join(' or '):
   x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
- if(x.bits&&x.bits.length)return`${hex(x.id,3)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
- if(x.l===1)return`${hex(x.id,3)} <span class="muted">bit ${x.s}</span>`;
+ if(x.bits&&x.bits.length)return`${canName(x.id)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
+ if(x.l===1)return`${canName(x.id)} <span class="muted">bit ${x.s}</span>`;
  const k=x.s>>3;
- if(x.l<8&&!x.be)return`${hex(x.id,3)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
- return`${hex(x.id,3)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
+ if(x.l<8&&!x.be)return`${canName(x.id)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
+ return`${canName(x.id)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
 async function learnAct(a,m){await post(`/api/learn/${a}?m=${m}`,a==='accept'?`Listening for ${nm(m)}`:`Requesting ${nm(m)} again`,()=>load(true))}
 /* What needs the driver, from what /api/live already carries: one line each,
    linking to the tab where it is dealt with. */
@@ -652,7 +671,7 @@ async function pollBusOnce(){
   if(dt&&ZC[k]!==undefined)ZHZ[k]=(c.count-ZC[k])/dt;ZC[k]=c.count;ZP[k]=b;
   const by=b.map((v,i)=>`<span class="${pb.length&&pb[i]!==v?'h':ch[i]?'l':''}">${v.toString(16).toUpperCase().padStart(2,'0')}</span>`).join('');
   const used=(C.signals||[]).filter(s=>s.can_id===c.id&&(s.mode===1||s.mode===3)).map(s=>nm(s.metric));
-  return`<tr><td>${c.ext?'ext ':''}${hex(c.id,3)}</td><td>${ZHZ[k]!==undefined?ZHZ[k].toFixed(0):'–'}${c.age>2000?' <span class="warn">idle</span>':''}</td>
+  return`<tr><td>${isBody(c.id)?canName(c.id):(c.ext?'ext ':'')+hex(c.id,3)}</td><td>${ZHZ[k]!==undefined?ZHZ[k].toFixed(0):'–'}${c.age>2000?' <span class="warn">idle</span>':''}</td>
    <td class="hx">${by}${used.length?` <span class="tag raw">${esc(used.join(', '))}</span>`:''}</td>
    <td><button class="b s" onclick="mapOpen(${c.id},${c.ext?1:0})">Map</button></td></tr>`}).join('')||'<tr><td colspan="4" class="empty">Nothing heard yet.</td></tr>';
  if(MAP)mapPrev()}
@@ -713,7 +732,7 @@ function metricOpts(sel,filter){return Object.keys(META).map(Number).filter(id=>
  .map(id=>`<option value="${id}" ${id===sel?'selected':''}>${esc(nm(id))}${un(id)?' ('+esc(un(id))+')':''}</option>`).join('')}
 /* The map dialog sits over the tab that opened it; while it is open the frames
    are read (pollBus), so its preview follows the bus. */
-function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapDlg').hidden=false;$('#mapId').textContent=hex(id,3);
+function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapDlg').hidden=false;$('#mapId').textContent=canName(id);
  $('#mpS').value=p.s||0;$('#mpL').value=p.l||8;$('#mpK').value=p.k||1;$('#mpO').value=p.o||0;$('#mpBE').value=p.be?'1':'0';
  $('#mpSg').checked=!!p.sg;$('#mpM').innerHTML=metricOpts(p.m||0x010C);mapPrev();pollBus()}
 function mapClose(){MAP=null;$('#mapDlg').hidden=true}
@@ -1240,9 +1259,9 @@ async function teachStart(){
    const tq=at();let b=null;asked++;
    try{b=await req(url,null,plan.deadline)}catch(e){}
    const tr=at(),i=b?teachSlot(durs,skip,tq,tr):-1;
-   if(b)TLAST.reads.push({t:[Math.round(tq),Math.round(tr)],step:i,c:b.census.filter(c=>!c.ext).map(c=>[c.id,c.d||'',c.e||'']),m:b.m||null});
+   if(b)TLAST.reads.push({t:[Math.round(tq),Math.round(tr)],step:i,c:b.census.filter(c=>!c.ext||isBody(c.id)).map(c=>[c.id,c.d||'',c.e||'']),m:b.m||null});
    if(i>=0){const k=steps[i][0];
-    TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
+    TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext||isBody(c.id)).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
     if(kind==='mot'){
      // The car as the master knows it at this poll: speed, steering, and a yaw
      // rate or lateral G already read from the bus (never one derived from these).
@@ -1309,9 +1328,9 @@ function teachAnalyze(steps){
 /** The raw signals feeding @p metric now: taught, mapped by hand or learned. */
 const feeding=metric=>(C.signals||[]).filter(g=>g.metric===metric&&(g.mode===1||g.mode===3));
 const sameSig=(g,x)=>g.can_id===x.can_id&&g.start===x.start&&g.len===x.len&&String(g.bits||'')===String(x.bits||'');
-const where=g=>hex(g.can_id,3)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):g.len===1?' bit '+g.start:` bits ${g.start}-${g.start+g.len-1}`);
+const where=g=>canName(g.can_id)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):g.len===1?' bit '+g.start:` bits ${g.start}-${g.start+g.len-1}`);
 function teachSig(r,m){
- const s={name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
+ const s={name:nm(m).slice(0,15),can_id:r.id,ext:isBody(r.id),start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
  if(r.codes){s.bits=r.bits;s.map=r.codes.map((c,g)=>[c,posValue(m,r.names[g],g)])}
  else if(r.map){s.bits=r.bits;s.map=r.map}            // the flasher while the side's bit says so
  else if(r.inv){s.scale=-1;s.offset=1}
@@ -1333,9 +1352,9 @@ async function teachAdd(list){
 async function teachUse(i){
  const r=TRES[i],m=r.metric||+$('#tM').value;
  if(!r.codes&&r.l!==1){BUS=BUS||{census:[]};
-  if(r.k!==undefined){mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
+  if(r.k!==undefined){mapOpen(r.id,isBody(r.id)?1:0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
    toast('Check it reads right (round the scale), then Use this value');return}
-  mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
+  mapOpen(r.id,isBody(r.id)?1:0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
   toast('Set the scale so the value reads right, then Use this value');return}
  if(!await teachAdd([teachSig(r,m)]))return;
  toast(`${nm(m)} is now read from the bus`);
@@ -1536,6 +1555,58 @@ async function serviceReset(){
  if(!confirm('Oil changed now: the reminder starts again from the odometer?'))return;
  try{const r=await fetch('/api/service/reset',{method:'POST'}),j=await r.json();toast(r.ok?'Reminder reset':j.error||'Failed');
   if(r.ok)await load(true);pollCodes()}catch(e){toast('Failed')}}
+/* ───────────── the body computer (Car tab) ───────────── */
+/* Where FastECU's table for the 2005-09 cars' body computer (over K-line)
+   puts these in its block 50 - bit = byte x 8 + bit, after "61 50": a place
+   to start looking on this car, not a fact about it. */
+const BIU_BITS=[[8,"Driver's door",0x1210],[9,"Passenger's door",0x1211],[11,'Rear left door',0x1212],
+ [10,'Rear right door',0x1213],[12,'Boot',0x1214],[32,'Handbrake',0x1205],[4,'Light switch',0x2108]];
+const OBD_NAME={0x7E0:'the engine computer',0x7E1:'the transmission computer'};
+let BODYS=null;
+function pollBody(){return solo('body',pollBodyOnce)}
+async function pollBodyOnce(){
+ if(TAB!=='car'||TEACH||UPD)return;
+ try{BODYS=await req('/api/body',null,5000)}catch(e){return}
+ renderBody();
+ if(BODYS.scanning)setTimeout(pollBody,1000)}
+const hexs=a=>a&&a.length?a.map(b=>b.toString(16).toUpperCase().padStart(2,'0')).join(' '):'—';
+function renderBody(){
+ const d=BODYS;if(!d)return;
+ const r=d.reader||{},found=d.found||[],rx0=tx=>C.biu_rx||tx+8;
+ $('#bdSub').textContent=d.scanning?`asking ${hex(d.at,3)}…`:r.tx?`reading ${hex(r.tx,3)}`:'';
+ $('#bdBarBox').hidden=!d.scanning;$('#bdBar').style.width=(d.pct||0)+'%';$('#bdBtn').disabled=!!d.scanning;
+ const said=f=>f.biu?`<span class="ok">a body computer</span>: block 50, ${f.len} bytes`:
+  f.reply[0]===0x7E?'present':f.reply[0]===0x7F?`answers, but not to 3E (refusal ${hex(f.reply[2]||0,2)})`:'answers: '+hexs(f.reply);
+ $('#bdTab').innerHTML=found.length?found.map(f=>`<tr><td class="mono">${hex(f.tx,3)}</td><td class="mono">${hex(f.rx,3)}</td>
+  <td style="white-space:normal">${said(f)}${OBD_NAME[f.tx]?` <span class="muted">(${OBD_NAME[f.tx]})</span>`:''}</td>
+  <td>${!f.biu?'':C.biu_tx===f.tx&&rx0(f.tx)===f.rx?'<span class="ok">in use</span>':`<button class="b s p" onclick="bodyUse(${f.tx},${f.rx})">Use</button>`}</td></tr>`).join(''):
+  `<tr><td colspan="4" class="empty">${d.scanning?'Asking…':d.scanned?'Nothing answered.':'Not looked yet.'}</td></tr>`;
+ $('#bdSay').innerHTML=(d.note?`<span class="warn">Stopped: ${esc(d.note)}</span>. `:'')+
+  (d.scanned&&!found.some(f=>f.biu)?'No computer answered 21 50 as a body computer: on this car its address or its requests are '+
+   'others. Record the bus while your scan tool reads the body computer (Bus tab, Raw recording, with the master\'s requests off) '+
+   'and send the file: the tool\'s requests and the answers are in it. ':'')+
+  (d.others&&d.others.length?`Also heard during the scan, from no address asked: ${d.others.map(x=>hex(x,3)).join(', ')}.`:'');
+ if(!r.tx){$('#bdRead').innerHTML='<p class="say" style="margin:0">Off. <b>Use</b> on a body computer the scan found starts reading it; '+
+  'its addresses can also be set by hand (Settings, Advanced, Requests).</p>';return}
+ const b0=(r.blocks||[])[0]||[],b1=(r.blocks||[])[1]||[];
+ const bit=(blk,n)=>blk.length>n>>3?(blk[n>>3]>>(n&7))&1:null,row=(lid,n)=>BODY|lid<<8|n>>6;
+ $('#bdRead').innerHTML=`<p class="say" style="margin:0 0 8px">${hex(r.tx,3)} → ${hex(r.rx,3)}, every ${C.biu_ms||500} ms: ${r.reads} answers, `+
+  `${r.fails} failed · ${r.age==null?'no answer yet':r.age<2000?'last answer just now':'last answer '+ago(Math.round(r.age/1000))}`+
+  `${r.note?` · <span class="warn">${esc(r.note)}</span>`:''}</p>`+
+  `<div class="wrap"><table><thead><tr><th>Block 50, as FastECU names it</th><th>Bit</th><th>Now</th><th></th></tr></thead><tbody>`+
+  BIU_BITS.map(([n,name,m])=>{const v=bit(b0,n);return`<tr><td>${name}</td><td class="mono">${n}</td>
+   <td>${v==null?'<span class="muted">—</span>':v?'<b class="warn">on</b>':'off'}</td>
+   <td><button class="b s" onclick="mapOpen(${row(0x50,n)},1,{s:${n&63},l:1,m:${m}})">Map</button></td></tr>`}).join('')+
+  `</tbody></table></div><p class="say mono" style="margin:8px 0 0">50: ${hexs(b0)}<br>51: ${hexs(b1)}</p>`+
+  `<p class="say" style="margin:6px 0 0">Check each on this car before you use it - open the door, watch its bit. Every byte is also `+
+  `in the Bus tab's frame table (<b>BIU 50 · 0-7</b> and on), where <b>Map</b> and teach by doing work on them as on any frame.</p>`}
+async function bodyScan(){
+ try{const r=await fetch('/api/body/scan',{method:'POST'}),j=await r.json();toast(r.ok?'Asking every address…':j.error||'Failed')}
+ catch(e){toast('Failed')}
+ setTimeout(pollBody,500)}
+async function bodyUse(tx,rx){
+ if(!LOADED){toast('Not loaded yet');return}
+ C.biu_tx=tx;C.biu_rx=rx===tx+8?0:rx;setDirty(true);await save();renderBody()}
 const kb=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixed(2)+' MB';
 const dur=s=>{s=Math.round(s);return s<60?s+' s':Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s'};
 function pollLogs(){return solo('logs',pollLogsOnce)}
@@ -1637,5 +1708,5 @@ renderSettings();
 try{advShow(localStorage.getItem('advOn')==='1')}catch(e){}
 go(location.hash.slice(1));
 load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);setInterval(pollRaw,2000);
-setInterval(pollCodes,3000);setInterval(pollLogs,3000);
+setInterval(pollCodes,3000);setInterval(pollLogs,3000);setInterval(pollBody,3000);
 </script></body></html>
