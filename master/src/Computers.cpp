@@ -26,7 +26,7 @@ static constexpr uint8_t  FAILS_SLOW  = 5;           /**< Unanswered reads in a 
 static constexpr uint32_t SLOW_MS     = 10000;       /**< ...that block is asked only this often. */
 static constexpr uint8_t  MAX_PARTS   = 8;           /**< Eight bytes a frame-table row: 64 bytes. */
 
-enum Phase : uint8_t { PH_IDLE, PH_FIND11, PH_FIND29, PH_ASK, PH_SEARCH };
+enum Phase : uint8_t { PH_IDLE, PH_FIND11, PH_FIND29, PH_ASK, PH_SEARCH, PH_VERIFY };
 
 /** The questions of "who are you", in CompAsk order. */
 static const uint8_t ASK_REQ[ASK_N][3] = {
@@ -45,9 +45,12 @@ static volatile int  s_searchWanted = -1;
 static Phase     s_phase = PH_IDLE;
 static uint32_t  s_next = FIRST11;
 static uint8_t   s_askAt = 0, s_askWhat = 0;
+static uint8_t   s_verifyAt = 0;
 static uint16_t  s_lid = 1;
 static uint8_t   s_lidSilent = 0;
 static CompFound *s_found = nullptr;     /**< COMP_MAX, from the heap at the first scan. */
+static bool      s_foundMulti[COMP_MAX] = {}; /**< True if discovered via multi-responder broadcast. */
+static uint8_t   s_foundSvc[COMP_MAX]   = {}; /**< Probe service that elicited the hit (0x3E / 0x01). */
 static uint8_t   s_foundN = 0;
 static CompStatus s_st;
 
@@ -131,8 +134,9 @@ static void setPhase(Phase p) {
     portEXIT_CRITICAL(&s_mux);
 }
 
-/** Add a computer that answered (once per request and reply ID). */
-static void addFound(uint32_t tx, const IsoHit &h) {
+/** Add a computer that answered (once per request and reply ID); PH_VERIFY
+ *  re-queries each directly to drop strays before deduplicating by reply ID. */
+static void addFound(uint32_t tx, const IsoHit &h, uint8_t svc, bool multi) {
     for (uint8_t i = 0; i < s_foundN; i++)
         if (s_found[i].tx == tx && s_found[i].rx == h.id) return;
     if (s_foundN >= COMP_MAX) return;
@@ -141,10 +145,52 @@ static void addFound(uint32_t tx, const IsoHit &h) {
     f.rx = h.id;
     memcpy(f.hello, h.data, 8);
     portENTER_CRITICAL(&s_mux);
-    s_found[s_foundN++] = f;
+    s_found[s_foundN]      = f;
+    s_foundMulti[s_foundN] = multi;
+    s_foundSvc[s_foundN]   = svc;
+    s_foundN++;
     s_st.found = s_foundN;
     portEXIT_CRITICAL(&s_mux);
     log_i("computers: 0x%X answers on 0x%X", (unsigned)tx, (unsigned)h.id);
+}
+
+/** Deduplicate verified computers that share the same reply CAN ID (e.g. a
+ *  module answering both functional 0x700 and physical 0x750 or 0x7DE),
+ *  preferring single-responder physical addressing and canonical tx == rx - 8. */
+static void dedupByRx() {
+    uint8_t w = 0;
+    for (uint8_t i = 0; i < s_foundN; i++) {
+        int dup = -1;
+        for (uint8_t j = 0; j < w; j++)
+            if (s_found[j].rx == s_found[i].rx) { dup = (int)j; break; }
+        if (dup < 0) {
+            if (w != i) {
+                s_found[w]      = s_found[i];
+                s_foundMulti[w] = s_foundMulti[i];
+                s_foundSvc[w]   = s_foundSvc[i];
+            }
+            w++;
+            continue;
+        }
+        const bool oldMulti = s_foundMulti[dup], newMulti = s_foundMulti[i];
+        const bool oldCanon = s_found[dup].tx <= 0x7FF && s_found[dup].tx + 8 == s_found[dup].rx;
+        const bool newCanon = s_found[i].tx <= 0x7FF && s_found[i].tx + 8 == s_found[i].rx;
+        const bool better = (!newMulti && oldMulti) || (newMulti == oldMulti && newCanon && !oldCanon);
+        if (better) {
+            log_i("computers: 0x%X preferred over 0x%X for reply 0x%X",
+                  (unsigned)s_found[i].tx, (unsigned)s_found[dup].tx, (unsigned)s_found[i].rx);
+            s_found[dup]      = s_found[i];
+            s_foundMulti[dup] = s_foundMulti[i];
+            s_foundSvc[dup]   = s_foundSvc[i];
+        } else {
+            log_i("computers: dropped duplicate 0x%X for reply 0x%X (kept 0x%X)",
+                  (unsigned)s_found[i].tx, (unsigned)s_found[i].rx, (unsigned)s_found[dup].tx);
+        }
+    }
+    portENTER_CRITICAL(&s_mux);
+    s_foundN = w;
+    s_st.found = s_foundN;
+    portEXIT_CRITICAL(&s_mux);
 }
 
 /** A request the bus would not take now. @return true: stop here, try later. */
@@ -159,7 +205,8 @@ static bool busy(IsoResult r) {
 static void findStep() {
     uint8_t heard[32];
     heard7xx(heard);
-    static const uint8_t TP[2] = { 0x3E, 0x00 };
+    static const uint8_t TP[2]  = { 0x3E, 0x00 };
+    static const uint8_t OBD[2] = { 0x01, 0x00 };
     IsoHit hits[4];
     size_t n;
     char why[48];
@@ -178,11 +225,20 @@ static void findStep() {
         if (!skip) {
             portENTER_CRITICAL(&s_mux);
             s_st.at  = id;
-            s_st.pct = (uint8_t)((id - FIRST11) * 70 / (LAST11 - FIRST11 + 1));
+            s_st.pct = (uint8_t)((id - FIRST11) * 65 / (LAST11 - FIRST11 + 1));
             portEXIT_CRITICAL(&s_mux);
             const IsoResult r = isoProbe(id, TP, sizeof TP, PROBE_MS, hits, 4, n, why, sizeof why);
             if (busy(r)) return;                 // the same ID again next time
-            for (size_t h = 0; h < n; h++) addFound(id, hits[h]);
+            uint8_t svc = 0x3E;
+            // Emissions ECUs (ECM 0x7E0, TCM 0x7E1...) often ignore 3E 00
+            // TesterPresent while answering OBD-II 01 00 cleanly.
+            if (n == 0 && id >= 0x7E0 && id <= 0x7E7) {
+                const IsoResult r2 = isoProbe(id, OBD, sizeof OBD, PROBE_MS, hits, 4, n, why, sizeof why);
+                if (busy(r2)) return;
+                svc = 0x01;
+            }
+            const bool multi = n > 1;
+            for (size_t h = 0; h < n; h++) addFound(id, hits[h], svc, multi);
         }
         s_next = id + 1;
     }
@@ -196,16 +252,55 @@ static void find29Step() {
     char why[48];
     portENTER_CRITICAL(&s_mux);
     s_st.at = FUNC29;
-    s_st.pct = 72;
+    s_st.pct = 68;
     portEXIT_CRITICAL(&s_mux);
     const IsoResult r = isoProbe(FUNC29, TP, sizeof TP, PROBE29_MS, hits, 8, n, why, sizeof why);
     if (busy(r)) return;
     for (size_t h = 0; h < n; h++)
         if (hits[h].ext && (hits[h].id & 0xFFFFFF00u) == 0x18DAF100u)
-            addFound(0x18DA00F1u | (hits[h].id & 0xFF) << 8, hits[h]);
+            addFound(0x18DA00F1u | (hits[h].id & 0xFF) << 8, hits[h], 0x3E, false);
+    s_verifyAt = 0;
     s_askAt = 0;
     s_askWhat = 0;
-    setPhase(PH_ASK);
+    setPhase(s_foundN ? PH_VERIFY : PH_ASK);
+}
+
+/** Directly re-query each discovered (tx, rx) pair to drop stray/late replies
+ *  captured during isoProbe() (in-place on heap-backed s_found). */
+static void verifyStep() {
+    uint8_t rsp[32];
+    size_t got;
+    char why[48];
+    for (uint8_t k = 0; k < STEP_ASKS && s_verifyAt < s_foundN; k++) {
+        const uint32_t tx = s_found[s_verifyAt].tx, rx = s_found[s_verifyAt].rx;
+        const uint8_t req[2] = { s_foundSvc[s_verifyAt] ? s_foundSvc[s_verifyAt] : (uint8_t)0x3E, 0x00 };
+        portENTER_CRITICAL(&s_mux);
+        s_st.at  = tx;
+        s_st.pct = (uint8_t)(68 + s_verifyAt * 7 / (s_foundN ? s_foundN : 1));
+        portEXIT_CRITICAL(&s_mux);
+        const IsoResult r = isoExchange(tx, rx, tx, req, 2, rsp, sizeof rsp, got, PROBE_MS, why, sizeof why);
+        if (busy(r)) return;
+        if (r == ISO_OK || r == ISO_NRC) {
+            s_verifyAt++;
+        } else {
+            log_i("computers: dropped stray 0x%X -> 0x%X (no direct reply)", (unsigned)tx, (unsigned)rx);
+            portENTER_CRITICAL(&s_mux);
+            for (uint8_t j = s_verifyAt; j + 1 < s_foundN; j++) {
+                s_found[j]      = s_found[j + 1];
+                s_foundMulti[j] = s_foundMulti[j + 1];
+                s_foundSvc[j]   = s_foundSvc[j + 1];
+            }
+            s_foundN--;
+            s_st.found = s_foundN;
+            portEXIT_CRITICAL(&s_mux);
+        }
+    }
+    if (s_verifyAt >= s_foundN) {
+        dedupByRx();
+        s_askAt = 0;
+        s_askWhat = 0;
+        setPhase(PH_ASK);
+    }
 }
 
 static void askStep() {
@@ -216,7 +311,7 @@ static void askStep() {
         const uint32_t tx = s_found[s_askAt].tx, rx = s_found[s_askAt].rx;
         portENTER_CRITICAL(&s_mux);
         s_st.at  = tx;
-        s_st.pct = (uint8_t)(72 + (s_askAt * ASK_N + s_askWhat) * 28 / (s_foundN * ASK_N));
+        s_st.pct = (uint8_t)(75 + (s_askAt * ASK_N + s_askWhat) * 25 / (s_foundN * ASK_N));
         portEXIT_CRITICAL(&s_mux);
         const IsoResult r = isoExchange(tx, rx, tx, ASK_REQ[s_askWhat], ASK_LEN[s_askWhat], rsp, sizeof rsp,
                                         got, ASK_MS, why, sizeof why);
@@ -342,7 +437,7 @@ static void readStep() {
     const uint8_t req[2] = { 0x21, r.lid };
     uint8_t rsp[2 + MAX_PARTS * 8];
     size_t got;
-    char why[48];
+    char why[40];
     const IsoResult res = isoExchange(r.tx, r.rx, r.tx, req, 2, rsp, sizeof rsp, got, READ_MS, why, sizeof why);
     if (res == ISO_BUSY) return;                  // not asked: no failure
     const bool ok = res == ISO_OK && got >= 2 && rsp[0] == 0x61 && rsp[1] == r.lid;
@@ -378,6 +473,8 @@ void compStep() {
             s_scanWanted = false;
             portENTER_CRITICAL(&s_mux);
             s_foundN = 0;
+            memset(s_foundMulti, 0, sizeof s_foundMulti);
+            memset(s_foundSvc, 0, sizeof s_foundSvc);
             s_next = FIRST11;
             s_phase = PH_FIND11;
             s_st = CompStatus();
@@ -408,6 +505,7 @@ void compStep() {
         switch (s_phase) {
             case PH_FIND11: findStep(); break;
             case PH_FIND29: find29Step(); break;
+            case PH_VERIFY: verifyStep(); break;
             case PH_ASK:    askStep(); break;
             case PH_SEARCH: searchStep(); break;
             default: break;

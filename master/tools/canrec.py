@@ -25,19 +25,23 @@ import sys
 MAGIC = b"CANREC1\0"
 EVENTS = ["boot", "bus-up", "settled", "tx-guard-trip", "rx-guard-trip", "bus-off", "sleep", "resume"]
 LOST_WHY = {1: "the recorder's buffer was full", 2: "the controller dropped them"}
-ERR_KIND = ["bit", "form", "stuff", "other"]
-# Where in the frame, as the ESP32's error-code capture register says it.
-ERR_WHERE = {0x03: "start of frame", 0x02: "ID 28-21", 0x06: "ID 20-18", 0x04: "SRTR bit", 0x05: "IDE bit",
-             0x07: "ID 17-13", 0x0F: "ID 12-5", 0x0E: "ID 4-0", 0x0C: "RTR bit", 0x0D: "reserved bit 1",
-             0x09: "reserved bit 0", 0x0B: "DLC", 0x0A: "data field", 0x08: "CRC", 0x18: "CRC delimiter",
-             0x19: "ACK slot", 0x1B: "ACK delimiter", 0x1A: "end of frame", 0x12: "intermission",
-             0x11: "active error flag", 0x16: "passive error flag", 0x13: "tolerating dominant bits",
-             0x17: "error delimiter", 0x1C: "overload flag"}
+ERR_KIND = ["BIT", "FORM", "STUFF", "OTHER"]
+# SJA1000 / ESP32 TWAI Error Code Capture (ECC[4:0]) segment names.
+ERR_WHERE = {0x03: "SOF", 0x02: "ID28-21", 0x06: "ID20-18", 0x04: "SRTR", 0x05: "IDE",
+             0x07: "ID17-13", 0x0F: "ID12-5", 0x0E: "ID4-0", 0x0C: "RTR", 0x0D: "RES1",
+             0x09: "RES0", 0x0B: "DLC", 0x0A: "DATA", 0x08: "CRC", 0x18: "CRC_DELIM",
+             0x19: "ACK_SLOT", 0x1B: "ACK_DELIM", 0x1A: "EOF", 0x12: "INTERMISSION",
+             0x11: "ACTIVE_ERR_FLAG", 0x16: "PASSIVE_ERR_FLAG", 0x13: "tolerate_dominant",
+             0x17: "ERR_DELIM", 0x1C: "OVERLOAD"}
 
 
 def err_name(ecc):
-    return "%s error %s, %s" % (ERR_KIND[ecc >> 6 & 3], "receiving" if ecc & 0x20 else "sending",
-                                ERR_WHERE.get(ecc & 0x1F, "segment 0x%02X" % (ecc & 0x1F)))
+    if ecc == 0:
+        return "cleared/unavailable (0x00)"
+    kind = ERR_KIND[(ecc >> 6) & 3]
+    direction = "RX" if (ecc & 0x20) else "TX"
+    seg = ERR_WHERE.get(ecc & 0x1F, "seg=0x%02X" % (ecc & 0x1F))
+    return "%s/%s/%s (0x%02X)" % (kind, direction, seg, ecc)
 
 
 class Error(Exception):
@@ -188,6 +192,69 @@ def candump(records):
     return lines, base
 
 
+def session_stats(recs):
+    """Per-session Bus-Off counts (0xE4 type=5), summed 0xE6 errors, and
+    engine-running vs KOEO split (tracking RPM from 0x7E8 PID 0C and 0x231)."""
+    stats = collections.OrderedDict()
+    rpm_by_sess = {}
+    obd_rpm_seen = {}
+
+    def get(s):
+        if s not in stats:
+            stats[s] = dict(reason=None, frames=0, tx=0, t_min=None, t_max=None,
+                            bus_offs=0, bo_run=0, bo_koeo=0,
+                            err_total=0, err_run=0, err_koeo=0,
+                            run_frames=0, koeo_frames=0, ecc=collections.Counter())
+        return stats[s]
+
+    for r in recs:
+        kind, sess, t = r[0], r[1], r[2]
+        st = get(sess)
+        if kind == "session":
+            st["reason"] = r[3]
+            rpm_by_sess[sess] = 0.0
+            obd_rpm_seen[sess] = False
+            continue
+        if kind == "frame":
+            _, _, _, fid, ext, rtr, tx, dlc, data = r
+            st["frames"] += 1
+            if tx:
+                st["tx"] += 1
+            if st["t_min"] is None or t < st["t_min"]:
+                st["t_min"] = t
+            if st["t_max"] is None or t > st["t_max"]:
+                st["t_max"] = t
+            if not ext and not rtr:
+                # OBD-II PID 0x0C reply (0x7E8: 04 41 0C A B)
+                if fid == 0x7E8 and len(data) >= 5 and data[0] >= 4 and data[1] == 0x41 and data[2] == 0x0C:
+                    rpm_by_sess[sess] = ((data[3] << 8) | data[4]) / 4.0
+                    obd_rpm_seen[sess] = True
+                # Subaru BM/EJ204 broadcast RPM on 0x231 bytes 0-1 LE (1 rpm/bit)
+                elif fid == 0x231 and len(data) >= 2 and not obd_rpm_seen.get(sess):
+                    cand = struct.unpack_from("<H", data, 0)[0]
+                    if cand <= 10000:
+                        rpm_by_sess[sess] = float(cand)
+            if rpm_by_sess.get(sess, 0.0) > 0.0:
+                st["run_frames"] += 1
+            else:
+                st["koeo_frames"] += 1
+        elif kind == "event" and r[3] == 5:                       # EV_BUS_OFF
+            st["bus_offs"] += 1
+            if rpm_by_sess.get(sess, 0.0) > 0.0:
+                st["bo_run"] += 1
+            else:
+                st["bo_koeo"] += 1
+        elif kind == "errors":
+            cnt, ecc = r[3], r[4]
+            st["err_total"] += cnt
+            st["ecc"][ecc] += cnt
+            if rpm_by_sess.get(sess, 0.0) > 0.0:
+                st["err_run"] += cnt
+            else:
+                st["err_koeo"] += cnt
+    return stats
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("recording")
@@ -232,11 +299,25 @@ def main():
     for r in recs:
         if r[0] == "errors":
             errs[r[4]] += r[3]
+    bus_offs_total = sum(1 for r in recs if r[0] == "event" and r[3] == 5)
     if errs:
         print("bus errors (error frames): %d - %s" % (sum(errs.values()), ", ".join(
             "%d %s" % (n, err_name(e)) for e, n in errs.most_common())))
     else:
         print("bus errors: none")
+    print("bus-offs (0xE4 type=5): %d" % bus_offs_total)
+    sstats = session_stats(recs)
+    if sstats:
+        print("sessions:")
+        for sid, st in sstats.items():
+            dur = ((st["t_max"] - st["t_min"]) / 1e6) if st["t_min"] is not None else 0.0
+            run_pct = (100.0 * st["run_frames"] / st["frames"]) if st["frames"] else 0.0
+            rsn = ("reason %d" % st["reason"]) if st["reason"] is not None else "no header"
+            print("  session %d (%s): %d frames (%d tx) in %.1f s (%.1f%% running), "
+                  "bus-offs: %d (%d running, %d KOEO), errors: %d (%d running, %d KOEO)" % (
+                      sid, rsn, st["frames"], st["tx"], dur, run_pct,
+                      st["bus_offs"], st["bo_run"], st["bo_koeo"],
+                      st["err_total"], st["err_run"], st["err_koeo"]))
     deaf = sum(r[3] for r in recs if r[0] == "deaf")
     print("the master could not hear the bus: %s" % ("%d time(s) (a flash write, reset mode, a reinstall)" % deaf
                                                      if deaf else "never"))
@@ -254,9 +335,14 @@ def main():
                 print("%12.6f  session %d (reset reason %d)" % (at(r), r[1], r[3]))
             elif r[0] == "event":
                 name = EVENTS[r[3]] if r[3] < len(EVENTS) else "event %d" % r[3]
-                print("%12.6f  %s  a=%d b=%d" % (at(r), name, r[4], r[5]))
+                extra = ""
+                if r[3] == 5 and r[5] == 2:
+                    extra = " (storm -> listen-only)"
+                elif r[3] == 5 and r[5] == 1:
+                    extra = " (rx-guard -> listen-only)"
+                print("%12.6f  %s%s  a=%d b=%d" % (at(r), name, extra, r[4], r[5]))
             elif r[0] == "lost":
-                print("%12.6f  %d frames lost: %s" % (at(r), r[3], LOST_WHY.get(r[4], "?")))
+                print("%12.6f  %d frames lost: %s" % (at(r), r[3], LOST_WHY.get(w, "?") if (w := r[4]) is not None else "?"))
             elif r[0] == "stop":
                 print("%12.6f  stopped" % at(r))
             elif r[0] == "errors":

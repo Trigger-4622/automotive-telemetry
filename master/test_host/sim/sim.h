@@ -23,7 +23,11 @@ struct EcuConfig {
     bool     tcmEnabled      = true;   ///< Transmission ECU answers functional requests.
     bool     ssmEnabled      = true;   ///< Engine ECU speaks SSM2.
     uint32_t ssmBadAddress   = 0;      ///< Read containing it: NRC 0x31 (0 = none).
-    int      ssmMaxAddrs     = 0;      ///< More addresses than this: NRC 0x31 (0 = no limit).
+    int      ssmMaxAddrs     = 0;      ///< More addresses than this: NRC 0x31/ssmSizeNrc (0 = no limit).
+    uint8_t  ssmSizeNrc      = 0x31;   ///< NRC returned when n > ssmMaxAddrs (0x12 on 2009 Legacy).
+    bool     ssmPartialCaps  = false;  ///< Use 2009 Legacy partial capability bitmap (0x113 unsupported).
+    bool     skipTesterPresent = false;///< ECM/TCM ignore 3E 00 (must be found via 01 00).
+    bool     dfco705         = false;  ///< 0x705 B3-B4 drops to raw 0 during high-RPM DFCO coast.
     uint8_t  ssmStmin        = 0;      ///< STmin in the ECU's flow control.
     uint32_t replyLatencyUs  = 4000;   ///< ECU reply delay.
     int      dropReplyEveryN = 0;      ///< Drop every Nth OBD reply (0 = never).
@@ -158,6 +162,9 @@ struct BusFaults {
      *  full of 2.4 GHz, a phone on the portal). Broadcasts are not
      *  acknowledged: the master cannot tell. */
     double   radioLoss = 0;
+    /** Model ESP-IDF's TWAI ISR clearing ECC to 0x00 on every running bus error
+     *  right after __wrap_twai_hal_get_events() captures it (bus-off freezes it). */
+    bool     idfClearsEcc = true;
 };
 
 extern EcuConfig ecu;
@@ -303,6 +310,8 @@ extern int codesCleared;                       ///< Service 04 accepted.
  *  Anything else they are asked, they refuse (11). */
 struct OthersSim {
     bool     enabled = false;
+    bool     func700 = false;            ///< 0x700 functional broadcast answered by BIU (0x758) & VDC (0x764, phys 0x7DE).
+    bool     injectStrayOn720 = false;   ///< Inject a one-shot stray 0x76E reply when 0x720 is probed.
     bool     doorDriver = false, doorPass = false, doorRL = false, doorRR = false;
     bool     boot = false, lightsSw = false, handbrake = false;
     int      reads = 0;                  ///< Data blocks answered.

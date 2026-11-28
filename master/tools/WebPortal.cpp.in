@@ -410,6 +410,8 @@ void WebPortal::setupRoutes() {
         g["pause"]  = st.guardPauseMs;
         g["silent"] = st.guardSilent;
         g["rx_silent"] = st.rxGuardSilent;
+        g["bo_storm"]   = st.busOffStorm;
+        g["bo_backoff"] = st.busOffBackoffMs;
         b["ids"] = masterCensusCount();
 
         JsonObject o = doc["obd"].to<JsonObject>();

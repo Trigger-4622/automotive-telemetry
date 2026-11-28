@@ -371,9 +371,14 @@ static void flagCheck() {
     s_couldFlag = could;
 }
 
-/** Latch an error in the error-code-capture register, as the controller does. */
-static void eccLatch(int errc, int dir, int seg) {
-    TWAI.error_code_capture_reg.val = (uint32_t)((errc << 6) | (dir << 5) | seg);
+/** Latch an error in the error-code-capture register, as the controller does,
+ *  then model __wrap_twai_hal_get_events() capturing ECC inside the TWAI ISR
+ *  before ESP-IDF's twai_ll_clear_err_code_cap() clears it on running errors. */
+static void eccLatch(int errc, int dir, int seg, bool busOff = false) {
+    const uint8_t code = (uint8_t)((errc << 6) | (dir << 5) | seg);
+    TWAI.error_code_capture_reg.val = code;
+    masterIsrCaptureEcc(code);
+    if (faults.idfClearsEcc && !busOff) TWAI.error_code_capture_reg.val = 0;
 }
 
 /** The master's controller detected an error in a frame it was receiving. */
@@ -640,7 +645,8 @@ static uint64_t carFrames(uint64_t now, std::map<uint32_t, uint64_t> &next) {
             case 0x332: m = frame(0x332, {s_cnt, (uint8_t)(s_cnt * 7), 0, 0, 0, 0, 0, 0}); break;
             case 0x705:
                 if (ecu.maf705) {
-                    const uint16_t q = (uint16_t)std::lround(v.rpm * v.throttle / 1000.0 / 0.005);
+                    uint16_t q = (uint16_t)std::lround(v.rpm * v.throttle / 1000.0 / 0.005);
+                    if (ecu.dfco705 && v.rpm > 1000.0 && ((int)t % 7) == 0) q = 0;
                     m = frame(0x705, {0x11, 0x60, 0x33, (uint8_t)q, (uint8_t)(q >> 8), 0x66, 0x77, 0x88});
                 } else {
                     m = frame(d.id, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88});
@@ -821,6 +827,7 @@ struct IsoNode {
 };
 static IsoNode s_ecmNode{"ECM", 0x7E0, 0x7E8}, s_tcmNode{"TCM", 0x7E1, 0x7E9};
 static IsoNode s_biuNode{"BIU", 0x750, 0x758}, s_meterNode{"meter", 0x7C0, 0x7D0};
+static IsoNode s_vdcNode{"VDC", 0x7DE, 0x764};
 static IsoNode s_epsNode{"EPS", 0x18DA30F1, 0x18DAF130};
 sim::OthersSim sim::others;
 std::map<uint32_t, int> sim::isoRequests;
@@ -854,6 +861,8 @@ static uint8_t ssmByte(uint32_t a) {
         case 0x23: return 101;
         case 0x24: return (uint8_t)(128 - 70 + v.throttle);
         case 0x29: return (uint8_t)std::lround(v.throttle * 2.55);
+        case 0x3C: return 65;                                 // Intake VVT R
+        case 0x3D: return 65;                                 // Intake VVT L
         case 0x46: return 128;                                // lambda 1.0
         case 0x4A: return (uint8_t)(v.gear - 1);
         case 0x10E: return odo2 >> 8;                        // odometer, 2 km a count
@@ -896,7 +905,21 @@ static void ssmHandle(const std::vector<uint8_t> &req) {
     const uint64_t at = simrtos::nowUs() + ecu.replyLatencyUs;
     if (req[0] == 0xAA) {
         std::vector<uint8_t> r = {0xEA, 0xA1, 0x10, 0x09, 0x5B, 0x44, 0x3C, 0x41, 0x07};
-        for (int i = 0; i < 96; i++) r.push_back(0xFF);   // every parameter supported
+        if (ecu.ssmPartialCaps) {
+            // Real 2009 Legacy B4 5B443C4107 capability flags (96 bytes):
+            // 0x113 Oil temp (cap 35, bit 5) = 0; 0x03C VVT R (cap 7, bit 8) = 1.
+            static const uint8_t CAPS[96] = {
+                0xF3,0xFA,0xC9,0x8C,0x82,0x06,0xFC,0xA8,0x00,0x10,0x00,0x4E,0xCE,0x54,0xFD,0xB8,
+                0x00,0x00,0x0F,0x20,0x00,0x00,0x00,0x00,0x00,0xDC,0x00,0x00,0x5D,0x1F,0x70,0x80,
+                0xF0,0xE4,0x00,0x00,0x53,0xFB,0x00,0xF5,0xE9,0x8E,0x00,0x00,0x00,0x01,0x2D,0xF1,
+                0xA0,0x00,0xA8,0x00,0x00,0x00,0x00,0x00,0xE0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+            };
+            r.insert(r.end(), CAPS, CAPS + 96);
+        } else {
+            for (int i = 0; i < 96; i++) r.push_back(0xFF);   // every parameter supported
+        }
         nodeSend(s_ecmNode, r, at);
         return;
     }
@@ -911,7 +934,8 @@ static void ssmHandle(const std::vector<uint8_t> &req) {
         }
         if (bad || (ecu.ssmMaxAddrs && (int)n > ecu.ssmMaxAddrs)) {
             if (bad) ssmReadsWithBad++;
-            nodeSend(s_ecmNode, {0x7F, 0xA8, 0x31}, at);
+            const uint8_t nrc = (!bad && ecu.ssmMaxAddrs && (int)n > ecu.ssmMaxAddrs) ? ecu.ssmSizeNrc : 0x31;
+            nodeSend(s_ecmNode, {0x7F, 0xA8, nrc}, at);
             return;
         }
         nodeSend(s_ecmNode, r, at);
@@ -941,6 +965,13 @@ static void obdIsoHandle(IsoNode &n, const std::vector<uint8_t> &req, bool funct
     const uint64_t at = simrtos::nowUs() + (tcm ? ecu.tcmLatencyUs : ecu.replyLatencyUs);
     auto refuse = [&](uint8_t code) { if (!functional) nodeSend(n, {0x7F, svc, code}, at); };
     if (ecu.ignoreIso && ecu.ignoreIso(tcm, svc)) return;
+    if (svc == 0x3E && ecu.skipTesterPresent) return;
+    if (svc == 0x01 && tcm && req.size() >= 2 && req[1] == 0x00) {
+        uint8_t d[4];
+        bitmap(TCM_PIDS, 0x00, d);
+        nodeSend(n, {0x41, 0x00, d[0], d[1], d[2], d[3]}, at);
+        return;
+    }
     if (svc == 0x03 || svc == 0x07 || svc == 0x0A) {
         if (svc == 0x0A && !ecu.permanentCodes) { refuse(0x11); return; }
         const std::vector<uint16_t> c = codesOf(tcm, svc);
@@ -984,10 +1015,11 @@ static void otherHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functi
     auto refuse = [&](uint8_t code) { nodeSend(n, {0x7F, req[0], code}, at); };
     if (req[0] == 0x3E) { nodeSend(n, {0x7E, 0x00}, at); return; }
     if (functional) return;                      // the rest only to its own address
-    const bool biu = &n == &s_biuNode, meter = &n == &s_meterNode;
-    if (req[0] == 0x1A && req.size() == 2 && req[1] == 0x80 && (biu || meter)) {
+    const bool biu = &n == &s_biuNode, meter = &n == &s_meterNode, vdc = &n == &s_vdcNode;
+    if (req[0] == 0x1A && req.size() == 2 && req[1] == 0x80 && (biu || meter || vdc)) {
         std::vector<uint8_t> r = {0x5A, 0x80};
-        for (char ch : std::string(biu ? "88281AJ000 BIU" : "85002AJ000 METER")) r.push_back((uint8_t)ch);
+        const char *tag = biu ? "88281AJ000 BIU" : meter ? "85002AJ000 METER" : "27596AJ000 VDC";
+        for (char ch : std::string(tag)) r.push_back((uint8_t)ch);
         nodeSend(n, r, at);
         return;
     }
@@ -1029,7 +1061,10 @@ static void otherHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functi
 /** Does this node answer @p svc? */
 static void nodeHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functional) {
     if (req.empty()) return;
-    if (&n == &s_biuNode || &n == &s_meterNode || &n == &s_epsNode) { otherHandle(n, req, functional); return; }
+    if (&n == &s_biuNode || &n == &s_meterNode || &n == &s_vdcNode || &n == &s_epsNode) {
+        otherHandle(n, req, functional);
+        return;
+    }
     const bool tcm = &n == &s_tcmNode;
     if (!tcm && (req[0] == 0xAA || req[0] == 0xA8)) {
         if (!functional && ecu.ssmEnabled) ssmHandle(req);
@@ -1137,11 +1172,13 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
     transmitted.push_back({simrtos::nowUs(), *m});
     if (faults.errorPerOwnFrame > 0 && urand() < faults.errorPerOwnFrame) {
         C.busErrors++;
-        eccLatch(0, 0, 0x0A);                              // bit error, sending, data field
         C.tec += 8;
+        const bool bo = C.tec > 255;
+        eccLatch(0, 0, 0x0A, bo);                          // bit error, sending, data field
         raiseAlert(TWAI_ALERT_BUS_ERROR);
         if (C.tec >= 128) raiseAlert(TWAI_ALERT_ERR_PASS);
-        if (C.tec > 255) {
+        if (bo) {
+            C.tec = 128;                                   // SJA1000 bus-off recovery counter
             C.state = TWAI_STATE_BUS_OFF;
             raiseAlert(TWAI_ALERT_BUS_OFF);
             return ESP_OK;                                  // the frame is lost
@@ -1162,6 +1199,16 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
     } else if (sim::others.enabled) {
         if (!m->extd && m->identifier == s_biuNode.reqId)   nodeFrame(s_biuNode, *m, false);
         if (!m->extd && m->identifier == s_meterNode.reqId) nodeFrame(s_meterNode, *m, false);
+        if (!m->extd && sim::others.func700 && m->identifier == s_vdcNode.reqId)
+            nodeFrame(s_vdcNode, *m, false);
+        if (!m->extd && sim::others.func700 && m->identifier == 0x700) {
+            nodeFrame(s_biuNode, *m, true);
+            nodeFrame(s_vdcNode, *m, true);
+        }
+        if (!m->extd && sim::others.injectStrayOn720 && m->identifier == 0x720) {
+            sim::others.injectStrayOn720 = false;          // one-shot stray reply: fails PH_VERIFY
+            schedule(simrtos::nowUs() + 2000, frame(0x76E, {0x02, 0x7E, 0x00, 0, 0, 0, 0, 0}));
+        }
         if (m->extd && m->identifier == s_epsNode.reqId)    nodeFrame(s_epsNode, *m, false);
         if (m->extd && m->identifier == 0x18DB33F1)         nodeFrame(s_epsNode, *m, true);
     }
@@ -1245,8 +1292,9 @@ static void busTask(void *) {
         lastIdle = now;
         if (faults.busOffNow && C.installed && C.mode == TWAI_MODE_NORMAL && C.state == TWAI_STATE_RUNNING) {
             faults.busOffNow = false;
-            C.tec = 256;
+            C.tec = 128;
             C.state = TWAI_STATE_BUS_OFF;
+            eccLatch(0, 0, 0x03, true);                    // bit error sending SOF, frozen by bus-off
             raiseAlert(TWAI_ALERT_BUS_OFF);
             flagCheck();
         }

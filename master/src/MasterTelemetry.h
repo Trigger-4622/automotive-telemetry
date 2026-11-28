@@ -133,6 +133,8 @@ struct MasterStats {
     uint32_t guardPauseMs; /**< Pause left, ms (0 = requests allowed).      */
     bool     guardSilent;  /**< A guard forced the controller to listen-only.*/
     bool     rxGuardSilent;/**< The receive-error guard did, specifically.  */
+    bool     busOffStorm;  /**< Hard circuit-breaker: >= 3 bus-offs in 30 s.*/
+    uint32_t busOffBackoffMs; /**< Exponential post-bus-off TX backoff left. */
     /** @} */
     /** @name Link quality: where the errors come from (main.cpp: missAccount,
      *  radioNoteErrors). Index [0] normal mode, [1] listen-only.

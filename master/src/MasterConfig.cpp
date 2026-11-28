@@ -788,8 +788,8 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     // Slower than ~1 s and the displays' 1.5 s stale timeout starts to bite.
     broadcastMs  = constrain(broadcastMs, 20, 1000);
     if (metricTtlMs < 200) metricTtlMs = 200;
-    // At least 2: a two-byte value is two addresses. FreeSSM's ceiling is 33.
-    ssmBatchMax  = constrain(ssmBatchMax, 2, 33);
+    // Down to 1 for ECUs that reject multi-address 0xA8 with NRC 0x12; FreeSSM ceiling is 33.
+    ssmBatchMax  = constrain(ssmBatchMax, 1, 33);
     if (bitrateKbps != 125 && bitrateKbps != 250 && bitrateKbps != 500 && bitrateKbps != 1000)
         bitrateKbps = CAN_BITRATE_KBPS;
     if (sleepIdleS < 10) sleepIdleS = 10;
@@ -839,7 +839,7 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     }
     // A computer's data block read into the frame table: a request ID (11-bit,
     // or 29-bit above 0x7FF), its reply ID, the block, how often. Anything
-    // malformed or repeated is dropped, not guessed at.
+    // malformed or colliding on the same reply ID is dropped/deduplicated.
     if (v["reads"].is<JsonArrayConst>()) {
         reads.clear();
         for (JsonVariantConst e : v["reads"].as<JsonArrayConst>()) {
@@ -852,7 +852,16 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
             if (!r.tx || !r.rx || r.tx == r.rx || r.tx > 0x1FFFFFFF || r.rx > 0x1FFFFFFF ||
                 (r.tx > 0x7FF) != (r.rx > 0x7FF)) continue;
             bool dup = false;
-            for (const RtRead &o : reads) dup |= o.tx == r.tx && o.lid == r.lid;
+            for (RtRead &o : reads) {
+                if ((o.tx == r.tx && o.lid == r.lid) ||
+                    (o.rx == r.rx && (o.lid == r.lid || o.tx != r.tx))) {
+                    // Prefer physical addressing (tx == rx - 8, e.g. 0x750 -> 0x758)
+                    // over functional broadcast (e.g. 0x700 -> 0x758) on collision.
+                    if (o.rx == r.rx && o.tx != o.rx - 8 && r.tx == r.rx - 8) o = r;
+                    dup = true;
+                    break;
+                }
+            }
             if (!dup) reads.push_back(r);
         }
     }

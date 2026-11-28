@@ -42,6 +42,7 @@
 #if defined(ESP_PLATFORM)
 #include "soc/gpio_reg.h"         // the restart latch (__wrap_esp_restart_noos)
 #include "soc/rtc_cntl_reg.h"
+#include "hal/twai_hal.h"         // ISR ECC capture (__wrap_twai_hal_get_events)
 #endif
 
 #include "MasterPacket.h"
@@ -287,10 +288,30 @@ static MasterMetric *findSlot(uint16_t id) {
     return nullptr;
 }
 
+/**
+ * @brief Physical-range guard for raw CAN signals: inherently non-negative
+ *        quantities (MAF, RPM, speed, MAP, voltages, levels) must never let a
+ *        bad offset, DFCO drop-to-zero, or signed-float glitch overwrite a
+ *        live OBD-II/SSM2 reading.
+ */
+static bool metricRawPlausible(uint16_t id, float v) {
+    switch (id) {
+        case METRIC_ID_MAF:
+        case METRIC_ID_RPM:
+        case METRIC_ID_SPEED:
+        case METRIC_ID_BATT_VOLTAGE:
+        case METRIC_ID_FUEL_RATE:
+            return v >= 0.0f;
+        default:
+            return true;
+    }
+}
+
 void publishMetric(uint16_t id, float value, uint8_t source) {
     // A NaN would also defeat the broadcaster's change test (NaN != NaN) and
     // go out every burst.
     if (!isfinite(value)) return;
+    if (source == SRC_RAW && !metricRawPlausible(id, value)) return;
     const uint32_t now = millis();
     portENTER_CRITICAL(&s_metricMux);
     MasterMetric *slot = findSlot(id);
@@ -484,6 +505,17 @@ static volatile bool     s_guardSilent  = false;
  *  so it protects even with the (transmit-side) bus guard turned off - which is
  *  how the car is configured - and clears on its own setting, not the guard's. */
 static volatile bool     s_rxGuardSilent = false;
+/** Hard bus-off storm circuit-breaker: >= BO_STORM_MAX bus-offs within
+ *  BO_STORM_WIN_MS latches listen-only even when guard and rx_guard are off,
+ *  preventing hundreds of consecutive bus-offs (P1718 risk). Cleared by
+ *  diagGuardReset() (portal Resume). */
+static volatile bool     s_busOffStorm   = false;
+static constexpr uint32_t BO_STORM_WIN_MS = 30000;
+static constexpr uint8_t  BO_STORM_MAX    = 3;
+static volatile uint32_t s_boBackoffAt   = 0;
+static volatile uint32_t s_boBackoffMs   = 0;
+static volatile uint8_t  s_boBackoffStep = 0;
+static volatile bool     s_boStormReset  = false;   /**< Reset busGuardTask's storm history. */
 static volatile bool     s_twaiReinstall = false;   /**< RX task reinstalls TWAI. */
 static volatile bool     s_twaiWantSilent = false;  /**< ...in this mode.        */
 static volatile bool     s_twaiSilentNow  = false;  /**< Mode actually installed. */
@@ -527,6 +559,12 @@ size_t masterStacks(StackView *out, size_t max) {
 /** @brief Milliseconds of guard pause left (0 = not paused). */
 static uint32_t guardPauseLeft() {
     const uint32_t len = s_guardPauseMs, elapsed = millis() - s_guardPauseAt;
+    return elapsed < len ? len - elapsed : 0;
+}
+
+/** @brief Milliseconds of exponential post-bus-off TX backoff left (0 = ready). */
+static uint32_t boBackoffLeft() {
+    const uint32_t len = s_boBackoffMs, elapsed = millis() - s_boBackoffAt;
     return elapsed < len ? len - elapsed : 0;
 }
 
@@ -577,8 +615,10 @@ bool diagGuardOk() {
     // A listen-only controller cannot transmit whatever the guard setting,
     // and nothing is sent while the bus settles, onto a bus that has gone
     // quiet, in SILENT (the moment it is chosen, not once the controller has
-    // been switched), or while the driver is being replaced or removed.
-    if (s_guardSilent || s_rxGuardSilent || s_twaiSilentNow || settleLeft()) return false;
+    // been switched), during a bus-off storm or post-bus-off backoff, or while
+    // the driver is being replaced or removed.
+    if (s_guardSilent || s_rxGuardSilent || s_busOffStorm || s_twaiSilentNow || settleLeft()) return false;
+    if (boBackoffLeft() > 0) return false;
     if (!heardWithin(TX_LIVE_MS) || Cfg.diagMode == DIAG_MODE_SILENT) return false;
     if (s_twaiReinstall || s_twaiShutdown) return false;
     if (!Cfg.guardEnabled) return true;
@@ -590,8 +630,8 @@ static uint8_t diagActivityMask() {
     uint8_t m = 0;
     if (s_obdActive)                        m |= 0x01;   // OBD-II poller running
     if (settleLeft())                       m |= 0x02;   // in the settle wait
-    if (s_guardSilent || s_rxGuardSilent || s_twaiSilentNow) m |= 0x04;  // listen-only
-    if (!(m & 0x04) && guardPauseLeft() == 0 && !settleLeft()) m |= 0x08; // free to transmit
+    if (s_guardSilent || s_rxGuardSilent || s_busOffStorm || s_twaiSilentNow) m |= 0x04;  // listen-only
+    if (!(m & 0x04) && guardPauseLeft() == 0 && boBackoffLeft() == 0 && !settleLeft()) m |= 0x08; // free to transmit
     m |= (uint8_t)((Cfg.diagMode & 0x0F) << 4);
     return m;
 }
@@ -601,6 +641,10 @@ void diagGuardReset() {
     s_guardTrips = 0;
     s_guardSilent = false;           // the guard task switches the mode back
     s_rxGuardSilent = false;         // and leaves the receive-error listen-only
+    s_busOffStorm = false;           // and clears a bus-off storm latch
+    s_boBackoffMs = 0;
+    s_boBackoffStep = 0;
+    s_boStormReset = true;
     evLog(EV_RESUME);
     log_i("bus guard: reset by user - requests resumed");
 }
@@ -1221,6 +1265,17 @@ static void refreshSignals() {
     s_sigs.assign(Cfg.signals.begin(), Cfg.signals.begin() + n);
     Cfg.unlock();
     verifyCarry(s_verify, from, n, MAX_SIGNALS);
+    // Any metric whose raw signal was switched off or rejected immediately
+    // yields to live OBD-II / SSM2 readings instead of holding SRC_RAW priority.
+    portENTER_CRITICAL(&s_metricMux);
+    for (auto &m : s_metrics) {
+        if (!m.used || m.source != SRC_RAW) continue;
+        bool hasRaw = false;
+        for (const auto &sg : s_sigs)
+            if (sg.publishes() && sg.metricId == m.id) { hasRaw = true; break; }
+        if (!hasRaw) m.source = SRC_NONE;
+    }
+    portEXIT_CRITICAL(&s_metricMux);
     for (auto &sg : s_sigs) {
         sg.ownMask = leverOwnMask(sg);
         if (!sg.ownMask) continue;
@@ -1738,6 +1793,31 @@ static void obdCountSupported() {
 }
 
 /**
+ * @brief Auto-disable configured OBD-II PIDs the ECU's live supported-PID
+ *        bitmap reports as unsupported (bit 0). Only called once every
+ *        existing range (0x00/20/40/60...) has been read, so a transient miss
+ *        on one range never disables supported PIDs.
+ */
+static void autoDisableUnsupportedPids() {
+    size_t disabled = 0;
+    Cfg.lock();
+    for (auto &p : Cfg.pids) {
+        if (!p.enabled) continue;
+        if (!((s_pidSupport[p.pid >> 3] >> (p.pid & 7)) & 1)) {
+            p.enabled = false;
+            disabled++;
+        }
+    }
+    if (disabled) {
+        Cfg.generation++;
+        Cfg.requestSave();
+    }
+    Cfg.unlock();
+    if (disabled)
+        log_i("OBD-II: auto-disabled %u PID(s) unsupported by this ECU", (unsigned)disabled);
+}
+
+/**
  * @brief Read the supported-PID bitmaps 0x00, 0x20 … 0xC0.
  *
  * Asks the engine ECU directly first. If it will not answer a physical
@@ -1778,6 +1858,7 @@ static AskResult obdProbe(bool &rangesComplete) {
     rangesComplete = obdProbeRanges();
     obdCountSupported();
     s_pidSupportKnown = true;
+    if (rangesComplete) autoDisableUnsupportedPids();
     log_i("OBD-II: ECU supports %u PIDs (%s addressing)%s", s_pidSupportCount,
           s_obdPhysical ? "physical 0x7E0" : "functional 0x7DF",
           rangesComplete ? "" : " - some ranges still to read");
@@ -2001,9 +2082,10 @@ static void obdPollTask(void *) {
             lastRanges = millis();
             rangesComplete = obdProbeRanges();
             obdCountSupported();
-            if (rangesComplete)
+            if (rangesComplete) {
+                autoDisableUnsupportedPids();
                 log_i("OBD-II: all PID ranges read - ECU supports %u PIDs", s_pidSupportCount);
-            else if (++rangeTries >= 20) {           // 5 minutes: it is not coming
+            } else if (++rangeTries >= 20) {           // 5 minutes: it is not coming
                 rangesComplete = true;
                 log_w("OBD-II: some PID ranges never arrived - using the %u PIDs known",
                       s_pidSupportCount);
@@ -2326,14 +2408,57 @@ extern "C" void IRAM_ATTR __attribute__((noreturn)) __wrap_esp_restart_noos(void
 }
 #endif
 
+/* ═══════════════════════ ISR ECC capture ═════════════════════════════════
+ *
+ * On SJA1000 / ESP32 TWAI hardware, reading the error-code-capture register
+ * (ECC) clears it and rearms BEI, and ESP-IDF's twai_hal_get_events() does
+ * that inside the TWAI ISR on every running bus error. By the time
+ * busGuardTask wakes and reads TWAI.error_code_capture_reg.val, the register
+ * is already 0x00 (unless bus-off froze it). Linker-wrapping
+ * twai_hal_get_events() in IRAM captures ECC before ESP-IDF clears it and
+ * queues non-zero codes in a lock-free DRAM ring for busGuardTask.
+ */
+static constexpr size_t ECC_RING_SZ = 64;
+static DRAM_ATTR uint8_t s_eccRing[ECC_RING_SZ] = {};
+static DRAM_ATTR volatile uint32_t s_eccHead = 0;
+static DRAM_ATTR volatile uint32_t s_eccTail = 0;
+
+static inline void IRAM_ATTR eccIsrPush(uint8_t ecc) {
+    if (!ecc) return;
+    const uint32_t h = s_eccHead;
+    if (h - s_eccTail < ECC_RING_SZ) {
+        s_eccRing[h & (ECC_RING_SZ - 1)] = ecc;
+        s_eccHead = h + 1;
+    }
+}
+
+#if defined(ESP_PLATFORM)
+extern "C" uint32_t __real_twai_hal_get_events(twai_hal_context_t *hal_ctx);
+extern "C" uint32_t IRAM_ATTR __wrap_twai_hal_get_events(twai_hal_context_t *hal_ctx) {
+    // Capture ECC before __real_twai_hal_get_events() clears it via
+    // twai_ll_clear_err_code_cap(). Never read interrupt_reg here: reading it
+    // clears all pending IRQ flags before ESP-IDF sees them.
+    const uint8_t ecc = (hal_ctx && hal_ctx->dev)
+        ? (uint8_t)(hal_ctx->dev->error_code_capture_reg.val & 0xFF)
+        : 0;
+    const uint32_t ev = __real_twai_hal_get_events(hal_ctx);
+    if (ecc && (ev & (TWAI_HAL_EVENT_BUS_ERR | TWAI_HAL_EVENT_BUS_OFF)))
+        eccIsrPush(ecc);
+    return ev;
+}
+#else
+void masterIsrCaptureEcc(uint8_t ecc) { eccIsrPush(ecc); }
+#endif
+
 /** @name Passive transmit mode (Cfg.txPassive)
  *  TEC is set this high right after the controller starts in normal mode,
  *  and topped up whenever the node's own successful frames (-1 each) have
- *  brought it down to the low mark. 220 leaves room for four transmit errors
- *  (+8 each) before bus-off at 256.
+ *  brought it down to the low mark. 184 stays well above the 128 error-passive
+ *  floor while leaving room for nine transmit errors (+8 each) before bus-off
+ *  at 256 (up from four at 220).
  *  @{ */
-static constexpr uint32_t TEC_PASSIVE     = 220;
-static constexpr uint32_t TEC_PASSIVE_LOW = 170;
+static constexpr uint32_t TEC_PASSIVE     = 184;
+static constexpr uint32_t TEC_PASSIVE_LOW = 152;
 /**
  * TEC in listen-only (listenOnlyErratumFix), well clear of 128: on the car
  * the S3 read 128 back as 127 straight after leaving reset mode, which left
@@ -2377,6 +2502,11 @@ static volatile uint32_t s_tecSeen = 0, s_recSeen = 0;
  * @return TEC as read back after the last write.
  */
 static uint32_t tecWrite(uint32_t tec, int rec = -1) {
+    // Keep the TX pad detached recessive across reset-mode entry/exit when
+    // called from normal mode (txPassiveTopUp), so a controller reset toggle
+    // can never glitch the transceiver TXD pin.
+    const bool detach = s_txLive;
+    if (detach) txPadRecessive();
     uint32_t got = 0;
     for (int attempt = 0; attempt < 3; attempt++) {
         masterBusBlind();            // a frame arriving now is lost to us
@@ -2388,6 +2518,7 @@ static uint32_t tecWrite(uint32_t tec, int rec = -1) {
         got = twai_ll_get_tec(&TWAI);
         if (tec < 128 || got >= 128) break;
     }
+    if (detach) txPadAttach();
     return got;
 }
 static void tecSet(uint32_t tec) { tecWrite(tec); }
@@ -2924,6 +3055,9 @@ static void busGuardTask(void *) {
     uint32_t lastRepin = 0;                   /**< Last listen-only pin (ms).         */
     bool     repinLogged = false;
     uint32_t rxWinStart = 0, rxWinErrs = 0;   /**< Receive-side errors, per window. */
+    uint32_t boTimes[BO_STORM_MAX] = {};      /**< Timestamps of recent bus-offs.   */
+    uint8_t  boCount = 0;
+    uint32_t boLastMs = 0;
     bool     wasPassive = false, wasSettling = false;
     bool     ctrlRunning = false;             /**< Last status read said RUNNING. */
     /** Last status read said bus-off or recovering: the driver will not be
@@ -2931,6 +3065,16 @@ static void busGuardTask(void *) {
      *  recovery in progress must finish), so no mode switch is asked for. */
     bool     ctrlOffBus = false;
     for (;;) {
+        if (s_boStormReset) {
+            s_boStormReset = false;
+            boCount = 0;
+            boLastMs = 0;
+        }
+        // Reset backoff/storm history after 60 s of clean normal operation.
+        if (boCount > 0 && ctrlRunning && !s_twaiSilentNow && millis() - boLastMs >= 60000) {
+            boCount = 0;
+            s_boBackoffStep = 0;
+        }
         // Mode follows the settings. Turning the guard off also ends a
         // listen-only it imposed: the user has taken responsibility.
         if (!Cfg.guardEnabled && s_guardSilent) {
@@ -2953,7 +3097,7 @@ static void busGuardTask(void *) {
         }
         wasSettling = settling;
         const bool wantSilent = Cfg.diagMode == DIAG_MODE_SILENT || s_guardSilent ||
-                                s_rxGuardSilent || settleLeft();
+                                s_rxGuardSilent || s_busOffStorm || settleLeft();
         // Towards listen-only the switch is immediate: every moment in normal
         // mode after a guard trip is another moment of error flags on the
         // car's traffic, and the likeliest trip is right after the settle
@@ -3043,6 +3187,9 @@ static void busGuardTask(void *) {
                         s_twaiWantSilent = true;
                         s_twaiReinstall  = true;
                     } else {
+                        // Refresh the post-bus-off backoff start so the full
+                        // backoff runs after returning to RUNNING.
+                        if (s_boBackoffMs) s_boBackoffAt = millis();
                         twaiGoLive(s_twaiSilentNow);   // recovery finished: counters at 0
                     }
                 }
@@ -3082,10 +3229,36 @@ static void busGuardTask(void *) {
         const bool tecRose = tecWrites == lastTecWrites && st.tx_error_counter > lastTec;
         lastTecWrites = tecWrites;
         lastTec = st.tx_error_counter;
-        if (delta && delta < 10000) {        // (a reinstall resets the count)
-            errKindAdd(ecc, stSilent, delta);
-            rawRecErrors(delta, ecc, stSilent, tecRose, (uint8_t)(st.tx_error_counter > 255 ? 255 : st.tx_error_counter),
-                         (uint8_t)(st.rx_error_counter > 255 ? 255 : st.rx_error_counter));
+        if (delta >= 10000) {
+            // Reinstall reset bus_error_count; drop any stale ISR ECC captures.
+            s_eccTail = s_eccHead;
+        } else if (delta) {
+            const uint8_t tec8 = (uint8_t)(st.tx_error_counter > 255 ? 255 : st.tx_error_counter);
+            const uint8_t rec8 = (uint8_t)(st.rx_error_counter > 255 ? 255 : st.rx_error_counter);
+            uint32_t taken = 0;
+            uint8_t runCode = 0;
+            uint32_t runCnt = 0;
+            while (taken < delta && s_eccTail != s_eccHead) {
+                const uint8_t c = s_eccRing[s_eccTail & (ECC_RING_SZ - 1)];
+                s_eccTail = s_eccTail + 1;
+                taken++;
+                if (runCnt && c != runCode) {
+                    errKindAdd(runCode, stSilent, runCnt);
+                    rawRecErrors(runCnt, runCode, stSilent, tecRose, tec8, rec8);
+                    runCnt = 0;
+                }
+                runCode = c;
+                runCnt++;
+            }
+            if (runCnt) {
+                errKindAdd(runCode, stSilent, runCnt);
+                rawRecErrors(runCnt, runCode, stSilent, tecRose, tec8, rec8);
+            }
+            if (taken < delta) {
+                const uint32_t rem = delta - taken;
+                errKindAdd(ecc, stSilent, rem);
+                rawRecErrors(rem, ecc, stSilent, tecRose, tec8, rec8);
+            }
             radioNoteErrors(delta);
             if (tecRose) {
                 s_errWhileTx += delta;
@@ -3167,23 +3340,49 @@ static void busGuardTask(void *) {
         // same errors back on the car's bus.
         if (wentBusOff) {
             log_w("TWAI bus-off - recovering");
-            if (Cfg.guardEnabled) {
-                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
-                if (diagGuardOk()) guardTrip("controller went bus-off");
-            } else if (Cfg.rxGuardEnabled && !s_rxGuardSilent) {
-                /*
-                 * Bus-off is the protocol itself throwing us off: our frames
-                 * failed 32 times over, each failure an active error flag on
-                 * the bus. With the transmit guard off, recovering and carrying
-                 * on as before would just do it all again, so the receive-error
-                 * guard's latch holds the controller listen-only until Resume.
-                 */
-                s_rxGuardSilent = true;
-                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 1);
-                log_e("bus-off with the bus guard off - switching to listen-only for this "
-                      "session (resume from the portal)");
+            const uint32_t now = millis();
+            boLastMs = now;
+            if (boCount < BO_STORM_MAX) {
+                boTimes[boCount++] = now;
             } else {
-                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
+                for (uint8_t k = 1; k < BO_STORM_MAX; k++) boTimes[k - 1] = boTimes[k];
+                boTimes[BO_STORM_MAX - 1] = now;
+            }
+            const bool storm = boCount >= BO_STORM_MAX && (now - boTimes[0]) <= BO_STORM_WIN_MS;
+            if (storm && !s_busOffStorm) {
+                // Hard circuit-breaker: applies even when guard and rx_guard
+                // are off, preventing hundreds of consecutive bus-offs.
+                s_busOffStorm = true;
+                evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 2);
+                log_e("bus-off storm: %u bus-offs in %u s - pausing TX and switching to "
+                      "listen-only (resume from the portal)",
+                      (unsigned)BO_STORM_MAX, (unsigned)(BO_STORM_WIN_MS / 1000));
+            } else {
+                // Exponential TX backoff after any bus-off: 500 ms -> 2 s -> 5 s.
+                static const uint32_t BO_BACKOFF_MS[] = { 500, 2000, 5000 };
+                const uint8_t step = s_boBackoffStep < 2 ? s_boBackoffStep : 2;
+                s_boBackoffMs = 0;
+                s_boBackoffAt = now;
+                s_boBackoffMs = BO_BACKOFF_MS[step];
+                if (s_boBackoffStep < 2) s_boBackoffStep++;
+                if (Cfg.guardEnabled) {
+                    evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
+                    if (!s_guardSilent && guardPauseLeft() == 0) guardTrip("controller went bus-off");
+                } else if (Cfg.rxGuardEnabled && !s_rxGuardSilent) {
+                    /*
+                     * Bus-off is the protocol itself throwing us off: our frames
+                     * failed 32 times over, each failure an active error flag on
+                     * the bus. With the transmit guard off, recovering and carrying
+                     * on as before would just do it all again, so the receive-error
+                     * guard's latch holds the controller listen-only until Resume.
+                     */
+                    s_rxGuardSilent = true;
+                    evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 1);
+                    log_e("bus-off with the bus guard off - switching to listen-only for this "
+                          "session (resume from the portal)");
+                } else {
+                    evLog(EV_BUS_OFF, (uint16_t)st.tx_error_counter, 0);
+                }
             }
         }
     }
@@ -3357,6 +3556,10 @@ size_t masterErrorKinds(ErrKindView *out, size_t max) {
 }
 
 void errKindText(uint8_t code, char *buf, size_t len) {
+    if (code == 0) {
+        snprintf(buf, len, "cleared/unavailable (0x00)");
+        return;
+    }
     static const char *TYPE[] = {"bit error", "form error", "stuff error", "error"};
     const char *seg;
     switch (code & 0x1F) {
@@ -3415,15 +3618,17 @@ void masterGetStats(MasterStats &out) {
     // Listen-only the user chose or the guard imposed - not the settle wait,
     // nor the moment after it while the controller switches back to normal.
     out.silent     = Cfg.diagMode == DIAG_MODE_SILENT || s_guardSilent || s_rxGuardSilent ||
-                     (s_twaiSilentNow && !settleLeft(3000));
+                     s_busOffStorm || (s_twaiSilentNow && !settleLeft(3000));
     out.settleMs   = settleLeft();
     out.errWhileTx = s_errWhileTx;
     out.errIdle    = s_errIdle;
     out.lomTecRead = s_lomTecRead;
     out.lomRepins  = s_lomRepins;
     out.guardTrips = s_guardTrips;
-    out.guardSilent = s_guardSilent || s_rxGuardSilent;
+    out.guardSilent = s_guardSilent || s_rxGuardSilent || s_busOffStorm;
     out.rxGuardSilent = s_rxGuardSilent;
+    out.busOffStorm = s_busOffStorm;
+    out.busOffBackoffMs = boBackoffLeft();
     out.guardPauseMs = guardPauseLeft();
     out.busBitsRx  = s_busBitsRx;
     out.canTx      = s_canTxCount;
@@ -3699,6 +3904,7 @@ static void setupTwai(bool silent) {
     // leaves it latched: there is no controller to give it to.)
     txPadRecessive();
     if (Cfg.txRecessiveHold) gpio_hold_en((gpio_num_t)CAN_TX_GPIO);
+    s_eccTail = s_eccHead;
     if (twai_driver_install(&g, &t, &f) != ESP_OK) {
         log_e("TWAI init failed — check CAN_TX/RX_GPIO wiring");
         return;

@@ -164,11 +164,67 @@ def run_portal():
     return "portal_teach", r.returncode, (r.stdout or "") + (r.stderr or ""), time.time() - t
 
 
+def run_canrec_unit():
+    """Verify canrec.py ECC 0x00 label, SJA1000 ECC decode, and per-session
+    Bus-Off / engine-running vs KOEO summary."""
+    import importlib.util
+    import struct
+    t = time.time()
+    spec = importlib.util.spec_from_file_location("canrec_mod", CANREC)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    lines = []
+    fails = 0
+
+    def chk(cond, msg, detail=""):
+        nonlocal fails
+        lines.append("  %s %s%s" % ("ok  " if cond else "FAIL", msg, "   " + detail if detail else ""))
+        if not cond:
+            fails += 1
+
+    e0 = mod.err_name(0x00)
+    chk(e0 == "cleared/unavailable (0x00)", "ECC 0x00 prints cleared/unavailable (0x00)", e0)
+    chk("BIT/TX/SOF" in mod.err_name(0x03), "ECC 0x03 decodes BIT/TX/SOF", mod.err_name(0x03))
+    chk("FORM/TX/tolerate_dominant" in mod.err_name(0x53), "ECC 0x53 decodes FORM/TX/tolerate_dominant", mod.err_name(0x53))
+    chk("BIT/TX/ID28-21" in mod.err_name(0x02), "ECC 0x02 decodes BIT/TX/ID28-21", mod.err_name(0x02))
+    chk("BIT/TX/SRTR" in mod.err_name(0x04), "ECC 0x04 decodes BIT/TX/SRTR", mod.err_name(0x04))
+    chk("BIT/TX/DATA" in mod.err_name(0x0A), "ECC 0x0A decodes BIT/TX/DATA", mod.err_name(0x0A))
+
+    # Build synthetic records with 2 sessions: S1 KOEO (0 bus-offs, 5 errors),
+    # S2 running + KOEO (2 bus-offs: 1 running, 1 KOEO; 10 errors: 7 running, 3 KOEO)
+    recs = [
+        ("session", 1, 1000000, 3),
+        ("frame", 1, 1010000, 0x231, False, False, False, 8, struct.pack("<H6B", 0, 0, 0, 0, 0, 0, 0)),
+        ("errors", 1, 1020000, 5, 0x00, 0x02, 200, 0),
+        ("session", 2, 1000000, 1),
+        ("frame", 2, 1010000, 0x231, False, False, False, 8, struct.pack("<H6B", 1800, 0, 0, 0, 0, 0, 0)),
+        ("errors", 2, 1020000, 7, 0x03, 0x00, 128, 0),
+        ("event", 2, 1025000, 5, 128, 0),
+        ("frame", 2, 2000000, 0x231, False, False, False, 8, struct.pack("<H6B", 0, 0, 0, 0, 0, 0, 0)),
+        ("errors", 2, 2010000, 3, 0x53, 0x00, 128, 0),
+        ("event", 2, 2015000, 5, 128, 2),
+    ]
+    st = mod.session_stats(recs)
+    chk(st[1]["bus_offs"] == 0 and st[1]["err_total"] == 5 and st[1]["err_koeo"] == 5,
+        "S1 KOEO stats exact", str(st[1]))
+    chk(st[2]["bus_offs"] == 2 and st[2]["bo_run"] == 1 and st[2]["bo_koeo"] == 1,
+        "S2 bus-offs split 1 running / 1 KOEO", str(st[2]))
+    chk(st[2]["err_total"] == 10 and st[2]["err_run"] == 7 and st[2]["err_koeo"] == 3,
+        "S2 errors split 7 running / 3 KOEO", str(st[2]))
+    lines.append("canrec_tool: %d/%d checks passed" % (len(lines) - fails, len(lines)))
+    return "canrec_tool", 1 if fails else 0, "\n".join(lines), time.time() - t
+
+
 def main():
     args = [a for a in sys.argv[1:] if a != "-v"]
     verbose = "-v" in sys.argv
     if args == ["portal_teach"]:                 # just the page's tests: no build needed
         name, code, out, dt = run_portal()
+        print(f"\n=== {name} ({dt:.1f} s) ===\n{out.rstrip()}")
+        print("\n" + ("ALL SCENARIOS PASSED" if code == 0 else "FAILED: " + name))
+        sys.exit(1 if code else 0)
+    if args == ["canrec_tool"]:
+        name, code, out, dt = run_canrec_unit()
         print(f"\n=== {name} ({dt:.1f} s) ===\n{out.rstrip()}")
         print("\n" + ("ALL SCENARIOS PASSED" if code == 0 else "FAILED: " + name))
         sys.exit(1 if code else 0)
@@ -182,7 +238,8 @@ def main():
     env.setdefault("DEVICE_CONFIG", os.path.join(HERE, "fixtures", "car_config_2026-09-25.json"))
     runs = []
     portal = not args or "portal_teach" in args
-    args = [a for a in args if a != "portal_teach"]
+    canrec_u = not args or "canrec_tool" in args
+    args = [a for a in args if a not in ("portal_teach", "canrec_tool")]
     for n in args or scenarios(env):               # (portal_teach alone was handled above)
         if n == "device_config" and not mine and fixtures:
             runs += [(n, f) for f in fixtures]
@@ -198,6 +255,13 @@ def main():
                 failed.append(name)
     if portal:
         name, code, out, dt = run_portal()
+        print(f"\n=== {name} ({dt:.1f} s) ===")
+        if out:
+            print(out.rstrip())
+        if code != 0:
+            failed.append(name)
+    if canrec_u:
+        name, code, out, dt = run_canrec_unit()
         print(f"\n=== {name} ({dt:.1f} s) ===")
         if out:
             print(out.rstrip())
