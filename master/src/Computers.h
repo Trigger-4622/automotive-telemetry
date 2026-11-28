@@ -89,7 +89,8 @@ struct CompFound {
 /** @brief The scan, for the portal. */
 struct CompStatus {
     uint8_t  phase = 0;           /**< 0 idle, 1 finding (11-bit), 2 finding (29-bit),
-                                       3 asking who they are, 4 searching one's data. */
+                                       3 asking who they are, 4 searching one's data,
+                                       5 verifying direct replies. */
     uint32_t at = 0;              /**< The ID being asked.                       */
     uint8_t  pct = 0;
     bool     scanned = false;     /**< A scan has finished since boot.           */

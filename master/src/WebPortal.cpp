@@ -449,7 +449,7 @@ document.addEventListener('change',e=>{
  if(el.dataset&&el.dataset.k){const v=parseEl(el);
   const why=v===undefined?'':refused(el.dataset.k,v);
   if(why){toast(why);if(el.type==='checkbox')el.checked=!!C[el.dataset.k];else el.value=C[el.dataset.k]??'';return}
-  if(v!==undefined){C[el.dataset.k]=v;fillBound();setDirty(true)}return}
+  if(v!==undefined){C[el.dataset.k]=v;if(el.dataset.k==='can_timing'&&v===0)C.can_sp875=false;fillBound();setDirty(true)}return}
  // An edit in the source tables (the switches above them only change the view).
  if(el.closest('#srcBox')&&!['srcEd','oAll','mAll'].includes(el.id))setDirty(true)});
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b),clone=o=>JSON.parse(JSON.stringify(o));
@@ -531,7 +531,7 @@ const SET_MAIN=[
   ['rx_guard','Receive-error guard','bool',0,'switches to listen-only if our controller starts corrupting other modules\' frames (a receive-error storm) — the protection against the transmission ECU losing the engine ECU\'s messages']]],
  ['CAN connection',[
   ['bitrate_kbps','CAN bitrate','sel',[[125,'125 kbit/s'],[250,'250 kbit/s'],[500,'500 kbit/s'],[1000,'1 Mbit/s']],'500 kbit/s on the OBD port'],
-  ['can_timing','CAN bit timing','sel',[[2,'87.5 %, triple sampling (recommended)'],[1,'87.5 %'],[0,'ESP-IDF preset (80 %)']],'87.5 % with triple sampling rides out spikes a single 80 % sample reads as errors']]],
+  ['can_timing','CAN bit timing','sel',[[2,'87.5 %, triple sampling (recommended)'],[1,'87.5 %'],[0,'80 %, SJW 3 (ESP-IDF preset)']],'87.5 % with triple sampling rides out spikes; 80 % (SJW 3) gives extra resync margin on noisy buses']]],
  ['Displays',[
   ['night_source','Night mode from','sel',[[2,"The car's light switch"],[1,'Light sensor on GPIO'],[0,'Never']]],
   ['broadcast_ms','Update every','num',[20,1000],'ms'],
@@ -552,7 +552,7 @@ const SET_ADV=[
   ['obd_p2can','After an unanswered request, wait at least (ISO 15765-4 P2CAN)','num',[0,2000],'ms from the send · 0 = off'],
   ['req_max_hz','Request budget','num',[0,200],'requests/s · 0 = no cap'],
   ['ssm_gap','Pause between SSM2 requests','num',[50,5000],'ms'],
-  ['ssm_batch','Values per SSM2 request','num',[2,33],'2–33'],
+  ['ssm_batch','Values per SSM2 request','num',[1,33],'1–33 (1 for ECUs refusing multi-address 0xA8)'],
   ['ssm_to','SSM2 reply timeout','num',[100,5000],'ms'],
   ['cover_ms','Skip a request while a better source is fresher than','num',[100,30000],'ms'],
   ['dtc_poll_s','Read the trouble codes every','num',[0,3600],'s while the car is on · 0 = only when asked']]],
@@ -648,7 +648,9 @@ async function learnAct(a,m){await post(`/api/learn/${a}?m=${m}`,a==='accept'?`L
    linking to the tab where it is dealt with. */
 function homeNotes(d){
  const v=id=>{const m=d.metrics.find(x=>x.id===id&&x.age<5000);return m?m.v:null},out=[];
- if(d.guard.rx_silent||d.guard.silent)out.push(['crit','<b>Listen-only to protect the bus</b>: bus errors followed our frames','bus']);
+ if(d.guard.bo_storm)out.push(['crit','<b>Bus-off storm — TX paused (listen-only)</b>: 3+ bus-offs in 30 s','bus']);
+ else if(d.guard.rx_silent||d.guard.silent)out.push(['crit','<b>Listen-only to protect the bus</b>: bus errors followed our frames','bus']);
+ else if(d.guard.bo_backoff)out.push(['warn',`<b>TX backoff</b> for ${Math.ceil(d.guard.bo_backoff/1000)} s after bus-off`,'bus']);
  else if(d.guard.pause)out.push(['warn',`<b>Requests paused</b> for ${Math.ceil(d.guard.pause/1000)} s after bus errors`,'bus']);
  const n=v(0x0400),mil=v(0x0101);
  if(n>0)out.push(['crit',`<b>${Math.round(n)} trouble code${n>=2?'s':''}</b>${mil?' · check-engine lamp on':''}`,'car']);
@@ -679,8 +681,10 @@ function renderHome(){
   if(nObd)say+=`OBD-II is asked for ${nObd} the car does not broadcast`+(nSsm?`, and SSM2 for ${nSsm} more OBD-II has no PID for. `:'. ');
   else if(nSsm)say+=`SSM2 is asked for ${nSsm}. `;
   if(d.obd.answers===2&&d.ssm.answers===2)say+='<span class="warn">The ECU answers neither OBD-II nor SSM2.</span> ';
-  if(d.guard.rx_silent)say+='<span class="crit">Our controller was corrupting other modules\' frames, so the master switched itself to listen-only.</span> See the Bus tab. ';
+  if(d.guard.bo_storm)say+='<span class="crit">Bus-off storm detected (3+ bus-offs in 30 s) — TX paused and switched to listen-only.</span> See the Bus tab. ';
+  else if(d.guard.rx_silent)say+='<span class="crit">Our controller was corrupting other modules\' frames, so the master switched itself to listen-only.</span> See the Bus tab. ';
   else if(d.guard.silent)say+='<span class="crit">Bus errors kept following our requests, so the master switched itself to listen-only.</span> See the Bus tab. ';
+  else if(d.guard.bo_backoff)say+=`<span class="warn">TX backed off for ${Math.ceil(d.guard.bo_backoff/1000)} s after a bus-off.</span> `;
   else if(d.guard.pause)say+=`<span class="warn">Requests paused for ${Math.ceil(d.guard.pause/1000)} s after bus errors.</span> `;
   if(todo)say+=`${todo} more ${todo===1?'is':'are'} being learned (Signals tab).`;
  }
@@ -746,7 +750,7 @@ const EK_SEG={3:'start of frame',2:'identifier',6:'identifier',7:'identifier',15
  4:'control bits',5:'control bits',12:'control bits',13:'control bits',9:'control bits',11:'length code',10:'data field',
  8:'CRC sequence',24:'CRC delimiter',25:'ACK slot',27:'ACK delimiter',26:'end of frame',18:'intermission',
  17:'active error flag',22:'passive error flag',19:'dominant bits after an error flag',23:'error delimiter',28:'overload flag'};
-function ekText(c){return['bit error','form error','stuff error','error'][c>>6]+' while '+((c&32)?'receiving':'sending')+' in '+(EK_SEG[c&31]||'segment '+(c&31))}
+function ekText(c){if(!c)return'cleared/unavailable (0x00)';return['bit error','form error','stuff error','error'][c>>6]+' while '+((c&32)?'receiving':'sending')+' in '+(EK_SEG[c&31]||'segment '+(c&31))}
 /* Where the errors come from: the car's regular frames the master missed
    (a gap in an ID's rhythm is a frame it misread), by mode, and the errors
    checked against our own radio. */
@@ -770,10 +774,12 @@ function renderBusTiles(){
  $('#ekTab').innerHTML=ks.map(k=>`<tr><td>${ekText(k.c)}</td><td>${k.s?'listen-only':'normal'}</td><td>${k.n}</td></tr>`).join('');
  $('#bErrTx').textContent=d.bus.err_tx;$('#bErrTx').className='v '+(d.bus.err_tx?'crit':'ok');
  $('#bErrTxS').textContent=`${d.bus.err_idle} while we were quiet`;
- const g=d.guard;$('#gCard').hidden=!(g.silent||g.pause);
+ const g=d.guard;$('#gCard').hidden=!(g.silent||g.pause||g.bo_storm||g.bo_backoff);
  const trips=C.guard_trips||3;
- if(g.rx_silent)$('#gSay').innerHTML='Our controller\'s receive-error counter climbed into the error-warning region: it was error-flagging — destroying — other modules\' frames, which is how the transmission ECU loses the engine ECU\'s messages. It was switched to <b>listen-only</b>. Check the transceiver ground and stub length, try the late sample point (Settings → CAN connection: bit timing), then resume. The evidence log below has the record.';
+ if(g.bo_storm)$('#gSay').innerHTML='<b>Bus-off storm circuit-breaker tripped</b> (3+ bus-offs in 30 s): TX was paused and the controller switched to <b>listen-only</b> to protect the car (prevents P1718). Check transceiver 3.3 V power, ground, TXD joint, and bit timing (try 80 % SJW 3), then press Resume.';
+ else if(g.rx_silent)$('#gSay').innerHTML='Our controller\'s receive-error counter climbed into the error-warning region: it was error-flagging — destroying — other modules\' frames, which is how the transmission ECU loses the engine ECU\'s messages. It was switched to <b>listen-only</b>. Check the transceiver ground and stub length, try the late sample point (Settings → CAN connection: bit timing), then resume. The evidence log below has the record.';
  else if(g.silent)$('#gSay').innerHTML='Bus errors kept following our frames, so the controller was switched to <b>listen-only</b> — it cannot disturb the car now. Fix the wiring (see below), then resume. The guard can be turned off in Settings → Bus protection.';
+ else if(g.bo_backoff)$('#gSay').innerHTML=`Controller recovered from bus-off; TX is backed off for another ${Math.ceil(g.bo_backoff/1000)} s before sending again.`;
  else if(g.pause)$('#gSay').innerHTML=`Bus errors followed our frames, so all requests are paused for another ${Math.ceil(g.pause/1000)} s (pause ${g.trips} of ${trips}; the last one switches to listen-only).`;
  $('#bLoad').textContent=d.bus.alive?RATES.load.toFixed(0)+'%':'–';
  const bar=$('#bBar');bar.style.width=Math.min(100,RATES.load)+'%';
@@ -1508,7 +1514,7 @@ function evDetail(e){
  if(e.t===2)return`after ${e.a} s of listening`;
  if(e.t===3)return`trip ${e.a}${e.b?' → listen-only':''}`;
  if(e.t===4)return`REC ${e.a}, ${e.b} receive errors in the window → listen-only`;
- if(e.t===5)return`TEC ${e.a}${e.b?' → listen-only (bus guard off)':''}`;
+ if(e.t===5)return`TEC ${e.a}${e.b===2?' → bus-off storm (listen-only)':e.b?' → listen-only (bus guard off)':''}`;
  return''}
 function pollEvlog(){return solo('ev',pollEvlogOnce)}
 async function pollEvlogOnce(){
@@ -1645,17 +1651,17 @@ async function pollCompOnce(){
  try{CC=await req('/api/computers',null,5000)}catch(e){return}
  renderComp();
  if(CC.phase)setTimeout(pollComp,1000)}
-const isRead=(tx,l)=>(C.reads||[]).some(r=>r.tx===tx&&r.lid===l);
+const isRead=(tx,rx,l)=>(C.reads||[]).some(r=>(r.tx===tx&&r.lid===l)||(r.rx===rx&&r.lid===l));
 function renderComp(){
  const d=CC;if(!d)return;
- const found=d.found||[],PH=['','asking','asking every 29-bit computer','asking who they are','searching'];
+ const found=d.found||[],PH=['','asking','asking every 29-bit computer','asking who they are','searching','verifying'];
  $('#ccSub').textContent=d.phase?`${PH[d.phase]||''} ${d.phase===4?'21 '+h2(d.at):hex(d.at,3)}…`:found.length?`${found.length} found`:'';
  $('#ccBarBox').hidden=!d.phase;$('#ccBar').style.width=(d.pct||0)+'%';$('#ccBtn').disabled=!!d.phase;
  $('#ccList').innerHTML=found.length?found.map((f,i)=>{
   const s=d.searching===i?`<span class="muted">searching its data blocks… ${d.pct} %</span>`:
    f.search===3?'<span class="muted">no data blocks to search: it has no service 21</span>':
    f.search===2?(f.lids.length?f.lids.map(([l,n])=>`<span style="white-space:nowrap;margin-right:10px">21 ${h2(l)} · ${n} B `+
-    (isRead(f.tx,l)?'<span class="ok">read</span>':`<button class="b s p" onclick="compRead(${f.tx},${f.rx},${l})">Read</button>`)+'</span>').join(''):
+    (isRead(f.tx,f.rx,l)?'<span class="ok">read</span>':`<button class="b s p" onclick="compRead(${f.tx},${f.rx},${l})">Read</button>`)+'</span>').join(''):
     '<span class="muted">no block answered</span>'):
    `<button class="b s" onclick="compSearch(${i})"${d.phase?' disabled':''}>Find its data</button>`;
   return`<div class="lr"><div class="lt"><span class="mono"><b>${compAddr(f.tx)}</b> → ${compAddr(f.rx)}</span></div>
@@ -1667,7 +1673,7 @@ function renderComp(){
    'record the bus while a scan tool reads it (Bus tab, Raw recording, master\'s requests off) and the tool\'s requests are in the file. ':'');
  const rs=d.reads||[];
  $('#ccRead').innerHTML=(C.reads||[]).length?(C.reads||[]).map((r,i)=>{const s=rs[i]&&rs[i].tx===r.tx&&rs[i].lid===r.lid?rs[i]:null;
-  return`<div class="lr"><div class="lt"><span><span class="mono"><b>${compAddr(r.tx)} 21 ${h2(r.lid)}</b></span> every ${r.ms} ms</span>
+  return`<div class="lr"><div class="lt"><span><span class="mono"><b>${compAddr(r.tx)}</b> → ${compAddr(r.rx)} <b>21 ${h2(r.lid)}</b></span> every ${r.ms} ms</span>
    <button class="x" title="Stop reading it" onclick="compUnread(${i})">✕</button></div>
    <div class="ls"><span>${s?`${s.reads} answers (${s.len} bytes), ${s.fails} failed · ${s.age==null?'no answer yet':s.age<2000?'last just now':'last '+ago(Math.round(s.age/1000))}`+
    (s.note?` · <span class="warn">${esc(s.note)}</span>`:''):'not read yet'}</span></div></div>`}).join('')+
@@ -1685,6 +1691,8 @@ async function compSearch(i){
 async function compRead(tx,rx,lid){
  if(!LOADED){toast('Not loaded yet');return}
  const rd=C.reads||[];
+ const dup=rd.find(r=>(r.tx===tx&&r.lid===lid)||(r.rx===rx&&(r.lid===lid||r.tx!==tx)));
+ if(dup){toast(`Already reading ${compAddr(rx)} via ${compAddr(dup.tx)} — remove it first`);return}
  if(rd.length>=16){toast('16 blocks at most');return}
  C.reads=rd.concat([{tx,rx,lid,ms:500}]);setDirty(true);await save();renderComp()}
 async function compUnread(i){C.reads=(C.reads||[]).filter((_,k)=>k!==i);setDirty(true);await save();renderComp()}
@@ -2138,6 +2146,8 @@ void WebPortal::setupRoutes() {
         g["pause"]  = st.guardPauseMs;
         g["silent"] = st.guardSilent;
         g["rx_silent"] = st.rxGuardSilent;
+        g["bo_storm"]   = st.busOffStorm;
+        g["bo_backoff"] = st.busOffBackoffMs;
         b["ids"] = masterCensusCount();
 
         JsonObject o = doc["obd"].to<JsonObject>();

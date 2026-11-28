@@ -28,3 +28,6 @@ void     twai_ll_set_tec(twai_dev_t *hw, uint32_t tec);
 /** Abort transmission: the frame in the buffer is not retransmitted after its
  *  current attempt (an aborted frame completes as failed). */
 void     twai_ll_set_cmd_abort_tx(twai_dev_t *hw);
+/** Host-sim hook called from the simulated TWAI ISR on bus error, before the
+ *  simulated IDF ISR clears error_code_capture_reg (models __wrap_twai_hal_get_events). */
+void     masterIsrCaptureEcc(uint8_t ecc);

@@ -62,8 +62,9 @@ static constexpr uint8_t NRC_PENDING  = 0x78;
 
 /** FreeSSM's per-request ceiling; the adaptive size never exceeds it. */
 static constexpr size_t  MAX_ADDR   = 33;
-/** ...and the floor: a two-byte value is two addresses. */
-static constexpr size_t  MIN_ADDR   = 2;
+/** ...and the floor: 1 for ECUs that reject multi-address 0xA8 with NRC 0x12
+ *  (two-byte parameters are split into two sequential single-address reads). */
+static constexpr size_t  MIN_ADDR   = 1;
 /** Reply wait is Cfg.ssmTimeoutMs (FreeSSM/ELM: 1000 ms); after a "pending"
  *  negative response the ECU gets this long. */
 static constexpr uint32_t T_PENDING_MS = 3000;
@@ -646,7 +647,7 @@ static ExResult ssm2Init() {
     Cfg.unlock();
     s_suspects.clear();
     s_batchCeil = MAX_ADDR;
-    s_batch = min((uint8_t)MAX_ADDR, Cfg.ssmBatchMax);
+    s_batch = max((uint8_t)MIN_ADDR, min((uint8_t)MAX_ADDR, Cfg.ssmBatchMax));
 
     char sys[8], rom[12], fl[sizeof(Cfg.ecuFlags)];
     hexStr(s_sysId, 3, sys, sizeof(sys));
@@ -654,14 +655,31 @@ static ExResult ssm2Init() {
     hexStr(s_flags, s_flagCount, fl, sizeof(fl));
     log_i("SSM2: ECU answered - SYS %s ROM %s, %u capability bytes", sys, rom, s_flagCount);
 
+    size_t disabled = 0;
     Cfg.lock();                          // the portal serialises them under it
+    bool changed = false;
     if (strcmp(Cfg.ecuId, rom) || strcmp(Cfg.ecuSysId, sys) || strcmp(Cfg.ecuFlags, fl)) {
         strlcpy(Cfg.ecuId, rom, sizeof(Cfg.ecuId));
         strlcpy(Cfg.ecuSysId, sys, sizeof(Cfg.ecuSysId));
         strlcpy(Cfg.ecuFlags, fl, sizeof(Cfg.ecuFlags));
-        Cfg.requestSave();
+        changed = true;
     }
+    if (s_flagCount >= 32) {
+        for (auto &e : Cfg.ssm) {
+            if (e.enabled && ssm2Supported(e) == 0) {
+                e.enabled = false;
+                disabled++;
+            }
+        }
+        if (disabled) {
+            Cfg.generation++;
+            changed = true;
+        }
+    }
+    if (changed) Cfg.requestSave();
     Cfg.unlock();
+    if (disabled)
+        log_i("SSM2: auto-disabled %u parameter(s) unsupported by this ECU", (unsigned)disabled);
     return EX_OK;
 }
 
@@ -868,6 +886,41 @@ static PollResult ssm2PollOnce() {
             while (b > 0 && due[b - 1].late < x.late) { due[b] = due[b - 1]; b--; }
             due[b] = x;
         }
+        // Single-address mode (cap == 1): a 2-byte parameter is read as two
+        // sequential single-frame 0xA8 exchanges (addr, addr + 1) so ECUs that
+        // reject multi-address 0xA8 with NRC 0x12 still deliver 16-bit values.
+        if (cap == 1 && !due.empty() && due[0].idx >= 0 && s_table[due[0].idx].bytes == 2) {
+            const size_t idx = (size_t)due[0].idx;
+            const RtSsm &e = s_table[idx];
+            Slot s = { e.metricId, 2, e.isSigned, e.scale, e.offset, 0, e.address, (int16_t)idx };
+            uint8_t comb[3] = { SSM_RSP_READ, 0, 0 };
+            for (uint8_t b = 0; b < 2; b++) {
+                const uint32_t a = e.address + b;
+                const uint8_t r1[5] = { SSM_CMD_READ, 0x00, (uint8_t)(a >> 16),
+                                        (uint8_t)(a >> 8), (uint8_t)a };
+                uint8_t rsp1[8];
+                size_t got1;
+                const ExResult er = exchange(r1, sizeof(r1), SSM_RSP_READ, rsp1, sizeof(rsp1), got1);
+                if (er == EX_BUSY) return P_BUSY;
+                if (er == EX_NRC) {
+                    const uint8_t code = s_lastNrc;
+                    if (code == 0x11 || code == 0x7F) return P_REFUSED;
+                    if (code != 0x13 && code != 0x14) refuse(s);
+                    return P_NRC;
+                }
+                if (er != EX_OK || got1 != 2 || rsp1[0] != SSM_RSP_READ) {
+                    if (er == EX_OK) setErr("reply %u bytes, expected 2", (unsigned)got1);
+                    return P_FAIL;
+                }
+                comb[1 + b] = rsp1[1];
+            }
+            publishReply(&s, 1, comb, now);
+            masterUpdateDerived();
+            s_responses++;
+            s_lastOkMs = now;
+            s_lastErr[0] = '\0';
+            return P_OK;
+        }
         for (const Due &d : due) {
             // A two-byte value that does not fit may leave room for a
             // one-byte one further on.
@@ -887,6 +940,19 @@ static PollResult ssm2PollOnce() {
         const uint8_t code = s_lastNrc;
         // "Service not supported": this ECU does not do SSM2 reads at all.
         if (code == 0x11 || code == 0x7F) { s_suspects.clear(); return P_REFUSED; }
+
+        // "Sub-function not supported" on a multi-address 0xA8 read: some
+        // Subaru CAN ECUs (e.g. 2009 Legacy 5B443C4107) reject ISO-TP
+        // multi-address 0xA8 bundles with 7F A8 12 while answering single-
+        // address 0xA8 reads cleanly. Step straight down to batch 1.
+        if (code == 0x12 && nAddr > 1) {
+            s_suspects.clear();
+            s_batchCeil = 1;
+            s_batch     = 1;
+            log_i("SSM2: ECU refused %u-address read (NRC 0x12) - stepping down to 1-address reads",
+                  (unsigned)nAddr);
+            return P_NRC;
+        }
 
         if (bisecting) {
             if (testing == 1) {                    // the culprit

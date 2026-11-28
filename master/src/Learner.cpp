@@ -110,11 +110,50 @@ bool learnable(uint16_t m) {
 
 bool isBitMetric(uint16_t m) { return (m & 0xFF00) == 0x2100 || m == METRIC_ID_MIL; }
 
+/** Discrete/stepped quantities that legitimately take fewer than 12 raw values. */
+bool isDiscreteMetric(uint16_t m) {
+    switch (m) {
+        case METRIC_ID_GEAR:
+        case METRIC_ID_GEAR_LEVER:
+        case METRIC_ID_SSM_ALT_MODE:
+        case METRIC_ID_SSM_SI_DRIVE:
+            return true;
+        default:
+            return (m & 0xFF00) == 0x2100 || (m & 0xFF00) == 0x1200;
+    }
+}
+
+/** Bitmask of quantities that physically never read raw 0 while the engine
+ *  spins > 1000 RPM AND the live ECU reference is still positive (prevents
+ *  DFCO fuel-rate on 0x705 from being mislearned as MAF without cross-metric
+ *  interference). */
+uint8_t nonZeroHighRpmBit(uint16_t m) {
+    switch (m) {
+        case METRIC_ID_MAF:          return 1u << 0;
+        case METRIC_ID_RPM:          return 1u << 1;
+        case METRIC_ID_MAP:          return 1u << 2;
+        case METRIC_ID_BATT_VOLTAGE: return 1u << 3;
+        default:                     return 0;
+    }
+}
+
 /* ─────────────────────────────── state ─────────────────────────────────── */
+
+static constexpr uint8_t MIN_DISTINCT_RAW = 12;
 
 /** @brief A field of a frame being tried, and its value when first seen
  *         (sums are centred on it for float precision). */
-struct Cand    { uint32_t id; uint8_t start, len; bool be; float x0; uint8_t ci; uint32_t bornMs; };
+struct Cand {
+    uint32_t id;
+    uint8_t  start, len;
+    bool     be;
+    float    x0;
+    uint8_t  ci;
+    uint32_t bornMs;
+    uint16_t seenRaw[MIN_DISTINCT_RAW]; /**< Distinct raw values observed (up to 12). */
+    uint8_t  nSeenRaw;
+    uint8_t  zeroHighRpmMask;           /**< Bits of nonZeroHighRpmBit() that saw raw 0 at >1000 RPM. */
+};
 struct BitCand { uint32_t id; uint8_t bit; uint8_t ci; };
 
 /**
@@ -167,6 +206,9 @@ struct Ref {
  */
 struct Excl { uint32_t id; uint8_t start, len; bool be; uint16_t metric; float k; uint8_t strikes; };
 struct Dead { uint32_t id; uint8_t start, len; bool be; };
+/** An active or confirming signal's bit mask, preventing a second metric from
+ *  claiming the same (can_id, start, len) field. */
+struct Claim { uint32_t id; uint64_t mask; uint16_t metric; };
 /** An evicted candidate, in four bytes: the learner only looks at 11-bit
  *  identifiers (discover()), and a field is at most 16 bits long. 512 of them
  *  at eight bytes were 4 KB. */
@@ -194,6 +236,7 @@ bool     s_exDirty = false;  /**< Changed since last written to the settings. */
  *  evaluation): their field is not proposed for their value again. */
 constexpr size_t MAX_OFF = 16;
 Dead     s_off[MAX_OFF]; uint16_t s_offMetric[MAX_OFF]; size_t s_noff = 0;
+Claim    s_claims[MAX_RT_SIGNALS]; size_t s_nClaims = 0;
 Evicted  s_dead[MAX_DEAD];   size_t s_ndead = 0, s_deadHead = 0;
 Watch    s_watch[MAX_WATCH]; size_t s_nWatch = 0;
 uint16_t s_learned[MAX_LEARNED]; volatile size_t s_nLearned = 0;
@@ -425,6 +468,26 @@ uint64_t fieldMask(uint8_t start, uint8_t len, bool be) {
     return m;
 }
 
+uint64_t signalMask(const RtSignal &s) {
+    if (s.nBits) {
+        uint64_t m = 0;
+        for (uint8_t i = 0; i < s.nBits; i++)
+            if (s.bitList[i] < 64) m |= 1ULL << s.bitList[i];
+        return m;
+    }
+    return fieldMask(s.startBit, s.bitLength, s.bigEndian);
+}
+
+/** @return true when any active or confirming signal for a DIFFERENT metric
+ *          already claims overlapping bits of @p id. */
+bool fieldClaimedByOther(uint32_t id, uint8_t start, uint8_t len, bool be, uint16_t metric) {
+    const uint64_t mine = fieldMask(start, len, be);
+    for (size_t i = 0; i < s_nClaims; i++)
+        if (s_claims[i].id == id && s_claims[i].metric != metric && (s_claims[i].mask & mine))
+            return true;
+    return false;
+}
+
 /**
  * @return true when this field must not be proposed for this value with
  *         slope @p k. Rejected once: not with this same slope (2 %). For good
@@ -490,6 +553,15 @@ void resetAll() {
 
 /* ─────────────────────────── candidate discovery ───────────────────────── */
 
+void initCand(Cand &dst, uint32_t id, uint8_t start, uint8_t len, bool be, uint8_t ci,
+              uint64_t raw0, uint32_t now) {
+    memset(&dst, 0, sizeof(dst));
+    dst.id = id; dst.start = start; dst.len = len; dst.be = be;
+    dst.x0 = (float)raw0; dst.ci = ci; dst.bornMs = now;
+    dst.seenRaw[0] = (uint16_t)raw0;
+    dst.nSeenRaw = 1;
+}
+
 void addCand(const CensusView &e, uint8_t ci, uint8_t start, uint8_t len, bool be) {
     if (isDead(e.id, start, len, be)) return;
     for (size_t i = 0; i < s_nc; i++)
@@ -503,7 +575,7 @@ void addCand(const CensusView &e, uint8_t ci, uint8_t start, uint8_t len, bool b
         if (!wanted && s_nWant < SWAP_MAX) s_want[s_nWant++] = { e.id, start, len, be, ci };
         return;
     }
-    s_c[s_nc] = { e.id, start, len, be, (float)masterExtract(e.data, e.dlc, start, len, be), ci, millis() };
+    initCand(s_c[s_nc], e.id, start, len, be, ci, masterExtract(e.data, e.dlc, start, len, be), millis());
     memset(&s_acc[s_nc * NA_MAX], 0, sizeof(Acc) * NA_MAX);
     for (size_t ai = 0; ai < NA_MAX; ai++) s_px[s_nc * NA_MAX + ai] = NAN;  // nothing held yet
     s_nc++;
@@ -645,11 +717,29 @@ void sampleAnalog(size_t ai, float y, Census &cen) {
      * (learn_slow_frame).
      */
     const uint32_t settled = now - r.levelSince;
+    float liveRpm = 0; uint32_t rpmAge = 0; uint8_t rpmSrc = 0;
+    const bool highRpm = metricLookup(METRIC_ID_RPM, liveRpm, rpmAge, rpmSrc) &&
+                         rpmAge < 2000 && liveRpm > 1000.0f;
     for (size_t i = 0; i < s_nc; i++) {
         Cand &c = s_c[i];
         const CensusView *e = lookup(cen, c.id, c.ci);
-        s_px[i * NA_MAX + ai] = (!e || e->ageMs > 5000 || e->ageMs > settled)
-            ? NAN : (float)masterExtract(e->data, e->dlc, c.start, c.len, c.be) - c.x0;
+        if (!e || e->ageMs > 5000 || e->ageMs > settled) {
+            s_px[i * NA_MAX + ai] = NAN;
+            continue;
+        }
+        const uint64_t raw64 = masterExtract(e->data, e->dlc, c.start, c.len, c.be);
+        const uint16_t raw16 = (uint16_t)raw64;
+        if (c.nSeenRaw < MIN_DISTINCT_RAW) {
+            bool seen = false;
+            for (uint8_t k = 0; k < c.nSeenRaw; k++)
+                if (c.seenRaw[k] == raw16) { seen = true; break; }
+            if (!seen) c.seenRaw[c.nSeenRaw++] = raw16;
+        }
+        const uint8_t zbit = nonZeroHighRpmBit(r.metric);
+        if (zbit && raw64 == 0 && highRpm &&
+            y > max(2.0f, need * Cfg.learnSteady * 2.0f))
+            c.zeroHighRpmMask |= zbit;
+        s_px[i * NA_MAX + ai] = (float)raw64 - c.x0;
     }
 }
 
@@ -843,8 +933,8 @@ void swapIn(Census &cen) {
         if (!e) continue;
         if (!s_swapped)
             log_i("learner: fields that started moving late take turns with ones that match nothing");
-        s_c[victim] = { f.id, f.start, f.len, f.be,
-                        (float)masterExtract(e->data, e->dlc, f.start, f.len, f.be), s_want[w].ci, now };
+        initCand(s_c[victim], f.id, f.start, f.len, f.be, s_want[w].ci,
+                 masterExtract(e->data, e->dlc, f.start, f.len, f.be), now);
         memset(&s_acc[victim * NA_MAX], 0, sizeof(Acc) * NA_MAX);
         for (size_t ai = 0; ai < NA_MAX; ai++) s_px[victim * NA_MAX + ai] = NAN;
         s_swapped++;
@@ -852,26 +942,41 @@ void swapIn(Census &cen) {
     s_nWant = 0;
 }
 
-/** @return false when the signal table is full (said once in the log). */
+/** @return false when the signal table is full or another metric already claims
+ *          these bits (said once in the log when full). */
 bool propose(uint16_t metric, uint32_t id, uint8_t start, uint8_t len, bool be,
              float scale, float offset, float vtol, float vspread,
              uint8_t mode = SIG_AUTO) {
-    bool added = false;
+    bool added = false, full = false;
+    const uint64_t mine = fieldMask(start, len, be);
     Cfg.lock();
-    if (Cfg.signals.size() < MAX_RT_SIGNALS) {
-        RtSignal s;
-        s.canId = id; s.extended = false; s.startBit = start; s.bitLength = len;
-        s.bigEndian = be; s.isSigned = false; s.scale = scale; s.offset = offset;
-        s.metricId = metric; s.mode = mode; s.refMetric = metric; s.learned = true;
-        s.vtol = vtol; s.vspread = vspread;
-        snprintf(s.name, sizeof(s.name), "learned %04X", metric);
-        Cfg.signals.push_back(s);
-        Cfg.generation++;
-        Cfg.requestSave();
-        added = true;
+    bool claimed = false;
+    for (const auto &ex : Cfg.signals) {
+        if (!ex.extended && ex.canId == id && ex.metricId != metric &&
+            (ex.publishes() || ex.mode == SIG_AUTO) && (signalMask(ex) & mine)) {
+            claimed = true;
+            break;
+        }
+    }
+    if (!claimed) {
+        if (Cfg.signals.size() < MAX_RT_SIGNALS) {
+            RtSignal s;
+            s.canId = id; s.extended = false; s.startBit = start; s.bitLength = len;
+            s.bigEndian = be; s.isSigned = false; s.scale = scale; s.offset = offset;
+            s.metricId = metric; s.mode = mode; s.refMetric = metric; s.learned = true;
+            s.vtol = vtol; s.vspread = vspread;
+            snprintf(s.name, sizeof(s.name), "learned %04X", metric);
+            Cfg.signals.push_back(s);
+            Cfg.generation++;
+            Cfg.requestSave();
+            added = true;
+        } else {
+            full = true;
+        }
     }
     Cfg.unlock();
-    if (!added && !s_tableFullLogged) {
+    if (added && s_nClaims < MAX_RT_SIGNALS) s_claims[s_nClaims++] = { id, mine, metric };
+    if (full && !s_tableFullLogged) {
         s_tableFullLogged = true;
         log_w("learner: the signal table is full (%u) - remove signals to learn more",
               (unsigned)MAX_RT_SIGNALS);
@@ -887,6 +992,7 @@ void syncWithSignals(uint16_t *pending, size_t &nPending) {
     Cfg.lock();
     bool changed = false;
     s_noff = 0;
+    s_nClaims = 0;
     for (size_t i = 0; i < Cfg.signals.size();) {
         const RtSignal &s = Cfg.signals[i];
         /*
@@ -899,6 +1005,8 @@ void syncWithSignals(uint16_t *pending, size_t &nPending) {
             s_off[s_noff] = { s.canId, s.startBit, s.bitLength, s.bigEndian };
             s_offMetric[s_noff++] = s.metricId;
         }
+        if (!s.extended && (s.publishes() || s.mode == SIG_AUTO) && s_nClaims < MAX_RT_SIGNALS)
+            s_claims[s_nClaims++] = { s.canId, signalMask(s), s.metricId };
         if (s.publishes()) { if (nl < MAX_LEARNED) s_learned[nl++] = s.metricId; }
         else if (s.mode == SIG_AUTO && s.learned) { if (nPending < MAX_RT_SIGNALS) pending[nPending++] = s.metricId; }
         else if (s.mode == SIG_REJECTED && s.learned) {
@@ -946,6 +1054,9 @@ void evaluate() {
             double r2, k, cc;
             if (!fit(a, r2, k, cc)) continue;
             if (excluded(c.id, c.start, c.len, c.be, r.metric, k)) continue;
+            if (fieldClaimedByOther(c.id, c.start, c.len, c.be, r.metric)) continue;
+            if (c.zeroHighRpmMask & nonZeroHighRpmBit(r.metric)) continue;
+            if (!isDiscreteMetric(r.metric) && c.nSeenRaw < MIN_DISTINCT_RAW) continue;
             /*
              * Guards against a coincidence. The pair must have seen the
              * value at three levels at least - through two, any field that
@@ -999,6 +1110,7 @@ void evaluate() {
             if ((uint16_t)(r.toggles - a.tog0) < 3) continue;
             const float p = phi(a);
             if (excluded(s_b[i].id, s_b[i].bit, 1, false, r.metric, p < 0 ? -1.0 : 1.0)) continue;
+            if (fieldClaimedByOther(s_b[i].id, s_b[i].bit, 1, false, r.metric)) continue;
             if (fabsf(p) > bq) { bq = fabsf(p); best = (int)i; binv = p < 0; }
         }
         if (best >= 0) { r.best = best; r.bestFit = bq; r.bestN = s_bacc[best * NB_MAX + bi].n; }
@@ -1054,6 +1166,7 @@ void doAccept(uint16_t m) {
             const float p = phi(a);
             // Not a bit the user or the verifier has turned down for this switch.
             if (excluded(s_b[i].id, s_b[i].bit, 1, false, m, p < 0 ? -1.0 : 1.0)) continue;
+            if (fieldClaimedByOther(s_b[i].id, s_b[i].bit, 1, false, m)) continue;
             if (fabsf(p) > bq) { bq = fabsf(p); best = (int)i; inv = p < 0; }
         }
         if (best < 0) { log_w("learner: 0x%04X - no candidate bit yet", m); return; }
@@ -1071,6 +1184,8 @@ void doAccept(uint16_t m) {
         double r2, k, cc;
         if (!fit(s_acc[i * NA_MAX + slot], r2, k, cc, 10)) continue;   // the user decides: 10 is enough
         if (excluded(c.id, c.start, c.len, c.be, m, k)) continue;
+        if (fieldClaimedByOther(c.id, c.start, c.len, c.be, m)) continue;
+        if (c.zeroHighRpmMask & nonZeroHighRpmBit(m)) continue;
         // ...but not on a field that cannot be the value, however well it
         // follows it for now (see evaluate()).
         if (fabs(k) > need || tooCoarse(k, need, r)) continue;
