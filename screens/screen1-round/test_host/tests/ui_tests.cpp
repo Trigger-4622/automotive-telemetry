@@ -146,12 +146,15 @@ static bool hidden(lv_obj_t *o) { return lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN);
 
 static void engineOn() { car.set(METRIC_ID_RPM, 850); car.set(METRIC_ID_SPEED, 0); }
 
-/** The parking screen kept from coming up by itself in reverse: for checks of
- *  another screen's readouts while the car is in reverse. */
-static JsonDocument noParkAuto() {
+/** The shipped layout with no screen coming up by itself (the parking screen
+ *  does in reverse): for checks of another screen's readouts in reverse. */
+static JsonDocument noAutoScreens() {
     JsonDocument d = shippedLayout();
-    for (JsonObject sc : d["screens"].as<JsonArray>())
-        if (!strcmp(sc["type"] | "", "park")) sc["auto_reverse"] = false;
+    for (JsonObject sc : d["screens"].as<JsonArray>()) {
+        sc.remove("show_when");
+        sc.remove("back_after_s");
+        sc.remove("back_now_when");
+    }
     return d;
 }
 
@@ -468,7 +471,7 @@ SCENARIO(migrate_v1_layout) {
     const size_t before = s.size();
     boot(d);
 
-    CHECK((Config.layout()["version"] | 0) == 4, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
     CHECK(Config.layout()["screens"].size() == before + 1, "dash not added");
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "dash not first");
     CHECK(Config.layout()["warnings"].is<JsonObject>(), "warnings block not added");
@@ -476,7 +479,7 @@ SCENARIO(migrate_v1_layout) {
     // Saved, so the next boot sees version 4 already.
     JsonDocument saved;
     deserializeJson(saved, hostfs::files["/layout.json"]);
-    CHECK((saved["version"] | 0) == 4, "migration not saved");
+    CHECK((saved["version"] | 0) == 6, "migration not saved");
     CHECK(!hostfs::files.count("/layout.tmp"), "temporary file left behind");
 
     // The user deletes the dash; a reboot must not bring it back.
@@ -501,8 +504,9 @@ SCENARIO(default_layout) {
     UI.begin();
     run(500);
     CHECK(!strcmp(Config.layout()["screens"][0]["type"] | "", "dash"), "default has no dash");
-    CHECK((Config.layout()["version"] | 0) == 4, "default is not version 4");
-    CHECK(UI._screens.size() == 6, "default built %zu screens", UI._screens.size());
+    CHECK((Config.layout()["version"] | 0) == 6, "default is not version 6");
+    CHECK(UI._screens.size() == 7, "default built %zu screens", UI._screens.size());
+    CHECK(screenOf("car") >= 0 && UI._screens[screenOf("car")].car >= 0, "default has no car screen");
     CHECK(screenOf("park") >= 0 && UI._screens[screenOf("park")].park >= 0, "default has no parking screen");
     shot("default_dash");
 }
@@ -999,7 +1003,7 @@ SCENARIO(ack_second_fault) {
 SCENARIO(gear_display) {
     engineOn();
     car.set(METRIC_ID_GEAR, 3);
-    JsonDocument d = noParkAuto();
+    JsonDocument d = noAutoScreens();
     boot(d);
     gotoType("dash");
     GaugeBinding *g = nullptr;
@@ -1029,7 +1033,7 @@ SCENARIO(gear_display) {
 SCENARIO(gear_lever) {
     engineOn();
     car.set(METRIC_ID_GEAR_LEVER, 'P');
-    JsonDocument d = noParkAuto();
+    JsonDocument d = noAutoScreens();
     boot(d);
     gotoType("dash");
     GaugeBinding *g = nullptr;
@@ -1433,7 +1437,7 @@ SCENARIO(migrate_v2_layout) {
     const size_t before = s.size();
     boot(d);
     JsonArray now = Config.layout()["screens"].as<JsonArray>();
-    CHECK((Config.layout()["version"] | 0) == 4, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
     CHECK(now.size() == before + 2, "screens: %zu, want %zu", now.size(), before + 2);
     const int g = screenOf("gmeter"), p = screenOf("perf"), dg = screenOf("diag");
     CHECK(g >= 0 && p == g + 1 && dg == p + 1, "G-meter %d, timers %d, diagnostics %d", g, p, dg);
@@ -1642,11 +1646,12 @@ SCENARIO(park_screen) {
     for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
 }
 
-/* Reverse brings the parking screen up by itself, wherever the driver was;
- * out of reverse it goes back to that screen 10 s later - not while shuffling
- * between R and D - or at once driving off above 15 km/h. A swipe meanwhile
- * is the driver's choice and stays. The lever's R does it too. */
-SCENARIO(park_auto_reverse) {
+/* The shipped parking screen's rule (show_when gear R, back after 10 s or at
+ * once above 15 km/h): reverse brings it up, wherever the driver was; out of
+ * reverse it goes back to that screen 10 s later - not while shuffling
+ * between R and D - or at once driving off. A swipe meanwhile is the driver's
+ * choice and stays. The lever's R does it too. */
+SCENARIO(auto_screen_reverse) {
     engineOn();
     car.set(METRIC_ID_STEERING_ANGLE, -30);
     boot();
@@ -1707,16 +1712,134 @@ SCENARIO(park_auto_reverse) {
     for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
 }
 
-/* Switched off on the screen (auto_reverse false), reverse leaves the display
- * alone. */
-SCENARIO(park_auto_off) {
-    JsonDocument d = noParkAuto();
+/* No rule on any screen: reverse leaves the display alone. */
+SCENARIO(auto_screen_none) {
+    JsonDocument d = noAutoScreens();
     engineOn();
     boot(d);
     gotoScreen(1);
     car.set(METRIC_ID_REVERSE, 1);
+    car.set(METRIC_ID_SPEED, 120);
     run(1500);
-    CHECK(UI._active == 1, "auto_reverse false, and reverse changed the screen: %zu", UI._active);
+    CHECK(UI._active == 1 && UI._auto.rules() == 0, "no rules, and the screen changed: %zu", UI._active);
+}
+
+/** Give screen @p type a rule (show_when, back_after_s, back_now_when). */
+static void ruleOn(JsonDocument &d, const char *type, const char *json) {
+    for (JsonObject sc : d["screens"].as<JsonArray>())
+        if (!strcmp(sc["type"] | "", type)) {
+            JsonDocument r;
+            deserializeJson(r, json);
+            for (JsonPairConst kv : r.as<JsonObjectConst>()) sc[kv.key()] = kv.value();
+            return;
+        }
+    printf("no %s screen\n", type);
+    exit(3);
+}
+
+/* Rules on any screen and any value: the G-meter above 100 km/h (back at
+ * once), the timers above 6000 rpm in third (back 2 s later). The timers'
+ * rule coming to hold takes over from the G-meter's; when it stops, the
+ * G-meter's still holds, so that comes back - and then the screen the driver
+ * had. A value the display has not got holds nothing; a rule that will not
+ * read is left out whole; the gear counts the lever's letter and the gear
+ * number alike. */
+SCENARIO(auto_screen_conditions) {
+    JsonDocument d = noAutoScreens();
+    ruleOn(d, "gmeter", R"({"show_when":[{"metric_id":"0x010D","op":">","value":100}],"back_after_s":0})");
+    ruleOn(d, "perf", R"({"show_when":[{"metric_id":"0x010C","op":">=","value":6000},{"gear":"3"}],
+                          "back_after_s":2})");
+    ruleOn(d, "diag", R"({"show_when":[{"metric_id":"0x010D","op":"~","value":1}]})");
+    engineOn();
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    car.set(METRIC_ID_GEAR, 2);
+    boot(d);
+    const int start = 1, g = screenOf("gmeter"), p = screenOf("perf");
+    gotoScreen(start);
+    CHECK(UI._auto.rules() == 2, "rules: %zu, want 2 (the unreadable one left out)", UI._auto.rules());
+    bool warned = false;
+    for (auto &l : host::logs) warned |= l.find("will not read") != std::string::npos;
+    CHECK(warned, "the unreadable rule not said");
+
+    car.set(METRIC_ID_SPEED, 110);
+    run(800);
+    CHECK((int)UI._active == g, "110 km/h: on %zu, want the G-meter %d", UI._active, g);
+    car.set(METRIC_ID_RPM, 6500);                          // in second: not yet
+    run(800);
+    CHECK((int)UI._active == g, "6500 rpm in second: moved to %zu", UI._active);
+    car.set(METRIC_ID_GEAR, 3);                            // the lever still says D
+    run(800);
+    CHECK((int)UI._active == p, "6500 rpm in third: on %zu, want the timers %d", UI._active, p);
+    car.set(METRIC_ID_RPM, 3000);
+    run(1000);
+    CHECK((int)UI._active == p, "went before its 2 s");
+    run(2000);
+    CHECK((int)UI._active == g, "after the timers' wait: on %zu, want the G-meter again %d", UI._active, g);
+    car.set(METRIC_ID_SPEED, 90);
+    run(800);
+    CHECK((int)UI._active == start, "90 km/h: on %zu, want screen %d at once", UI._active, start);
+
+    car.drop(METRIC_ID_SPEED);                             // no speed at all: "above 100" never holds
+    run(2500);
+    car.set(METRIC_ID_RPM, 6500);
+    car.drop(METRIC_ID_GEAR);
+    car.set(METRIC_ID_GEAR_LEVER, '3');                    // a manual's lever reading "3"
+    run(800);
+    CHECK((int)UI._active == p, "the lever in 3 at 6500 rpm: on %zu, want the timers", UI._active);
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* A version 4 layout (this firmware's first parking screen): its switch
+ * becomes the rule it stood for, or nothing where it was off; the key goes. */
+SCENARIO(migrate_v4_layout) {
+    JsonDocument d = shippedLayout();
+    d["version"] = 4;
+    JsonArray s = d["screens"].as<JsonArray>();
+    for (JsonObject sc : s)
+        if (!strcmp(sc["type"] | "", "park")) {
+            sc.remove("show_when"); sc.remove("back_after_s"); sc.remove("back_now_when");
+        }
+    JsonObject off = s.add<JsonObject>();                  // a second one, switched off
+    off["id"] = "park2"; off["type"] = "park"; off["auto_reverse"] = false;
+    boot(d);
+    JsonArray now = Config.layout()["screens"].as<JsonArray>();
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
+    const int k = screenOf("park");
+    JsonObject a = now[k], b = now[now.size() - 1];
+    CHECK(!strcmp(a["show_when"][0]["gear"] | "", "R") && (a["back_after_s"] | 0) == 10 &&
+          (a["back_now_when"][0]["value"] | 0) == 15, "the switch on: not the reverse rule");
+    CHECK(b["show_when"].isNull() && b["auto_reverse"].isNull(), "the switch off: a rule, or the key left");
+    CHECK(UI._auto.rules() == 1 && UI._auto._rules[0].screen == (size_t)k, "rules: %zu", UI._auto.rules());
+    CHECK(!Config.migrateLayout(), "migration ran twice");
+}
+
+/* A version 5 layout gains the car from above once, before diagnostics;
+ * deleted in the studio, it stays deleted. (The round board: the cluster's
+ * LVGL heap has no room for it beside a full layout.) */
+SCENARIO(migrate_v5_layout) {
+    JsonDocument d = shippedLayout();
+    d["version"] = 5;
+    JsonArray s = d["screens"].as<JsonArray>();
+    for (size_t i = s.size(); i-- > 0;)
+        if (!strcmp(s[i]["type"] | "", "car")) s.remove(i);
+    const size_t before = s.size();
+    boot(d);
+    JsonArray now = Config.layout()["screens"].as<JsonArray>();
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
+    if (!ROUND) {
+        // Offered in the studio, not added: no room for it in the LVGL heap
+        // beside a layout like the example one.
+        CHECK(now.size() == before && screenOf("car") < 0, "the cluster gained a car screen");
+        return;
+    }
+    CHECK(now.size() == before + 1, "screens: %zu, want %zu", now.size(), before + 1);
+    const int c = screenOf("car"), dg = screenOf("diag");
+    CHECK(c >= 0 && dg == c + 1 && UI._screens[c].car >= 0, "car %d, diagnostics %d", c, dg);
+    now.remove((size_t)c);
+    Config.persistLayout();
+    Config.begin();
+    CHECK(Config.layout()["screens"].size() == before, "came back after being deleted");
+    CHECK(!Config.migrateLayout(), "migration ran twice");
 }
 
 /* A version 3 layout - the owner's displays - gains the parking screen once,
@@ -1730,17 +1853,134 @@ SCENARIO(migrate_v3_layout) {
     const size_t before = s.size();
     boot(d);
     JsonArray now = Config.layout()["screens"].as<JsonArray>();
-    CHECK((Config.layout()["version"] | 0) == 4, "version not bumped");
+    CHECK((Config.layout()["version"] | 0) == 6, "version not bumped");
     CHECK(now.size() == before + 1, "screens: %zu, want %zu", now.size(), before + 1);
     const int k = screenOf("park"), dg = screenOf("diag");
     CHECK(k >= 0 && dg == k + 1, "parking %d, diagnostics %d", k, dg);
-    CHECK(k >= 0 && UI._screens[k].park >= 0 && UI._parkAuto.screen == k, "not built");
+    CHECK(k >= 0 && UI._screens[k].park >= 0 && UI._auto.rules() == 1 && UI._auto._rules[0].screen == (size_t)k,
+          "not built, or not with the reverse rule");
     CHECK(screenOf("gmeter") >= 0 && screenOf("perf") >= 0, "the version 3 screens went");
     now.remove((size_t)k);
     Config.persistLayout();
     Config.begin();
     CHECK(Config.layout()["screens"].size() == before, "came back after being deleted");
     CHECK(!Config.migrateLayout(), "migration ran twice");
+}
+
+/** The car body's top and bottom edges on screen. */
+static int carYTop(const CarView &v) { return lv_obj_get_y(v.body); }
+static int carYBottom(const CarView &v) { return lv_obj_get_y(v.body) + lv_obj_get_height(v.body); }
+
+/* ──────────────────────────── the car from above ───────────────────────── */
+
+/** The shipped layout with a car-from-above screen at the front. */
+static JsonDocument withCarScreen(const char *extra = "{}") {
+    JsonDocument d = noAutoScreens();
+    JsonDocument c;
+    deserializeJson(c, extra);
+    JsonArray s = d["screens"].as<JsonArray>();
+    JsonDocument old;
+    old.set(s);
+    s.clear();
+    JsonObject car = s.add<JsonObject>();
+    car["id"] = "car"; car["type"] = "car";
+    for (JsonPairConst kv : c.as<JsonObjectConst>()) car[kv.key()] = kv.value();
+    for (JsonVariantConst v : old.as<JsonArrayConst>()) s.add(v);
+    return d;
+}
+/** Where a line's last point is, in its parent. */
+static void lineEnd(lv_obj_t *l, int &x, int &y) {
+    const lv_line_t *ln = (const lv_line_t *)l;
+    const lv_point_t &p = ln->point_array[ln->point_num - 1];
+    x = lv_obj_get_x(l) + p.x;
+    y = lv_obj_get_y(l) + p.y;
+}
+
+/* What is open, in amber, swung out; the rest shut, in grey; nothing known,
+ * said so. The indicators light their corners, the lights the headlamps. The
+ * path goes ahead in a drive gear and back in reverse, bending the way the
+ * wheel is turned. */
+SCENARIO(car_screen) {
+    engineOn();
+    JsonDocument d = withCarScreen();
+    boot(d);
+    gotoType("car");
+    run(500);
+    CHECK(UI._screens[UI._active].car == 0, "not on the car screen");
+    CarScreenView &v = UI._cars[0];
+    // Round: the line over the car; landscape: the doors' line of the rows,
+    // without its colour ("#RRGGBB OPEN#").
+    auto status = [&] {
+        if (v.status) return std::string(lv_label_get_text(v.status));
+        std::string t = lv_label_get_text(v.vals);
+        t = t.substr(0, t.find('\n'));
+        return t.size() > 9 ? t.substr(8, t.size() - 9) : t;
+    };
+    CHECK(status() == (ROUND ? "NO DOOR DATA" : "--"), "nothing known: '%s'", status().c_str());
+    CHECK(hidden(v.car.path[0]), "a path with no steering angle");
+    shot("car_nothing");
+
+    for (uint16_t id : {METRIC_ID_DOOR_FL, METRIC_ID_DOOR_FR, METRIC_ID_DOOR_RL, METRIC_ID_DOOR_RR,
+                        METRIC_ID_TRUNK, METRIC_ID_HOOD})
+        car.set(id, 0);
+    car.set(METRIC_ID_HANDBRAKE, 1);
+    run(500);
+    CHECK(ROUND ? status() == "ALL SHUT \xE2\x80\xA2 HANDBRAKE" : status() == "SHUT", "all shut: '%s'", status().c_str());
+    car.set(METRIC_ID_DOOR_FL, 1);
+    car.set(METRIC_ID_TRUNK, 1);
+    car.set(METRIC_ID_SW_LIGHTS, 1);
+    car.set(METRIC_ID_TURN_LEFT, 1);
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    car.set(METRIC_ID_STEERING_ANGLE, 270);
+    run(800);
+    CHECK(ROUND ? status() == "DOOR FL + BOOT" : status() == "FL", "front left and boot: '%s'", status().c_str());
+    CHECK(lv_obj_get_style_line_color(v.car.side[0], 0).full == lv_color_hex(UI_WARN).full &&
+          lv_obj_get_style_line_color(v.car.side[1], 0).full == lv_color_hex(UI_MUTED).full,
+          "front left amber, front right grey");
+    int x0, y0, x1, y1;
+    lineEnd(v.car.side[0], x0, y0);
+    CHECK(x0 < v.car.cx - (int)(0.89f * v.car.ppm) - 4, "the open door does not swing out: end x %d", x0);
+    CHECK(!hidden(v.car.head[0]) && !hidden(v.car.corner[0]), "lights or the left indicator not shown");
+    CHECK(!hidden(v.car.path[0]), "no path with the angle known");
+    lineEnd(v.car.path[0], x0, y0);
+    lineEnd(v.car.path[1], x1, y1);
+    CHECK(y0 < carYTop(v.car) && x0 < v.car.cx - (int)(0.89f * v.car.ppm),
+          "in D turned left, the path does not go ahead to the left: end %d,%d", x0, y0);
+    shot("car_open_left_ahead");
+
+    car.set(METRIC_ID_GEAR_LEVER, 'R');
+    car.set(METRIC_ID_STEERING_ANGLE, -270);
+    car.set(METRIC_ID_DOOR_FL, 0);
+    car.set(METRIC_ID_TRUNK, 0);
+    run(800);
+    lineEnd(v.car.path[1], x1, y1);
+    CHECK(y1 > carYBottom(v.car) && x1 > v.car.cx + (int)(0.89f * v.car.ppm),
+          "in R turned right, the path does not go back to the right: end %d,%d", x1, y1);
+    shot("car_reverse_right");
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
+}
+
+/* The parking screen's other view: the car from above and its path, with
+ * the angle beside it. */
+SCENARIO(park_path_view) {
+    engineOn();
+    JsonDocument d = noAutoScreens();
+    for (JsonObject sc : d["screens"].as<JsonArray>())
+        if (!strcmp(sc["type"] | "", "park")) sc["view"] = "path";
+    car.set(METRIC_ID_STEERING_ANGLE, 180);
+    car.set(METRIC_ID_REVERSE, 1);
+    boot(d);
+    gotoType("park");
+    run(800);
+    const ParkView &v = UI._parks[0];
+    CHECK(v.pathView && v.car.body && !v.lock, "not the path view");
+    CHECK(std::string(lv_label_get_text(v.value)) == "180\xC2\xB0", "angle '%s'", lv_label_get_text(v.value));
+    CHECK(!hidden(v.car.path[0]), "no path");
+    int x, y;
+    lineEnd(v.car.path[0], x, y);
+    CHECK(y > carYBottom(v.car) && x < v.car.cx, "in reverse turned left, the path does not go back to the left: %d,%d", x, y);
+    shot("park_path_view");
+    for (auto &l : host::logs) CHECK(l[0] != 'E', "error logged: %s", l.c_str());
 }
 
 /* ─────────────────────────────── backlight ─────────────────────────────── */
@@ -1779,6 +2019,177 @@ SCENARIO(backlight_levels) {
     CHECK(Config._layout["global"]["brightness_day"].isNull(), "a slider's level was stored");
     Config._server.request(HTTP_POST, "/api/backlight", "{\"level\":40}");
     CHECK(Config._server.code == 400 && Display.brightness == 102, "a body without pct: %d", Config._server.code);
+}
+
+/* A screen left out of the swipe order ("swipe": false) comes up by its rule
+ * alone: the display starts on the first screen of the order, swipes go
+ * round the others, and its rule still brings it up. One with no rule to
+ * bring it up stays in the order (it could never be seen), with a warning. */
+SCENARIO(rule_only_screens) {
+    engineOn();
+    JsonDocument d;
+    deserializeJson(d, R"({"version":6,"screens":[
+      {"id":"rev","type":"arc_gauge","metric_id":"0x010D","label":"REV","swipe":false,"show_when":[{"gear":"R"}],"back_after_s":2},
+      {"id":"a","type":"arc_gauge","metric_id":"0x010C","label":"A"},
+      {"id":"c","type":"arc_gauge","metric_id":"0x0105","label":"C"},
+      {"id":"norule","type":"arc_gauge","metric_id":"0x010F","label":"D","swipe":false}]})");
+    boot(d);
+    CHECK(UI._active == 1, "started on screen %zu, want 1 (the first of the swipe order)", UI._active);
+    std::string seen;
+    for (int i = 0; i < 6; i++) { UI.nextScreen(); run(400); seen += std::to_string(UI._active); }
+    CHECK(seen == "231231", "swiped through %s, want 231231 (never 0)", seen.c_str());
+    UI.prevScreen(); run(400);
+    CHECK(UI._active == 3, "back from 1 to %zu, want 3", UI._active);
+    bool warned = false;
+    for (auto &l : host::logs) warned |= l.find("needs a show_when rule") != std::string::npos;
+    CHECK(warned, "no warning for the rule-only screen without a rule");
+    UI.nextScreen(); run(400);
+    car.set(METRIC_ID_REVERSE, 1);
+    run(800);
+    CHECK(UI._active == 0, "reverse: on %zu, want the rule's screen 0", UI._active);
+    car.set(METRIC_ID_REVERSE, 0);
+    run(3000);
+    CHECK(UI._active == 1, "out of reverse: back on %zu, want 1", UI._active);
+}
+
+/* A layout uploaded to the display keeps the display's own network settings
+ * wherever the file says nothing of them - the master's channel above all:
+ * a file from another display must not take this one off it. What the file
+ * does say, it changes. */
+SCENARIO(layout_upload_keeps_network) {
+    JsonDocument d = shippedLayout();
+    d["network"]["wifi_channel"] = 6;
+    d["network"]["ap_ssid"] = "Mine";
+    d["network"]["ap_password"] = "secret123";
+    d["network"]["master_mac"] = "AA:BB:CC:DD:EE:FF";
+    boot(d);
+    Config.enterConfigMode();
+    JsonDocument up = shippedLayout();
+    up.remove("network");
+    up["network"]["ap_ssid"] = "Telemetry-Gauge-Race";
+    std::string body;
+    serializeJson(up, body);
+    Config._server.upload("/api/layout", "layout.json", body);
+    JsonObject n = Config.layout()["network"];
+    CHECK(Config._server.code == 200, "uploaded (%d %s)", Config._server.code, Config._server.body.c_str());
+    CHECK((n["wifi_channel"] | 0) == 6 && std::string(n["ap_password"] | "") == "secret123" &&
+          std::string(n["master_mac"] | "") == "AA:BB:CC:DD:EE:FF", "the display's channel, password and master kept");
+    CHECK(std::string(n["ap_ssid"] | "") == "Telemetry-Gauge-Race", "the name the file gives taken: %s",
+          (const char *)(n["ap_ssid"] | ""));
+    JsonDocument stored;
+    deserializeJson(stored, hostfs::files["/layout.json"]);
+    CHECK((stored["network"]["wifi_channel"] | 0) == 6, "and stored so");
+    up.remove("network");
+    body.clear();
+    serializeJson(up, body);
+    Config._server.upload("/api/layout", "layout.json", body);
+    n = Config.layout()["network"];
+    CHECK(Config._server.code == 200 && (n["wifi_channel"] | 0) == 6 &&
+          std::string(n["ap_ssid"] | "") == "Telemetry-Gauge-Race", "a file with no network block changes none of it");
+}
+
+/** A layout file of screens/screen1-round/layouts/. */
+static bool layoutFile(const char *name, JsonDocument &d) {
+    const std::string s = readFile(env("PROJECT_DIR") + "/layouts/" + name);
+    return !s.empty() && !deserializeJson(d, s);
+}
+static bool lampOn(const char *key) {
+    for (size_t i = 0; i < UI._lamps.size(); i++)
+        if (!strcmp(UI._lamps[i].key, key)) return UI._lamps[i].on;
+    return false;
+}
+static void layoutBoots(const char *name, JsonDocument &d) {
+    boot(d);
+    const host::HeapReport h = heapLine(name);
+    CHECK(h.targetUsed + 8192 <= h.budget, "%s: device LVGL heap %zu of %zu bytes, under 8 KB left", name,
+          h.targetUsed, h.budget);
+    CHECK(UI._screens.size() == d["screens"].as<JsonArray>().size(), "%s: %zu screens built of %zu", name,
+          UI._screens.size(), d["screens"].as<JsonArray>().size());
+    for (auto &l : host::logs) CHECK(l[0] != 'E' && l[0] != 'W', "%s: %s", name, l.c_str());
+}
+
+/* The two round-screen layouts (layouts/daily.json, layouts/race.json), one a
+ * scenario: each boots within the LVGL heap with nothing to warn about, and
+ * its rules do what its note says. The daily one: the car from above only
+ * when parking - in P with its doors, in R with its path - and neither in the
+ * swipe order. The race one (below): no watchdog card ever, RPM and coolant
+ * over on the lamp strip and bringing their screens up, the timers at a
+ * launch, the G-meter braking. */
+SCENARIO(round_layout_daily) {
+    if (!ROUND) { printf("      (round-screen layouts: nothing to check on this board)\n"); return; }
+    JsonDocument d;
+    CHECK(layoutFile("daily.json", d), "layouts/daily.json does not read");
+    engineOn();
+    car.set(METRIC_ID_COOLANT_TEMP, 88);
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    layoutBoots("daily", d);
+    const int parked = screenOf("car"), reversing = screenOf("park");
+    CHECK(!UI._screens[parked].inSwipe && !UI._screens[reversing].inSwipe, "daily: car views in the swipe order");
+    for (int i = 0; i < 12; i++) {
+        UI.nextScreen(); run(300);
+        CHECK((int)UI._active != parked && (int)UI._active != reversing, "daily: swiped onto a car view (%zu)", UI._active);
+    }
+    gotoScreen(0);
+    shot("daily_dash");
+    car.set(METRIC_ID_GEAR_LEVER, 'P');
+    run(800);
+    CHECK((int)UI._active == parked, "daily: in P on %zu, want the car %d", UI._active, parked);
+    shot("daily_parked");
+    car.set(METRIC_ID_GEAR_LEVER, 'R');
+    car.set(METRIC_ID_STEERING_ANGLE, 120);
+    run(800);
+    CHECK((int)UI._active == reversing, "daily: in R on %zu, want the reversing view %d", UI._active, reversing);
+    CHECK(UI._parks[UI._screens[reversing].park].pathView, "daily: reversing without the path view");
+    shot("daily_reversing");
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    car.set(METRIC_ID_SPEED, 20);
+    run(1500);
+    CHECK((int)UI._active == 0, "daily: driving off, on %zu, want the dash", UI._active);
+}
+
+SCENARIO(round_layout_race) {
+    if (!ROUND) { printf("      (round-screen layouts: nothing to check on this board)\n"); return; }
+    JsonDocument r;
+    CHECK(layoutFile("race.json", r), "layouts/race.json does not read");
+    engineOn();
+    car.set(METRIC_ID_COOLANT_TEMP, 90);
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    car.set(METRIC_ID_SPEED, 80);
+    car.set(METRIC_ID_RPM, 4000);
+    layoutBoots("race", r);
+    CHECK(!UI._watchPopups && UI._watch.size() == 2, "race: watchdog %s, %zu items",
+          UI._watchPopups ? "draws its card" : "silent", UI._watch.size());
+    shot("race_dash");
+    car.set(METRIC_ID_COOLANT_TEMP, 108);
+    run(3000);
+    CHECK(!alertShown(), "race: a card over the screen at 108 degrees");
+    CHECK(lampOn("coolant_hot"), "race: ENGINE HOT not on the strip at 108 degrees");
+    CHECK((int)UI._active == screenOf("arc_gauge"), "race: hot, on %zu, want the coolant gauge", UI._active);
+    shot("race_hot");
+    car.set(METRIC_ID_COOLANT_TEMP, 95);
+    run(12000);
+    CHECK((int)UI._active == 0, "race: cooled down, on %zu, want the dash again", UI._active);
+    car.set(METRIC_ID_RPM, 6300);
+    run(600);
+    CHECK(lampOn("custom_1") && !lampOn("custom_2") && (int)UI._active == 0, "race: SHIFT at 6300 rpm, still the dash");
+    car.set(METRIC_ID_RPM, 6600);
+    run(800);
+    CHECK(lampOn("custom_2") && !alertShown(), "race: OVER-REV on the strip, no card");
+    CHECK((int)UI._active == screenOf("meter_gauge"), "race: over-rev, on %zu, want the big tach", UI._active);
+    shot("race_overrev");
+    car.set(METRIC_ID_RPM, 4000);
+    run(4000);
+    car.set(METRIC_ID_SPEED, 0);
+    car.set(METRIC_ID_RPM, 3500);
+    run(800);
+    CHECK((int)UI._active == screenOf("perf"), "race: a launch, on %zu, want the timers", UI._active);
+    car.set(METRIC_ID_SPEED, 60);
+    car.set(METRIC_ID_RPM, 5000);
+    run(26000);
+    car.set(METRIC_ID_LON_ACCEL, -0.9f);
+    run(800);
+    CHECK((int)UI._active == screenOf("gmeter"), "race: hard braking, on %zu, want the G-meter", UI._active);
+    shot("race_braking");
 }
 
 /* ─────────────────────────────── main ──────────────────────────────────── */

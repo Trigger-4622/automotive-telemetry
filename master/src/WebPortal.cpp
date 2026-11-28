@@ -21,6 +21,7 @@
 #include "FwUpdate.h"
 #include "DriveLog.h"
 #include "RawRec.h"
+#include "Computers.h"
 #include "Learner.h"
 #include "MasterConfig.h"
 #include "MasterTelemetry.h"
@@ -286,6 +287,19 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
    <div id="lgIds" class="row" style="margin-top:8px"></div>
    <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
+ <div class="card"><h2>The car's computers <small id="ccSub"></small>
+   <button class="b" id="ccBtn" style="margin-left:auto" onclick="compScan()">Find them</button></h2>
+  <p class="say" style="margin:0 0 8px">Every computer on this bus that answers a diagnostic request, wherever it is and whatever it
+   speaks - the engine and the transmission, and the others (on this car the body computer, the ABS/VDC, the meter...). Standing,
+   ignition on, <b>Find them</b> asks every address from 0x700 to 0x7F7 "are you there" (3E) - not the ones the car's modules send on -
+   and every 29-bit computer at once, takes each answer from wherever it comes, then asks each computer who it is (OBD-II, SSM,
+   KWP2000, UDS). <b>Find its data</b> asks a computer for every data block it has (21 01 to 21 FE). Only reads: nothing in a
+   computer changes. Half a minute or so each, with the OBD-II requests going ahead.</p>
+  <div class="bar" id="ccBarBox" hidden><i id="ccBar" style="width:0"></i></div>
+  <div id="ccList"></div>
+  <p class="say" id="ccSay" style="margin:8px 0 0"></p>
+  <div class="grp" style="margin-top:16px">Read into the frame table</div>
+  <div id="ccRead"></div></div>
  <div class="card"><h2>Engine computer</h2>
   <p class="say" style="margin:0 0 8px">RomRaider lists its ROM definitions by the <b>calibration ID</b> (its "internal ID") and its
    logger definitions by the <b>ROM ID</b> SSM2 reports. If its definition files list this calibration ID, RomRaider can read and
@@ -358,6 +372,13 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 const META={257:["MIL lamp", "", "Status & switches", 0],259:["Fuel system status", "", "Status & switches", 0],260:["Engine load", "%", "Engine", 1],261:["Coolant", "°C", "Temperatures", 0],262:["STFT B1", "%", "Fuel & mixture", 1],263:["LTFT B1", "%", "Fuel & mixture", 1],264:["STFT B2", "%", "Fuel & mixture", 1],265:["LTFT B2", "%", "Fuel & mixture", 1],266:["Fuel press", "kPa", "Fuel & mixture", 0],267:["MAP", "kPa", "Engine", 0],268:["RPM", "rpm", "Engine", 0],269:["Speed", "km/h", "Driving", 0],270:["Timing", "°", "Engine", 1],271:["IAT", "°C", "Temperatures", 0],272:["MAF", "g/s", "Engine", 1],273:["Throttle", "%", "Engine", 1],276:["O2 B1S1", "V", "Fuel & mixture", 2],277:["O2 B1S2", "V", "Fuel & mixture", 2],280:["O2 B2S1", "V", "Fuel & mixture", 2],281:["O2 B2S2", "V", "Fuel & mixture", 2],287:["Run time", "s", "Driving", 0],289:["Dist MIL", "km", "Driving", 0],290:["Fuel rail (vac)", "kPa", "Fuel & mixture", 0],291:["Fuel rail gauge", "kPa", "Fuel & mixture", 0],292:["WB B1S1", "λ", "Fuel & mixture", 3],296:["WB B2S1", "λ", "Fuel & mixture", 3],300:["EGR cmd", "%", "Fuel & mixture", 1],301:["EGR error", "%", "Fuel & mixture", 1],302:["Evap purge", "%", "Fuel & mixture", 1],303:["Fuel level", "%", "Fuel & mixture", 1],304:["Warm-ups", "", "Driving", 0],305:["Dist cleared", "km", "Driving", 0],306:["Evap vapor", "Pa", "Fuel & mixture", 0],307:["Barometric", "kPa", "Engine", 0],308:["WB B1S1 λ (I)", "λ", "Fuel & mixture", 3],312:["WB B2S1 λ (I)", "λ", "Fuel & mixture", 3],316:["Cat temp", "°C", "Temperatures", 0],317:["Cat temp B2S1", "°C", "Temperatures", 0],318:["Cat temp B1S2", "°C", "Temperatures", 0],319:["Cat temp B2S2", "°C", "Temperatures", 0],322:["Battery", "V", "Electrical", 2],323:["Abs load", "%", "Engine", 1],324:["Cmd", "λ", "Engine", 3],325:["Rel throttle", "%", "Engine", 1],326:["Ambient", "°C", "Temperatures", 0],327:["Abs throttle B", "%", "Engine", 1],328:["Throttle C", "%", "Engine", 1],329:["Pedal D", "%", "Engine", 1],330:["Pedal E", "%", "Engine", 1],331:["Pedal F", "%", "Engine", 1],332:["Cmd throttle", "%", "Engine", 1],333:["Time MIL on", "min", "Driving", 0],334:["Time since clear", "min", "Driving", 0],337:["Fuel type", "", "Status & switches", 0],338:["Ethanol", "%", "Fuel & mixture", 1],339:["Evap abs", "kPa", "Fuel & mixture", 0],345:["Fuel rail abs", "kPa", "Fuel & mixture", 0],346:["Relative pedal", "%", "Engine", 1],347:["Hybrid SOC", "%", "Engine", 1],348:["Oil temp", "°C", "Temperatures", 0],349:["Injection timing", "°", "Fuel & mixture", 1],350:["Fuel rate", "L/h", "Fuel & mixture", 1],353:["Demand torque", "%", "Engine", 1],354:["Actual torque", "%", "Engine", 1],355:["Reference torque", "Nm", "Engine", 0],422:["Odometer", "km", "Driving", 0],769:["DTC count", "", "Status & switches", 0],788:["O2 B1S1 trim", "%", "Fuel & mixture", 1],789:["O2 B1S2 trim", "%", "Fuel & mixture", 1],792:["O2 B2S1 trim", "%", "Fuel & mixture", 1],793:["O2 B2S2 trim", "%", "Fuel & mixture", 1],804:["WB B1S1", "V", "Fuel & mixture", 2],808:["WB B2S1", "V", "Fuel & mixture", 2],820:["WB B1S1", "mA", "Fuel & mixture", 1],824:["WB B2S1", "mA", "Fuel & mixture", 1],1024:["Trouble codes", "", "Status & switches", 0],1025:["Trouble code 1", "", "Status & switches", 0],1026:["Trouble code 2", "", "Status & switches", 0],1027:["Trouble code 3", "", "Status & switches", 0],1028:["Trouble code 4", "", "Status & switches", 0],1029:["Trouble code 5", "", "Status & switches", 0],1030:["Trouble code 6", "", "Status & switches", 0],1031:["Trouble code 7", "", "Status & switches", 0],1032:["Trouble code 8", "", "Status & switches", 0],4097:["Boost", "bar", "Engine", 2],4098:["AFR", "AFR", "Fuel & mixture", 1],4099:["Oil press", "bar", "Engine", 2],4100:["EGT", "°C", "Temperatures", 0],4101:["Gear", "", "Driving", 0],4102:["Steering", "°", "Driving", 1],4103:["Brake", "bar", "Driving", 2],4104:["Wheel FL", "km/h", "Driving", 0],4105:["Wheel FR", "km/h", "Driving", 0],4106:["Wheel RL", "km/h", "Driving", 0],4107:["Wheel RR", "km/h", "Driving", 0],4108:["Lateral G", "g", "Driving", 2],4109:["Longitudinal G", "g", "Driving", 2],4110:["Yaw rate", "°/s", "Driving", 1],4111:["Gear lever", "", "Driving", 0],4112:["Cruise set", "km/h", "Driving", 0],4113:["ATF temp", "°C", "Temperatures", 0],4353:["Batt current", "A", "Electrical", 1],4354:["Batt SOC", "%", "Electrical", 1],4355:["Batt SOH", "%", "Electrical", 1],4356:["Batt temp", "°C", "Temperatures", 0],4357:["Alternator", "V", "Electrical", 2],4358:["Alternator", "A", "Electrical", 1],4359:["Alternator load", "%", "Electrical", 1],4360:["12V rail", "V", "Electrical", 2],4361:["Elec load", "W", "Electrical", 0],4362:["Charge status", "", "Status & switches", 0],4609:["Left turn signal", "", "Status & switches", 0],4610:["Right turn signal", "", "Status & switches", 0],4611:["High beam", "", "Status & switches", 0],4612:["Door open", "", "Status & switches", 0],4613:["Handbrake", "", "Status & switches", 0],4614:["Seatbelt unfastened", "", "Status & switches", 0],4615:["Cruise active", "", "Status & switches", 0],4616:["Reverse", "", "Status & switches", 0],4617:["Lever in P", "", "Status & switches", 0],4618:["Lever in N", "", "Status & switches", 0],4619:["Lever in D", "", "Status & switches", 0],4620:["Hazard lights", "", "Status & switches", 0],4621:["Cruise main", "", "Status & switches", 0],4622:["Front fog", "", "Status & switches", 0],4623:["Rear fog", "", "Status & switches", 0],4624:["Door FL", "", "Status & switches", 0],4625:["Door FR", "", "Status & switches", 0],4626:["Door RL", "", "Status & switches", 0],4627:["Door RR", "", "Status & switches", 0],4628:["Trunk open", "", "Status & switches", 0],4629:["Hood open", "", "Status & switches", 0],4630:["VDC off", "", "Status & switches", 0],4631:["Passenger belt unfastened", "", "Status & switches", 0],7937:["Night sense", "", "System", 0],7938:["Master uptime", "s", "System", 0],7939:["CAN frames/s", "", "System", 0],7940:["CAN IDs", "", "System", 0],7941:["OBD replies/s", "", "System", 0],7942:["SSM2 exch/s", "", "System", 0],7952:["Oil change due", "km", "System", 0],8193:["Knock corr", "°", "Engine", 1],8194:["Knock corr fine", "°", "Engine", 1],8195:["A/F learn", "%", "Fuel & mixture", 1],8196:["A/F corr", "%", "Fuel & mixture", 1],8197:["Inj duty", "%", "Fuel & mixture", 1],8198:["Target boost", "bar", "Engine", 2],8199:["Wastegate", "%", "Engine", 1],8200:["A/F corr 2", "%", "Fuel & mixture", 1],8201:["A/F learn 2", "%", "Fuel & mixture", 1],8202:["Front O2 #1", "V", "Fuel & mixture", 2],8203:["Rear O2", "V", "Fuel & mixture", 2],8204:["Front O2 #2", "V", "Fuel & mixture", 2],8205:["MAF sensor", "V", "Engine", 2],8206:["TPS", "V", "Engine", 2],8207:["Atmospheric", "kPa", "Engine", 0],8208:["Manifold rel", "kPa", "Engine", 0],8209:["Tank press", "kPa", "Engine", 0],8210:["Learned timing", "°", "Engine", 1],8211:["Accel pedal", "%", "Engine", 1],8212:["Fuel temp", "°C", "Temperatures", 0],8213:["Wastegate 2", "%", "Engine", 1],8214:["CPC duty", "%", "Fuel & mixture", 1],8215:["ISC duty", "%", "Engine", 1],8216:["A/F lean", "%", "Fuel & mixture", 1],8217:["A/F heater", "%", "Fuel & mixture", 1],8218:["ISC step", "", "Engine", 0],8219:["EGR steps", "", "Fuel & mixture", 0],8220:["Alternator duty", "%", "Electrical", 1],8221:["Fuel pump", "%", "Fuel & mixture", 1],8222:["Intake VVT R", "°", "Engine", 1],8223:["Intake VVT L", "°", "Engine", 1],8224:["Intake OCV R", "%", "Engine", 1],8225:["Intake OCV L", "%", "Engine", 1],8226:["A/F current", "mA", "Fuel & mixture", 1],8227:["Lambda", "λ", "Fuel & mixture", 3],8228:["Lambda 2", "λ", "Fuel & mixture", 3],8229:["Throttle motor", "%", "Engine", 1],8230:["Main TPS", "V", "Engine", 2],8231:["Main APS", "V", "Engine", 2],8232:["Brake boost", "kPa", "Driving", 0],8233:["Fuel HP", "MPa", "Fuel & mixture", 2],8235:["Exhaust VVT R", "°", "Engine", 1],8236:["Exhaust VVT L", "°", "Engine", 1],8237:["Rough cyl 1", "", "Engine", 0],8238:["Rough cyl 2", "", "Engine", 0],8239:["Rough cyl 3", "", "Engine", 0],8240:["Rough cyl 4", "", "Engine", 0],8241:["Inj 2 pulse", "ms", "Fuel & mixture", 2],8242:["Cold start inj", "ms", "Engine", 2],8243:["Alternator mode", "", "Status & switches", 0],8244:["Fuel sender", "V", "Fuel & mixture", 2],8245:["Radiator fan", "%", "Engine", 1],8246:["Learned ign corr", "°", "Engine", 1],8247:["Boost feedback", "%", "Engine", 1],8248:["Target RPM", "rpm", "Engine", 0],8249:["SI-Drive", "", "Status & switches", 0],8250:["Odometer (SSM)", "km", "Driving", 0],8251:["EPS current", "A", "Electrical", 1],8252:["Fuel pump", "A", "Fuel & mixture", 1],8254:["Inj 1 pulse", "ms", "Fuel & mixture", 2],8449:["Brake switch", "", "Status & switches", 0],8450:["Clutch switch", "", "Status & switches", 0],8451:["Neutral switch", "", "Status & switches", 0],8452:["A/C switch", "", "Status & switches", 0],8453:["Idle switch", "", "Status & switches", 0],8454:["Knock signal", "", "Status & switches", 0],8455:["Electrical load", "", "Status & switches", 0],8456:["Light switch", "", "Status & switches", 0],8457:["Radiator fan 1", "", "Status & switches", 0],8458:["Radiator fan 2", "", "Status & switches", 0],8459:["A/C compressor", "", "Status & switches", 0],8460:["Fuel pump relay", "", "Status & switches", 0],8461:["Oil pressure switch", "", "Status & switches", 0],8462:["Starter", "", "Status & switches", 0],8463:["Rear defogger", "", "Status & switches", 0],8464:["Blower", "", "Status & switches", 0],8465:["Wiper switch", "", "Status & switches", 0],8466:["Ignition", "", "Status & switches", 0],8467:["Stop lamp switch", "", "Status & switches", 0],8468:["Knock signal 2", "", "Status & switches", 0],12289:["Custom 1", "", "Custom", 0],12290:["Custom 2", "", "Custom", 0],12291:["Custom 3", "", "Custom", 0],12292:["Custom 4", "", "Custom", 0],12293:["Custom 5", "", "Custom", 0],12294:["Custom 6", "", "Custom", 0],12295:["Custom 7", "", "Custom", 0],12296:["Custom 8", "", "Custom", 0],12297:["Custom 9", "", "Custom", 0],12298:["Custom 10", "", "Custom", 0],12299:["Custom 11", "", "Custom", 0],12300:["Custom 12", "", "Custom", 0],12301:["Custom 13", "", "Custom", 0],12302:["Custom 14", "", "Custom", 0],12303:["Custom 15", "", "Custom", 0],12304:["Custom 16", "", "Custom", 0]};
 const $=q=>document.querySelector(q);
 const hex=(n,w)=>'0x'+Number(n).toString(16).toUpperCase().padStart(w,'0');
+/* The computers' answers are in the frame table as extended IDs of their own
+   (Computers.h): COMP | address << 12 | block << 4 | which eight bytes - the
+   address an 11-bit request ID, or 0x800 | the target of a 29-bit one. */
+const COMP=0x1E000000,isPseudo=id=>id>=COMP&&id<0x1F000000;
+const h2=n=>Number(n).toString(16).toUpperCase().padStart(2,'0');
+const compAddr=a=>a>0x7FF&&a<0x1000?'29-bit '+h2(a&0xFF):a>0xFFF?hex(a,8):hex(a,3);
+const canName=id=>isPseudo(id)?`${compAddr(id>>12&0xFFF)} 21 ${h2(id>>4&0xFF)} · ${(id&0xF)*8}-${(id&0xF)*8+7}`:hex(id,3);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const nm=id=>META[id]?META[id][0]:hex(id,4);
 const un=id=>META[id]?META[id][1]:'';
@@ -391,14 +412,15 @@ function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v);if(!v)return;
  $('#saveRb').hidden=!rb}
 /* Five tabs, each polling only what it shows (the master answers one request
    at a time): Home and Signals /api/live, Bus also /api/bus and the evidence
-   log, Car the codes and the drive logs, Settings the firmware once. */
+   log, Car the codes, the drive logs and the car's computers, Settings the
+   firmware once. */
 const TABS=['home','sig','bus','car','set'];
 function go(t){if(!TABS.includes(t))t='home';TAB=t;
  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
  TABS.forEach(x=>$('#t-'+x).hidden=x!==t);
  try{history.replaceState(null,'','#'+t)}catch(e){}
  if(t==='home'&&L)renderHome();if(t==='sig'){renderSources();if(L)renderLearn()}
- if(t==='bus'){pollBus();pollEvlog();pollRaw()}if(t==='car'){pollCodes();pollLogs()}
+ if(t==='bus'){pollBus();pollEvlog();pollRaw()}if(t==='car'){pollCodes();pollLogs();pollComp()}
  if(t==='set'){fwInfo();if(ADV_ON&&LOADED&&!JSON_ED)jsonShow()}}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
@@ -616,11 +638,11 @@ function field(x){
  const on01=x.map&&x.bits&&(x.m>>8)===0x12&&x.map.every(p=>p[1]===0||p[1]===1);
  const tbl=on01?' • on when '+x.map.filter(p=>p[1]===1).map(p=>x.bits.map((b,i)=>`${b} ${(p[0]>>i)&1?'set':'clear'}`).join(', ')).join(' or '):
   x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
- if(x.bits&&x.bits.length)return`${hex(x.id,3)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
- if(x.l===1)return`${hex(x.id,3)} <span class="muted">bit ${x.s}</span>`;
+ if(x.bits&&x.bits.length)return`${canName(x.id)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
+ if(x.l===1)return`${canName(x.id)} <span class="muted">bit ${x.s}</span>`;
  const k=x.s>>3;
- if(x.l<8&&!x.be)return`${hex(x.id,3)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
- return`${hex(x.id,3)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
+ if(x.l<8&&!x.be)return`${canName(x.id)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
+ return`${canName(x.id)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
 async function learnAct(a,m){await post(`/api/learn/${a}?m=${m}`,a==='accept'?`Listening for ${nm(m)}`:`Requesting ${nm(m)} again`,()=>load(true))}
 /* What needs the driver, from what /api/live already carries: one line each,
    linking to the tab where it is dealt with. */
@@ -716,7 +738,7 @@ async function pollBusOnce(){
   if(dt&&ZC[k]!==undefined)ZHZ[k]=(c.count-ZC[k])/dt;ZC[k]=c.count;ZP[k]=b;
   const by=b.map((v,i)=>`<span class="${pb.length&&pb[i]!==v?'h':ch[i]?'l':''}">${v.toString(16).toUpperCase().padStart(2,'0')}</span>`).join('');
   const used=(C.signals||[]).filter(s=>s.can_id===c.id&&(s.mode===1||s.mode===3)).map(s=>nm(s.metric));
-  return`<tr><td>${c.ext?'ext ':''}${hex(c.id,3)}</td><td>${ZHZ[k]!==undefined?ZHZ[k].toFixed(0):'–'}${c.age>2000?' <span class="warn">idle</span>':''}</td>
+  return`<tr><td>${isPseudo(c.id)?canName(c.id):(c.ext?'ext ':'')+hex(c.id,3)}</td><td>${ZHZ[k]!==undefined?ZHZ[k].toFixed(0):'–'}${c.age>2000?' <span class="warn">idle</span>':''}</td>
    <td class="hx">${by}${used.length?` <span class="tag raw">${esc(used.join(', '))}</span>`:''}</td>
    <td><button class="b s" onclick="mapOpen(${c.id},${c.ext?1:0})">Map</button></td></tr>`}).join('')||'<tr><td colspan="4" class="empty">Nothing heard yet.</td></tr>';
  if(MAP)mapPrev()}
@@ -777,7 +799,7 @@ function metricOpts(sel,filter){return Object.keys(META).map(Number).filter(id=>
  .map(id=>`<option value="${id}" ${id===sel?'selected':''}>${esc(nm(id))}${un(id)?' ('+esc(un(id))+')':''}</option>`).join('')}
 /* The map dialog sits over the tab that opened it; while it is open the frames
    are read (pollBus), so its preview follows the bus. */
-function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapDlg').hidden=false;$('#mapId').textContent=hex(id,3);
+function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapDlg').hidden=false;$('#mapId').textContent=canName(id);
  $('#mpS').value=p.s||0;$('#mpL').value=p.l||8;$('#mpK').value=p.k||1;$('#mpO').value=p.o||0;$('#mpBE').value=p.be?'1':'0';
  $('#mpSg').checked=!!p.sg;$('#mpM').innerHTML=metricOpts(p.m||0x010C);mapPrev();pollBus()}
 function mapClose(){MAP=null;$('#mapDlg').hidden=true}
@@ -1304,9 +1326,9 @@ async function teachStart(){
    const tq=at();let b=null;asked++;
    try{b=await req(url,null,plan.deadline)}catch(e){}
    const tr=at(),i=b?teachSlot(durs,skip,tq,tr):-1;
-   if(b)TLAST.reads.push({t:[Math.round(tq),Math.round(tr)],step:i,c:b.census.filter(c=>!c.ext).map(c=>[c.id,c.d||'',c.e||'']),m:b.m||null});
+   if(b)TLAST.reads.push({t:[Math.round(tq),Math.round(tr)],step:i,c:b.census.filter(c=>!c.ext||isPseudo(c.id)).map(c=>[c.id,c.d||'',c.e||'']),m:b.m||null});
    if(i>=0){const k=steps[i][0];
-    TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
+    TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext||isPseudo(c.id)).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
     if(kind==='mot'){
      // The car as the master knows it at this poll: speed, steering, and a yaw
      // rate or lateral G already read from the bus (never one derived from these).
@@ -1373,9 +1395,9 @@ function teachAnalyze(steps){
 /** The raw signals feeding @p metric now: taught, mapped by hand or learned. */
 const feeding=metric=>(C.signals||[]).filter(g=>g.metric===metric&&(g.mode===1||g.mode===3));
 const sameSig=(g,x)=>g.can_id===x.can_id&&g.start===x.start&&g.len===x.len&&String(g.bits||'')===String(x.bits||'');
-const where=g=>hex(g.can_id,3)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):g.len===1?' bit '+g.start:` bits ${g.start}-${g.start+g.len-1}`);
+const where=g=>canName(g.can_id)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):g.len===1?' bit '+g.start:` bits ${g.start}-${g.start+g.len-1}`);
 function teachSig(r,m){
- const s={name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
+ const s={name:nm(m).slice(0,15),can_id:r.id,ext:isPseudo(r.id),start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
  if(r.codes){s.bits=r.bits;s.map=r.codes.map((c,g)=>[c,posValue(m,r.names[g],g)])}
  else if(r.map){s.bits=r.bits;s.map=r.map}            // the flasher while the side's bit says so
  else if(r.inv){s.scale=-1;s.offset=1}
@@ -1397,9 +1419,9 @@ async function teachAdd(list){
 async function teachUse(i){
  const r=TRES[i],m=r.metric||+$('#tM').value;
  if(!r.codes&&r.l!==1){BUS=BUS||{census:[]};
-  if(r.k!==undefined){mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
+  if(r.k!==undefined){mapOpen(r.id,isPseudo(r.id)?1:0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
    toast('Check it reads right (round the scale), then Use this value');return}
-  mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
+  mapOpen(r.id,isPseudo(r.id)?1:0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
   toast('Set the scale so the value reads right, then Use this value');return}
  if(!await teachAdd([teachSig(r,m)]))return;
  toast(`${nm(m)} is now read from the bus`);
@@ -1600,6 +1622,72 @@ async function serviceReset(){
  if(!confirm('Oil changed now: the reminder starts again from the odometer?'))return;
  try{const r=await fetch('/api/service/reset',{method:'POST'}),j=await r.json();toast(r.ok?'Reminder reset':j.error||'Failed');
   if(r.ok)await load(true);pollCodes()}catch(e){toast('Failed')}}
+/* ───────────── the car's computers (Car tab) ───────────── */
+/* Who a computer said it is, every way it was asked (Computers.h CompAsk);
+   nothing here knows any computer in advance. */
+const ASKS=['OBD-II','SSM','KWP2000','UDS name','UDS part no.'];
+const hexj=a=>(a||[]).map(h2).join('');
+const txt=a=>(a||[]).map(c=>c>=32&&c<127?String.fromCharCode(c):' ').join('').replace(/\s+/g,' ').trim();
+function compWho(f){
+ const a=f.ask||[],ok=q=>a[q]&&a[q][0]===1,d=q=>a[q]?a[q][2]:[],out=[];
+ if(ok(0))out.push('<b>OBD-II</b> (an emissions computer)');
+ if(ok(1))out.push(`<b>SSM</b> SYS ${hexj(d(1).slice(1,4))} · ROM ${hexj(d(1).slice(4,9))}`);
+ if(ok(2))out.push(`<b>KWP2000</b> "${esc(txt(d(2).slice(2)))}"`);
+ if(ok(3))out.push(`<b>UDS</b> "${esc(txt(d(3).slice(3)))}"`);
+ if(ok(4))out.push(`part no. "${esc(txt(d(4).slice(3)))}"`);
+ if(!out.length){const no=a.map((x,q)=>x&&x[0]===2?ASKS[q]:null).filter(Boolean);
+  out.push(a.some(x=>x&&x[0])?'answers "are you there" only'+(no.length?` (refuses ${no.join(', ')})`:''):'not asked yet')}
+ return out.join(' · ')}
+let CC=null;
+function pollComp(){return solo('comp',pollCompOnce)}
+async function pollCompOnce(){
+ if(TAB!=='car'||TEACH||UPD)return;
+ try{CC=await req('/api/computers',null,5000)}catch(e){return}
+ renderComp();
+ if(CC.phase)setTimeout(pollComp,1000)}
+const isRead=(tx,l)=>(C.reads||[]).some(r=>r.tx===tx&&r.lid===l);
+function renderComp(){
+ const d=CC;if(!d)return;
+ const found=d.found||[],PH=['','asking','asking every 29-bit computer','asking who they are','searching'];
+ $('#ccSub').textContent=d.phase?`${PH[d.phase]||''} ${d.phase===4?'21 '+h2(d.at):hex(d.at,3)}…`:found.length?`${found.length} found`:'';
+ $('#ccBarBox').hidden=!d.phase;$('#ccBar').style.width=(d.pct||0)+'%';$('#ccBtn').disabled=!!d.phase;
+ $('#ccList').innerHTML=found.length?found.map((f,i)=>{
+  const s=d.searching===i?`<span class="muted">searching its data blocks… ${d.pct} %</span>`:
+   f.search===3?'<span class="muted">no data blocks to search: it has no service 21</span>':
+   f.search===2?(f.lids.length?f.lids.map(([l,n])=>`<span style="white-space:nowrap;margin-right:10px">21 ${h2(l)} · ${n} B `+
+    (isRead(f.tx,l)?'<span class="ok">read</span>':`<button class="b s p" onclick="compRead(${f.tx},${f.rx},${l})">Read</button>`)+'</span>').join(''):
+    '<span class="muted">no block answered</span>'):
+   `<button class="b s" onclick="compSearch(${i})"${d.phase?' disabled':''}>Find its data</button>`;
+  return`<div class="lr"><div class="lt"><span class="mono"><b>${compAddr(f.tx)}</b> → ${compAddr(f.rx)}</span></div>
+   <div style="white-space:normal">${compWho(f)}</div><div class="ls" style="justify-content:flex-start;flex-wrap:wrap">${s}</div></div>`}).join(''):
+  `<p class="say" style="margin:0">${d.phase?'Asking…':d.scanned?'Nothing answered.':'Not looked yet.'}</p>`;
+ $('#ccSay').innerHTML=(d.note?`<span class="warn">Stopped: ${esc(d.note)}</span>. `:'')+
+  (d.scanned?`${d.skipped} address${d.skipped===1?'':'es'} left alone: the car's modules send on them. `:'')+
+  (d.scanned&&found.length<=2?'Fewer than expected? A computer may answer only on another bus (the body computer is the gateway to it): '+
+   'record the bus while a scan tool reads it (Bus tab, Raw recording, master\'s requests off) and the tool\'s requests are in the file. ':'');
+ const rs=d.reads||[];
+ $('#ccRead').innerHTML=(C.reads||[]).length?(C.reads||[]).map((r,i)=>{const s=rs[i]&&rs[i].tx===r.tx&&rs[i].lid===r.lid?rs[i]:null;
+  return`<div class="lr"><div class="lt"><span><span class="mono"><b>${compAddr(r.tx)} 21 ${h2(r.lid)}</b></span> every ${r.ms} ms</span>
+   <button class="x" title="Stop reading it" onclick="compUnread(${i})">✕</button></div>
+   <div class="ls"><span>${s?`${s.reads} answers (${s.len} bytes), ${s.fails} failed · ${s.age==null?'no answer yet':s.age<2000?'last just now':'last '+ago(Math.round(s.age/1000))}`+
+   (s.note?` · <span class="warn">${esc(s.note)}</span>`:''):'not read yet'}</span></div></div>`}).join('')+
+  '<p class="say" style="margin:8px 0 0">In the Bus tab\'s frame table as rows of their own (e.g. <b>0x750 21 50 · 0-7</b>): '+
+  'teach by doing finds a door or a switch there as on any frame, and <b>Map</b> names a bit or a byte.</p>':
+  '<p class="say" style="margin:0">None. <b>Read</b> a block a computer\'s search found.</p>'}
+async function compScan(){
+ try{const r=await fetch('/api/computers/scan',{method:'POST'}),j=await r.json();toast(r.ok?'Asking every address…':j.error||'Failed')}
+ catch(e){toast('Failed')}
+ setTimeout(pollComp,500)}
+async function compSearch(i){
+ try{const r=await fetch('/api/computers/search?i='+i,{method:'POST'}),j=await r.json();toast(r.ok?'Asking for its blocks…':j.error||'Failed')}
+ catch(e){toast('Failed')}
+ setTimeout(pollComp,500)}
+async function compRead(tx,rx,lid){
+ if(!LOADED){toast('Not loaded yet');return}
+ const rd=C.reads||[];
+ if(rd.length>=16){toast('16 blocks at most');return}
+ C.reads=rd.concat([{tx,rx,lid,ms:500}]);setDirty(true);await save();renderComp()}
+async function compUnread(i){C.reads=(C.reads||[]).filter((_,k)=>k!==i);setDirty(true);await save();renderComp()}
 const kb=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixed(2)+' MB';
 const dur=s=>{s=Math.round(s);return s<60?s+' s':Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s'};
 function pollLogs(){return solo('logs',pollLogsOnce)}
@@ -1701,7 +1789,7 @@ renderSettings();
 try{advShow(localStorage.getItem('advOn')==='1')}catch(e){}
 go(location.hash.slice(1));
 load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);setInterval(pollRaw,2000);
-setInterval(pollCodes,3000);setInterval(pollLogs,3000);
+setInterval(pollCodes,3000);setInterval(pollLogs,3000);setInterval(pollComp,3000);
 </script></body></html>
 )HTML";
 
@@ -2283,6 +2371,75 @@ void WebPortal::setupRoutes() {
         else s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
     });
     s_server.on("/api/log/clear", HTTP_POST, []() { driveLogDeleteAll(); sendOk(); });
+
+    /*
+     * The car's computers (Computers.h): the scan, who each one said it is,
+     * the data blocks a search found, and the reads table as it goes.
+     */
+    s_server.on("/api/computers", HTTP_GET, []() {
+        CompStatus st;
+        compGetStatus(st);
+        JsonDocument d;
+        d["phase"]     = st.phase;
+        d["at"]        = st.at;
+        d["pct"]       = st.pct;
+        d["scanned"]   = st.scanned;
+        d["searching"] = st.searching;
+        d["skipped"]   = st.skipped;
+        d["note"]      = st.note;
+        JsonArray fa = d["found"].to<JsonArray>();
+        CompFound f;                           // ~180 B of the loop task's 12 KB, not static RAM
+        for (size_t i = 0; compFoundAt(i, f); i++) {
+            JsonObject o = fa.add<JsonObject>();
+            o["tx"] = f.tx;
+            o["rx"] = f.rx;
+            JsonArray h = o["hello"].to<JsonArray>();
+            for (uint8_t k = 0; k < 8; k++) h.add(f.hello[k]);
+            JsonArray aa = o["ask"].to<JsonArray>();
+            for (uint8_t q = 0; q < ASK_N; q++) {
+                JsonArray a = aa.add<JsonArray>();
+                a.add(f.ans[q].how);
+                a.add(f.ans[q].code);
+                JsonArray b = a.add<JsonArray>();
+                for (uint8_t k = 0; k < f.ans[q].len; k++) b.add(f.ans[q].d[k]);
+            }
+            o["search"] = f.search;
+            JsonArray la = o["lids"].to<JsonArray>();
+            for (uint8_t k = 0; k < f.nLids; k++) {
+                JsonArray l = la.add<JsonArray>();
+                l.add(f.lid[k]);
+                l.add(f.lidLen[k]);
+            }
+        }
+        JsonArray ra = d["reads"].to<JsonArray>();
+        CompReadView r;
+        for (size_t i = 0; compReadAt(i, r); i++) {
+            JsonObject o = ra.add<JsonObject>();
+            o["tx"] = r.tx;
+            o["lid"] = r.lid;
+            o["reads"] = r.reads;
+            o["fails"] = r.fails;
+            o["len"] = r.len;
+            if (r.ageMs != UINT32_MAX) o["age"] = r.ageMs;
+            o["note"] = r.note;
+        }
+        sendJson(d);
+    });
+    s_server.on("/api/computers/scan", HTTP_POST, []() {
+        char why[96] = "";
+        if (compRequestScan(why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = why;
+        sendJson(d, 409);
+    });
+    s_server.on("/api/computers/search", HTTP_POST, []() {
+        char why[96] = "";
+        const long i = s_server.hasArg("i") ? s_server.arg("i").toInt() : -1;
+        if (i >= 0 && compRequestSearch((size_t)i, why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = *why ? why : "which computer?";
+        sendJson(d, 409);
+    });
 
     /*
      * The raw bus recording (RawRec): every frame to the logs partition, for

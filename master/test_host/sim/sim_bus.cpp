@@ -820,6 +820,9 @@ struct IsoNode {
     struct { std::vector<uint8_t> msg; size_t off = 0; uint8_t sn = 1; bool waitingFc = false; } tx;
 };
 static IsoNode s_ecmNode{"ECM", 0x7E0, 0x7E8}, s_tcmNode{"TCM", 0x7E1, 0x7E9};
+static IsoNode s_biuNode{"BIU", 0x750, 0x758}, s_meterNode{"meter", 0x7C0, 0x7D0};
+static IsoNode s_epsNode{"EPS", 0x18DA30F1, 0x18DAF130};
+sim::OthersSim sim::others;
 std::map<uint32_t, int> sim::isoRequests;
 int sim::codesCleared = 0;
 
@@ -862,18 +865,25 @@ static uint8_t ssmByte(uint32_t a) {
     }
 }
 
+/** A frame from node @p n: 29-bit when its reply ID is above 0x7FF. */
+static twai_message_t nodeFrameOut(const IsoNode &n) {
+    twai_message_t m = frame(n.rspId, {});
+    m.extd = n.rspId > 0x7FF;
+    return m;
+}
+
 static void nodeSend(IsoNode &n, const std::vector<uint8_t> &msg, uint64_t at) {
     // Still waiting for our flow control for its last long answer: that one
     // was abandoned.
     if (n.tx.waitingFc) { sim::isoAbandoned++; n.tx.waitingFc = false; }
     if (msg.size() <= 7) {
-        twai_message_t m = frame(n.rspId, {});
+        twai_message_t m = nodeFrameOut(n);
         m.data[0] = (uint8_t)msg.size();
         std::memcpy(&m.data[1], msg.data(), msg.size());
         schedule(at, m);
         return;
     }
-    twai_message_t m = frame(n.rspId, {});
+    twai_message_t m = nodeFrameOut(n);
     m.data[0] = (uint8_t)(0x10 | ((msg.size() >> 8) & 0x0F));
     m.data[1] = (uint8_t)(msg.size() & 0xFF);
     std::memcpy(&m.data[2], msg.data(), 6);
@@ -966,9 +976,60 @@ static void obdIsoHandle(IsoNode &n, const std::vector<uint8_t> &req, bool funct
     refuse(0x11);                                       // service not supported
 }
 
+/** The other computers (sim::others): present, who they are, their blocks. */
+static void otherHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functional) {
+    sim::OthersSim &o = sim::others;
+    o.asked.push_back((uint64_t)n.reqId << 8 | req[0]);
+    const uint64_t at = simrtos::nowUs() + ecu.replyLatencyUs;
+    auto refuse = [&](uint8_t code) { nodeSend(n, {0x7F, req[0], code}, at); };
+    if (req[0] == 0x3E) { nodeSend(n, {0x7E, 0x00}, at); return; }
+    if (functional) return;                      // the rest only to its own address
+    const bool biu = &n == &s_biuNode, meter = &n == &s_meterNode;
+    if (req[0] == 0x1A && req.size() == 2 && req[1] == 0x80 && (biu || meter)) {
+        std::vector<uint8_t> r = {0x5A, 0x80};
+        for (char ch : std::string(biu ? "88281AJ000 BIU" : "85002AJ000 METER")) r.push_back((uint8_t)ch);
+        nodeSend(n, r, at);
+        return;
+    }
+    if (req[0] == 0x21 && req.size() == 2 && (biu || meter)) {
+        if (biu && req[1] == 0x50) {
+            std::vector<uint8_t> r = {0x61, 0x50};
+            std::vector<uint8_t> d(16, 0);
+            d[0] = (uint8_t)(o.lightsSw ? 0x10 : 0);
+            d[1] = (uint8_t)((o.doorDriver ? 1 : 0) | (o.doorPass ? 2 : 0) | (o.doorRR ? 4 : 0) |
+                             (o.doorRL ? 8 : 0) | (o.boot ? 0x10 : 0));
+            d[4] = (uint8_t)(o.handbrake ? 1 : 0);
+            d[5] = 0x40;                                  // something that never moves
+            r.insert(r.end(), d.begin(), d.end());
+            o.reads++;
+            nodeSend(n, r, at);
+            return;
+        }
+        if (biu && req[1] == 0x51) {
+            o.reads++;
+            nodeSend(n, {0x61, 0x51, (uint8_t)(o.lightsSw ? 1 : 0), (uint8_t)(o.lightsSw ? 1 : 0), 0}, at);
+            return;
+        }
+        if (meter && req[1] == 0x01) {
+            o.reads++;
+            nodeSend(n, {0x61, 0x01, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC}, at);
+            return;
+        }
+        refuse(0x31);                                     // no such block
+        return;
+    }
+    if (req[0] == 0x22 && req.size() == 3 && &n == &s_epsNode) {
+        if (req[1] == 0xF1 && req[2] == 0x97) { nodeSend(n, {0x62, 0xF1, 0x97, 'E', 'P', 'S'}, at); return; }
+        refuse(0x31);
+        return;
+    }
+    refuse(0x11);                                         // service not supported
+}
+
 /** Does this node answer @p svc? */
 static void nodeHandle(IsoNode &n, const std::vector<uint8_t> &req, bool functional) {
     if (req.empty()) return;
+    if (&n == &s_biuNode || &n == &s_meterNode || &n == &s_epsNode) { otherHandle(n, req, functional); return; }
     const bool tcm = &n == &s_tcmNode;
     if (!tcm && (req[0] == 0xAA || req[0] == 0xA8)) {
         if (!functional && ecu.ssmEnabled) ssmHandle(req);
@@ -997,7 +1058,7 @@ static void nodeFrame(IsoNode &n, const twai_message_t &m, bool functional) {
         if (&n == &s_ecmNode && ecu.ssmCutEveryN && ++replies % ecu.ssmCutEveryN == 0)
             end = n.tx.msg.size() > 6 + 7 ? 6 + 7 : std::min<size_t>(end, 6);
         while (n.tx.off < end) {
-            twai_message_t cf = frame(n.rspId, {});
+            twai_message_t cf = nodeFrameOut(n);
             cf.data[0] = (uint8_t)(0x20 | (n.tx.sn++ & 0x0F));
             const size_t k = std::min((size_t)7, n.tx.msg.size() - n.tx.off);
             std::memcpy(&cf.data[1], &n.tx.msg[n.tx.off], k);
@@ -1018,7 +1079,9 @@ static void nodeFrame(IsoNode &n, const twai_message_t &m, bool functional) {
         n.rx.buf.assign(m.data + 2, m.data + 8);
         n.rx.sn = 1;
         n.rx.active = true;
-        schedule(now + 1000, frame(n.rspId, {0x30, 0x00, ecu.ssmStmin, 0, 0, 0, 0, 0}));
+        twai_message_t fc = nodeFrameOut(n);
+        fc.data[0] = 0x30; fc.data[2] = ecu.ssmStmin;
+        schedule(now + 1000, fc);
         return;
     }
     if (pci == 0x20) {
@@ -1096,6 +1159,11 @@ esp_err_t twai_transmit(const twai_message_t *m, TickType_t) {
         else if (m->identifier == 0x7E0) nodeFrame(s_ecmNode, *m, false);
         else if (m->identifier == 0x7E1) nodeFrame(s_tcmNode, *m, false);
         else { nodeFrame(s_ecmNode, *m, true); nodeFrame(s_tcmNode, *m, true); }
+    } else if (sim::others.enabled) {
+        if (!m->extd && m->identifier == s_biuNode.reqId)   nodeFrame(s_biuNode, *m, false);
+        if (!m->extd && m->identifier == s_meterNode.reqId) nodeFrame(s_meterNode, *m, false);
+        if (m->extd && m->identifier == s_epsNode.reqId)    nodeFrame(s_epsNode, *m, false);
+        if (m->extd && m->identifier == 0x18DB33F1)         nodeFrame(s_epsNode, *m, true);
     }
     return ESP_OK;
 }

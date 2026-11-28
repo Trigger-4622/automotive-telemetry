@@ -21,6 +21,7 @@
 #include "FwUpdate.h"
 #include "DriveLog.h"
 #include "RawRec.h"
+#include "Computers.h"
 #include "Learner.h"
 #include "MasterConfig.h"
 #include "MasterTelemetry.h"
@@ -642,6 +643,75 @@ void WebPortal::setupRoutes() {
         else s_server.send(404, "application/json", "{\"error\":\"no such log\"}");
     });
     s_server.on("/api/log/clear", HTTP_POST, []() { driveLogDeleteAll(); sendOk(); });
+
+    /*
+     * The car's computers (Computers.h): the scan, who each one said it is,
+     * the data blocks a search found, and the reads table as it goes.
+     */
+    s_server.on("/api/computers", HTTP_GET, []() {
+        CompStatus st;
+        compGetStatus(st);
+        JsonDocument d;
+        d["phase"]     = st.phase;
+        d["at"]        = st.at;
+        d["pct"]       = st.pct;
+        d["scanned"]   = st.scanned;
+        d["searching"] = st.searching;
+        d["skipped"]   = st.skipped;
+        d["note"]      = st.note;
+        JsonArray fa = d["found"].to<JsonArray>();
+        CompFound f;                           // ~180 B of the loop task's 12 KB, not static RAM
+        for (size_t i = 0; compFoundAt(i, f); i++) {
+            JsonObject o = fa.add<JsonObject>();
+            o["tx"] = f.tx;
+            o["rx"] = f.rx;
+            JsonArray h = o["hello"].to<JsonArray>();
+            for (uint8_t k = 0; k < 8; k++) h.add(f.hello[k]);
+            JsonArray aa = o["ask"].to<JsonArray>();
+            for (uint8_t q = 0; q < ASK_N; q++) {
+                JsonArray a = aa.add<JsonArray>();
+                a.add(f.ans[q].how);
+                a.add(f.ans[q].code);
+                JsonArray b = a.add<JsonArray>();
+                for (uint8_t k = 0; k < f.ans[q].len; k++) b.add(f.ans[q].d[k]);
+            }
+            o["search"] = f.search;
+            JsonArray la = o["lids"].to<JsonArray>();
+            for (uint8_t k = 0; k < f.nLids; k++) {
+                JsonArray l = la.add<JsonArray>();
+                l.add(f.lid[k]);
+                l.add(f.lidLen[k]);
+            }
+        }
+        JsonArray ra = d["reads"].to<JsonArray>();
+        CompReadView r;
+        for (size_t i = 0; compReadAt(i, r); i++) {
+            JsonObject o = ra.add<JsonObject>();
+            o["tx"] = r.tx;
+            o["lid"] = r.lid;
+            o["reads"] = r.reads;
+            o["fails"] = r.fails;
+            o["len"] = r.len;
+            if (r.ageMs != UINT32_MAX) o["age"] = r.ageMs;
+            o["note"] = r.note;
+        }
+        sendJson(d);
+    });
+    s_server.on("/api/computers/scan", HTTP_POST, []() {
+        char why[96] = "";
+        if (compRequestScan(why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = why;
+        sendJson(d, 409);
+    });
+    s_server.on("/api/computers/search", HTTP_POST, []() {
+        char why[96] = "";
+        const long i = s_server.hasArg("i") ? s_server.arg("i").toInt() : -1;
+        if (i >= 0 && compRequestSearch((size_t)i, why, sizeof why)) { sendOk(); return; }
+        JsonDocument d;
+        d["error"] = *why ? why : "which computer?";
+        sendJson(d, 409);
+    });
 
     /*
      * The raw bus recording (RawRec): every frame to the logs partition, for

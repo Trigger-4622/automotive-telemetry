@@ -202,6 +202,298 @@ void perfUpdate(PerfView &v, const PerfTimer &p, uint32_t masterNow, bool speedK
     }
 }
 
+/* ═══════════════════════════ the car from above ══════════════════════════ */
+
+/* The Legacy BM's measures [m]: the wheelbase is the layout's. */
+static constexpr float CAR_W = 1.78f, CAR_LEN = 4.735f, CAR_RO = 1.035f, CAR_TRACK = 1.53f;
+static constexpr int   CAR_PTS = 2 * 6 + 2 * 2 + 2 * CAR_PATH_PTS;   /**< Points of every line. */
+static constexpr float DEG = 0.017453293f;                         /**< To radians.          */
+
+static constexpr float CAR_FRONT = CAR_LEN - CAR_RO;               /**< Front bumper [m].    */
+static int   carX(const CarView &v, float x) { return (int)lroundf(v.cx + x * v.ppm); }
+static int   carY(const CarView &v, float y) { return (int)lroundf(v.axleY - y * v.ppm); }
+
+/** Put line @p l through @p n points (parent coordinates): the object spans
+ *  only them, so a change redraws only around it. */
+static void carLine(lv_obj_t *l, lv_point_t *p, const int (*xy)[2], int n) {
+    int ox = xy[0][0], oy = xy[0][1];
+    for (int i = 1; i < n; i++) { if (xy[i][0] < ox) ox = xy[i][0]; if (xy[i][1] < oy) oy = xy[i][1]; }
+    ox -= 6; oy -= 6;
+    for (int i = 0; i < n; i++) { p[i].x = (lv_coord_t)(xy[i][0] - ox); p[i].y = (lv_coord_t)(xy[i][1] - oy); }
+    lv_obj_set_pos(l, ox, oy);
+    lv_line_set_points(l, p, (uint16_t)n);
+}
+
+static lv_obj_t *carLineNew(lv_obj_t *parent, int width, uint32_t color) {
+    lv_obj_t *l = lv_line_create(parent);
+    lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_line_width(l, width, 0);
+    lv_obj_set_style_line_rounded(l, true, 0);
+    lv_obj_set_style_line_color(l, lv_color_hex(color), 0);
+    return l;
+}
+
+static void showIf(lv_obj_t *o, bool on) {
+    if (on) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+/** Side @p i (doors FL FR RL RR, boot, bonnet) shut, or swung open. */
+static void carSide(CarView &v, int i, bool open) {
+    int xy[2][2];
+    const float wb = v.g.wheelbase;
+    if (i < 4) {
+        const float sx = (i & 1) ? 1.0f : -1.0f;               // FL RL left, FR RR right
+        const float y1 = (i < 2 ? 0.80f : 0.42f) * wb, y2 = (i < 2 ? 0.42f : 0.08f) * wb;
+        const float len = y1 - y2, x = sx * CAR_W / 2;
+        xy[0][0] = carX(v, x); xy[0][1] = carY(v, y1);           // the hinge, at the front
+        if (open) { xy[1][0] = carX(v, x + sx * len * 0.82f); xy[1][1] = carY(v, y1 - len * 0.57f); }
+        else      { xy[1][0] = carX(v, x);                     xy[1][1] = carY(v, y2); }
+    } else {
+        const bool boot = i == 4;
+        const float y = boot ? (open ? -CAR_RO - 0.40f : -CAR_RO + 0.10f)
+                             : (open ? CAR_FRONT + 0.40f : CAR_FRONT - 0.10f);
+        xy[0][0] = carX(v, -CAR_W / 2 + 0.28f); xy[0][1] = carY(v, y);
+        xy[1][0] = carX(v,  CAR_W / 2 - 0.28f); xy[1][1] = carY(v, y);
+    }
+    carLine(v.side[i], v.pts + 2 * i, xy, 2);
+}
+
+/** The front wheels, turned @p road degrees (+ left). */
+static void carWheels(CarView &v, float road) {
+    const float s = sinf(road * DEG) * 0.31f, c = cosf(road * DEG) * 0.31f;
+    for (int k = 0; k < 2; k++) {
+        const float x = (k ? 1.0f : -1.0f) * CAR_TRACK / 2, y = v.g.wheelbase;
+        const int xy[2][2] = { { carX(v, x + s), carY(v, y - c) }, { carX(v, x - s), carY(v, y + c) } };
+        carLine(v.wheel[k], v.pts + 12 + 2 * k, xy, 2);
+    }
+}
+
+/** The corners' path: @p dir -1 back from the rear bumper, 1 ahead from the
+ *  front one, the road wheels turned @p road degrees (+ left). */
+static void carPath(CarView &v, float road, int dir) {
+    const float wb = v.g.wheelbase, y0 = dir < 0 ? -CAR_RO : CAR_FRONT;
+    const float room = (dir < 0 ? v.bottom - carY(v, y0) : carY(v, y0) - v.top) / v.ppm;
+    const float len = room < v.g.pathM ? (room > 0 ? room : 0) : v.g.pathM;
+    const float t = tanf(road * DEG);
+    for (int k = 0; k < 2; k++) {
+        const float x0 = (k ? 1.0f : -1.0f) * CAR_W / 2;
+        int xy[CAR_PATH_PTS][2];
+        for (int n = 0; n < CAR_PATH_PTS; n++) {
+            const float sArc = dir * len * n / (CAR_PATH_PTS - 1);
+            float x = x0, y = y0 + sArc;
+            if (fabsf(t) > 1e-4f) {
+                // About a centre on the rear axle's line, wb / tan(road) to the
+                // side the wheels are turned; the rear axle moves sArc along it.
+                const float R = wb / t, cxm = -R, phi = sArc / R;
+                const float dx = x0 - cxm, dy = y0;
+                x = cxm + dx * cosf(phi) - dy * sinf(phi);
+                y = dx * sinf(phi) + dy * cosf(phi);
+            }
+            xy[n][0] = carX(v, x);
+            xy[n][1] = carY(v, y);
+        }
+        carLine(v.path[k], v.pts + 16 + CAR_PATH_PTS * k, xy, CAR_PATH_PTS);
+    }
+}
+
+void carBuild(CarView &v, lv_obj_t *parent, int cx, int axleY, float ppm, int top, int bottom,
+              const CarGeom &g) {
+    v.g = g;
+    if (!(v.g.ratio >= 5 && v.g.ratio <= 40)) v.g.ratio = 15.0f;
+    if (!(v.g.wheelbase >= 1.5f && v.g.wheelbase <= 4.0f)) v.g.wheelbase = 2.75f;
+    v.ppm = ppm; v.cx = cx; v.axleY = axleY; v.top = top; v.bottom = bottom;
+    const float wb = v.g.wheelbase;
+
+    v.body = shape(parent, (int)lroundf(CAR_W * ppm), (int)lroundf(CAR_LEN * ppm));
+    lv_obj_set_pos(v.body, carX(v, -CAR_W / 2), carY(v, CAR_FRONT));
+    lv_obj_set_style_radius(v.body, (int)lroundf(0.35f * ppm), 0);
+    lv_obj_set_style_bg_color(v.body, lv_color_hex(UI_PANEL), 0);
+    lv_obj_set_style_bg_opa(v.body, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(v.body, 2, 0);
+    lv_obj_set_style_border_color(v.body, lv_color_hex(UI_MUTED), 0);
+    lv_obj_set_style_border_opa(v.body, LV_OPA_COVER, 0);
+    const float cy1 = 0.86f * wb, cy0 = 0.02f * wb;                // the glasshouse
+    v.cabin = shape(parent, (int)lroundf((CAR_W - 0.36f) * ppm), (int)lroundf((cy1 - cy0) * ppm));
+    lv_obj_set_pos(v.cabin, carX(v, -CAR_W / 2 + 0.18f), carY(v, cy1));
+    lv_obj_set_style_radius(v.cabin, (int)lroundf(0.25f * ppm), 0);
+    lv_obj_set_style_border_width(v.cabin, 1, 0);
+    lv_obj_set_style_border_color(v.cabin, lv_color_hex(UI_LINE), 0);
+    lv_obj_set_style_border_opa(v.cabin, LV_OPA_COVER, 0);
+
+    const int ww = (int)lroundf(0.2f * ppm) < 4 ? 4 : (int)lroundf(0.2f * ppm);
+    for (int k = 0; k < 2; k++) {                                  // rear wheels
+        lv_obj_t *r = shape(parent, ww, (int)lroundf(0.62f * ppm));
+        lv_obj_set_pos(r, carX(v, (k ? 1.0f : -1.0f) * CAR_TRACK / 2) - ww / 2, carY(v, 0.31f));
+        lv_obj_set_style_radius(r, 2, 0);
+        lv_obj_set_style_bg_color(r, lv_color_hex(UI_DIM), 0);
+        lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+        v.wheel[2 + k] = r;
+    }
+    v.pts = (lv_point_t *)lv_mem_alloc(sizeof(lv_point_t) * CAR_PTS);   // for good, as the screen
+    if (!v.pts) return;
+    memset(v.pts, 0, sizeof(lv_point_t) * CAR_PTS);
+    for (int k = 0; k < 2; k++) v.wheel[k] = carLineNew(parent, ww, UI_DIM);
+    carWheels(v, 0);
+    for (int i = 0; i < 6; i++) {
+        v.side[i] = carLineNew(parent, i < 4 ? 4 : 3, UI_LINE);
+        carSide(v, i, false);
+    }
+    for (int i = 0; i < 4; i++) {                                  // indicators at the corners
+        lv_obj_t *d = shape(parent, 8, 8);
+        lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(d, lv_color_hex(UI_LAMP_GREEN), 0);
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+        const float x = (i & 1 ? 1.0f : -1.0f) * (CAR_W / 2 + 0.05f);
+        const float y = i < 2 ? CAR_FRONT - 0.25f : -CAR_RO + 0.25f;
+        lv_obj_set_pos(d, carX(v, x) - 4, carY(v, y) - 4);
+        lv_obj_add_flag(d, LV_OBJ_FLAG_HIDDEN);
+        v.corner[i] = d;
+    }
+    for (int k = 0; k < 2; k++) {                                  // headlights
+        lv_obj_t *h = shape(parent, (int)lroundf(0.38f * ppm), 3);
+        lv_obj_set_pos(h, carX(v, (k ? 1.0f : -1.0f) * (CAR_W / 2 - 0.30f)) - (int)lroundf(0.19f * ppm),
+                       carY(v, CAR_FRONT - 0.12f));
+        lv_obj_set_style_radius(h, 1, 0);
+        lv_obj_set_style_bg_opa(h, LV_OPA_COVER, 0);
+        lv_obj_add_flag(h, LV_OBJ_FLAG_HIDDEN);
+        v.head[k] = h;
+    }
+    for (int k = 0; k < 2; k++) {
+        v.path[k] = carLineNew(parent, 3, UI_ACCENT);
+        lv_obj_add_flag(v.path[k], LV_OBJ_FLAG_HIDDEN);
+    }
+    v.lastDeg = INT16_MIN;
+    v.lastDir = 0;
+}
+
+void carUpdate(CarView &v, const CarState &s) {
+    if (!v.body || !v.pts) return;
+    // Doors: where none is known on its own, "a door is open" lights them all.
+    const bool singles = s.door[0] >= 0 || s.door[1] >= 0 || s.door[2] >= 0 || s.door[3] >= 0;
+    for (int i = 0; i < 6; i++) {
+        int8_t st = i < 4 ? s.door[i] : i == 4 ? s.boot : s.bonnet;
+        bool amberShut = false;
+        if (i < 4 && !singles && s.anyDoor >= 0) { amberShut = s.anyDoor == 1; st = 0; }
+        const int8_t code = amberShut ? 2 : st;                  // 2: one of them, not known which
+        if (code == v.lastSide[i]) continue;
+        v.lastSide[i] = code;
+        carSide(v, i, code == 1);
+        const uint32_t c = code == 1 || code == 2 ? UI_WARN : code == 0 ? UI_MUTED : UI_LINE;
+        lv_obj_set_style_line_color(v.side[i], lv_color_hex(c), 0);
+    }
+    const uint8_t lamps = (uint8_t)((s.turnL ? 1 : 0) | (s.turnR ? 2 : 0) | (s.lights == 1 ? 4 : 0) |
+                                    (s.highBeam == 1 ? 8 : 0));
+    if (lamps != v.lastLamps) {
+        v.lastLamps = lamps;
+        showIf(v.corner[0], s.turnL); showIf(v.corner[2], s.turnL);
+        showIf(v.corner[1], s.turnR); showIf(v.corner[3], s.turnR);
+        for (lv_obj_t *h : v.head) {
+            showIf(h, s.lights == 1 || s.highBeam == 1);
+            lv_obj_set_style_bg_color(h, lv_color_hex(s.highBeam == 1 ? UI_LAMP_BLUE : UI_LAMP_GREEN), 0);
+        }
+    }
+    const int8_t dir = s.angleOk && v.g.path ? (s.reverse ? -1 : 1) : 0;
+    const int16_t deg = s.angleOk ? (int16_t)lroundf(s.angle > 3600 ? 3600 : s.angle < -3600 ? -3600 : s.angle) : 0;
+    if (deg != v.lastDeg || dir != v.lastDir) {
+        v.lastDeg = deg;
+        v.lastDir = dir;
+        const float road = deg / v.g.ratio;
+        carWheels(v, road);
+        for (lv_obj_t *w : v.wheel)
+            if (w) lv_obj_set_style_line_color(w, lv_color_hex(s.angleOk ? UI_TEXT_DIM : UI_DIM), 0);
+        for (lv_obj_t *p : v.path) showIf(p, dir != 0);
+        if (dir) carPath(v, road, dir);
+    }
+}
+
+/* The "car" screen: round, the car in the middle and one line under it;
+   landscape, the car on the left and a row for each thing to its right. */
+
+void carScreenBuild(CarScreenView &v, lv_obj_t *parent, int w, int h, const CarGeom &g) {
+    const bool wide = w > h * 1.4f;
+    CarGeom gg = g;
+    gg.pathM = 1.5f;
+    const float ppm = wide ? (h - 16) / (CAR_LEN + 3.0f) : 22.0f;
+    const int cx = wide ? 150 : w / 2;
+    const int mid = wide ? h / 2 : h / 2 - 4;
+    const int axleY = (int)lroundf(mid + (CAR_LEN / 2 - CAR_RO) * ppm);
+    carBuild(v.car, parent, cx, axleY, ppm, wide ? 4 : 42, h - 4, gg);
+    if (wide) {
+        // Two labels, a line each, not ten: the cluster's LVGL heap is the
+        // tight one. Captions above the values, both 46 px apart.
+        lv_obj_t *cap = label(parent, "DOORS\nBOOT\nBONNET\nLIGHTS\nHANDBRAKE", &lv_font_montserrat_12,
+                              UI_MUTED, LV_ALIGN_TOP_LEFT, 300, 28);
+        lv_obj_set_style_text_line_space(cap, 46 - 14, 0);
+        v.vals = label(parent, "", &lv_font_montserrat_20, UI_TEXT_DIM, LV_ALIGN_TOP_LEFT, 300, 44);
+        lv_obj_set_style_text_line_space(v.vals, 46 - 22, 0);
+        lv_label_set_recolor(v.vals, true);
+    } else {
+        // At the top: the lamp strip has the bottom of the glass.
+        v.status = label(parent, "", &lv_font_montserrat_14, UI_MUTED, LV_ALIGN_TOP_MID, 0, 18);
+    }
+}
+
+static void setTextColor(lv_obj_t *l, uint32_t &last, uint32_t rgb) {
+    if (last == rgb) return;
+    last = rgb;
+    lv_obj_set_style_text_color(l, lv_color_hex(rgb), 0);
+}
+
+void carScreenUpdate(CarScreenView &v, const CarState &s) {
+    carUpdate(v.car, s);
+    static const char *const DOOR[4] = {"FL", "FR", "RL", "RR"};
+    // Which doors are open, in words.
+    char doors[24] = "";
+    int open = 0, known = 0;
+    for (int i = 0; i < 4; i++) {
+        if (s.door[i] < 0) continue;
+        known++;
+        if (s.door[i] == 1) {
+            if (open++) strlcat(doors, " ", sizeof doors);
+            strlcat(doors, DOOR[i], sizeof doors);
+        }
+    }
+    int8_t anyDoor = known ? (open ? 1 : 0) : s.anyDoor;
+    if (!known && s.anyDoor == 1) strlcpy(doors, "OPEN", sizeof doors);
+    if (v.status) {
+        char t[40];
+        uint32_t c = UI_MUTED;
+        if (anyDoor == 1 || s.boot == 1 || s.bonnet == 1) {
+            t[0] = '\0';
+            if (anyDoor == 1) { strlcat(t, open > 1 ? "DOORS " : "DOOR ", sizeof t); strlcat(t, doors, sizeof t); }
+            if (s.boot == 1)   strlcat(t, t[0] ? " + BOOT" : "BOOT OPEN", sizeof t);
+            if (s.bonnet == 1) strlcat(t, t[0] ? " + BONNET" : "BONNET OPEN", sizeof t);
+            c = UI_WARN;
+        } else if (anyDoor == 0 || s.boot == 0 || s.bonnet == 0) {
+            strlcpy(t, s.handbrake == 1 ? "ALL SHUT \xE2\x80\xA2 HANDBRAKE" : "ALL SHUT", sizeof t);
+            c = UI_OK;
+        } else {
+            strlcpy(t, "NO DOOR DATA", sizeof t);
+            c = UI_DIM;
+        }
+        setText(v.status, v.lastStatus, sizeof v.lastStatus, t);
+        setTextColor(v.status, v.lastStatusRgb, c);
+    }
+    if (v.vals) {
+        const int8_t st[5] = {anyDoor, s.boot, s.bonnet, s.lights, s.handbrake};
+        char all[160] = "";
+        for (int i = 0; i < 5; i++) {
+            const char *t = st[i] < 0 ? "--" : (i == 0 && st[i] == 1) ? doors
+                          : i == 3 ? (st[i] ? (s.highBeam == 1 ? "HIGH BEAM" : "ON") : "OFF")
+                          : i == 4 ? (st[i] ? "ON" : "OFF") : (st[i] ? "OPEN" : "SHUT");
+            const uint32_t c = st[i] < 0 ? UI_DIM
+                             : i < 3 ? (st[i] ? UI_WARN : UI_OK)
+                             : i == 3 ? (st[i] ? (s.highBeam == 1 ? UI_LAMP_BLUE : UI_LAMP_GREEN) : UI_TEXT_DIM)
+                             : (st[i] ? UI_WARN : UI_TEXT_DIM);
+            char line[40];
+            snprintf(line, sizeof line, "%s#%06X %s#", i ? "\n" : "", (unsigned)c, t);
+            strlcat(all, line, sizeof all);
+        }
+        setText(v.vals, v.lastVals, sizeof v.lastVals, all);
+    }
+}
+
 /* ═════════════════════════════ parking screen ════════════════════════════ */
 
 /** The spokes' places on the wheel, clockwise from twelve o'clock [deg]; the
@@ -225,10 +517,33 @@ static void parkLine(ParkView &v, int i, float deg) {
     lv_line_set_points(v.line[i], p, 2);
 }
 
-void parkBuild(ParkView &v, lv_obj_t *parent, int w, int h, float steerMax, float straightDeg) {
+void parkBuild(ParkView &v, lv_obj_t *parent, int w, int h, float steerMax, float straightDeg,
+               bool pathView, const CarGeom &g) {
     v.steerMax = steerMax >= 30 ? steerMax : 540;
     v.straight = straightDeg >= 0 ? straightDeg : 10;
     const bool wide = w > h * 1.4f;
+    if (pathView) {
+        // The car from above and its path where the wheel would be; the angle
+        // to its left (round) or right (landscape), as in the wheel view.
+        v.pathView = true;
+        const float ppm = wide ? (h - 16) / (CAR_LEN + 4.0f) : 20.0f;
+        const int cx = wide ? (h - 48) / 2 + 40 : w / 2 + 12;
+        const int axleY = (int)lroundf(h / 2 + (CAR_LEN / 2 - CAR_RO) * ppm);
+        carBuild(v.car, parent, cx, axleY, ppm, 8, h - 8, g);
+        v.rim = v.car.body;                       // built: parkUpdate's guard
+        if (wide) {
+            const int x = cx + (h - 48) / 2 + 36;
+            label(parent, "STEERING", &lv_font_montserrat_12, UI_MUTED, LV_ALIGN_TOP_LEFT, x, h / 2 - 78);
+            v.value = label(parent, "--", &lv_font_montserrat_48, UI_TEXT, LV_ALIGN_TOP_LEFT, x, h / 2 - 60);
+            v.word  = label(parent, "", &lv_font_montserrat_20, UI_MUTED, LV_ALIGN_TOP_LEFT, x, h / 2 + 2);
+        } else {
+            v.value = label(parent, "--", &lv_font_montserrat_28, UI_TEXT, LV_ALIGN_TOP_LEFT, 14, h / 2 - 26);
+            v.word  = label(parent, "", &lv_font_montserrat_12, UI_MUTED, LV_ALIGN_TOP_LEFT, 14, h / 2 + 8);
+        }
+        v.lastOk = true;
+        parkUpdate(v, 0, false);
+        return;
+    }
     // Round: the wheel in the middle, the angle in it, the arc round it with
     // its gap at the bottom for the word. Landscape: wheel and arc on the
     // left, the angle and the word to their right.
@@ -300,16 +615,23 @@ void parkBuild(ParkView &v, lv_obj_t *parent, int w, int h, float steerMax, floa
     parkUpdate(v, 0, false);
 }
 
-void parkUpdate(ParkView &v, float deg, bool ok) {
+void parkUpdate(ParkView &v, float deg, bool ok, const CarState *car) {
     if (!v.rim) return;
+    if (v.pathView) {
+        CarState c = car ? *car : CarState();
+        c.angleOk = ok;
+        c.angle = deg;
+        carUpdate(v.car, c);
+    }
     if (ok != v.lastOk) {
         v.lastOk = ok;
         for (lv_obj_t *l : v.line) {
+            if (!l) continue;
             if (ok) lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
             else    lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
         }
         if (!ok) {
-            lv_arc_set_value(v.lock, 0);
+            if (v.lock) lv_arc_set_value(v.lock, 0);
             setText(v.value, v.lastValue, sizeof v.lastValue, "--");
             setText(v.word, v.lastWord, sizeof v.lastWord, "NO STEERING ANGLE");
             lv_obj_set_style_text_color(v.word, lv_color_hex(UI_DIM), 0);
@@ -325,7 +647,7 @@ void parkUpdate(ParkView &v, float deg, bool ok) {
         v.lastDeg = d;
         if (v.pts) for (int i = 0; i < 4; i++) parkLine(v, i, (float)d);
         const float lim = v.steerMax;
-        lv_arc_set_value(v.lock, (int16_t)lroundf(-d > lim ? lim : -d < -lim ? -lim : -d));
+        if (v.lock) lv_arc_set_value(v.lock, (int16_t)lroundf(-d > lim ? lim : -d < -lim ? -lim : -d));
         char t[12];
         snprintf(t, sizeof t, "%d\xC2\xB0", d < 0 ? -d : d);
         setText(v.value, v.lastValue, sizeof v.lastValue, t);
@@ -338,7 +660,9 @@ void parkUpdate(ParkView &v, float deg, bool ok) {
                 side > 0 ? LV_SYMBOL_LEFT " LEFT" : side < 0 ? "RIGHT " LV_SYMBOL_RIGHT : "STRAIGHT");
         lv_obj_set_style_text_color(v.word, lv_color_hex(side ? UI_TEXT_DIM : UI_OK), 0);
         lv_obj_set_style_text_color(v.value, lv_color_hex(side ? UI_TEXT : UI_OK), 0);
-        lv_obj_set_style_line_color(v.line[3], lv_color_hex(c), 0);
-        lv_obj_set_style_arc_color(v.lock, lv_color_hex(c), LV_PART_INDICATOR);
+        if (v.line[3]) lv_obj_set_style_line_color(v.line[3], lv_color_hex(c), 0);
+        if (v.lock) lv_obj_set_style_arc_color(v.lock, lv_color_hex(c), LV_PART_INDICATOR);
+        for (lv_obj_t *p : v.car.path)
+            if (p) lv_obj_set_style_line_color(p, lv_color_hex(c), 0);
     }
 }

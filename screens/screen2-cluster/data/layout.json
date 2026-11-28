@@ -1,6 +1,6 @@
 {
   "_doc": "Dash cluster layout schema v1 — 480x272 LANDSCAPE. Keys starting with '_' are documentation only. Edit via the Gauge Studio web portal (5s hold on screen) or by hand; or POST it to /api/layout - never 'pio run -t uploadfs', which replaces the layout and the touch calibration stored on the display. This is the SAME schema as the 1.28in round display, plus the landscape-only screen types 'cluster' and 'bars' and a wider grid — a layout written for the round board loads here unchanged, it just will not use the extra room.",
-  "version": 4,
+  "version": 6,
 
   "global": {
     "_doc": "smoothing_alpha: EMA coefficient 0-1 applied at packet rate (higher = snappier, lower = smoother). lerp_speed: fraction moved toward target per UI tick (needle glide). stale_timeout_ms: metric age before it renders as '--'.",
@@ -220,14 +220,16 @@
       "label": "PERF"
     },
     {
-      "_doc": "SCREEN 10 — Parking: the steering wheel as it is turned, an arc from straight ahead to full lock (steer_max either way) and STRAIGHT in green within straight_deg of the centre. With auto_reverse it comes up by itself when reverse is selected and goes back 10 s after reverse ends, or at once above 15 km/h; a swipe meanwhile keeps the screen you chose. The angle is the master's steering angle (0x1006, positive to the left).",
+      "_doc": "SCREEN 10 — Parking: the steering wheel as it is turned, an arc from straight ahead to full lock (steer_max either way) and STRAIGHT in green within straight_deg of the centre (the master's steering angle, 0x1006, positive to the left). Like any screen it can come up by itself: show_when lists conditions that must all hold (a gear, or a metric_id with op > < >= <= == != and a value); back_after_s after they stop holding it goes back to the screen before, or at once when one of back_now_when holds. Here: in reverse, back 10 s after it or at once above 15 km/h. A swipe meanwhile keeps the screen you chose.",
       "id": "park",
       "type": "park",
       "label": "PARK",
       "metric_id": "0x1006",
       "steer_max": 540,
       "straight_deg": 10,
-      "auto_reverse": true
+      "show_when": [ { "gear": "R" } ],
+      "back_after_s": 10,
+      "back_now_when": [ { "metric_id": "0x010D", "op": ">", "value": 15 } ]
     },
     {
       "_doc": "SCREEN 11 — Diagnostics: link rate, drops, heap, uptime and the live GPIO scan for identifying the side button.",

@@ -31,7 +31,7 @@
 
 static constexpr const char *LABEL    = "logs";
 static constexpr char        MAGIC[8] = {'C', 'A', 'N', 'R', 'E', 'C', '1', '\0'};
-static constexpr uint16_t    VERSION  = 1;
+static constexpr uint16_t    VERSION  = 2;   /**< 2: E6, E7, DLC 9-15 kept. */
 static constexpr uint32_t    PAGE     = 256;
 static constexpr uint32_t    SECTOR   = 4096;
 static constexpr uint32_t    DATA_OFF = SECTOR;          /**< The header has sector 0.      */
@@ -44,7 +44,7 @@ static constexpr uint8_t     MAX_IDX  = 0xE0;            /**< Indices 0..0xDF.  
 static constexpr size_t      SYNC_LEN = 16;
 static constexpr uint32_t    WRITE_MS = 20;              /**< The task's pace.              */
 
-enum : uint8_t { T_FULL = 0xE0, T_SYNC, T_SESSION, T_LOST, T_EVENT, T_STOP, T_PAD = 0xFF };
+enum : uint8_t { T_FULL = 0xE0, T_SYNC, T_SESSION, T_LOST, T_EVENT, T_STOP, T_ERRORS, T_DEAF, T_PAD = 0xFF };
 enum : uint8_t { LOST_BUFFER = 1, LOST_CONTROLLER = 2 };
 
 /** An ID's last frame as recorded: what its next one is coded against. */
@@ -64,11 +64,17 @@ static uint64_t s_lastUs = 0;  /**< The previous record's time, as a reader adds
 static uint16_t s_session = 0;
 static uint32_t s_frames = 0, s_txFrames = 0, s_lost = 0, s_sinceSync = 0;
 static uint32_t s_lostBuf = 0, s_lostCtrl = 0;   /**< Lost, not yet in the recording. */
+/** Moments the master was deaf to the bus since the last record (masterBusBlind():
+ *  a flash write, reset mode, a reinstall), and when the first was. Their own
+ *  lock: masterBusBlind() is called from anywhere, and takes nothing else. */
+static portMUX_TYPE s_deafMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_deafN = 0;
+static uint64_t s_deafUs = 0;
 static volatile bool    s_armReq = false;
 static volatile uint8_t s_erasePct = 0;
 static char     s_note[64] = "";
 static uint32_t s_armMs = 0;
-static uint32_t s_rateBytes = 0, s_rateMs = 0, s_rate = 0, s_ratePos = 0;
+static uint32_t s_rateMs = 0, s_rate = 0, s_ratePos = 0;
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
@@ -168,6 +174,22 @@ static bool lostLocked(uint64_t tUs) {
     return true;
 }
 
+/** The deaf moments since the last record, as one record at the first one. */
+static void deafLocked() {
+    uint32_t n;
+    uint64_t at;
+    portENTER_CRITICAL(&s_deafMux);
+    n = s_deafN;
+    at = s_deafUs;
+    s_deafN = 0;
+    portEXIT_CRITICAL(&s_deafMux);
+    if (!n) return;
+    if (at < s_lastUs) at = s_lastUs;           // never before the record ahead of it
+    uint8_t b[2];
+    put16(b, n > 0xFFFF ? 0xFFFF : (uint16_t)n);
+    placeLocked(T_DEAF, at, b, 2, true);
+}
+
 static int findLocked(uint32_t id, bool ext, bool tx) {
     for (uint8_t i = 0; i < s_nIds; i++)
         if (s_ids[i].id == id && s_ids[i].ext == (uint8_t)ext && s_ids[i].tx == (uint8_t)tx) return i;
@@ -181,7 +203,10 @@ static void frameLocked(const twai_message_t &m, uint64_t tUs, bool ours) {
         if (s_state == RR_RECORDING) { s_lostBuf++; s_lost++; }
         return;
     }
-    const uint8_t dlc = m.data_length_code > 8 ? 8 : m.data_length_code;
+    deafLocked();
+    // The DLC as it was on the wire: 9-15 is legal there and carries 8 bytes.
+    const uint8_t dlc = m.data_length_code > 15 ? 15 : m.data_length_code;
+    const uint8_t nb  = dlc > 8 ? 8 : dlc;
     const bool data = !m.rtr;
     int idx = data ? findLocked(m.identifier, m.extd, ours) : -1;
     uint8_t b[20];
@@ -190,11 +215,11 @@ static void frameLocked(const twai_message_t &m, uint64_t tUs, bool ours) {
         // As the bytes that changed since its last frame.
         uint8_t mask = 0;
         size_t n = 1;
-        for (uint8_t i = 0; i < dlc; i++)
+        for (uint8_t i = 0; i < nb; i++)
             if (m.data[i] != s_ids[idx].d[i]) { mask |= (uint8_t)(1u << i); b[n++] = m.data[i]; }
         b[0] = mask;
         ok = placeLocked((uint8_t)idx, tUs, b, n, true);
-        if (ok) memcpy(s_ids[idx].d, m.data, dlc);
+        if (ok) memcpy(s_ids[idx].d, m.data, nb);
     } else {
         // In full: a new ID or length (it becomes the reference), a remote
         // frame, or an ID past the table. The master's own frames get indices
@@ -207,7 +232,7 @@ static void frameLocked(const twai_message_t &m, uint64_t tUs, bool ours) {
         if (m.extd) { put32(b + n, m.identifier); n += 4; }
         else        { put16(b + n, (uint16_t)m.identifier); n += 2; }
         b[n++] = dlc;
-        if (data) { memcpy(b + n, m.data, dlc); n += dlc; }
+        if (data) { memcpy(b + n, m.data, nb); n += nb; }
         ok = placeLocked(T_FULL, tUs, b, n, true);
         if (ok && define) {
             Ref &r = s_ids[idx];
@@ -459,6 +484,30 @@ void rawRecLost(uint32_t n) {
     s_lostCtrl += n;
     s_lost += n;
     portEXIT_CRITICAL(&s_mux);
+}
+
+void rawRecErrors(uint32_t n, uint8_t ecc, bool listenOnly, bool ours, uint8_t tec, uint8_t rec) {
+    if (s_state != RR_RECORDING || !n) return;
+    const uint64_t t = nowUs();
+    uint8_t body[6];
+    put16(body, n > 0xFFFF ? 0xFFFF : (uint16_t)n);
+    body[2] = ecc;
+    body[3] = (uint8_t)((listenOnly ? 1 : 0) | (ours ? 2 : 0));
+    body[4] = tec;
+    body[5] = rec;
+    portENTER_CRITICAL(&s_mux);
+    deafLocked();
+    placeLocked(T_ERRORS, t, body, sizeof body, true);
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void rawRecDeaf() {
+    if (s_state != RR_RECORDING) return;
+    const uint64_t t = nowUs();
+    portENTER_CRITICAL(&s_deafMux);
+    if (!s_deafN) s_deafUs = t;
+    s_deafN++;
+    portEXIT_CRITICAL(&s_deafMux);
 }
 
 void rawRecEvent(uint8_t type, uint16_t a, uint16_t b) {

@@ -222,6 +222,19 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
   <div class="f" style="display:block"><div class="l"><b>Values recorded</b><span id="lgEst"></span></div>
    <div id="lgIds" class="row" style="margin-top:8px"></div>
    <div class="row" style="margin-top:8px"><select id="lgAdd" style="flex:1;min-width:180px"></select><button class="b" onclick="logAdd()">Add</button></div></div></div>
+ <div class="card"><h2>The car's computers <small id="ccSub"></small>
+   <button class="b" id="ccBtn" style="margin-left:auto" onclick="compScan()">Find them</button></h2>
+  <p class="say" style="margin:0 0 8px">Every computer on this bus that answers a diagnostic request, wherever it is and whatever it
+   speaks - the engine and the transmission, and the others (on this car the body computer, the ABS/VDC, the meter...). Standing,
+   ignition on, <b>Find them</b> asks every address from 0x700 to 0x7F7 "are you there" (3E) - not the ones the car's modules send on -
+   and every 29-bit computer at once, takes each answer from wherever it comes, then asks each computer who it is (OBD-II, SSM,
+   KWP2000, UDS). <b>Find its data</b> asks a computer for every data block it has (21 01 to 21 FE). Only reads: nothing in a
+   computer changes. Half a minute or so each, with the OBD-II requests going ahead.</p>
+  <div class="bar" id="ccBarBox" hidden><i id="ccBar" style="width:0"></i></div>
+  <div id="ccList"></div>
+  <p class="say" id="ccSay" style="margin:8px 0 0"></p>
+  <div class="grp" style="margin-top:16px">Read into the frame table</div>
+  <div id="ccRead"></div></div>
  <div class="card"><h2>Engine computer</h2>
   <p class="say" style="margin:0 0 8px">RomRaider lists its ROM definitions by the <b>calibration ID</b> (its "internal ID") and its
    logger definitions by the <b>ROM ID</b> SSM2 reports. If its definition files list this calibration ID, RomRaider can read and
@@ -294,6 +307,13 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:10px
 const META=/*META*/;
 const $=q=>document.querySelector(q);
 const hex=(n,w)=>'0x'+Number(n).toString(16).toUpperCase().padStart(w,'0');
+/* The computers' answers are in the frame table as extended IDs of their own
+   (Computers.h): COMP | address << 12 | block << 4 | which eight bytes - the
+   address an 11-bit request ID, or 0x800 | the target of a 29-bit one. */
+const COMP=0x1E000000,isPseudo=id=>id>=COMP&&id<0x1F000000;
+const h2=n=>Number(n).toString(16).toUpperCase().padStart(2,'0');
+const compAddr=a=>a>0x7FF&&a<0x1000?'29-bit '+h2(a&0xFF):a>0xFFF?hex(a,8):hex(a,3);
+const canName=id=>isPseudo(id)?`${compAddr(id>>12&0xFFF)} 21 ${h2(id>>4&0xFF)} · ${(id&0xF)*8}-${(id&0xF)*8+7}`:hex(id,3);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const nm=id=>META[id]?META[id][0]:hex(id,4);
 const un=id=>META[id]?META[id][1]:'';
@@ -327,14 +347,15 @@ function setDirty(v){DIRTY=v;$('#save').classList.toggle('on',v);if(!v)return;
  $('#saveRb').hidden=!rb}
 /* Five tabs, each polling only what it shows (the master answers one request
    at a time): Home and Signals /api/live, Bus also /api/bus and the evidence
-   log, Car the codes and the drive logs, Settings the firmware once. */
+   log, Car the codes, the drive logs and the car's computers, Settings the
+   firmware once. */
 const TABS=['home','sig','bus','car','set'];
 function go(t){if(!TABS.includes(t))t='home';TAB=t;
  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
  TABS.forEach(x=>$('#t-'+x).hidden=x!==t);
  try{history.replaceState(null,'','#'+t)}catch(e){}
  if(t==='home'&&L)renderHome();if(t==='sig'){renderSources();if(L)renderLearn()}
- if(t==='bus'){pollBus();pollEvlog();pollRaw()}if(t==='car'){pollCodes();pollLogs()}
+ if(t==='bus'){pollBus();pollEvlog();pollRaw()}if(t==='car'){pollCodes();pollLogs();pollComp()}
  if(t==='set'){fwInfo();if(ADV_ON&&LOADED&&!JSON_ED)jsonShow()}}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
 
@@ -552,11 +573,11 @@ function field(x){
  const on01=x.map&&x.bits&&(x.m>>8)===0x12&&x.map.every(p=>p[1]===0||p[1]===1);
  const tbl=on01?' • on when '+x.map.filter(p=>p[1]===1).map(p=>x.bits.map((b,i)=>`${b} ${(p[0]>>i)&1?'set':'clear'}`).join(', ')).join(' or '):
   x.map&&x.map.length?' • '+x.map.map(p=>esc(posLabel(x.m,p[1]))).join(' '):'';
- if(x.bits&&x.bits.length)return`${hex(x.id,3)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
- if(x.l===1)return`${hex(x.id,3)} <span class="muted">bit ${x.s}</span>`;
+ if(x.bits&&x.bits.length)return`${canName(x.id)} <span class="muted">bit${x.bits.length>1?'s':''} ${x.bits.join(' ')}${tbl}</span>`;
+ if(x.l===1)return`${canName(x.id)} <span class="muted">bit ${x.s}</span>`;
  const k=x.s>>3;
- if(x.l<8&&!x.be)return`${hex(x.id,3)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
- return`${hex(x.id,3)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
+ if(x.l<8&&!x.be)return`${canName(x.id)} <span class="muted">bits ${x.s}–${x.s+x.l-1}${tbl}</span>`;
+ return`${canName(x.id)} <span class="muted">${x.l===8?'byte '+k:'bytes '+k+'–'+(k+1)}${x.l===12||x.l===14?' ('+x.l+' bit)':''}${x.be&&x.l>8?' BE':''}${tbl}</span>`}
 async function learnAct(a,m){await post(`/api/learn/${a}?m=${m}`,a==='accept'?`Listening for ${nm(m)}`:`Requesting ${nm(m)} again`,()=>load(true))}
 /* What needs the driver, from what /api/live already carries: one line each,
    linking to the tab where it is dealt with. */
@@ -652,7 +673,7 @@ async function pollBusOnce(){
   if(dt&&ZC[k]!==undefined)ZHZ[k]=(c.count-ZC[k])/dt;ZC[k]=c.count;ZP[k]=b;
   const by=b.map((v,i)=>`<span class="${pb.length&&pb[i]!==v?'h':ch[i]?'l':''}">${v.toString(16).toUpperCase().padStart(2,'0')}</span>`).join('');
   const used=(C.signals||[]).filter(s=>s.can_id===c.id&&(s.mode===1||s.mode===3)).map(s=>nm(s.metric));
-  return`<tr><td>${c.ext?'ext ':''}${hex(c.id,3)}</td><td>${ZHZ[k]!==undefined?ZHZ[k].toFixed(0):'–'}${c.age>2000?' <span class="warn">idle</span>':''}</td>
+  return`<tr><td>${isPseudo(c.id)?canName(c.id):(c.ext?'ext ':'')+hex(c.id,3)}</td><td>${ZHZ[k]!==undefined?ZHZ[k].toFixed(0):'–'}${c.age>2000?' <span class="warn">idle</span>':''}</td>
    <td class="hx">${by}${used.length?` <span class="tag raw">${esc(used.join(', '))}</span>`:''}</td>
    <td><button class="b s" onclick="mapOpen(${c.id},${c.ext?1:0})">Map</button></td></tr>`}).join('')||'<tr><td colspan="4" class="empty">Nothing heard yet.</td></tr>';
  if(MAP)mapPrev()}
@@ -713,7 +734,7 @@ function metricOpts(sel,filter){return Object.keys(META).map(Number).filter(id=>
  .map(id=>`<option value="${id}" ${id===sel?'selected':''}>${esc(nm(id))}${un(id)?' ('+esc(un(id))+')':''}</option>`).join('')}
 /* The map dialog sits over the tab that opened it; while it is open the frames
    are read (pollBus), so its preview follows the bus. */
-function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapDlg').hidden=false;$('#mapId').textContent=hex(id,3);
+function mapOpen(id,ext,p){p=p||{};MAP={id,ext:!!ext};$('#mapDlg').hidden=false;$('#mapId').textContent=canName(id);
  $('#mpS').value=p.s||0;$('#mpL').value=p.l||8;$('#mpK').value=p.k||1;$('#mpO').value=p.o||0;$('#mpBE').value=p.be?'1':'0';
  $('#mpSg').checked=!!p.sg;$('#mpM').innerHTML=metricOpts(p.m||0x010C);mapPrev();pollBus()}
 function mapClose(){MAP=null;$('#mapDlg').hidden=true}
@@ -1240,9 +1261,9 @@ async function teachStart(){
    const tq=at();let b=null;asked++;
    try{b=await req(url,null,plan.deadline)}catch(e){}
    const tr=at(),i=b?teachSlot(durs,skip,tq,tr):-1;
-   if(b)TLAST.reads.push({t:[Math.round(tq),Math.round(tr)],step:i,c:b.census.filter(c=>!c.ext).map(c=>[c.id,c.d||'',c.e||'']),m:b.m||null});
+   if(b)TLAST.reads.push({t:[Math.round(tq),Math.round(tr)],step:i,c:b.census.filter(c=>!c.ext||isPseudo(c.id)).map(c=>[c.id,c.d||'',c.e||'']),m:b.m||null});
    if(i>=0){const k=steps[i][0];
-    TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
+    TEACH.S[k].push(new Map(b.census.filter(c=>!c.ext||isPseudo(c.id)).map(c=>[c.id,{b:hb(c.d||''),e:c.e?hb(c.e):null}])));
     if(kind==='mot'){
      // The car as the master knows it at this poll: speed, steering, and a yaw
      // rate or lateral G already read from the bus (never one derived from these).
@@ -1309,9 +1330,9 @@ function teachAnalyze(steps){
 /** The raw signals feeding @p metric now: taught, mapped by hand or learned. */
 const feeding=metric=>(C.signals||[]).filter(g=>g.metric===metric&&(g.mode===1||g.mode===3));
 const sameSig=(g,x)=>g.can_id===x.can_id&&g.start===x.start&&g.len===x.len&&String(g.bits||'')===String(x.bits||'');
-const where=g=>hex(g.can_id,3)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):g.len===1?' bit '+g.start:` bits ${g.start}-${g.start+g.len-1}`);
+const where=g=>canName(g.can_id)+(g.bits&&g.bits.length?' bits '+g.bits.join(' '):g.len===1?' bit '+g.start:` bits ${g.start}-${g.start+g.len-1}`);
 function teachSig(r,m){
- const s={name:nm(m).slice(0,15),can_id:r.id,ext:false,start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
+ const s={name:nm(m).slice(0,15),can_id:r.id,ext:isPseudo(r.id),start:r.s,len:r.l,be:false,signed:false,scale:1,offset:0,metric:m,mode:1,ref:0,learned:false};
  if(r.codes){s.bits=r.bits;s.map=r.codes.map((c,g)=>[c,posValue(m,r.names[g],g)])}
  else if(r.map){s.bits=r.bits;s.map=r.map}            // the flasher while the side's bit says so
  else if(r.inv){s.scale=-1;s.offset=1}
@@ -1333,9 +1354,9 @@ async function teachAdd(list){
 async function teachUse(i){
  const r=TRES[i],m=r.metric||+$('#tM').value;
  if(!r.codes&&r.l!==1){BUS=BUS||{census:[]};
-  if(r.k!==undefined){mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
+  if(r.k!==undefined){mapOpen(r.id,isPseudo(r.id)?1:0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m,k:+r.k.toPrecision(3),o:+r.o.toPrecision(3)});
    toast('Check it reads right (round the scale), then Use this value');return}
-  mapOpen(r.id,0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
+  mapOpen(r.id,isPseudo(r.id)?1:0,{s:r.s,l:r.l,be:r.be,sg:r.sg,m});
   toast('Set the scale so the value reads right, then Use this value');return}
  if(!await teachAdd([teachSig(r,m)]))return;
  toast(`${nm(m)} is now read from the bus`);
@@ -1536,6 +1557,72 @@ async function serviceReset(){
  if(!confirm('Oil changed now: the reminder starts again from the odometer?'))return;
  try{const r=await fetch('/api/service/reset',{method:'POST'}),j=await r.json();toast(r.ok?'Reminder reset':j.error||'Failed');
   if(r.ok)await load(true);pollCodes()}catch(e){toast('Failed')}}
+/* ───────────── the car's computers (Car tab) ───────────── */
+/* Who a computer said it is, every way it was asked (Computers.h CompAsk);
+   nothing here knows any computer in advance. */
+const ASKS=['OBD-II','SSM','KWP2000','UDS name','UDS part no.'];
+const hexj=a=>(a||[]).map(h2).join('');
+const txt=a=>(a||[]).map(c=>c>=32&&c<127?String.fromCharCode(c):' ').join('').replace(/\s+/g,' ').trim();
+function compWho(f){
+ const a=f.ask||[],ok=q=>a[q]&&a[q][0]===1,d=q=>a[q]?a[q][2]:[],out=[];
+ if(ok(0))out.push('<b>OBD-II</b> (an emissions computer)');
+ if(ok(1))out.push(`<b>SSM</b> SYS ${hexj(d(1).slice(1,4))} · ROM ${hexj(d(1).slice(4,9))}`);
+ if(ok(2))out.push(`<b>KWP2000</b> "${esc(txt(d(2).slice(2)))}"`);
+ if(ok(3))out.push(`<b>UDS</b> "${esc(txt(d(3).slice(3)))}"`);
+ if(ok(4))out.push(`part no. "${esc(txt(d(4).slice(3)))}"`);
+ if(!out.length){const no=a.map((x,q)=>x&&x[0]===2?ASKS[q]:null).filter(Boolean);
+  out.push(a.some(x=>x&&x[0])?'answers "are you there" only'+(no.length?` (refuses ${no.join(', ')})`:''):'not asked yet')}
+ return out.join(' · ')}
+let CC=null;
+function pollComp(){return solo('comp',pollCompOnce)}
+async function pollCompOnce(){
+ if(TAB!=='car'||TEACH||UPD)return;
+ try{CC=await req('/api/computers',null,5000)}catch(e){return}
+ renderComp();
+ if(CC.phase)setTimeout(pollComp,1000)}
+const isRead=(tx,l)=>(C.reads||[]).some(r=>r.tx===tx&&r.lid===l);
+function renderComp(){
+ const d=CC;if(!d)return;
+ const found=d.found||[],PH=['','asking','asking every 29-bit computer','asking who they are','searching'];
+ $('#ccSub').textContent=d.phase?`${PH[d.phase]||''} ${d.phase===4?'21 '+h2(d.at):hex(d.at,3)}…`:found.length?`${found.length} found`:'';
+ $('#ccBarBox').hidden=!d.phase;$('#ccBar').style.width=(d.pct||0)+'%';$('#ccBtn').disabled=!!d.phase;
+ $('#ccList').innerHTML=found.length?found.map((f,i)=>{
+  const s=d.searching===i?`<span class="muted">searching its data blocks… ${d.pct} %</span>`:
+   f.search===3?'<span class="muted">no data blocks to search: it has no service 21</span>':
+   f.search===2?(f.lids.length?f.lids.map(([l,n])=>`<span style="white-space:nowrap;margin-right:10px">21 ${h2(l)} · ${n} B `+
+    (isRead(f.tx,l)?'<span class="ok">read</span>':`<button class="b s p" onclick="compRead(${f.tx},${f.rx},${l})">Read</button>`)+'</span>').join(''):
+    '<span class="muted">no block answered</span>'):
+   `<button class="b s" onclick="compSearch(${i})"${d.phase?' disabled':''}>Find its data</button>`;
+  return`<div class="lr"><div class="lt"><span class="mono"><b>${compAddr(f.tx)}</b> → ${compAddr(f.rx)}</span></div>
+   <div style="white-space:normal">${compWho(f)}</div><div class="ls" style="justify-content:flex-start;flex-wrap:wrap">${s}</div></div>`}).join(''):
+  `<p class="say" style="margin:0">${d.phase?'Asking…':d.scanned?'Nothing answered.':'Not looked yet.'}</p>`;
+ $('#ccSay').innerHTML=(d.note?`<span class="warn">Stopped: ${esc(d.note)}</span>. `:'')+
+  (d.scanned?`${d.skipped} address${d.skipped===1?'':'es'} left alone: the car's modules send on them. `:'')+
+  (d.scanned&&found.length<=2?'Fewer than expected? A computer may answer only on another bus (the body computer is the gateway to it): '+
+   'record the bus while a scan tool reads it (Bus tab, Raw recording, master\'s requests off) and the tool\'s requests are in the file. ':'');
+ const rs=d.reads||[];
+ $('#ccRead').innerHTML=(C.reads||[]).length?(C.reads||[]).map((r,i)=>{const s=rs[i]&&rs[i].tx===r.tx&&rs[i].lid===r.lid?rs[i]:null;
+  return`<div class="lr"><div class="lt"><span><span class="mono"><b>${compAddr(r.tx)} 21 ${h2(r.lid)}</b></span> every ${r.ms} ms</span>
+   <button class="x" title="Stop reading it" onclick="compUnread(${i})">✕</button></div>
+   <div class="ls"><span>${s?`${s.reads} answers (${s.len} bytes), ${s.fails} failed · ${s.age==null?'no answer yet':s.age<2000?'last just now':'last '+ago(Math.round(s.age/1000))}`+
+   (s.note?` · <span class="warn">${esc(s.note)}</span>`:''):'not read yet'}</span></div></div>`}).join('')+
+  '<p class="say" style="margin:8px 0 0">In the Bus tab\'s frame table as rows of their own (e.g. <b>0x750 21 50 · 0-7</b>): '+
+  'teach by doing finds a door or a switch there as on any frame, and <b>Map</b> names a bit or a byte.</p>':
+  '<p class="say" style="margin:0">None. <b>Read</b> a block a computer\'s search found.</p>'}
+async function compScan(){
+ try{const r=await fetch('/api/computers/scan',{method:'POST'}),j=await r.json();toast(r.ok?'Asking every address…':j.error||'Failed')}
+ catch(e){toast('Failed')}
+ setTimeout(pollComp,500)}
+async function compSearch(i){
+ try{const r=await fetch('/api/computers/search?i='+i,{method:'POST'}),j=await r.json();toast(r.ok?'Asking for its blocks…':j.error||'Failed')}
+ catch(e){toast('Failed')}
+ setTimeout(pollComp,500)}
+async function compRead(tx,rx,lid){
+ if(!LOADED){toast('Not loaded yet');return}
+ const rd=C.reads||[];
+ if(rd.length>=16){toast('16 blocks at most');return}
+ C.reads=rd.concat([{tx,rx,lid,ms:500}]);setDirty(true);await save();renderComp()}
+async function compUnread(i){C.reads=(C.reads||[]).filter((_,k)=>k!==i);setDirty(true);await save();renderComp()}
 const kb=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixed(2)+' MB';
 const dur=s=>{s=Math.round(s);return s<60?s+' s':Math.floor(s/60)+' min '+String(s%60).padStart(2,'0')+' s'};
 function pollLogs(){return solo('logs',pollLogsOnce)}
@@ -1637,5 +1724,5 @@ renderSettings();
 try{advShow(localStorage.getItem('advOn')==='1')}catch(e){}
 go(location.hash.slice(1));
 load();poll();setInterval(poll,1000);setInterval(pollBus,1000);setInterval(pollEvlog,3000);setInterval(pollRaw,2000);
-setInterval(pollCodes,3000);setInterval(pollLogs,3000);
+setInterval(pollCodes,3000);setInterval(pollLogs,3000);setInterval(pollComp,3000);
 </script></body></html>

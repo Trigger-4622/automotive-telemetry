@@ -463,7 +463,10 @@ void UIBuilder::begin() {
     buildAlertCard();
     _gaugeAlarms = Config.gaugeAlarmColors();
     applyNight(false);
-    lv_scr_load(_screens[0].scr);
+    // The first screen of the swipe order: one that comes up only by its rule
+    // waits for it.
+    if (!_screens[0].inSwipe) _active = swipeStep(0, 1);
+    lv_scr_load(_screens[_active].scr);
     _timer = lv_timer_create(uiTimerCb, UI_UPDATE_PERIOD_MS, this);
     log_i("UI built: %u screens, %u lamps, warnings %s", (unsigned)_screens.size(),
           (unsigned)_lamps.size(), _lamps.enabled() ? "on" : "off");
@@ -482,6 +485,7 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     _screens.emplace_back();
     ScreenDef &sd = _screens.back();
     sd.allowPopup = cfg["show_popup"] | true;
+    sd.inSwipe = cfg["swipe"] | true;
     // The lamp strip would cover the diagnostics screen's colour swatches.
     sd.showTelltales = cfg["show_telltales"] | (strcmp(type, "diag") != 0);
     sd.scr = lv_obj_create(nullptr);
@@ -503,6 +507,7 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     else if (!strcmp(type, "gmeter"))      buildGMeter(sd, cfg);
     else if (!strcmp(type, "perf"))        buildPerf(sd);
     else if (!strcmp(type, "park"))        buildPark(sd, cfg);
+    else if (!strcmp(type, "car"))         buildCar(sd, cfg);
     else if (!strcmp(type, "diag"))      { buildDiag(sd); _diagIndex = _screens.size() - 1; }
     else                                   buildArcGauge(sd, cfg);   // fallback
 
@@ -511,6 +516,16 @@ void UIBuilder::buildScreen(JsonObject cfg) {
                             lv_palette_main(LV_PALETTE_RED),
                             LV_ALIGN_TOP_MID, 0, 10);
     lv_obj_add_flag(sd.linkIcon, LV_OBJ_FLAG_HIDDEN);
+
+    const size_t rulesBefore = _auto.rules();
+    _auto.add(cfg, _screens.size() - 1);       // its show_when, if it has one
+    // Left out of the swipe order with no rule to bring it up: it could never
+    // be seen - it stays in.
+    if (!_screens.back().inSwipe && _auto.rules() == rulesBefore) {
+        _screens.back().inSwipe = true;
+        log_w("screen %u: \"swipe\": false needs a show_when rule - kept in the swipe order",
+              (unsigned)(_screens.size() - 1));
+    }
 }
 
 /**
@@ -608,18 +623,25 @@ static void pageDotsDrawCb(lv_event_t *e) {
  * ±56 px of usable width — enough for a dozen dots.
  */
 void UIBuilder::addPageDots() {
-    const size_t n = _screens.size();
+    // The swipe order's screens: one that comes up only by its rule has no
+    // place in the row, nor a row of its own.
+    bool any = false;
+    for (const auto &s : _screens) any |= s.inSwipe;
+    size_t n = 0;
+    for (const auto &s : _screens) n += !any || s.inSwipe;
     if (n < 2 || n > 12) return;                 // pointless / too wide
 
     // One small object per screen that draws the whole row itself.
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0, pos = 0; i < _screens.size(); i++) {
+        if (any && !_screens[i].inSwipe) continue;
+        const size_t at = pos++;
         lv_obj_t *row = lv_obj_create(_screens[i].root);
         lv_obj_remove_style_all(row);
         lv_obj_set_size(row, (lv_coord_t)((n - 1) * 10 + 6), 6);
         lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -12);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, pageDotsDrawCb, LV_EVENT_DRAW_MAIN,
-                            (void *)(uintptr_t)(i | (n << 8)));
+                            (void *)(uintptr_t)(at | (n << 8)));
     }
 }
 
@@ -1604,31 +1626,70 @@ void UIBuilder::buildPark(ScreenDef &sd, JsonObject cfg) {
     ParkView &v = _parks.back();
     v.metric = cfg["metric_id"].isNull() ? (uint16_t)METRIC_ID_STEERING_ANGLE
                                          : parseMetricId(cfg["metric_id"]);
+    CarGeom g;
+    g.ratio = cfg["steer_ratio"] | 15.0f;
+    g.wheelbase = (cfg["wheelbase_mm"] | 2750.0f) / 1000.0f;
     parkBuild(v, sd.root, LCD_WIDTH, LCD_HEIGHT, cfg["steer_max"] | 540.0f,
-              cfg["straight_deg"] | 10.0f);
-    if ((cfg["auto_reverse"] | true) && _parkAuto.screen < 0)
-        _parkAuto.screen = (int)_screens.size() - 1;
+              cfg["straight_deg"] | 10.0f, !strcmp(cfg["view"] | "wheel", "path"), g);
 }
 
-void UIBuilder::parkAuto(bool reverse, uint32_t now) {
-    ParkAuto &p = _parkAuto;
-    if (p.screen < 0 || _configActive || _calActive) return;
-    if (reverse && !p.reverse && (int)_active != p.screen) {
-        p.back  = _active;
-        p.shown = true;
-        loadScreen((size_t)p.screen, true);
+void UIBuilder::buildCar(ScreenDef &sd, JsonObject cfg) {
+    _cars.emplace_back();
+    sd.car = (int)_cars.size() - 1;
+    CarGeom g;
+    g.ratio = cfg["steer_ratio"] | 15.0f;
+    g.wheelbase = (cfg["wheelbase_mm"] | 2750.0f) / 1000.0f;
+    g.path = cfg["path"] | true;
+    carScreenBuild(_cars.back(), sd.root, LCD_WIDTH, LCD_HEIGHT, g);
+}
+
+CarState UIBuilder::carState() {
+    CarState s;
+    auto flag = [](uint16_t id) -> int8_t {
+        MetricSample m;
+        if (!Telemetry.peek(id, m) || !(m.flags & METRIC_FLAG_VALID) || m.stale) return -1;
+        return m.raw >= 0.5f ? 1 : 0;
+    };
+    static const uint16_t DOORS[4] = {METRIC_ID_DOOR_FL, METRIC_ID_DOOR_FR, METRIC_ID_DOOR_RL,
+                                      METRIC_ID_DOOR_RR};
+    for (int i = 0; i < 4; i++) s.door[i] = flag(DOORS[i]);
+    s.anyDoor   = flag(METRIC_ID_DOOR_OPEN);
+    s.boot      = flag(METRIC_ID_TRUNK);
+    s.bonnet    = flag(METRIC_ID_HOOD);
+    s.lights    = flag(METRIC_ID_SW_LIGHTS);
+    s.highBeam  = flag(METRIC_ID_HIGH_BEAM);
+    s.handbrake = flag(METRIC_ID_HANDBRAKE);
+    // The indicators as the lamps show them (their flash, the hazard lights),
+    // or straight from the bus where the lamps are switched off.
+    const int l = _lamps.find("turn_left"), r = _lamps.find("turn_right");
+    s.turnL = l >= 0 && _lamps[(size_t)l].enabled ? _lamps[(size_t)l].on : flag(METRIC_ID_TURN_LEFT) == 1;
+    s.turnR = r >= 0 && _lamps[(size_t)r].enabled ? _lamps[(size_t)r].on : flag(METRIC_ID_TURN_RIGHT) == 1;
+    s.reverse = reverseEngaged() || gearLever() == 'R';
+    return s;
+}
+
+bool UIBuilder::condHolds(const ScreenCond &c) {
+    if (!c.metric) {
+        // The gear as the readout has it: the reverse switch over everything,
+        // else the lever's letter and the gear number both count ("D" and "3").
+        char a = 0, b = 0;
+        if (reverseEngaged()) {
+            a = 'R';
+        } else {
+            a = (char)gearLever();
+            MetricSample g;
+            if (Telemetry.peek(METRIC_ID_GEAR, g) && (g.flags & METRIC_FLAG_VALID) && !g.stale) {
+                const long n = lroundf(g.raw);
+                b = n < 0 ? 'R' : n == 0 ? 'N' : n <= 9 ? (char)('0' + n) : 0;
+            }
+        }
+        if (!a && !b) return false;                      // no gear known
+        const bool is = c.gear == a || c.gear == b;
+        return c.op == ScreenCond::NE ? !is : is;
     }
-    if (!reverse && p.reverse) p.outMs = now;
-    p.reverse = reverse;
-    if (!p.shown || reverse) return;
-    // Elapsed time, unsigned (right across the millis() wrap).
-    MetricSample sp;
-    const bool away = Telemetry.peek(METRIC_ID_SPEED, sp) && (sp.flags & METRIC_FLAG_VALID) &&
-                      !sp.stale && sp.raw > PARK_BACK_KMH;
-    if (away || now - p.outMs >= PARK_BACK_MS) {
-        p.shown = false;
-        if ((int)_active == p.screen && p.back < _screens.size()) loadScreen(p.back, false);
-    }
+    MetricSample s;
+    if (!Telemetry.peek(c.metric, s) || !(s.flags & METRIC_FLAG_VALID) || s.stale) return false;
+    return screenCondCompare(c.op, s.raw, c.value);
 }
 
 void UIBuilder::updateDrive(uint32_t now, float lerp) {
@@ -1659,7 +1720,19 @@ void UIBuilder::updateDrive(uint32_t now, float lerp) {
         ParkView &pv = _parks[sd.park];
         MetricSample st{};
         const bool ok = sampleOnce(pv.metric, lerp, st) && (st.flags & METRIC_FLAG_VALID) && !st.stale;
-        parkUpdate(pv, st.value, ok);
+        if (pv.pathView) {
+            const CarState cs = carState();
+            parkUpdate(pv, st.value, ok, &cs);
+        } else {
+            parkUpdate(pv, st.value, ok);
+        }
+    }
+    if (sd.car >= 0) {
+        CarState cs = carState();
+        MetricSample a{};
+        cs.angleOk = sampleOnce(METRIC_ID_STEERING_ANGLE, lerp, a) && (a.flags & METRIC_FLAG_VALID) && !a.stale;
+        cs.angle = a.value;
+        carScreenUpdate(_cars[sd.car], cs);
     }
 }
 
@@ -1750,7 +1823,10 @@ void UIBuilder::tick() {
     }
 
     // Last: a screen change starts its slide, and the ticks wait for it.
-    parkAuto(reverse || lever == 'R', now);
+    if (!_configActive && !_calActive) {
+        const int to = _auto.tick(_active, now, [this](const ScreenCond &c) { return condHolds(c); });
+        if (to >= 0 && (size_t)to < _screens.size()) loadScreen((size_t)to, (size_t)to > _active);
+    }
 }
 
 bool UIBuilder::sampleOnce(uint16_t id, float lerp, MetricSample &s) {
@@ -2673,19 +2749,34 @@ void UIBuilder::loadScreen(size_t idx, bool forward) {
     if (lv_anim_t *a = lv_anim_get(outgoing, nullptr))          a->path_cb = path;
 }
 
+size_t UIBuilder::swipeStep(size_t from, int dir) const {
+    const size_t n = _screens.size();
+    bool any = false;
+    for (const auto &s : _screens) any |= s.inSwipe;
+    for (size_t k = 1; k < n; k++) {
+        const size_t i = dir > 0 ? (from + k) % n : (from + n - k) % n;
+        if (!any || _screens[i].inSwipe) return i;
+    }
+    return from;
+}
+
 void UIBuilder::nextScreen() {
     // The BOOT button during the calibration wizard: back to the gauges.
     if (_calActive) { cancelTouchCalibration(); return; }
     if (_configActive || _screens.size() < 2) return;
-    _parkAuto.shown = false;                 // the driver chose: it stays
-    loadScreen((_active + 1) % _screens.size(), true);
+    const size_t to = swipeStep(_active, 1);
+    if (to == _active) return;
+    _auto.swiped();                          // the driver chose: it stays
+    loadScreen(to, true);
 }
 
 void UIBuilder::prevScreen() {
     if (_calActive) { cancelTouchCalibration(); return; }
     if (_configActive || _screens.size() < 2) return;
-    _parkAuto.shown = false;
-    loadScreen((_active + _screens.size() - 1) % _screens.size(), false);
+    const size_t to = swipeStep(_active, -1);
+    if (to == _active) return;
+    _auto.swiped();
+    loadScreen(to, false);
 }
 
 void UIBuilder::togglePeaks() {

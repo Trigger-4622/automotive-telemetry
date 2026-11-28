@@ -143,3 +143,18 @@ enum IsoResult : uint8_t {
 IsoResult isoExchange(uint32_t txId, uint32_t rxId, uint32_t fcId,
                       const uint8_t *req, size_t len, uint8_t *rsp, size_t max, size_t &got,
                       uint32_t timeoutMs, char *why, size_t whyCap);
+
+/** @brief One frame that answered a probe. */
+struct IsoHit { uint32_t id; bool ext; uint8_t len; uint8_t data[8]; };
+
+/**
+ * @brief Send one single-frame request to @p txId (29-bit above 0x7FF) and
+ *        collect, for @p waitMs, every frame from ANY other ID that answers
+ *        it: a single frame "service+0x40 ..." or "7F service code", or the
+ *        first frame of a long answer (which is left without flow control).
+ *        One hit per answering ID. Same lock, guard and refusals as
+ *        isoExchange(); nothing else is taken from the bus meanwhile.
+ * @return ISO_OK with hits, ISO_NO_REPLY, or ISO_BUSY (never sent).
+ */
+IsoResult isoProbe(uint32_t txId, const uint8_t *req, size_t len, uint32_t waitMs,
+                   IsoHit *hits, size_t maxHits, size_t &nHits, char *why, size_t whyCap);

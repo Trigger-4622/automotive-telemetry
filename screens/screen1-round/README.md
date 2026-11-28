@@ -68,15 +68,19 @@ in USB still enters the ROM bootloader.
 
 Gauge Studio has five tabs. **Screens**: add, order and edit screens (the dash,
 arc gauges, needle tachometers, 2/4-way splits, text lists, trend charts, the
-G-meter, the performance timers, the parking screen, diagnostics) with a live circular preview -
+G-meter, the performance timers, the parking screen, the car from above, diagnostics) with a live circular preview -
 each type offers only what it draws, and its background (texture, gradient,
 image, bezel). **Lamps**: the warning lamps and their strip. **Watchdog**:
 values guarded on every screen. **Settings**: display (with the backlight by
 day and at night, shown on the display as its slider moves), alerts, the
 master and network, the side button - each setting in one place. **Device**: the
 display's figures, live telemetry, background images (LVGL `.bin`) and the
-layout file, to keep a copy or open one. Save sends the layout as a file,
-which the display writes to flash as it arrives and only then reads.
+layout file, to keep a copy, open one, or upload one straight to the display
+as it is (as the master's settings Upload does; the display keeps its touch
+calibration and any network setting the file leaves out). Save sends the
+layout as a file, which the display writes to flash as it arrives and only
+then reads. Ready-made layouts are in `layouts/` (a daily one and a race one;
+see its README).
 
 **Driving screens.** `gmeter` draws the car's acceleration as a dot in a
 friction circle (up speeding up, down braking, left in a left-hand bend; rim
@@ -86,9 +90,27 @@ second to arm a standing start; 80-120 times itself whenever the speed passes
 80 on the way up. Layout version 3 adds both to an existing layout once.
 `park` shows the steering wheel as it is turned, an arc from straight ahead to
 full lock (`steer_max`) and STRAIGHT in green within `straight_deg` of the
-centre; in reverse it comes up by itself and goes back 10 s after reverse ends,
-or at once above 15 km/h - unless you swipe meanwhile (`auto_reverse` false
-leaves the screens alone). Layout version 4 adds it once.
+centre; with `view` "path" it shows the car from above instead, with the lines
+its corners will take. Layout version 4 adds it once.
+`car` shows the car from above, front up: the doors swung out in amber when
+open, boot and bonnet, the indicators at its corners, the headlights, the front
+wheels turned by the steering, and the path its corners will take - ahead, or
+back from the rear bumper in reverse - with what is open in words above it
+("ALL SHUT", "DOOR FL + BOOT"). The path is a single-track model: the road
+wheels turned by the steering angle over `steer_ratio` (15), about a centre on
+the rear axle's line `wheelbase_mm` (2750, the Legacy BM's) behind the front
+one. A door the master does not know is drawn faint, never as shut. Layout
+version 6 adds it once.
+
+**Screens that come up by themselves.** Any screen can have conditions of its
+own (studio: *Show this screen by itself*): the gear, the speed or any metric,
+all of which must hold. The display then changes to it, and goes back to the
+screen before once they stop holding - after a wait you set, or at once when
+one of its "go back at once" conditions holds. A swipe keeps the screen you
+chose. The parking screen ships with one: in reverse, back 10 s after it or at
+once above 15 km/h (`src/ui/AutoScreen.h` has the details). *Only by itself*
+(`"swipe": false`) leaves a screen out of the swipe order and the page dots,
+so only its rule brings it up.
 
 **Trouble codes and the oil change.** The check-engine card names the codes the
 master read (`P1718 TCM 2/2`, then what it means), one every 3 s; with the

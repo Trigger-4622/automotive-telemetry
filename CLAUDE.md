@@ -88,7 +88,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   project includes it (DiagCodes.cpp, Telltales.cpp).
 - Shared by the two screens, change both: `include/Palette.h`,
   `include/TelltaleIcons.h`, `src/ui/Telltales.*`, `src/ui/PerfTimer.*`,
-  `src/ui/DriveViews.*`, `tools/embed_studio.py`, `tools/make_icons.py`,
+  `src/ui/DriveViews.*`, `src/ui/AutoScreen.*`, `tools/embed_studio.py`, `tools/make_icons.py`,
   `tools/telltale_icons.json` and all of `test_host/`.
 - Generated, never edit by hand: `master/src/WebPortal.cpp` (from
   `master/tools/portal_page.html` + `WebPortal.cpp.in` via build_portal.py),
@@ -146,7 +146,12 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   now about 1.5 KB. A layout that will not parse or has no screens, or a
   flash that will not take it, changes nothing and puts the stored layout
   back; the page shows the display's reason. The device's `touch_cal` stands
-  over the upload's. A bare JSON body (curl) streams the same way.
+  over the upload's, and so does every `network` key the upload leaves out
+  (the master's channel, the AP name and password: a file from another
+  display must not move this one off the channel - `layout_upload_keeps_network`).
+  A bare JSON body (curl) streams the same way. The studio's Device tab also
+  has "Upload to the display": a file sent as it is, as the master's
+  settings Upload works, then the editor reloads what the display took.
 - Master bus rules: only the TWAI RX task may reinstall or uninstall the
   driver; everything that transmits goes through `diagGuardOk()` /
   `diagBusLock()` and hands its frame over with `masterTransmit()` (under
@@ -172,8 +177,9 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   tasks run right after a clock reading, as a preemption or the other core).
 - **Asking the car** (`pacing_p2can*`, `obd_two_ecus`, `obd_pending`,
   `dtc_functional_fc`, `dtc_tcm_silent`): one request on the bus at a time,
-  whoever sends it - the OBD-II poller, SSM2 and the code reader all take
-  `diagBusLock()` - and the lock is kept until that request is settled:
+  whoever sends it - the OBD-II poller, SSM2, the code reader and the
+  computers' scan, search and reads all take `diagBusLock()` - and the lock
+  is kept until that request is settled:
   answered by every computer known to answer it, refused, or P2CAN since it
   went out (`obdAsk()`: the longer of `obd_to` and `obd_p2can`; "still
   working", 0x78, is waited on for up to 2 s). `obd_to` alone used to end the
@@ -385,7 +391,7 @@ allowlist; if the build cannot download, say so - CI builds all three anyway.
   one at a time, and polls nothing else while a teach runs. Five tabs, each
   polling only what it shows: Home, Signals (learning, teach by doing, the
   sources), Bus (its health, the frames, the evidence log), Car (codes, oil
-  change, drive logs) and Settings (the everyday ones, Device, then an
+  change, drive logs, the car's computers) and Settings (the everyday ones, Device, then an
   Advanced section). Every setting is in exactly one row of the page's
   settings block (`SET_MAIN`, `SET_ADV`, `SET_CAR`): a new config key gets a
   row there and nowhere else - `portal_tests.js` checks the block against
@@ -417,8 +423,8 @@ traffic/legacy_2010_teach_turn.json`) found no frame on this bus that follows
 the lamps - with the right indicator and the hazard lights the only thing that
 moved was 0x432 byte 5, a value (61 or 64 at rest, 63 and 66 with each flash),
 whose bit 41 the page then offered as the right lamp; it flashed with either
-side. Extended identifiers are not in the teach's readings - not yet checked
-whether this bus has any.
+side. Extended identifiers are not in the teach's readings (but for the
+computers' rows, below) - not yet checked whether this bus has any.
 
 Teach by doing (portal Signals tab; its analysis is the `teach-core` JS in
 `portal_page.html`, tested by `master/test_host/portal_tests.js`) finds a
@@ -483,7 +489,7 @@ before, once confirmed. The screens flash both arrows while `METRIC_ID_HAZARD`
 is on - following each side's own bit when it flashes, in step by themselves
 when it does not (`lamp_hazard_switch`).
 
-## Codes, oil change, G-meter, drive log, raw recording, timers, parking, backlight
+## Codes, oil change, G-meter, drive log, raw recording, body computer, timers, parking, car view, backlight
 
 - **Trouble codes** (`master/src/DiagCodes.*`): services 03/07/0A from the
   ECM (0x7E0) and TCM (0x7E1, through 0x7DF with flow control to 0x7E1 if it
@@ -537,17 +543,75 @@ when it does not (`lamp_hazard_switch`).
   frame is stored as the bytes that changed since its identifier's last (the
   master's own too: 6.2 bytes a frame in the simulator, about 20 minutes of
   this car's ~1,250 frames/s), the controller's drops and the ring's are
-  recorded where they happened, and so are the evidence log's events. It
+  recorded where they happened, and so are the evidence log's events.
+  Everything that comes over the line is in it, recognised or not (format
+  version 2, `rawrec_everything`): every frame as the controller hands it
+  over - remote frames, 29-bit ones, a DLC of 9-15 as it was on the wire
+  (candump's `_<DLC>`; version 1 cut it to 8) - the bus errors, i.e. the
+  error frames (E6: how many, the error-code capture's kind, direction and
+  place, listen-only or not, during the master's own frame or not, TEC and
+  REC), and every moment the master could not hear the bus (E7, from
+  `masterBusBlind()`: a flash write, reset mode for a TEC write, a
+  reinstall), so a gap in it says why. It
   goes on across sleeps and restarts, each a new session after the last
   page, until stopped (a byte in the header), full, or given back. Meanwhile
   what the master saves by itself (`Cfg.serviceSave()`, `evService()`) waits
   - a sector erase would cost frames - until the recording ends or the next
   sleep or restart; a Save from the portal is made at once. The format is at
   the top of RawRec.h. Scenarios `rawrec_*`; run.py checks canrec.py against
-  the firmware's own reading of `rawrec_roundtrip`'s recording, frame for
-  frame. Not tried on the board: the frames a page program costs (the
+  the firmware's own reading of `rawrec_roundtrip`'s and `rawrec_everything`'s
+  recordings, frame for frame; it reads versions 1 and 2. Not tried on the board: the frames a page program costs (the
   simulator has no flash timing), the erase's minute, the download over the
   AP.
+- **The car's computers** (master, `master/src/Computers.*`; portal Car
+  tab, "The car's computers"; `/api/computers`, `/scan`, `/search?i=`).
+  Nothing in it knows a computer, an address or a data layout in advance:
+  no public source gives this car's computers their CAN addresses (searched
+  2026-11-28, English, Japanese and Russian, and Subaru's own documents).
+  Subaru's Technician Reference Booklet "Electrical Systems Operation &
+  Diagnosis" (module 602, June 2013) says the BIU is the gateway between the
+  500 kbit/s high-speed CAN (ECM, TCM, ABS/VDC, steering angle sensor, and on
+  later cars EPS, EPB, keyless, EyeSight) and the 125 kbit/s low-speed one
+  (meter, auto A/C), that later cars put all of them on the high-speed bus at
+  the data link connector, and that the BIU sets U1221-U122B when it hears
+  nothing from the ECM, TCM, VDC, EPB, meter or A/C; its SSM-III data list
+  has the door, lock and light switches, ambient temperature and fuel level -
+  no IDs. A community tool for the 2020+ (SGP) cars lists 7E0 ECM, 7E1 TCM,
+  7B0 VDC, 780 SRS, 7C0 meter, 7C4 A/C, 740 BIU, 746 EPS, 750 keyless, 787
+  EyeSight, each answering on +8 - a newer platform; not used here. Find
+  (standing, the bus up, not listen-only, settled): "3E 00" to every 11-bit
+  ID 0x700-0x7F7 but 0x7DF, 0x7E8-0x7EF and any ID the master has heard on
+  the bus (another module sends there - the car's 0x705/0x706: a frame of
+  ours could meet one of its own in arbitration; the old body-computer scan
+  did send there, `comp_scan` catches it), the answer taken from whatever ID
+  it comes on by what it says (`isoProbe()` in Ssm2.cpp: "7E ..." or "7F 3E
+  ..."), then "3E 00" once to every 29-bit computer (0x18DB33F1; answers on
+  0x18DAF1xx are computers at 0x18DAxxF1 - `isoExchange()` takes IDs above
+  0x7FF as 29-bit), then each one asked who it is: "01 00" (OBD-II), "AA"
+  (SSM IDs), "1A 80" (KWP2000 identification), "22 F1 97" and "22 F1 87"
+  (UDS name, part number). About 22 s on the simulator, with the OBD-II
+  poller keeping its turns. Search (one computer): "21 01" to "21 FE", each
+  block that answers kept with its length; a refusal 11 or silence to the
+  first three ends it (`comp_search`). Reads (`reads`: [{tx, rx, lid, ms}],
+  at most 16, empty by default - `comp_off`; a table, edited on the Car tab):
+  each block every `ms` (10 s after five failures in a row), from the codes
+  task, its answer into the frame table as extended IDs `COMP_PSEUDO_BASE`
+  0x1E000000 | address << 12 | block << 4 | eight-byte part (the address an
+  11-bit request ID, or 0x800 | a 29-bit one's target; "0x750 21 50 · 0-7"
+  on the portal) through a queue the RX task drains: a signal mapped there
+  publishes like a broadcast one, teach by doing takes the rows in, they
+  are never missed frames (`idOnRequest`) or in the raw recording
+  (`comp_reader`); the learner leaves extended IDs alone. Only reading
+  services are sent (3E, 01, AA, 1A, 21, 22 and flow control). The scan's
+  tables come from the heap at the first scan (about 3 KB) and the reads'
+  state at the first read (1 KB). The simulator has three other computers:
+  a KWP2000 body computer at 0x750, a meter at 0x7C0 answering on 0x7D0 and
+  a 29-bit UDS one at 0x18DA30F1 (`sim::others`). Not tried on the car: which
+  of its computers answer on this bus at all, and what they speak. If the
+  body computer does not answer, a raw recording while the owner's scan
+  tool reads it (master's requests off) holds the tool's requests. Nothing
+  is ever written to a computer (no 2E, 2F, 30, 31, 3B - locking and
+  unlocking are not implemented).
 - **Firmware update over Wi-Fi** (master only, `master/src/FwUpdate.*`;
   portal Settings > Device, `/api/update`): the upload goes into the spare
   app slot (app0/app1; a USB upload always writes app0 and resets otadata to
@@ -573,19 +637,72 @@ when it does not (`lamp_hazard_switch`).
 - **Timers** (screens, `PerfTimer`): 0-100, 80-120, quarter mile on the
   display from the master's speed, on the master's clock (`TelemetryStore::
   stamped()`). Layout version 3 adds the `gmeter` and `perf` screens once,
-  version 4 the `park` screen.
+  version 4 the `park` screen, version 5 the rules below, version 6 the `car`
+  screen (round board only).
 - **Parking screen** (screens, `park`; `parkBuild`/`parkUpdate` in the shared
   DriveViews): the steering wheel turned as the driver has it (`metric_id`,
   default the steering angle 0x1006, ISO 8855: positive to the left), an arc
   from straight ahead to full lock either way (`steer_max`, 540), the angle
-  and LEFT or RIGHT, STRAIGHT in green within `straight_deg` (10). With
-  `auto_reverse` (on) reverse - `METRIC_ID_REVERSE` or the lever's R - brings
-  the first such screen up, and it goes back to the screen before
-  `PARK_BACK_MS` (10 s) after reverse ends - not while shuffling R-D-R - or
-  at once above `PARK_BACK_KMH` (15 km/h); a swipe meanwhile keeps the
-  driver's screen (`park_screen`, `park_auto_reverse`, `park_auto_off`).
-  Layout version 4 adds it once, before `diag` (`migrate_v3_layout`). LVGL
-  heap: 2.3 KB on the round board, 2.8 KB on the cluster.
+  and LEFT or RIGHT, STRAIGHT in green within `straight_deg` (10)
+  (`park_screen`). It comes up in reverse by the rule below that it ships
+  with. Layout version 4 adds it once, before `diag` (`migrate_v3_layout`);
+  version 5 turns that version's `auto_reverse` switch into the rule, or into
+  nothing where it was off (`migrate_v4_layout`). LVGL heap: 2.3 KB on the
+  round board, 2.8 KB on the cluster. `view` "path" shows the car from above
+  (below) in place of the wheel, its path drawn from the same angle
+  (`park_path_view`).
+- **The car from above** (screens, `car`; `carBuild`/`carUpdate` and
+  `carScreenBuild` in the shared DriveViews; studio type "Car from above"):
+  front up, the doors swung out in amber when open (FL FR RL RR, or "a door
+  open" when only that is known; faint when not known at all - never drawn
+  shut), boot and bonnet, the indicators at its corners (each side's lamp as
+  the display's `turn_left`/`turn_right` lamps have it), the headlights and
+  the front wheels turned by the steering, and what is open in words
+  ("ALL SHUT", "DOOR FL + BOOT"). The path its corners will take - ahead,
+  or back from the rear bumper in reverse (the switch or the lever's R) - is
+  the single-track model: road wheels at the steering angle over
+  `steer_ratio` (15), about a centre on the rear axle's line `wheelbase_mm`
+  (2750, the Legacy BM's) behind the front; `path` false leaves it out
+  (`car_screen`). Lines are `lv_line`s with their points on the heap (LVGL
+  keeps the pointer), each object moved to its line's bounding box. Layout
+  version 6 adds it once, before `diag`, on the round board only: on the
+  cluster it costs about 6 KB of LVGL heap and its layout would leave less
+  than the 8 KB kept spare - the studio offers it there, and a cluster layout
+  is migrated to version 6 without it (`migrate_v5_layout`).
+- **Screens that come up by themselves** (screens, shared `AutoScreen.*`;
+  studio: "Show this screen by itself" on every screen): `show_when`, a list
+  of conditions that must all hold - `{"gear":"R"}` (`"op":"!="` for "is
+  not"; the reverse switch, the lever's letter and the gear number all count)
+  or `{"metric_id","op","value"}` (> < >= <= == !=, == on whole numbers); a
+  value the display has not got, or has gone stale, holds nothing. Only
+  conditions coming to hold change the screen; when they stop, back to the
+  screen before after `back_after_s` (10), or at once when one of
+  `back_now_when` holds. A swipe keeps the driver's screen; a screen chosen by
+  hand is never taken away; a rule coming to hold takes over from another, and
+  when its wait ends a rule still holding gets its screen back before the
+  driver's. A rule with a condition that will not read is left out whole,
+  with a warning. The shipped parking screen: gear R, back 10 s after or at
+  once above 15 km/h (`auto_screen_reverse`, `auto_screen_conditions`,
+  `auto_screen_none`). studio_tests.js checks the editor's keys, default,
+  operators and gears against AutoScreen.cpp. `"swipe": false` (studio:
+  "Only by itself") leaves a screen out of the swipe order and the page
+  dots: only its rule brings it up; the display starts on the first screen
+  of the order; one with no rule that reads stays in it, with a warning
+  (`rule_only_screens`).
+- **Round-screen layouts** (`screens/screen1-round/layouts/`, uploaded with
+  the studio's "Upload to the display"): `daily.json` - the shipped screens,
+  the car from above only when parking (P: the car with its doors; R: the
+  parking screen's path view; neither in the swipe order), no network block
+  (the display keeps its own); `race.json` - the watchdog guards only RPM
+  over (6200 / 6500) and coolant over (105 / 112) and never draws its card;
+  they show on the lamp strip (custom_1 SHIFT, custom_2 OVER-REV,
+  coolant_hot at 105, strip always up) and bring their screens up (the big
+  tach, the coolant gauge); a launch (standing, over 2500 rpm) brings the
+  timers, hard braking (-0.7 g) the G-meter; boost, timing, fine knock,
+  throttle, the temperatures and AFR on quads, a boost trend; only its AP
+  name in network (Telemetry-Gauge-Race). `round_layout_daily` and
+  `round_layout_race` boot each (LVGL heap: daily 46.1, race 37.2 of 56 KB)
+  and drive its rules.
 - **Backlight** (screens): `global.brightness_day` and `brightness_night`, in
   percent, held to 2-100 (never quite off: the screen is how its settings are
   reached); defaults 100 and 27 (round) / 31 (cluster), the old fixed 70 and

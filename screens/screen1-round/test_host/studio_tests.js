@@ -125,7 +125,8 @@ ok(core, 'the page has its @core-begin / @core-end block');
 const ctx = {};
 vm.createContext(ctx);
 vm.runInContext(`'use strict';const BOARD=${JSON.stringify(BOARD)};\n${core}\n` +
-  'this.out={SETTINGS,SET,TYPES,TYPES_ALL,F,DASH_PARTS,DASH_BASE,BG,BEZEL,GONE,cleanLayout,bezelDefault};', ctx);
+  'this.out={SETTINGS,SET,TYPES,TYPES_ALL,F,DASH_PARTS,DASH_BASE,BG,BEZEL,GONE,cleanLayout,bezelDefault,' +
+  'COND_OPS,GEARS,BACK_AFTER};', ctx);
 const P = ctx.out;
 
 const shared = s => between(s, '/* @shared-begin', '/* @shared-end');
@@ -220,6 +221,7 @@ const BUILD = {
   arc_gauge: ['buildArcGauge'], meter_gauge: ['buildMeterGauge'], quad: ['buildQuad'],
   text_list: ['buildTextList'], bars: ['buildBars'], cluster: ['buildCluster'], chart: ['buildChart'],
   dash: ['buildDash', 'dashPart'], gmeter: ['buildGMeter'], perf: ['buildPerf'], park: ['buildPark'],
+  car: ['buildCar'],
   diag: ['buildDiag'],
 };
 const COMMON = ['UIBuilder::buildScreen', 'UIBuilder::applyBackground', 'UIBuilder::parseCommon',
@@ -295,6 +297,8 @@ for (const [type, sp] of Object.entries(P.TYPES)) {
     ok(literal(src, seg), `background "${f[0]}": "${seg}" is not read by applyBackground`);
   ok(literal(get('UIBuilder::buildScreen'), 'show_popup') && literal(get('UIBuilder::buildScreen'), 'show_telltales'),
      'buildScreen reads show_popup and show_telltales');
+  ok(literal(get('UIBuilder::buildScreen'), 'swipe') && /swipeOnly/.test(page),
+     'the editor\'s "only by itself" writes "swipe", which buildScreen reads');
   ok((P.BEZEL.length > 0) === literal(get('UIBuilder::buildScreen'), 'dial_face'),
      'the screen-wide bezel switch is offered exactly where buildScreen reads dial_face');
   for (const f of P.BEZEL) ok(literal(get('UIBuilder::buildScreen'), f[0]), `bezel "${f[0]}" is read by buildScreen`);
@@ -302,6 +306,24 @@ for (const [type, sp] of Object.entries(P.TYPES)) {
   if (listLike) for (const t of Object.keys(P.TYPES))
     ok(P.bezelDefault(t) === !listLike[1].includes('"' + t + '"'),
        `the bezel's default for ${t} is the firmware's`);
+}
+
+/* Show this screen by itself: what the editor writes is what AutoScreen.cpp
+   reads - the keys, the wait's default, the operators and the gears. */
+section('screens that come up by themselves, against AutoScreen.cpp');
+{
+  const as = stripComments(read(ROOT, 'src', 'ui', 'AutoScreen.cpp'));
+  ok(literal(get('UIBuilder::buildScreen'), 'show_when') || /_auto\.add\(cfg/.test(get('UIBuilder::buildScreen')),
+     'buildScreen hands every screen to the rules');
+  for (const k of ['show_when', 'back_after_s', 'back_now_when', 'gear', 'metric_id', 'op', 'value'])
+    ok(literal(as, k), `the editor writes "${k}", which AutoScreen.cpp does not read`);
+  const d = defaultsOf(as, '\\w+', 'back_after_s').map(cValue);
+  ok(d.length && d.every(v => v === P.BACK_AFTER), `"back_after_s" defaults to ${P.BACK_AFTER} in the editor, ${d} in the firmware`);
+  const ops = (as.match(/OPS\[\]\s*=\s*\{([^}]*)\}/) || [, ''])[1].match(/"[^"]*"/g) || [];
+  ok(JSON.stringify(ops.map(o => JSON.parse(o))) === JSON.stringify(P.COND_OPS.map(o => o[0])),
+     `the editor's operators ${P.COND_OPS.map(o => o[0])} are the firmware's ${ops}`);
+  const gears = (as.match(/strchr\("([A-Z0-9]+)"/) || [, ''])[1];
+  ok(gears && P.GEARS.join('') === gears, `the editor's gears ${P.GEARS.join('')} are the ones the firmware takes (${gears})`);
 }
 
 /* ── page elements ─────────────────────────────────────────────────────── */

@@ -25,7 +25,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 S1, S2 = "screens/screen1-round", "screens/screen2-cluster"
 SHARED = ["include/Palette.h", "include/TelltaleIcons.h", "src/ui/Telltales.h",
           "src/ui/Telltales.cpp", "src/ui/PerfTimer.h", "src/ui/PerfTimer.cpp",
-          "src/ui/DriveViews.h", "src/ui/DriveViews.cpp", "tools/embed_studio.py",
+          "src/ui/DriveViews.h", "src/ui/DriveViews.cpp", "src/ui/AutoScreen.h",
+          "src/ui/AutoScreen.cpp", "tools/embed_studio.py",
           "tools/make_icons.py", "tools/telltale_icons.json"]
 SKIP_DIRS = {"build", "shots", "__pycache__"}
 problems = []

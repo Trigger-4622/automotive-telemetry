@@ -38,7 +38,7 @@ static constexpr const char *FS_PARTITION_LABEL = "spiffs";
  * (e.g. first flash without `pio run -t uploadfs`). The full annotated
  * example lives in data/layout.json. */
 static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
-  "version": 4,
+  "version": 6,
   "global": { "smoothing_alpha": 0.35, "lerp_speed": 0.18,
               "stale_timeout_ms": 1500, "swipe_anim_ms": 250,
               "day_bg": "#101418", "night_bg": "#000000" },
@@ -58,7 +58,10 @@ static const char DEFAULT_LAYOUT[] PROGMEM = R"JSON({
                       "overlay_text": "SHIFT!" } } },
     { "id": "gmeter", "type": "gmeter", "label": "G", "max_g": 1.0 },
     { "id": "perf", "type": "perf", "label": "PERF" },
-    { "id": "park", "type": "park", "label": "PARK" },
+    { "id": "park", "type": "park", "label": "PARK",
+      "show_when": [ { "gear": "R" } ], "back_after_s": 10,
+      "back_now_when": [ { "metric_id": "0x010D", "op": ">", "value": 15 } ] },
+    { "id": "car", "type": "car", "label": "CAR" },
     { "id": "diag", "type": "diag" }
   ]
 })JSON";
@@ -138,7 +141,8 @@ void ConfigManager::begin() {
         }
     }
     if (migrateLayout()) {
-        log_i("layout: updated to version 4 (warning lamps, dash, G-meter, timers, parking)");
+        log_i("layout: updated to version 6 (warning lamps, dash, G-meter, timers, parking, "
+              "screens that come up by themselves, the car from above)");
         persistLayout();
     }
 }
@@ -205,20 +209,23 @@ bool ConfigManager::persistLayout() {
 
 bool ConfigManager::migrateLayout() {
     const int version = _layout["version"] | 1;
-    if (version >= 4) return false;
+    if (version >= 6) return false;
     if (version < 2) migrateToV2();
 
     // Version 3: the G-meter and the performance timers; version 4: the
-    // parking screen. Each once, before the diagnostics screen; deleted in
-    // the studio, they stay deleted.
-    bool hasG = false, hasP = false, hasPark = false;
+    // parking screen; version 6: the car from above (on the round board -
+    // see below). Each once, before the diagnostics screen; deleted in the
+    // studio, they stay deleted.
+    bool hasG = false, hasP = false, hasPark = false, hasCar = false;
     for (JsonObject s : _layout["screens"].as<JsonArray>()) {
         hasG |= !strcmp(s["type"] | "", "gmeter");
         hasP |= !strcmp(s["type"] | "", "perf");
         hasPark |= !strcmp(s["type"] | "", "park");
+        hasCar |= !strcmp(s["type"] | "", "car");
     }
     if (version >= 3) hasG = hasP = true;          // already offered once
-    if (!hasG || !hasP || !hasPark) {
+    if (version >= 4) hasPark = true;
+    if (!hasG || !hasP || !hasPark || !hasCar) {
         JsonDocument old;
         old.set(_layout["screens"]);
         JsonArray screens = _layout["screens"].to<JsonArray>();
@@ -238,6 +245,10 @@ bool ConfigManager::migrateLayout() {
                 JsonObject k = screens.add<JsonObject>();
                 k["id"] = "park"; k["type"] = "park"; k["label"] = "PARK";
             }
+            if (!hasCar) {                             // version 6: the car from above
+                JsonObject c = screens.add<JsonObject>();
+                c["id"] = "car"; c["type"] = "car"; c["label"] = "CAR";
+            }
         };
         for (JsonVariantConst v : old.as<JsonArrayConst>()) {
             if (!strcmp(v["type"] | "", "diag")) addNew();
@@ -245,7 +256,24 @@ bool ConfigManager::migrateLayout() {
         }
         addNew();
     }
-    _layout["version"] = 4;
+
+    // Version 5: any screen comes up by itself on conditions of its own
+    // (show_when - UIBuilder, AutoScreen.h). The parking screen's switch of
+    // version 4 (auto_reverse, on unless false) becomes the rule it stood for:
+    // in reverse, back 10 s after it or at once above 15 km/h.
+    for (JsonObject sc : _layout["screens"].as<JsonArray>()) {
+        if (strcmp(sc["type"] | "", "park")) continue;
+        const bool on = sc["auto_reverse"] | true;
+        sc.remove("auto_reverse");
+        if (!on || !sc["show_when"].isNull()) continue;
+        sc["show_when"].to<JsonArray>().add<JsonObject>()["gear"] = "R";
+        sc["back_after_s"] = 10;
+        JsonObject f = sc["back_now_when"].to<JsonArray>().add<JsonObject>();
+        f["metric_id"] = "0x010D";
+        f["op"] = ">";
+        f["value"] = 15;
+    }
+    _layout["version"] = 6;
     return true;
 }
 
@@ -330,8 +358,9 @@ bool ConfigManager::applyLayoutFile(const char *path, char *why, size_t whyLen, 
      * one is parsed into its place, so the two are never held together.
      * Nothing reads it meanwhile: the portal runs in the loop, as the UI does.
      */
-    JsonDocument cal;
+    JsonDocument cal, net;
     cal.set(_layout["global"]["touch_cal"]);
+    net.set(_layout["network"]);
     _layout.clear();
 
     DeserializationError err = DeserializationError::InvalidInput;
@@ -356,9 +385,26 @@ bool ConfigManager::applyLayoutFile(const char *path, char *why, size_t whyLen, 
         return false;
     }
 
-    bool stored;
+    bool patched = false;
     if (!cal.isNull() && _layout["global"]["touch_cal"] != cal) {
         _layout["global"]["touch_cal"] = cal;
+        patched = true;
+    }
+    /*
+     * The display's network settings stand wherever the upload says nothing
+     * of them: a layout file from another display, or one written by hand,
+     * must not move this one off the master's channel, or change the name and
+     * password its settings are reached by, unless it says so (the studio's
+     * own Save always sends them all).
+     */
+    if (net.is<JsonObject>()) {
+        JsonObject dst = _layout["network"].is<JsonObject>() ? _layout["network"].as<JsonObject>()
+                                                             : _layout["network"].to<JsonObject>();
+        for (JsonPair kv : net.as<JsonObject>())
+            if (dst[kv.key()].isNull()) { dst[kv.key()] = kv.value(); patched = true; }
+    }
+    bool stored;
+    if (patched) {
         LittleFS.remove(path);
         stored = persistLayout();
     } else {
