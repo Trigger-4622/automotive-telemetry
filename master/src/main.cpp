@@ -50,7 +50,7 @@
 #include "MasterTelemetry.h"
 #include "Learner.h"
 #include "Ssm2.h"
-#include "BodyUnit.h"
+#include "Computers.h"
 #include "DiagCodes.h"
 #include "FwUpdate.h"
 #include "DriveLog.h"
@@ -745,7 +745,7 @@ static volatile uint32_t s_blindEpoch = 0;
  *  the CAN interrupt off, or the queue overflowed), so the gaps next to it say
  *  nothing about the rhythm either. */
 static volatile uint32_t s_stallEpoch = 0;
-void masterBusBlind() { s_blindEpoch = s_blindEpoch + 1; }
+void masterBusBlind() { s_blindEpoch = s_blindEpoch + 1; rawRecDeaf(); }
 void masterBusStall() { s_stallEpoch = s_stallEpoch + 1; masterBusBlind(); }
 
 /** Frames received and bus errors counted, by mode: [0] normal, [1] listen-only. */
@@ -758,9 +758,9 @@ static bool idPeriodic(const CanIdCount &c) {
 }
 /** Diagnostic requests and replies come when asked, not on a clock. */
 static bool idOnRequest(const CanIdCount &c) {
-    // Diagnostic answers, and the body computer's answers in the frame table
-    // (BodyUnit.h): they come when asked, not to a rhythm.
-    return (!c.extd && c.id >= 0x7DF && c.id <= 0x7EF) || bodyPseudoId(c.id, c.extd);
+    // Diagnostic answers, and the computers' answers in the frame table
+    // (Computers.h): they come when asked, not to a rhythm.
+    return (!c.extd && c.id >= 0x7DF && c.id <= 0x7EF) || compPseudoId(c.id, c.extd);
 }
 
 /** No car broadcast repeats faster than this. Frames of one ID closer than
@@ -2530,7 +2530,7 @@ static bool twaiGoLive(bool silent) {
 /**
  * @brief Every signal of the frame's identifier, decoded and published (or
  *        compared, for one being verified). The receive task's - for a frame
- *        off the bus and for the body computer's answers (BodyUnit.h) alike.
+ *        off the bus and for the computers' answers (Computers.h) alike.
  */
 static void decodeSignals(const twai_message_t &msg, uint32_t rxMs) {
     /*
@@ -2626,9 +2626,9 @@ static void twaiRxTask(void *) {
             xSemaphoreGive(s_twaiCtl);
         }
         censusServiceReset();
-        // The body computer's answers, read by the codes task: into the frame
+        // The computers' answers, read by the codes task: into the frame
         // table and through the signals like a frame (never the recording).
-        for (twai_message_t pm; bodyTakeFrame(pm);) {
+        for (twai_message_t pm; compTakeFrame(pm);) {
             censusAdd(pm);
             decodeSignals(pm, millis());
         }
@@ -2653,8 +2653,8 @@ static void twaiRxTask(void *) {
         // bytes follow) comes with data[8], and a remote frame keeps its DLC
         // but carries no data (the driver zeroes it). Nothing below may read
         // past data[8], and a remote frame is bus activity, not values.
+        rawRecRx(msg);                       // every frame as it came, before anything is made of it
         if (msg.data_length_code > 8) msg.data_length_code = 8;
-        rawRecRx(msg);                       // every frame, before anything is made of it
         const bool remote = msg.rtr;
         if (remote) msg.data_length_code = 0;
         s_canFramesRx++;
@@ -3084,6 +3084,8 @@ static void busGuardTask(void *) {
         lastTec = st.tx_error_counter;
         if (delta && delta < 10000) {        // (a reinstall resets the count)
             errKindAdd(ecc, stSilent, delta);
+            rawRecErrors(delta, ecc, stSilent, tecRose, (uint8_t)(st.tx_error_counter > 255 ? 255 : st.tx_error_counter),
+                         (uint8_t)(st.rx_error_counter > 255 ? 255 : st.rx_error_counter));
             radioNoteErrors(delta);
             if (tecRose) {
                 s_errWhileTx += delta;
@@ -3828,7 +3830,7 @@ void setup() {
     xTaskCreatePinnedToCore(busGuardTask,    "busguard",  4096, nullptr,  9, &s_tasks[4].h, 1);
     ssm2Begin();
     codesBegin();
-    bodyBegin();                             // the queue the BIU's answers come by
+    compBegin();                             // the queue the computers' answers come by
     // The raw recorder first: a recording on the log partition keeps the
     // drive logs off it (they would format it).
     rawRecBegin();

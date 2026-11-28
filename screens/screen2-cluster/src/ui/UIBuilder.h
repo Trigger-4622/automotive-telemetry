@@ -218,6 +218,9 @@ struct ScreenDef {
      * that screen. Swiping to another screen shows the alert again.
      */
     bool      allowPopup = true;
+    /** In the swipe order ("swipe", default true); false: it comes up only by
+     *  its rule (AutoScreen.h). */
+    bool      inSwipe = true;
     /**
      * @brief Whether the warning-lamp strip may be drawn over this screen.
      *
@@ -308,6 +311,9 @@ public:
      *  Wired to TouchManager and ButtonManager in main.cpp.
      *  @{ */
     /** @brief Advance one screen (swipe left / button tap). */
+    /** @brief The next screen of the swipe order from @p from, @p dir +1 or -1
+     *         (@p from when there is no other). Every screen is in it when none is. */
+    size_t swipeStep(size_t from, int dir) const;
     void nextScreen();
     /** @brief Go back one screen (swipe right). */
     void prevScreen();

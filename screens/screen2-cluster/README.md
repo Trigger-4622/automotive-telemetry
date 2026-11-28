@@ -56,6 +56,10 @@ to the screen before after a wait, or at once on conditions of its own; a
 swipe keeps the screen you chose. The parking screen ships with one: in
 reverse, back 10 s after it or at once above 15 km/h. Layout version 5 turns
 version 4's `auto_reverse` switch into that rule. See `src/ui/AutoScreen.h`.
+*Only by itself* (`"swipe": false`) leaves a screen out of the swipe order and
+the page dots, so only its rule brings it up. The studio's Device tab can
+upload a layout file straight to the display (it keeps its touch calibration
+and any network setting the file leaves out).
 
 Added here, because they need the width:
 

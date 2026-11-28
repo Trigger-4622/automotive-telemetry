@@ -463,7 +463,10 @@ void UIBuilder::begin() {
     buildAlertCard();
     _gaugeAlarms = Config.gaugeAlarmColors();
     applyNight(false);
-    lv_scr_load(_screens[0].scr);
+    // The first screen of the swipe order: one that comes up only by its rule
+    // waits for it.
+    if (!_screens[0].inSwipe) _active = swipeStep(0, 1);
+    lv_scr_load(_screens[_active].scr);
     _timer = lv_timer_create(uiTimerCb, UI_UPDATE_PERIOD_MS, this);
     log_i("UI built: %u screens, %u lamps, warnings %s", (unsigned)_screens.size(),
           (unsigned)_lamps.size(), _lamps.enabled() ? "on" : "off");
@@ -482,6 +485,7 @@ void UIBuilder::buildScreen(JsonObject cfg) {
     _screens.emplace_back();
     ScreenDef &sd = _screens.back();
     sd.allowPopup = cfg["show_popup"] | true;
+    sd.inSwipe = cfg["swipe"] | true;
     // The lamp strip would cover the diagnostics screen's colour swatches.
     sd.showTelltales = cfg["show_telltales"] | (strcmp(type, "diag") != 0);
     sd.scr = lv_obj_create(nullptr);
@@ -513,7 +517,15 @@ void UIBuilder::buildScreen(JsonObject cfg) {
                             LV_ALIGN_TOP_MID, 0, 10);
     lv_obj_add_flag(sd.linkIcon, LV_OBJ_FLAG_HIDDEN);
 
+    const size_t rulesBefore = _auto.rules();
     _auto.add(cfg, _screens.size() - 1);       // its show_when, if it has one
+    // Left out of the swipe order with no rule to bring it up: it could never
+    // be seen - it stays in.
+    if (!_screens.back().inSwipe && _auto.rules() == rulesBefore) {
+        _screens.back().inSwipe = true;
+        log_w("screen %u: \"swipe\": false needs a show_when rule - kept in the swipe order",
+              (unsigned)(_screens.size() - 1));
+    }
 }
 
 /**
@@ -611,18 +623,25 @@ static void pageDotsDrawCb(lv_event_t *e) {
  * ±56 px of usable width — enough for a dozen dots.
  */
 void UIBuilder::addPageDots() {
-    const size_t n = _screens.size();
+    // The swipe order's screens: one that comes up only by its rule has no
+    // place in the row, nor a row of its own.
+    bool any = false;
+    for (const auto &s : _screens) any |= s.inSwipe;
+    size_t n = 0;
+    for (const auto &s : _screens) n += !any || s.inSwipe;
     if (n < 2 || n > 12) return;                 // pointless / too wide
 
     // One small object per screen that draws the whole row itself.
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = 0, pos = 0; i < _screens.size(); i++) {
+        if (any && !_screens[i].inSwipe) continue;
+        const size_t at = pos++;
         lv_obj_t *row = lv_obj_create(_screens[i].root);
         lv_obj_remove_style_all(row);
         lv_obj_set_size(row, (lv_coord_t)((n - 1) * 10 + 6), 6);
         lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -12);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, pageDotsDrawCb, LV_EVENT_DRAW_MAIN,
-                            (void *)(uintptr_t)(i | (n << 8)));
+                            (void *)(uintptr_t)(at | (n << 8)));
     }
 }
 
@@ -2730,19 +2749,34 @@ void UIBuilder::loadScreen(size_t idx, bool forward) {
     if (lv_anim_t *a = lv_anim_get(outgoing, nullptr))          a->path_cb = path;
 }
 
+size_t UIBuilder::swipeStep(size_t from, int dir) const {
+    const size_t n = _screens.size();
+    bool any = false;
+    for (const auto &s : _screens) any |= s.inSwipe;
+    for (size_t k = 1; k < n; k++) {
+        const size_t i = dir > 0 ? (from + k) % n : (from + n - k) % n;
+        if (!any || _screens[i].inSwipe) return i;
+    }
+    return from;
+}
+
 void UIBuilder::nextScreen() {
     // The BOOT button during the calibration wizard: back to the gauges.
     if (_calActive) { cancelTouchCalibration(); return; }
     if (_configActive || _screens.size() < 2) return;
+    const size_t to = swipeStep(_active, 1);
+    if (to == _active) return;
     _auto.swiped();                          // the driver chose: it stays
-    loadScreen((_active + 1) % _screens.size(), true);
+    loadScreen(to, true);
 }
 
 void UIBuilder::prevScreen() {
     if (_calActive) { cancelTouchCalibration(); return; }
     if (_configActive || _screens.size() < 2) return;
+    const size_t to = swipeStep(_active, -1);
+    if (to == _active) return;
     _auto.swiped();
-    loadScreen((_active + _screens.size() - 1) % _screens.size(), false);
+    loadScreen(to, false);
 }
 
 void UIBuilder::togglePeaks() {

@@ -2021,6 +2021,177 @@ SCENARIO(backlight_levels) {
     CHECK(Config._server.code == 400 && Display.brightness == 102, "a body without pct: %d", Config._server.code);
 }
 
+/* A screen left out of the swipe order ("swipe": false) comes up by its rule
+ * alone: the display starts on the first screen of the order, swipes go
+ * round the others, and its rule still brings it up. One with no rule to
+ * bring it up stays in the order (it could never be seen), with a warning. */
+SCENARIO(rule_only_screens) {
+    engineOn();
+    JsonDocument d;
+    deserializeJson(d, R"({"version":6,"screens":[
+      {"id":"rev","type":"arc_gauge","metric_id":"0x010D","label":"REV","swipe":false,"show_when":[{"gear":"R"}],"back_after_s":2},
+      {"id":"a","type":"arc_gauge","metric_id":"0x010C","label":"A"},
+      {"id":"c","type":"arc_gauge","metric_id":"0x0105","label":"C"},
+      {"id":"norule","type":"arc_gauge","metric_id":"0x010F","label":"D","swipe":false}]})");
+    boot(d);
+    CHECK(UI._active == 1, "started on screen %zu, want 1 (the first of the swipe order)", UI._active);
+    std::string seen;
+    for (int i = 0; i < 6; i++) { UI.nextScreen(); run(400); seen += std::to_string(UI._active); }
+    CHECK(seen == "231231", "swiped through %s, want 231231 (never 0)", seen.c_str());
+    UI.prevScreen(); run(400);
+    CHECK(UI._active == 3, "back from 1 to %zu, want 3", UI._active);
+    bool warned = false;
+    for (auto &l : host::logs) warned |= l.find("needs a show_when rule") != std::string::npos;
+    CHECK(warned, "no warning for the rule-only screen without a rule");
+    UI.nextScreen(); run(400);
+    car.set(METRIC_ID_REVERSE, 1);
+    run(800);
+    CHECK(UI._active == 0, "reverse: on %zu, want the rule's screen 0", UI._active);
+    car.set(METRIC_ID_REVERSE, 0);
+    run(3000);
+    CHECK(UI._active == 1, "out of reverse: back on %zu, want 1", UI._active);
+}
+
+/* A layout uploaded to the display keeps the display's own network settings
+ * wherever the file says nothing of them - the master's channel above all:
+ * a file from another display must not take this one off it. What the file
+ * does say, it changes. */
+SCENARIO(layout_upload_keeps_network) {
+    JsonDocument d = shippedLayout();
+    d["network"]["wifi_channel"] = 6;
+    d["network"]["ap_ssid"] = "Mine";
+    d["network"]["ap_password"] = "secret123";
+    d["network"]["master_mac"] = "AA:BB:CC:DD:EE:FF";
+    boot(d);
+    Config.enterConfigMode();
+    JsonDocument up = shippedLayout();
+    up.remove("network");
+    up["network"]["ap_ssid"] = "Telemetry-Gauge-Race";
+    std::string body;
+    serializeJson(up, body);
+    Config._server.upload("/api/layout", "layout.json", body);
+    JsonObject n = Config.layout()["network"];
+    CHECK(Config._server.code == 200, "uploaded (%d %s)", Config._server.code, Config._server.body.c_str());
+    CHECK((n["wifi_channel"] | 0) == 6 && std::string(n["ap_password"] | "") == "secret123" &&
+          std::string(n["master_mac"] | "") == "AA:BB:CC:DD:EE:FF", "the display's channel, password and master kept");
+    CHECK(std::string(n["ap_ssid"] | "") == "Telemetry-Gauge-Race", "the name the file gives taken: %s",
+          (const char *)(n["ap_ssid"] | ""));
+    JsonDocument stored;
+    deserializeJson(stored, hostfs::files["/layout.json"]);
+    CHECK((stored["network"]["wifi_channel"] | 0) == 6, "and stored so");
+    up.remove("network");
+    body.clear();
+    serializeJson(up, body);
+    Config._server.upload("/api/layout", "layout.json", body);
+    n = Config.layout()["network"];
+    CHECK(Config._server.code == 200 && (n["wifi_channel"] | 0) == 6 &&
+          std::string(n["ap_ssid"] | "") == "Telemetry-Gauge-Race", "a file with no network block changes none of it");
+}
+
+/** A layout file of screens/screen1-round/layouts/. */
+static bool layoutFile(const char *name, JsonDocument &d) {
+    const std::string s = readFile(env("PROJECT_DIR") + "/layouts/" + name);
+    return !s.empty() && !deserializeJson(d, s);
+}
+static bool lampOn(const char *key) {
+    for (size_t i = 0; i < UI._lamps.size(); i++)
+        if (!strcmp(UI._lamps[i].key, key)) return UI._lamps[i].on;
+    return false;
+}
+static void layoutBoots(const char *name, JsonDocument &d) {
+    boot(d);
+    const host::HeapReport h = heapLine(name);
+    CHECK(h.targetUsed + 8192 <= h.budget, "%s: device LVGL heap %zu of %zu bytes, under 8 KB left", name,
+          h.targetUsed, h.budget);
+    CHECK(UI._screens.size() == d["screens"].as<JsonArray>().size(), "%s: %zu screens built of %zu", name,
+          UI._screens.size(), d["screens"].as<JsonArray>().size());
+    for (auto &l : host::logs) CHECK(l[0] != 'E' && l[0] != 'W', "%s: %s", name, l.c_str());
+}
+
+/* The two round-screen layouts (layouts/daily.json, layouts/race.json), one a
+ * scenario: each boots within the LVGL heap with nothing to warn about, and
+ * its rules do what its note says. The daily one: the car from above only
+ * when parking - in P with its doors, in R with its path - and neither in the
+ * swipe order. The race one (below): no watchdog card ever, RPM and coolant
+ * over on the lamp strip and bringing their screens up, the timers at a
+ * launch, the G-meter braking. */
+SCENARIO(round_layout_daily) {
+    if (!ROUND) { printf("      (round-screen layouts: nothing to check on this board)\n"); return; }
+    JsonDocument d;
+    CHECK(layoutFile("daily.json", d), "layouts/daily.json does not read");
+    engineOn();
+    car.set(METRIC_ID_COOLANT_TEMP, 88);
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    layoutBoots("daily", d);
+    const int parked = screenOf("car"), reversing = screenOf("park");
+    CHECK(!UI._screens[parked].inSwipe && !UI._screens[reversing].inSwipe, "daily: car views in the swipe order");
+    for (int i = 0; i < 12; i++) {
+        UI.nextScreen(); run(300);
+        CHECK((int)UI._active != parked && (int)UI._active != reversing, "daily: swiped onto a car view (%zu)", UI._active);
+    }
+    gotoScreen(0);
+    shot("daily_dash");
+    car.set(METRIC_ID_GEAR_LEVER, 'P');
+    run(800);
+    CHECK((int)UI._active == parked, "daily: in P on %zu, want the car %d", UI._active, parked);
+    shot("daily_parked");
+    car.set(METRIC_ID_GEAR_LEVER, 'R');
+    car.set(METRIC_ID_STEERING_ANGLE, 120);
+    run(800);
+    CHECK((int)UI._active == reversing, "daily: in R on %zu, want the reversing view %d", UI._active, reversing);
+    CHECK(UI._parks[UI._screens[reversing].park].pathView, "daily: reversing without the path view");
+    shot("daily_reversing");
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    car.set(METRIC_ID_SPEED, 20);
+    run(1500);
+    CHECK((int)UI._active == 0, "daily: driving off, on %zu, want the dash", UI._active);
+}
+
+SCENARIO(round_layout_race) {
+    if (!ROUND) { printf("      (round-screen layouts: nothing to check on this board)\n"); return; }
+    JsonDocument r;
+    CHECK(layoutFile("race.json", r), "layouts/race.json does not read");
+    engineOn();
+    car.set(METRIC_ID_COOLANT_TEMP, 90);
+    car.set(METRIC_ID_GEAR_LEVER, 'D');
+    car.set(METRIC_ID_SPEED, 80);
+    car.set(METRIC_ID_RPM, 4000);
+    layoutBoots("race", r);
+    CHECK(!UI._watchPopups && UI._watch.size() == 2, "race: watchdog %s, %zu items",
+          UI._watchPopups ? "draws its card" : "silent", UI._watch.size());
+    shot("race_dash");
+    car.set(METRIC_ID_COOLANT_TEMP, 108);
+    run(3000);
+    CHECK(!alertShown(), "race: a card over the screen at 108 degrees");
+    CHECK(lampOn("coolant_hot"), "race: ENGINE HOT not on the strip at 108 degrees");
+    CHECK((int)UI._active == screenOf("arc_gauge"), "race: hot, on %zu, want the coolant gauge", UI._active);
+    shot("race_hot");
+    car.set(METRIC_ID_COOLANT_TEMP, 95);
+    run(12000);
+    CHECK((int)UI._active == 0, "race: cooled down, on %zu, want the dash again", UI._active);
+    car.set(METRIC_ID_RPM, 6300);
+    run(600);
+    CHECK(lampOn("custom_1") && !lampOn("custom_2") && (int)UI._active == 0, "race: SHIFT at 6300 rpm, still the dash");
+    car.set(METRIC_ID_RPM, 6600);
+    run(800);
+    CHECK(lampOn("custom_2") && !alertShown(), "race: OVER-REV on the strip, no card");
+    CHECK((int)UI._active == screenOf("meter_gauge"), "race: over-rev, on %zu, want the big tach", UI._active);
+    shot("race_overrev");
+    car.set(METRIC_ID_RPM, 4000);
+    run(4000);
+    car.set(METRIC_ID_SPEED, 0);
+    car.set(METRIC_ID_RPM, 3500);
+    run(800);
+    CHECK((int)UI._active == screenOf("perf"), "race: a launch, on %zu, want the timers", UI._active);
+    car.set(METRIC_ID_SPEED, 60);
+    car.set(METRIC_ID_RPM, 5000);
+    run(26000);
+    car.set(METRIC_ID_LON_ACCEL, -0.9f);
+    run(800);
+    CHECK((int)UI._active == screenOf("gmeter"), "race: hard braking, on %zu, want the G-meter", UI._active);
+    shot("race_braking");
+}
+
 /* ─────────────────────────────── main ──────────────────────────────────── */
 
 int main(int argc, char **argv) {

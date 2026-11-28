@@ -297,6 +297,8 @@ for (const [type, sp] of Object.entries(P.TYPES)) {
     ok(literal(src, seg), `background "${f[0]}": "${seg}" is not read by applyBackground`);
   ok(literal(get('UIBuilder::buildScreen'), 'show_popup') && literal(get('UIBuilder::buildScreen'), 'show_telltales'),
      'buildScreen reads show_popup and show_telltales');
+  ok(literal(get('UIBuilder::buildScreen'), 'swipe') && /swipeOnly/.test(page),
+     'the editor\'s "only by itself" writes "swipe", which buildScreen reads');
   ok((P.BEZEL.length > 0) === literal(get('UIBuilder::buildScreen'), 'dial_face'),
      'the screen-wide bezel switch is offered exactly where buildScreen reads dial_face');
   for (const f of P.BEZEL) ok(literal(get('UIBuilder::buildScreen'), f[0]), `bezel "${f[0]}" is read by buildScreen`);

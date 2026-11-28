@@ -18,7 +18,8 @@
  * does drop are counted into the recording where they happened.
  *
  * Format (all little-endian; master/tools/canrec.py reads it):
- *   Sector 0 (4096 bytes): the header - "CANREC1\0", u16 version (1),
+ *   Sector 0 (4096 bytes): the header - "CANREC1\0", u16 version (2; 1 had
+ *     no E6/E7 and cut a DLC of 9-15 to 8),
  *     u16 page size (256), u32 data offset (4096), u32 partition size,
  *     u32 bitrate [kbit/s], u32 uptime at arming [ms], char[32] firmware,
  *     then at offset 64 a byte that is 0x00 once the recording was stopped.
@@ -31,7 +32,8 @@
  *                 is set, data[0] = bit 0]; length as before. An index defined
  *                 by a frame of the master's is the master's own frames.
  *     0xE0  a frame in full: [E0][dt][flags][idx if flags bit 3][id: 2 bytes,
- *           or 4 if extended][dlc][data]. flags: bit 0 extended, bit 1 remote,
+ *           or 4 if extended][dlc][data]. dlc is the one on the wire, 0-15;
+ *           9-15 carry 8 bytes, a remote frame none. flags: bit 0 extended, bit 1 remote,
  *           bit 2 sent by the master, bit 3 defines (or redefines) the index:
  *           the next delta records of it are against this frame (and sent by
  *           the master if bit 2 is set).
@@ -43,6 +45,13 @@
  *           was full, 2 the controller dropped them].
  *     0xE4  an evidence-log event: [E4][dt][u8 type][u16 a][u16 b].
  *     0xE5  stopped: [E5][dt].
+ *     0xE6  bus errors - error frames on the line - since the last: [E6][dt]
+ *           [u16 count][u8 the controller's error-code capture: bits 6-7 the
+ *           kind (bit, form, stuff, other), bit 5 set while receiving, bits
+ *           0-4 where in the frame][u8 flags: bit 0 listen-only, bit 1 while
+ *           the master sent][u8 TEC][u8 REC].
+ *     0xE7  the master was deaf to the bus (a flash write, the controller in
+ *           reset mode, a reinstall): [E7][dt][u16 times], at the first.
  *     0xFF  nothing more in this page.
  */
 #pragma once
@@ -84,6 +93,11 @@ void rawRecRx(const twai_message_t &m);
 void rawRecTx(const twai_message_t &m);
 /** @brief Frames the controller dropped (its FIFO or the driver's queue). */
 void rawRecLost(uint32_t n);
+/** @brief Bus errors: @p n since the last call, the latest one's error-code
+ *         capture, the mode, whether the master was sending, the counters. */
+void rawRecErrors(uint32_t n, uint8_t ecc, bool listenOnly, bool ours, uint8_t tec, uint8_t rec);
+/** @brief The master is deaf to the bus for a moment (masterBusBlind()). */
+void rawRecDeaf();
 /** @brief An evidence-log event, into the recording too. */
 void rawRecEvent(uint8_t type, uint16_t a, uint16_t b);
 /**

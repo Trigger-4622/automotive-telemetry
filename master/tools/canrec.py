@@ -8,9 +8,12 @@ Download) into a candump log, and say what is in it.
 
 The log is candump's: "(seconds) can0 1A3#0011223344556677". Frames the master
 sent itself are on "tx0" (the controller does not receive its own), remote
-frames end in "#R". Time is seconds from the start of the recording; each new
-session (arming, a boot, a wake from sleep) starts one second after the last
-frame of the one before, as the master's clock restarted.
+frames end in "#R", and a DLC of 9-15 (legal on the wire, 8 bytes follow) in
+"_<hex DLC>" as candump writes it. Time is seconds from the start of the
+recording; each new session (arming, a boot, a wake from sleep) starts one
+second after the last frame of the one before, as the master's clock
+restarted. Bus errors (error frames) and the moments the master could not hear
+the bus are in the summary and, with --events, in time.
 
 The format is described at the top of master/src/RawRec.h.
 """
@@ -22,6 +25,19 @@ import sys
 MAGIC = b"CANREC1\0"
 EVENTS = ["boot", "bus-up", "settled", "tx-guard-trip", "rx-guard-trip", "bus-off", "sleep", "resume"]
 LOST_WHY = {1: "the recorder's buffer was full", 2: "the controller dropped them"}
+ERR_KIND = ["bit", "form", "stuff", "other"]
+# Where in the frame, as the ESP32's error-code capture register says it.
+ERR_WHERE = {0x03: "start of frame", 0x02: "ID 28-21", 0x06: "ID 20-18", 0x04: "SRTR bit", 0x05: "IDE bit",
+             0x07: "ID 17-13", 0x0F: "ID 12-5", 0x0E: "ID 4-0", 0x0C: "RTR bit", 0x0D: "reserved bit 1",
+             0x09: "reserved bit 0", 0x0B: "DLC", 0x0A: "data field", 0x08: "CRC", 0x18: "CRC delimiter",
+             0x19: "ACK slot", 0x1B: "ACK delimiter", 0x1A: "end of frame", 0x12: "intermission",
+             0x11: "active error flag", 0x16: "passive error flag", 0x13: "tolerating dominant bits",
+             0x17: "error delimiter", 0x1C: "overload flag"}
+
+
+def err_name(ecc):
+    return "%s error %s, %s" % (ERR_KIND[ecc >> 6 & 3], "receiving" if ecc & 0x20 else "sending",
+                                ERR_WHERE.get(ecc & 0x1F, "segment 0x%02X" % (ecc & 0x1F)))
 
 
 class Error(Exception):
@@ -50,8 +66,8 @@ def decode(raw):
     firmware = raw[28:60].split(b"\0")[0].decode("ascii", "replace")
     info = dict(version=version, page=page, bitrate=bitrate, firmware=firmware,
                 stopped=len(raw) > 64 and raw[64] == 0, partition=part_size)
-    if version != 1:
-        raise Error("format version %d - this tool reads version 1" % version)
+    if version not in (1, 2):
+        raise Error("format version %d - this tool reads versions 1 and 2" % version)
     out = []
     refs = []
     t = 0
@@ -71,7 +87,7 @@ def decode(raw):
                 pos += 11
                 refs = []
                 out.append(("session", session, t, reason))
-            elif tag in (0xE3, 0xE4, 0xE5):
+            elif tag in (0xE3, 0xE4, 0xE5, 0xE6, 0xE7):
                 dt, pos = uleb(raw, pos)
                 t += dt * 10
                 if tag == 0xE3:
@@ -82,6 +98,14 @@ def decode(raw):
                     ty, a, b = struct.unpack_from("<BHH", raw, pos)
                     pos += 5
                     out.append(("event", session, t, ty, a, b))
+                elif tag == 0xE6:                             # bus errors (error frames)
+                    n, ecc, flags, tec, rec = struct.unpack_from("<HBBBB", raw, pos)
+                    pos += 6
+                    out.append(("errors", session, t, n, ecc, flags, tec, rec))
+                elif tag == 0xE7:                             # the master could not hear the bus
+                    n = struct.unpack_from("<H", raw, pos)[0]
+                    pos += 2
+                    out.append(("deaf", session, t, n))
                 else:
                     out.append(("stop", session, t))
             elif tag == 0xE0:                                 # a frame in full
@@ -101,9 +125,10 @@ def decode(raw):
                     pos += 2
                 dlc = raw[pos]
                 pos += 1
-                data = b"" if flags & 2 else bytes(raw[pos:pos + dlc])
+                nb = min(dlc, 8)                              # a DLC of 9-15 carries 8 bytes
+                data = b"" if flags & 2 else bytes(raw[pos:pos + nb])
                 if not flags & 2:
-                    pos += dlc
+                    pos += nb
                 if idx is not None:
                     if idx > len(refs):
                         raise Error("index %d defined out of order at %d" % (idx, pos))
@@ -121,7 +146,7 @@ def decode(raw):
                 mask = raw[pos]
                 pos += 1
                 ref = refs[tag]
-                for i in range(ref[2]):
+                for i in range(min(ref[2], 8)):
                     if mask & (1 << i):
                         ref[3][i] = raw[pos]
                         pos += 1
@@ -157,6 +182,8 @@ def candump(records):
         last_out = ts
         ident = ("%08X" if ext else "%03X") % fid
         body = ("R" if not dlc else "R%d" % dlc) if rtr else data.hex().upper()
+        if not rtr and dlc > 8:
+            body += "_%X" % dlc                           # candump's len8_dlc
         lines.append("(%.6f) %s %s#%s" % (ts, "tx0" if tx else "can0", ident, body))
     return lines, base
 
@@ -201,6 +228,18 @@ def main():
         print("lost: " + ", ".join("%d (%s)" % (n, LOST_WHY.get(w, "?")) for w, n in sorted(lost.items())))
     else:
         print("lost: none")
+    errs = collections.Counter()
+    for r in recs:
+        if r[0] == "errors":
+            errs[r[4]] += r[3]
+    if errs:
+        print("bus errors (error frames): %d - %s" % (sum(errs.values()), ", ".join(
+            "%d %s" % (n, err_name(e)) for e, n in errs.most_common())))
+    else:
+        print("bus errors: none")
+    deaf = sum(r[3] for r in recs if r[0] == "deaf")
+    print("the master could not hear the bus: %s" % ("%d time(s) (a flash write, reset mode, a reinstall)" % deaf
+                                                     if deaf else "never"))
     ids = collections.Counter((r[3], r[4], r[6]) for r in frames)
     print("%d identifiers:" % len(ids))
     for (fid, ext, tx), n in sorted(ids.items()):
@@ -220,6 +259,12 @@ def main():
                 print("%12.6f  %d frames lost: %s" % (at(r), r[3], LOST_WHY.get(r[4], "?")))
             elif r[0] == "stop":
                 print("%12.6f  stopped" % at(r))
+            elif r[0] == "errors":
+                print("%12.6f  %d bus error(s): %s%s%s, TEC %d REC %d" % (
+                    at(r), r[3], err_name(r[4]), ", listen-only" if r[5] & 1 else "",
+                    ", while the master sent" if r[5] & 2 else "", r[6], r[7]))
+            elif r[0] == "deaf":
+                print("%12.6f  the master could not hear the bus (%d time(s))" % (at(r), r[3]))
     print("written: %s (%d lines)" % (out, len(lines)))
 
 

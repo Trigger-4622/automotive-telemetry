@@ -192,6 +192,10 @@ static IsoLink *volatile s_link = &s_ssmLink;
 static volatile uint32_t s_rxId = SSM_RESPONSE_ID;
 /** The exchange in progress asked every computer (0x7DF). */
 static volatile bool     s_toAll = false;
+/** A probe is listening (isoProbe): an answer to this service, from any ID,
+ *  goes to the exchange's queue. -1: none. */
+static volatile int      s_probeSvc = -1;
+static volatile uint32_t s_probeTx  = 0;
 
 /** @brief Why the exchange in progress failed, for whoever asked. */
 static void linkErr(const char *fmt, ...) {
@@ -257,9 +261,27 @@ void ssm2GetStatus(Ssm2Status &out) {
 
 /* ─────────────────────────────── transport ───────────────────────────────── */
 
+/** Does @p m look like an answer to service @p svc: a single frame "svc+0x40
+ *  ..." or "7F svc code", or the first frame of a long "svc+0x40 ..."? */
+static bool answers(const twai_message_t &m, uint8_t svc) {
+    if (m.rtr || m.data_length_code < 3) return false;
+    const uint8_t pci = m.data[0] & 0xF0, n = m.data[0] & 0x0F;
+    if (pci == 0x00)
+        return n >= 1 && n <= 7 && n < m.data_length_code &&
+               (m.data[1] == (uint8_t)(svc + 0x40) || (n >= 3 && m.data[1] == 0x7F && m.data[2] == svc));
+    return pci == 0x10 && m.data_length_code == 8 && m.data[2] == (uint8_t)(svc + 0x40);
+}
+
 bool ssm2FeedFrame(const twai_message_t &msg) {
+    if (!s_inExchange || !s_rxQ) return false;
+    if (s_probeSvc >= 0) {
+        // A probe takes an answer from whoever gives it - but only an answer.
+        if (msg.identifier == s_probeTx || !answers(msg, (uint8_t)s_probeSvc)) return false;
+        xQueueSend(s_rxQ, &msg, 0);
+        return true;
+    }
     // Outside an exchange a 0x7E8 frame is an OBD-II reply, not ours.
-    if (!s_inExchange || !s_rxQ || msg.extd) return false;
+    if ((bool)msg.extd != (s_rxId > 0x7FF)) return false;
     if (msg.identifier != s_rxId) {
         // A request to every computer (0x7DF): the others answer it as well.
         // The exchange gets their frames too - a long answer opens with a
@@ -292,6 +314,7 @@ static bool tx8To(uint32_t id, const uint8_t data[8]) {
     if (!diagGuardOk()) { linkErr("%s", guardWhy()); return false; }
     twai_message_t m = {};
     m.identifier       = id;
+    m.extd             = id > 0x7FF;    // above the 11-bit range: a 29-bit address
     m.data_length_code = 8;
     memcpy(m.data, data, 8);
     if (!masterTransmit(m, 50)) {
@@ -554,6 +577,46 @@ IsoResult isoExchange(uint32_t txId, uint32_t rxId, uint32_t fcId,
         return ISO_NRC;
     }
     return got ? ISO_OK : ISO_NO_REPLY;
+}
+
+IsoResult isoProbe(uint32_t txId, const uint8_t *req, size_t len, uint32_t waitMs,
+                   IsoHit *hits, size_t maxHits, size_t &nHits, char *why, size_t whyCap) {
+    nHits = 0;
+    char none[4];
+    IsoLink L = { txId, 0, txId, waitMs, why && whyCap ? why : none, why && whyCap ? whyCap : sizeof(none) };
+    L.err[0] = '\0';
+    if (!s_rxQ || !len || len > 7) { snprintf(L.err, L.errCap, "not started"); return ISO_BUSY; }
+    if (!diagGuardOk()) { snprintf(L.err, L.errCap, "%s", guardWhy()); return ISO_BUSY; }
+    if (!diagBusLock(250)) { snprintf(L.err, L.errCap, "the bus is in use"); return ISO_BUSY; }
+    s_link = &L;
+    s_probeTx  = txId;
+    s_probeSvc = req[0];               // before s_inExchange: the RX task reads both
+    s_inExchange = true;
+    flushRx();
+    uint8_t f[8] = {};
+    f[0] = (uint8_t)len;
+    memcpy(&f[1], req, len);
+    const bool sent = tx8(f);
+    const uint32_t t0 = millis();
+    twai_message_t m;
+    while (sent) {
+        const uint32_t waited = millis() - t0;
+        if (waited >= waitMs || !rxFrame(m, waitMs - waited)) break;
+        size_t k = 0;
+        while (k < nHits && !(hits[k].id == m.identifier && hits[k].ext == (bool)m.extd)) k++;
+        if (k < nHits || nHits >= maxHits) continue;   // one answer a computer is enough
+        IsoHit &h = hits[nHits++];
+        h.id  = m.identifier;
+        h.ext = m.extd;
+        h.len = m.data_length_code > 8 ? 8 : m.data_length_code;
+        memcpy(h.data, m.data, 8);
+    }
+    s_inExchange = false;
+    s_probeSvc = -1;
+    s_link = &s_ssmLink;
+    diagBusUnlock();
+    if (!sent) return ISO_BUSY;
+    return nHits ? ISO_OK : ISO_NO_REPLY;
 }
 
 /* ───────────────────────────────── init ──────────────────────────────────── */

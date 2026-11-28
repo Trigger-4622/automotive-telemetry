@@ -411,12 +411,12 @@ public:
     /** Read the trouble codes this often while the car is on, seconds
      *  (0 = only when the portal asks). */
     uint16_t dtcPollS    = 60;
-    /** The body computer (BIU), read with "21 50" / "21 51" (BodyUnit.h):
-     *  its request ID (0 = not read), reply ID (0 = request + 8), and how
-     *  often [ms]. */
-    uint16_t biuTx       = 0;
-    uint16_t biuRx       = 0;
-    uint16_t biuMs       = 500;
+    /** Data blocks of the car's computers read into the frame table
+     *  (Computers.h): "21 <lid>" to tx, answered on rx, every ms. Empty =
+     *  none read. IDs above 0x7FF are 29-bit. At most MAX_READS. */
+    struct RtRead { uint32_t tx = 0, rx = 0; uint8_t lid = 0; uint16_t ms = 500; };
+    static constexpr size_t MAX_READS = 16;
+    std::vector<RtRead> reads;
     uint32_t oilEveryKm  = 7500;   /**< Oil change interval [km].           */
     /** Odometer at the last oil change [km]; -1 = not set: no reminder. */
     int32_t  oilAtKm     = -1;

@@ -800,8 +800,8 @@ console.log('--- the page: tabs, and every setting in one place');
     const toJson = body.slice(0, body.search(/\n}\n/));
     const keys = [...new Set([...toJson.matchAll(/doc\["([a-z0-9_]+)"\]/g)].map(m => m[1]))];
     // Not settings: read-only identity, and the tables, which have their own
-    // editors (Signals tab; log_ids on the Car tab).
-    const NOT = ['cfg_ver', 'ecu_id', 'ecu_sys_id', 'ecu_flags', 'ecu_cal_id', 'vin', 'learn_excl', 'log_ids',
+    // editors (Signals tab; log_ids and reads on the Car tab).
+    const NOT = ['cfg_ver', 'ecu_id', 'ecu_sys_id', 'ecu_flags', 'ecu_cal_id', 'vin', 'learn_excl', 'log_ids', 'reads',
                  'pids', 'signals', 'ssm', 'ssm_removed'];
     const settings = keys.filter(k => !NOT.includes(k));
     check(keys.length > 50 && NOT.every(k => keys.includes(k)), 'toJson read', `${keys.length} keys, ${settings.length} settings`);

@@ -75,8 +75,12 @@ values guarded on every screen. **Settings**: display (with the backlight by
 day and at night, shown on the display as its slider moves), alerts, the
 master and network, the side button - each setting in one place. **Device**: the
 display's figures, live telemetry, background images (LVGL `.bin`) and the
-layout file, to keep a copy or open one. Save sends the layout as a file,
-which the display writes to flash as it arrives and only then reads.
+layout file, to keep a copy, open one, or upload one straight to the display
+as it is (as the master's settings Upload does; the display keeps its touch
+calibration and any network setting the file leaves out). Save sends the
+layout as a file, which the display writes to flash as it arrives and only
+then reads. Ready-made layouts are in `layouts/` (a daily one and a race one;
+see its README).
 
 **Driving screens.** `gmeter` draws the car's acceleration as a dot in a
 friction circle (up speeding up, down braking, left in a left-hand bend; rim
@@ -104,7 +108,9 @@ all of which must hold. The display then changes to it, and goes back to the
 screen before once they stop holding - after a wait you set, or at once when
 one of its "go back at once" conditions holds. A swipe keeps the screen you
 chose. The parking screen ships with one: in reverse, back 10 s after it or at
-once above 15 km/h (`src/ui/AutoScreen.h` has the details).
+once above 15 km/h (`src/ui/AutoScreen.h` has the details). *Only by itself*
+(`"swipe": false`) leaves a screen out of the swipe order and the page dots,
+so only its rule brings it up.
 
 **Trouble codes and the oil change.** The check-engine card names the codes the
 master read (`P1718 TCM 2/2`, then what it means), one every 3 s; with the

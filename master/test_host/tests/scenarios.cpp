@@ -20,7 +20,7 @@
 #include "esp_ota_ops.h"
 #include "DriveLog.h"
 #include "RawRec.h"
-#include "BodyUnit.h"
+#include "Computers.h"
 #include <array>
 #include "DtcText.h"
 #include "Learner.h"
@@ -4651,6 +4651,8 @@ struct RecDecoded {
     std::string err;                     ///< The first thing that would not decode.
     std::vector<RecFrame> frames;
     std::vector<std::array<uint32_t, 4>> events;   ///< type, a, b, session
+    std::vector<std::array<uint32_t, 5>> errors;   ///< count, ecc, flags, tec, rec
+    uint32_t deaf = 0;                   ///< Deaf moments recorded.
     uint32_t lostBuf = 0, lostCtrl = 0, syncs = 0, sessions = 0, stops = 0, dataBytes = 0;
     std::vector<uint64_t> sessionStart;  ///< Each session's start time [us].
     std::vector<uint32_t> sessionAt;     ///< ...and where its record is (data offset).
@@ -4704,6 +4706,14 @@ static RecDecoded decodeRec(const std::vector<uint8_t> &raw) {
                 pos += 5;
             } else if (tag == 0xE5) {
                 uleb(dt); t += dt * 10; r.stops++;
+            } else if (tag == 0xE6) {
+                uleb(dt); t += dt * 10;
+                r.errors.push_back({le16(&raw[pos]), raw[pos + 2], raw[pos + 3], raw[pos + 4], raw[pos + 5]});
+                pos += 6;
+            } else if (tag == 0xE7) {
+                uleb(dt); t += dt * 10;
+                r.deaf += le16(&raw[pos]);
+                pos += 2;
             } else if (tag == 0xE0) {
                 uleb(dt); t += dt * 10;
                 RecFrame f = {};
@@ -4713,7 +4723,8 @@ static RecDecoded decodeRec(const std::vector<uint8_t> &raw) {
                 f.ext = fl & 1; f.rtr = fl & 2; f.tx = fl & 4;
                 if (f.ext) { f.id = le32(&raw[pos]); pos += 4; } else { f.id = le16(&raw[pos]); pos += 2; }
                 f.dlc = raw[pos++];
-                if (!f.rtr) { std::memcpy(f.d, &raw[pos], f.dlc); pos += f.dlc; }
+                const uint8_t nb = f.dlc > 8 ? 8 : f.dlc;
+                if (!f.rtr) { std::memcpy(f.d, &raw[pos], nb); pos += nb; }
                 f.tUs = t; f.session = session;
                 if (idx >= 0) {
                     if (idx > (int)refs.size()) { r.err = fmt("index %d out of order at %u", idx, at); break; }
@@ -4727,7 +4738,7 @@ static RecDecoded decodeRec(const std::vector<uint8_t> &raw) {
                 uleb(dt); t += dt * 10;
                 Ref &ref = refs[tag];
                 const uint8_t mask = raw[pos++];
-                for (int i = 0; i < ref.dlc; i++) if (mask & (1 << i)) ref.d[i] = raw[pos++];
+                for (int i = 0; i < ref.dlc && i < 8; i++) if (mask & (1 << i)) ref.d[i] = raw[pos++];
                 RecFrame f = {};
                 f.tUs = t; f.id = ref.id; f.ext = ref.ext; f.tx = ref.tx; f.dlc = ref.dlc; f.session = session;
                 std::memcpy(f.d, ref.d, 8);
@@ -4743,10 +4754,11 @@ static RecDecoded decodeRec(const std::vector<uint8_t> &raw) {
     return r;
 }
 
+/** The same frame as on the wire: its DLC as sent (9-15 too), and its bytes. */
 static bool sameFrame(const RecFrame &f, const twai_message_t &m) {
-    const uint8_t dlc = m.data_length_code > 8 ? 8 : m.data_length_code;
-    return f.id == m.identifier && f.ext == (bool)m.extd && f.rtr == (bool)m.rtr && f.dlc == dlc &&
-           (m.rtr || !std::memcmp(f.d, m.data, dlc));
+    const uint8_t nb = m.data_length_code > 8 ? 8 : m.data_length_code;
+    return f.id == m.identifier && f.ext == (bool)m.extd && f.rtr == (bool)m.rtr && f.dlc == m.data_length_code &&
+           (m.rtr || !std::memcmp(f.d, m.data, nb));
 }
 
 static RawRecState recState() { RawRecStatus s; rawRecStatus(s); return s.state; }
@@ -4778,9 +4790,12 @@ static std::string recCandump(const RecDecoded &r) {
         }
         const double ts = offset + (double)(f.tUs - first) / 1e6;
         last = ts;
-        char line[96], data[20] = "";
+        char line[96], data[24] = "";
         if (f.rtr) snprintf(data, sizeof data, f.dlc ? "R%u" : "R", f.dlc);
-        else for (int i = 0; i < f.dlc; i++) snprintf(data + 2 * i, 3, "%02X", f.d[i]);
+        else {
+            for (int i = 0; i < f.dlc && i < 8; i++) snprintf(data + 2 * i, 3, "%02X", f.d[i]);
+            if (f.dlc > 8) snprintf(data + 16, 4, "_%X", f.dlc);     // candump's len8_dlc
+        }
         snprintf(line, sizeof line, "(%.6f) %s %s#%s\n", ts, f.tx ? "tx0" : "can0",
                  (f.ext ? fmt("%08X", f.id) : fmt("%03X", f.id)).c_str(), data);
         out += line;
@@ -5035,139 +5050,270 @@ static void scRawRecLostMarked() {
     commonChecks();
 }
 
-/* ───────────────────────── the car's other computers ───────────────────── */
+/**
+ * Everything that comes over the line, recognised or not: a frame with a DLC
+ * of 12 (legal on the wire, 8 bytes follow) keeps its DLC, a remote frame and
+ * an extended one of an identifier nothing knows are in as they came, the bus
+ * errors (error frames) are in with what the controller said they were, and
+ * so are the moments the master could not hear the bus.
+ */
+static void scRawRecEverything() {
+    sim::speedOverride = [](double) { return 0.0; };
+    sim::keepDelivered = true;
+    boot();
+    runUntil(5);
+    char why[120] = "";
+    check(rawRecArm(why, sizeof why) && recWait(RR_RECORDING, 10), "armed", why);
+    runUntil(tNow() + 1);
+    twai_message_t big = {};
+    big.identifier = 0x6A5;                          // nobody's: not a known ID
+    big.dlc_non_comp = 1;
+    big.data_length_code = 12;
+    for (int i = 0; i < 8; i++) big.data[i] = (uint8_t)(0xA0 + i);
+    sim::injectFrame(big);
+    twai_message_t rtr = {};
+    rtr.identifier = 0x6A6;
+    rtr.rtr = 1;
+    rtr.data_length_code = 3;
+    sim::injectFrame(rtr);
+    twai_message_t ext = {};
+    ext.identifier = 0x1ABCDE01;
+    ext.extd = 1;
+    ext.data_length_code = 2;
+    ext.data[0] = 0x55; ext.data[1] = 0xAA;
+    sim::injectFrame(ext);
+    sim::faults.errorPerOwnFrame = 0.05;             // error frames during the master's requests
+    runUntil(tNow() + 6);
+    sim::faults.errorPerOwnFrame = 0;
+    masterBusBlind();                                // as a flash write does
+    masterBusBlind();
+    runUntil(tNow() + 1);
+    rawRecStop();
+    runUntil(tNow() + 0.5);
+    const RecDecoded r = decodeRec(simfs::logsRawBytes());
+    check(r.err.empty(), "reads back", r.err);
+    const RecFrame *fb = nullptr, *fr = nullptr, *fe = nullptr;
+    for (const auto &f : r.frames) {
+        if (f.id == 0x6A5 && !f.ext) fb = &f;
+        if (f.id == 0x6A6 && !f.ext) fr = &f;
+        if (f.id == 0x1ABCDE01 && f.ext) fe = &f;
+    }
+    check(fb && fb->dlc == 12 && fb->d[0] == 0xA0 && fb->d[7] == 0xA7, "a DLC of 12 kept, its 8 bytes",
+          fb ? fmt("DLC %u", fb->dlc) : "not in it");
+    check(fr && fr->rtr && fr->dlc == 3, "a remote frame, its DLC", fr ? fmt("DLC %u", fr->dlc) : "not in it");
+    check(fe && fe->dlc == 2 && fe->d[0] == 0x55, "an extended frame nothing knows", fe ? "in it" : "not in it");
+    MasterStats st;
+    masterGetStats(st);
+    uint32_t errs = 0;
+    bool kinds = !r.errors.empty();
+    for (const auto &e : r.errors) {
+        errs += e[0];
+        kinds &= e[1] == 0x0A;                       // bit error, sending (bit 5 clear), in the data field
+    }
+    check(errs > 0 && errs == st.errByMode[0] + st.errByMode[1] && kinds,
+          "every bus error in it, with its kind", fmt("%u in it, %u counted", errs, st.errByMode[0] + st.errByMode[1]));
+    check(r.deaf >= 2, "the moments it could not hear", fmt("%u", r.deaf));
+    if (const char *out = getenv("RAWREC_OUT")) {    // for run.py: canrec.py must read it alike
+        FILE *f = fopen((std::string(out) + ".bin").c_str(), "wb");
+        if (f) { fwrite(simfs::logsRawBytes().data(), 1, rawRecSize(), f); fclose(f); }
+        f = fopen((std::string(out) + "_expected.log").c_str(), "wb");
+        if (f) { const std::string s = recCandump(r); fwrite(s.data(), 1, s.size(), f); fclose(f); }
+    }
+    commonChecks();
+}
 
-/** Run until the scan has finished (or @p maxS passes). */
-static bool scanDone(double maxS) {
+/* ───────────────────────── the car's computers ────────────────────────── */
+
+/** Run until the scan or search has finished (or @p maxS passes). */
+static bool compIdle(double maxS) {
     const double until = tNow() + maxS;
-    BodyStatus st;
     for (;;) {
-        bodyGetStatus(st);
-        if (!st.scanning && (st.scanned || st.scanNote[0])) return st.scanned;
+        CompStatus st;
+        compGetStatus(st);
+        if (st.phase == 0) return true;
         if (tNow() >= until) return false;
         runUntil(tNow() + 0.1);
     }
 }
-/** Every request the master sent outside OBD-II's own addresses: its service
- *  byte (single frames) - flow control left out. */
-static std::vector<uint8_t> servicesSentTo7xx() {
+/** Single-frame requests the master sent to IDs the scan alone asks (not
+ *  0x7DF/0x7E0/0x7E1, where the OBD-II poller, SSM2 and the codes go):
+ *  their service bytes; flow control left out, anything else as 0xFF. */
+static std::vector<uint8_t> scanServices(double from = 0) {
     std::vector<uint8_t> out;
-    for (const auto &t : sim::transmitted) {
-        const twai_message_t &m = t.msg;
-        if (m.extd || m.identifier < 0x700 || m.identifier > 0x7F7 || m.identifier == 0x7DF ||
-            m.identifier == 0x7E0 || m.identifier == 0x7E1) continue;
+    for (const auto &r : sim::transmitted) {
+        const twai_message_t &m = r.msg;
+        if (tOf(r.tUs) < from) continue;
+        const bool scanOnly = m.extd || (m.identifier >= 0x700 && m.identifier <= 0x7F7 &&
+                                         m.identifier != 0x7DF && m.identifier != 0x7E0 && m.identifier != 0x7E1);
+        if (!scanOnly) continue;
         const uint8_t pci = m.data[0] & 0xF0;
         if (pci == 0x00) out.push_back(m.data[1]);
-        else if (pci != 0x30) out.push_back(0xFF);       // anything but a single frame or flow control
+        else if (pci != 0x30) out.push_back(0xFF);
     }
     return out;
 }
+static int foundIndex(uint32_t tx) {
+    CompFound f;
+    for (size_t i = 0; compFoundAt(i, f); i++) if (f.tx == tx) return (int)i;
+    return -1;
+}
+static std::string asciiAfter(const CompAnswer &a, size_t skip) {
+    std::string s;
+    for (size_t k = skip; k < a.len; k++) s += (a.d[k] >= 32 && a.d[k] < 127) ? (char)a.d[k] : '.';
+    return s;
+}
 
 /**
- * "Find the car's computers": standing still, every request ID from 0x700 to
- * 0x7F7 is asked "3E 00" once, and every one that answers "21 50". The engine
- * and transmission computers answer (with "not supported"), and the body
- * computer at 0x750 answers both - flagged as one. Nothing but those two
- * requests goes out, and the OBD-II poller keeps its turns meanwhile.
- * Refused while moving.
+ * "Find the car's computers", standing still: every 11-bit ID 0x700-0x7F7
+ * that no module sends on is asked "3E 00", and every 29-bit computer at once.
+ * The answers come from wherever they come - the meter on 0x7D0, not its
+ * request + 8 - and each computer is asked who it is: the engine computer is
+ * an OBD-II one and gives its SSM IDs, the body computer and the meter their
+ * KWP2000 identification, the 29-bit one its UDS name. Nothing is sent on an
+ * ID the car's modules use (0x705, 0x706), nothing but reading services goes
+ * out, the OBD-II poller keeps its turns, and moving it is refused.
  */
-static void scBodyScan() {
-    sim::biu.enabled = true;
+static void scCompScan() {
+    sim::others.enabled = true;
     sim::speedOverride = [](double) { return 0.0; };
     boot();
     runUntil(15);
     char why[96] = "";
-    const double tStart = tNow();
-    check(bodyRequestScan(why, sizeof why), "the scan starts", why);
     const double t0 = tNow();
-    const bool done = scanDone(90);
-    check(done, "and finishes", fmt("in %.1f s", tNow() - t0));
-    BodyStatus st;
-    bodyGetStatus(st);
-    bool ecm = false, tcm = false, biu = false, extra = false;
-    for (size_t i = 0; i < st.found; i++) {
-        BodyFound f;
-        bodyFoundAt(i, f);
-        if (f.tx == 0x7E0) ecm = !f.biu;
-        else if (f.tx == 0x7E1) tcm = !f.biu;
-        else if (f.tx == 0x750) biu = f.biu && f.rx == 0x758 && f.biuLen == 16;
-        else extra = true;
-    }
-    check(ecm && biu && !extra, "the engine computer, and 0x750 as a body computer",
-          fmt("%u found%s", (unsigned)st.found, tcm ? " (and the transmission)" : ""));
-    const std::vector<uint8_t> svc = servicesSentTo7xx();
+    check(compRequestScan(why, sizeof why), "the scan starts", why);
+    const bool done = compIdle(120);
+    CompStatus st;
+    compGetStatus(st);
+    check(done && st.scanned, "and finishes", fmt("in %.1f s, %u IDs left alone", tNow() - t0, (unsigned)st.skipped));
+    std::string list;
+    CompFound f;
+    for (size_t i = 0; compFoundAt(i, f); i++) list += fmt("%s0x%X>0x%X", i ? " " : "", (unsigned)f.tx, (unsigned)f.rx);
+    const int ecm = foundIndex(0x7E0), biu = foundIndex(0x750), meter = foundIndex(0x7C0), eps = foundIndex(0x18DA30F1);
+    check(ecm >= 0 && biu >= 0 && meter >= 0 && eps >= 0 && st.found <= 5, "every computer, and nothing else", list);
+    CompFound fe, fb, fm, fp;
+    compFoundAt(ecm, fe); compFoundAt(biu, fb); compFoundAt(meter, fm); compFoundAt(eps, fp);
+    check(fb.rx == 0x758 && fm.rx == 0x7D0 && fp.rx == 0x18DAF130, "each answer taken where it came from",
+          fmt("0x%X 0x%X 0x%X", (unsigned)fb.rx, (unsigned)fm.rx, (unsigned)fp.rx));
+    check(fe.ans[ASK_OBD].how == HOW_ANSWERED && fe.ans[ASK_SSM].how == HOW_ANSWERED && fe.ans[ASK_SSM].d[0] == 0xEA,
+          "the engine computer: OBD-II, and its SSM IDs", fmt("%02X %02X %02X", fe.ans[ASK_SSM].d[1], fe.ans[ASK_SSM].d[2], fe.ans[ASK_SSM].d[3]));
+    check(fb.ans[ASK_KWP].how == HOW_ANSWERED && asciiAfter(fb.ans[ASK_KWP], 2).find("BIU") != std::string::npos &&
+          fb.ans[ASK_OBD].how == HOW_REFUSED, "the body computer: its KWP2000 identification", asciiAfter(fb.ans[ASK_KWP], 2));
+    check(fp.ans[ASK_UDS_NAME].how == HOW_ANSWERED && asciiAfter(fp.ans[ASK_UDS_NAME], 3) == "EPS",
+          "the 29-bit one: its UDS name", asciiAfter(fp.ans[ASK_UDS_NAME], 3));
+    size_t onTheirs = 0;
+    for (const auto &r : sim::transmitted)
+        if (!r.msg.extd && (r.msg.identifier == 0x705 || r.msg.identifier == 0x706)) onTheirs++;
+    check(onTheirs == 0 && st.skipped >= 2, "never a frame on an ID the car's modules send on",
+          fmt("%zu frames on 0x705/0x706", onTheirs));
+    const std::vector<uint8_t> svc = scanServices();
     bool onlyReads = !svc.empty();
-    for (uint8_t b : svc) onlyReads &= b == 0x3E || b == 0x21;
-    check(onlyReads, "only 3E and 21 sent to the other addresses", fmt("%zu requests", svc.size()));
-    const uint64_t obd = txCount(isObdReq, tStart, tNow());
-    check(obd > (tNow() - tStart) * 10, "the OBD-II poller kept its turns",
-          fmt("%llu requests in %.0f s", (unsigned long long)obd, tNow() - tStart));
+    for (uint8_t b : svc) onlyReads &= b == 0x3E || b == 0x01 || b == 0xAA || b == 0x1A || b == 0x22 || b == 0x21;
+    check(onlyReads, "only reading services sent", fmt("%zu requests", svc.size()));
+    const uint64_t obd = txCount(isObdReq, t0, tNow());
+    check(obd > (tNow() - t0) * 10, "the OBD-II poller kept its turns",
+          fmt("%llu requests in %.0f s", (unsigned long long)obd, tNow() - t0));
     sim::speedOverride = [](double) { return 40.0; };
     runUntil(tNow() + 3);
-    check(!bodyRequestScan(why, sizeof why) && std::strstr(why, "moving"), "refused while moving", why);
+    check(!compRequestScan(why, sizeof why) && std::strstr(why, "moving"), "refused while moving", why);
     commonChecks();
 }
 
 /**
- * The body computer read: its blocks land in the frame table as frames of
- * their own, so a signal mapped on one - the driver's door, bit 8 of block
- * 0x50 - publishes like one off the bus. They count no missed frames, and
- * the raw recorder never sees them.
+ * "Find its data": the body computer's blocks are 50 (16 bytes) and 51 (3
+ * bytes) - found by asking 21 01 to 21 FE, nothing else sent - and the 29-bit
+ * computer, which has no service 21, is left after its first refusal.
  */
-static void scBodyReader() {
-    sim::biu.enabled = true;
-    const uint32_t id50 = BODY_PSEUDO_BASE | 0x5000;
-    storedConfig(fmt(R"({"biu_tx":1872,"biu_ms":500,"signals":[{"can_id":%u,"ext":true,"start":8,"len":1,"metric":%u,"mode":%d}]})",
+static void scCompSearch() {
+    sim::others.enabled = true;
+    sim::speedOverride = [](double) { return 0.0; };
+    boot();
+    runUntil(15);
+    char why[96] = "";
+    compRequestScan(why, sizeof why);
+    compIdle(120);
+    const int biu = foundIndex(0x750), eps = foundIndex(0x18DA30F1);
+    const double t0 = tNow();
+    check(biu >= 0 && compRequestSearch((size_t)biu, why, sizeof why), "the search starts", why);
+    compIdle(120);
+    CompFound f;
+    compFoundAt(biu, f);
+    std::string lids;
+    for (uint8_t k = 0; k < f.nLids; k++) lids += fmt("%s%02X(%u)", k ? " " : "", f.lid[k], f.lidLen[k]);
+    check(f.search == SEARCH_DONE && f.nLids == 2 && f.lid[0] == 0x50 && f.lidLen[0] == 16 && f.lid[1] == 0x51 &&
+          f.lidLen[1] == 3, "the body computer's blocks: 50 and 51", fmt("%s in %.1f s", lids.c_str(), tNow() - t0));
+    std::vector<uint8_t> svc = scanServices(t0);
+    bool only21 = !svc.empty();
+    for (uint8_t b : svc) only21 &= b == 0x21;
+    check(only21, "only 21 sent", fmt("%zu requests", svc.size()));
+    const double t1 = tNow();
+    check(compRequestSearch((size_t)eps, why, sizeof why), "the 29-bit one's search starts", why);
+    compIdle(60);
+    compFoundAt(eps, f);
+    const size_t asked = scanServices(t1).size();
+    check(f.search == SEARCH_NO_SERVICE && asked == 1, "it has no service 21: one request", fmt("%zu requests", asked));
+    commonChecks();
+}
+
+/**
+ * The reads table: the body computer's block 50 and the meter's block 01 in
+ * the frame table as rows of their own, a door mapped on the first publishing
+ * like a broadcast; never missed frames. Gone quiet, each is asked only every
+ * 10 s.
+ */
+static void scCompReader() {
+    sim::others.enabled = true;
+    const uint32_t id50 = compPseudo(0x750, 0x50, 0);
+    storedConfig(fmt(R"({"reads":[{"tx":1872,"rx":1880,"lid":80,"ms":500},{"tx":1984,"rx":2000,"lid":1,"ms":1000}],)"
+                     R"("signals":[{"can_id":%u,"ext":true,"start":8,"len":1,"metric":%u,"mode":%d}]})",
                      (unsigned)id50, (unsigned)METRIC_ID_DOOR_FL, (int)SIG_ON).c_str());
     boot();
     runUntil(20);
     float v = -1; uint32_t age = 0; uint8_t src = 0;
-    check(metricLookup(METRIC_ID_DOOR_FL, v, age, src) && v == 0 && age < 2000, "the door, shut",
-          fmt("%.0f, %u ms old", v, (unsigned)age));
-    sim::biu.doorDriver = true;
+    bool have = metricLookup(METRIC_ID_DOOR_FL, v, age, src);
+    check(have && v == 0 && age < 2000, "the door, shut", fmt("%.0f, %u ms old", v, (unsigned)age));
+    sim::others.doorDriver = true;
     runUntil(tNow() + 2);
-    check(metricLookup(METRIC_ID_DOOR_FL, v, age, src) && v == 1, "opened", fmt("%.0f", v));
-    sim::biu.doorDriver = false;
+    have = metricLookup(METRIC_ID_DOOR_FL, v, age, src);
+    check(have && v == 1, "opened", fmt("%.0f", v));
+    sim::others.doorDriver = false;
     runUntil(tNow() + 2);
-    check(metricLookup(METRIC_ID_DOOR_FL, v, age, src) && v == 0, "shut again", fmt("%.0f", v));
-    BodyStatus st;
-    bodyGetStatus(st);
-    check(st.tx == 0x750 && st.rx == 0x758 && st.reads > 40 && st.blockLen[0] == 16 && st.blockLen[1] == 3,
-          "read every 500 ms, both blocks", fmt("%u reads, %u failed", (unsigned)st.reads, (unsigned)st.fails));
-    // In the frame table: 0x50 in two rows, 0x51 in one; no missed frames.
+    have = metricLookup(METRIC_ID_DOOR_FL, v, age, src);
+    check(have && v == 0, "shut again", fmt("%.0f", v));
+    CompReadView r0, r1;
+    have = compReadAt(0, r0) && compReadAt(1, r1);
+    check(have && r0.reads > 30 && r1.reads > 15 && r0.len == 16 && r1.len == 6,
+          "both read, each at its own pace", fmt("%u and %u reads", (unsigned)r0.reads, (unsigned)r1.reads));
     uint8_t order[128];
     const size_t n = masterCensusOrder(order, sizeof order);
     int rows = 0;
     for (size_t i = 0; i < n; i++) {
         CensusView c;
-        if (masterCensusRow(order[i], c) && bodyPseudoId(c.id, c.extd)) rows++;
+        if (masterCensusRow(order[i], c) && compPseudoId(c.id, c.extd)) rows++;
     }
     check(rows == 3, "three rows in the frame table", fmt("%d", rows));
     MissView mv[64];
     const size_t nm = masterMissedIds(mv, 64);
-    bool pseudoListed = false;
-    for (size_t i = 0; i < nm; i++) pseudoListed |= bodyPseudoId(mv[i].id, mv[i].extd);
-    check(!pseudoListed, "never counted as missed frames");
-    // The body computer goes quiet: the reads slow to one every 10 s.
-    sim::biu.enabled = false;
+    bool listed = false;
+    for (size_t i = 0; i < nm; i++) listed |= compPseudoId(mv[i].id, mv[i].extd);
+    check(!listed, "never counted as missed frames");
+    sim::others.enabled = false;
     runUntil(tNow() + 10);
-    const size_t sent0 = servicesSentTo7xx().size();
+    const size_t sent0 = scanServices().size();
     runUntil(tNow() + 30);
-    const size_t sent = servicesSentTo7xx().size() - sent0;
-    check(sent <= 8, "quiet, it is asked every 10 s", fmt("%zu requests in 30 s", sent));
+    const size_t sent = scanServices().size() - sent0;
+    check(sent <= 8, "quiet, each is asked every 10 s", fmt("%zu requests in 30 s", sent));
     commonChecks();
 }
 
-/** biu_tx 0 (the default): the body computer is never asked. */
-static void scBodyOff() {
-    sim::biu.enabled = true;
+/** No reads (the default) and no scan: none of them is asked anything. */
+static void scCompOff() {
+    sim::others.enabled = true;
     boot();
     runUntil(40);
-    check(sim::biu.services.empty() && servicesSentTo7xx().empty(), "nothing sent to it",
-          fmt("%zu", sim::biu.services.size()));
+    check(sim::others.asked.empty() && scanServices().empty(), "nothing sent to them",
+          fmt("%zu", sim::others.asked.size()));
     commonChecks();
 }
-
 
 static const Scenario SCENARIOS[] = {
     {"auto", scAuto, 0}, {"silent", scSilent, 0}, {"mode_switch", scModeSwitch, 0},
@@ -5251,13 +5397,15 @@ static const Scenario SCENARIOS[] = {
     {"rawrec_roundtrip", scRawRecRoundtrip, 0}, {"rawrec_resume", scRawRecResume, 0},
     {"rawrec_stopped_kept", scRawRecStoppedKept, 0}, {"rawrec_full", scRawRecFull, 0},
     {"rawrec_refused", scRawRecRefused, 0}, {"rawrec_lost_marked", scRawRecLostMarked, 0},
+    {"rawrec_everything", scRawRecEverything, 0},
     {"log_move_cut", scLogMoveCut, 0}, {"log_move_fails", scLogMoveFails, 0},
     {"fw_update", scFwUpdate, 0}, {"fw_update_moving", scFwUpdateMoving, 0},
     {"fw_update_wrong_image", scFwUpdateWrongImage, 0}, {"fw_update_cut", scFwUpdateCut, 0},
     {"fw_trial", scFwTrial, 0}, {"fw_trial_late_clock", scFwTrialLateClock, 0},
     {"fw_trial_sleep", scFwTrialSleep, 0}, {"fw_rolled_back", scFwRolledBack, 0},
     {"sleep_busy_bus_race", scSleepBusyBusRace, 0},
-    {"body_scan", scBodyScan, 0}, {"body_reader", scBodyReader, 0}, {"body_off", scBodyOff, 0},
+    {"comp_scan", scCompScan, 0}, {"comp_search", scCompSearch, 0},
+    {"comp_reader", scCompReader, 0}, {"comp_off", scCompOff, 0},
 };
 
 static const Scenario *s_sc = nullptr;

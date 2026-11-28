@@ -382,8 +382,9 @@ bool ConfigManager::applyLayoutFile(const char *path, char *why, size_t whyLen, 
      * one is parsed into its place, so the two are never held together.
      * Nothing reads it meanwhile: the portal runs in the loop, as the UI does.
      */
-    JsonDocument cal;
+    JsonDocument cal, net;
     cal.set(_layout["global"]["touch_cal"]);
+    net.set(_layout["network"]);
     _layout.clear();
 
     DeserializationError err = DeserializationError::InvalidInput;
@@ -408,9 +409,26 @@ bool ConfigManager::applyLayoutFile(const char *path, char *why, size_t whyLen, 
         return false;
     }
 
-    bool stored;
+    bool patched = false;
     if (!cal.isNull() && _layout["global"]["touch_cal"] != cal) {
         _layout["global"]["touch_cal"] = cal;
+        patched = true;
+    }
+    /*
+     * The display's network settings stand wherever the upload says nothing
+     * of them: a layout file from another display, or one written by hand,
+     * must not move this one off the master's channel, or change the name and
+     * password its settings are reached by, unless it says so (the studio's
+     * own Save always sends them all).
+     */
+    if (net.is<JsonObject>()) {
+        JsonObject dst = _layout["network"].is<JsonObject>() ? _layout["network"].as<JsonObject>()
+                                                             : _layout["network"].to<JsonObject>();
+        for (JsonPair kv : net.as<JsonObject>())
+            if (dst[kv.key()].isNull()) { dst[kv.key()] = kv.value(); patched = true; }
+    }
+    bool stored;
+    if (patched) {
         LittleFS.remove(path);
         stored = persistLayout();
     } else {

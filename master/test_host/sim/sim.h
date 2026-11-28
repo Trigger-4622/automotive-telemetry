@@ -289,19 +289,27 @@ extern int  bugUninstallWhileWaiting;          ///< Uninstall with a task blocke
 extern std::map<uint32_t, int> isoRequests;
 extern int codesCleared;                       ///< Service 04 accepted.
 
-/** A body computer (BIU) on the bus, answering KWP2000 over ISO-TP as
- *  FastECU found the 2005-09 cars' one on K-line: "3E" (present), "21 50"
- *  (switches, 16 bytes) and "21 51" (lighting, 3 bytes). Off unless a
- *  scenario switches it on. */
-struct BiuSim {
+/** The car's other computers, as different as they come (Computers.h finds
+ *  them; off unless a scenario switches them on):
+ *  - a body computer at 0x750 -> 0x758, KWP2000: "3E", "1A 80" (its
+ *    identification), "21 50" (switches, 16 bytes: byte 0 bit 4 the light
+ *    switch, byte 1 the doors and boot, byte 4 bit 0 the handbrake) and
+ *    "21 51" (lighting, 3 bytes); any other block is refused (31);
+ *  - a meter at 0x7C0 that answers on 0x7D0 (not the request + 8): "3E",
+ *    "1A 80", "21 01" (6 bytes);
+ *  - a UDS computer on 29-bit addresses, 0x18DA30F1 -> 0x18DAF130, which also
+ *    answers "3E 00" sent to every 29-bit computer (0x18DB33F1): "22 F1 97"
+ *    is "EPS"; it has no service 21.
+ *  Anything else they are asked, they refuse (11). */
+struct OthersSim {
     bool     enabled = false;
-    uint32_t req = 0x750, rsp = 0x758;
     bool     doorDriver = false, doorPass = false, doorRL = false, doorRR = false;
     bool     boot = false, lightsSw = false, handbrake = false;
-    int      reads = 0;                  ///< "21 50" and "21 51" answered.
-    std::vector<uint8_t> services;       ///< Every service byte it was sent.
+    int      reads = 0;                  ///< Data blocks answered.
+    /** Every single-frame request they were sent: request ID << 8 | service. */
+    std::vector<uint64_t> asked;
 };
-extern BiuSim biu;
+extern OthersSim others;
 /** Speed of the car in km/h at time t (seconds since start), replacing the
  *  built-in drive; nullptr = the built-in drive. */
 extern double (*speedOverride)(double t);

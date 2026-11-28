@@ -254,8 +254,9 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
       <h2>Layout file</h2>
       <p class="hint">Everything above, as the display stores it. Edit it here
       and apply it to the editor, keep a copy, or open one kept earlier; then
-      save it to the display. The display keeps its own touch calibration
-      whatever the file says.</p>
+      save it to the display. <b>Upload to the display</b> sends a file
+      straight to it as it is, as the master's settings Upload does. The
+      display keeps its own touch calibration whatever the file says.</p>
       <textarea id="jsonEd" spellcheck="false"></textarea>
       <div class="btnrow">
         <button class="b primary" onclick="applyJson()">Apply to the editor</button>
@@ -263,6 +264,9 @@ select:focus,input:focus{outline:2px solid var(--accent);outline-offset:1px}
         <button class="b" onclick="$('#layoutFile').click()">Open a file…</button>
         <input type="file" id="layoutFile" accept=".json,application/json" hidden
           onchange="openLayout(this)">
+        <button class="b" onclick="$('#layoutUpload').click()">Upload to the display…</button>
+        <input type="file" id="layoutUpload" accept=".json,application/json" hidden
+          onchange="uploadLayout(this)">
       </div>
     </div>
   </section>
@@ -1183,7 +1187,9 @@ function autoHtml(s){
     number; <b>equal to</b> compares whole numbers.</p>
     ${condRows('show_when',w)}
     <div class="btnrow"><button class="b" onclick="condAdd('show_when')">Add a condition</button></div>`;
-  if(w.length)h+=`<div class="grid2">${fld('Go back after (s)',inp('back_after_s',s.back_after_s??'','number',
+  if(w.length)h+=`<label class="f wide"><input type="checkbox" ${s.swipe===false?'checked':''}
+      onchange="swipeOnly(this.checked)"> Only by itself: left out of the swipe order and the page dots</label>
+    <div class="grid2">${fld('Go back after (s)',inp('back_after_s',s.back_after_s??'','number',
       `data-num="1" min="0" step="any" placeholder="${BACK_AFTER}"`))}</div>
     <p class="hint">Go back at once, without the wait, when any of these holds:</p>
     ${condRows('back_now_when',Array.isArray(s.back_now_when)?s.back_now_when:[])}
@@ -1207,6 +1213,12 @@ function condRows(k,list){
       <button class="b" title="Remove" onclick="condDel('${k}',${i})">✕</button></div>`;
   }).join('');
 }
+/* "swipe": false - the screen comes up only by its rule (the firmware keeps
+   one without a rule in the swipe order). */
+function swipeOnly(on){
+  const s=scr();if(on)s.swipe=false;else delete s.swipe;
+  renderList();draw();
+}
 function condAdd(k){
   const s=scr();if(!Array.isArray(s[k]))s[k]=[];
   s[k].push(k==='show_when'&&!s[k].length?{gear:'R'}:{metric_id:'0x010D',op:'>',value:k==='show_when'?100:15});
@@ -1215,6 +1227,7 @@ function condAdd(k){
 function condDel(k,i){
   const s=scr();if(!Array.isArray(s[k]))return;
   s[k].splice(i,1);
+  if(k==='show_when'&&!s[k].length)delete s.swipe;      // no rule: back in the swipe order
   if(!s[k].length){delete s[k];if(k==='show_when'){delete s.back_after_s;delete s.back_now_when;}}
   renderEditor();
 }
@@ -1339,6 +1352,39 @@ function openLayout(el){
   const f=el.files[0];el.value='';if(!f)return;
   f.text().then(t=>{$('#jsonEd').value=t;applyJson();})
    .catch(()=>toast('That file could not be read',1));
+}
+/* A layout file straight to the display, as it is - the master's settings
+   Upload works the same way: checked here, written by the display to flash as
+   it arrives and read from there (a file it cannot take changes nothing, and
+   its reason is shown); the editor then shows what the display took. */
+async function uploadLayout(el){
+  const f=el.files[0];el.value='';if(!f||saving)return;
+  let text,j;
+  try{text=await f.text();}catch(e){return toast('That file could not be read',1);}
+  try{j=JSON.parse(text);}catch(e){return toast('Not a layout: '+e.message,1);}
+  if(!j||typeof j!=='object'||Array.isArray(j)||!Array.isArray(j.screens)||!j.screens.length)
+    return toast('Not uploaded: a layout needs a "screens" list with at least one screen',1);
+  if(!confirm('Replace everything on the display with '+f.name+' ('+j.screens.length+
+      ' screens)? Its own touch calibration stays.'))return;
+  saving=true;stopPoll();
+  const body=new FormData();
+  body.append('layout',new Blob([text],{type:'application/json'}),'layout.json');
+  let ok=false;
+  try{
+    const r=await req('/api/layout',{method:'POST',body},20000);
+    if(!r.ok)throw new Error(await replyError(r));
+    ok=true;
+  }catch(e){toast('Not uploaded: '+failText(e),1);}
+  saving=false;
+  if(ok){
+    layout=null;await boot();                     // what the display now holds
+    if(confirm('Uploaded ✔ Restart the display now to show it?')){
+      try{await req('/api/reboot',{method:'POST'},4000);}catch(e){}
+      return toast('Restarting — reconnect to the display network');
+    }
+    toast('Uploaded ✔ — it shows after the next restart');
+  }
+  if(curTab==='device')poll();
 }
 
 /* ───────────────────────────── device tab ──────────────────────────────── */

@@ -613,9 +613,6 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["ecu_cal_id"]   = copied(ecuCalId);
     doc["vin"]          = copied(vin);
     doc["dtc_poll_s"]   = dtcPollS;
-    doc["biu_tx"]       = biuTx;
-    doc["biu_rx"]       = biuRx;
-    doc["biu_ms"]       = biuMs;
     doc["oil_every_km"] = oilEveryKm;
     doc["oil_at_km"]    = oilAtKm;
     doc["log_on"]       = logOn;
@@ -623,6 +620,11 @@ void MasterConfig::toJson(JsonDocument &doc) const {
     doc["log_max_kb"]   = logMaxKb;
     JsonArray li = doc["log_ids"].to<JsonArray>();
     for (uint16_t id : logIds) li.add(id);
+    JsonArray ra = doc["reads"].to<JsonArray>();
+    for (const RtRead &r : reads) {
+        JsonObject o = ra.add<JsonObject>();
+        o["tx"] = r.tx; o["rx"] = r.rx; o["lid"] = r.lid; o["ms"] = r.ms;
+    }
     JsonArray rm = doc["ssm_removed"].to<JsonArray>();
     for (uint32_t a : ssmRemoved) rm.add(a);
     JsonArray lx = doc["learn_excl"].to<JsonArray>();
@@ -819,9 +821,6 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
     if (v["vin"].is<const char *>())
         strlcpy(vin, v["vin"].as<const char *>(), sizeof(vin));
     dtcPollS   = (uint16_t)jint(v["dtc_poll_s"], dtcPollS, 0, 3600);
-    biuTx      = (uint16_t)jint(v["biu_tx"], biuTx, 0, 0x7FF);
-    biuRx      = (uint16_t)jint(v["biu_rx"], biuRx, 0, 0x7FF);
-    biuMs      = (uint16_t)jint(v["biu_ms"], biuMs, 100, 10000);
     oilEveryKm = (uint32_t)jint(v["oil_every_km"], (int)oilEveryKm, 500, 100000);
     oilAtKm    = jint(v["oil_at_km"], oilAtKm, -1, 9999999);
     logOn      = v["log_on"] | logOn;
@@ -836,6 +835,25 @@ bool MasterConfig::fromJson(JsonVariantConst v, bool fromUser) {
             if (id && logIds.size() < 24 &&
                 std::find(logIds.begin(), logIds.end(), (uint16_t)id) == logIds.end())
                 logIds.push_back((uint16_t)id);
+        }
+    }
+    // A computer's data block read into the frame table: a request ID (11-bit,
+    // or 29-bit above 0x7FF), its reply ID, the block, how often. Anything
+    // malformed or repeated is dropped, not guessed at.
+    if (v["reads"].is<JsonArrayConst>()) {
+        reads.clear();
+        for (JsonVariantConst e : v["reads"].as<JsonArrayConst>()) {
+            if (reads.size() >= MAX_READS || !e.is<JsonObjectConst>()) continue;
+            RtRead r;
+            r.tx  = e["tx"]  | 0u;
+            r.rx  = e["rx"]  | 0u;
+            r.lid = (uint8_t)jint(e["lid"], 0, 0, 0xFF);
+            r.ms  = (uint16_t)jint(e["ms"], 500, 100, 60000);
+            if (!r.tx || !r.rx || r.tx == r.rx || r.tx > 0x1FFFFFFF || r.rx > 0x1FFFFFFF ||
+                (r.tx > 0x7FF) != (r.rx > 0x7FF)) continue;
+            bool dup = false;
+            for (const RtRead &o : reads) dup |= o.tx == r.tx && o.lid == r.lid;
+            if (!dup) reads.push_back(r);
         }
     }
 
